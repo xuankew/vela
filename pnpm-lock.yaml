@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@automann/maple-mono-cn':
+        specifier: 7.9.2
+        version: 7.9.2
       '@codemirror/autocomplete':
         specifier: ^6.20.3
         version: 6.20.3
@@ -71,6 +74,11 @@ importers:
         version: 2.11.14(solid-js@1.9.15)(vite@8.3.0)
 
 packages:
+
+  '@automann/maple-mono-cn@7.9.2':
+    resolution: {integrity: sha512-eEq6Hv5ftprDyxSHgiA/kJsz1bYkP+DIVI/To6TBOX8WXhLIWpeYG/WXiZvGTucT82JtTqHZezyqfDcwFx5jdw==}
+    engines: {node: '>=20'}
+    hasBin: true
 
   '@babel/code-frame@7.29.7':
     resolution: {integrity: sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw==}
@@ -834,6 +842,8 @@ packages:
     resolution: {integrity: sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==}
 
 snapshots:
+
+  '@automann/maple-mono-cn@7.9.2': {}
 
   '@babel/code-frame@7.29.7':
     dependencies:

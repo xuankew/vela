@@ -13,8 +13,11 @@
  */
 
 :root {
-  /* 字体分区。M4 的主题系统会接管这三个变量。 */
+  /* 字体分区。M4 的主题系统会接管这几个变量。
+     editor = Markdown 正文；code = 代码块/表格（按语法节点分流，见 editor/setup.ts）；ui = 界面。
+     正文与代码是两个正交维度，各自可切换，因此必须同时驻留。 */
   --vela-font-editor: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --vela-font-code: ui-monospace, SFMono-Regular, Menlo, monospace;
   --vela-font-ui: -apple-system, BlinkMacSystemFont, sans-serif;
   --vela-font-size: 14px;
   --vela-line-height: 1.75;
@@ -258,8 +261,16 @@ select {
 
 /* ---------- 字体对齐测试台（验收项 #3）---------- */
 
+/* editor/setup.ts 的语法装饰：围栏代码块 / 缩进代码 / Markdown 表格所在的行。
+   只换字体不动行高——行高一变，CM6 的行高测量与滚动位置全会错。 */
+.cm-line.vela-code {
+  font-family: var(--vela-font-code);
+}
+
 .align-test {
-  font-family: var(--vela-font-editor);
+  /* 跟代码区字体走而非正文字体：#3 量的是「代码区能不能对齐」，
+     指向 --vela-font-editor 的话切了代码字体这里量的还是文楷，结论会反。 */
+  font-family: var(--vela-font-code);
   font-size: var(--vela-font-size);
   line-height: var(--vela-line-height);
   white-space: pre;

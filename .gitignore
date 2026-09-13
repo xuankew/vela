@@ -4,4 +4,5 @@ src-tauri/target/
 src-tauri/gen/
 *.local
 .DS_Store
-.m0-*.log
+# M0 验证脚手架的临时产物（脚本、日志、报告快照），验收结束整体删除
+.m0-*

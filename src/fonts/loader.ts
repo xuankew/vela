@@ -72,7 +72,52 @@ export const FONT_VARIANTS: Record<FontVariantId, FontVariant> = {
 
 export const DEFAULT_VARIANT: FontVariantId = 'screen-gb'
 
+/**
+ * 代码区字体（PLAN.md D2 已定为「按内容分字体」）。
+ *
+ * 与正文字体是**两个正交维度**：正文字体决定 Markdown 正文与 UI，
+ * 代码区字体决定围栏代码块 / 缩进代码 / Markdown 表格。
+ *
+ * 为什么必须分开：M0 验收项 #3 实测 LXGW WenKai Screen 的拉丁是**比例宽度**
+ * （ASCII 步进极差 8.63px），CJK/ASCII = 1.666 而非 2.0，50 个中文字累积漂移 140px。
+ * 文楷用于代码区连纯英文的列都对不齐，只能退回正文与 UI。
+ *
+ * Maple Mono CN 的许可证状况比文楷宽松：OFL-1.1 且**没有 Reserved Font Name**
+ * （上游 OFL.txt 的版权声明后没有任何 RFN 声明），所以分片分发不触发改名义务。
+ */
+export type CodeFontId = 'maple-cn' | 'inherit'
+
+export interface CodeFont {
+  id: CodeFontId
+  label: string
+  /** 注入后声明的 CSS family 名；null 表示跟随正文字体，无需注入 */
+  family: string | null
+  shards: number
+  shardBytes: number
+  load?: () => Promise<{ default: string }>
+}
+
+export const CODE_FONTS: Record<CodeFontId, CodeFont> = {
+  'maple-cn': {
+    id: 'maple-cn',
+    label: 'Maple Mono CN（等宽 2:1）',
+    family: 'Maple Mono CN',
+    // 只发 400 一个字重：dist/fonts/400 下 239 个 woff2。
+    // 粗体走浏览器合成，与文楷的 R16 现状一致，真要字重再加一档 CSS。
+    shards: 239,
+    shardBytes: 9.3 * 1024 * 1024,
+    // 路径不能写成 dist/regular.css：该包有 exports 白名单，只暴露 ./regular.css，
+    // 写真实路径 dev 下可能侥幸通过但 rolldown 构建会直接失败。
+    load: () => import('@automann/maple-mono-cn/regular.css?inline'),
+  },
+  // D2 的选项 (a)：代码区也用文楷，接受列对齐漂移。保留成一键切换而非删掉。
+  inherit: { id: 'inherit', label: '跟随正文（文楷，不对齐）', family: null, shards: 0, shardBytes: 0 },
+}
+
+export const DEFAULT_CODE_FONT: CodeFontId = 'maple-cn'
+
 const STYLE_NODE_ID = 'vela-font-faces'
+const CODE_STYLE_NODE_ID = 'vela-code-font-faces'
 
 export interface FontApplyResult {
   id: FontVariantId
@@ -89,6 +134,7 @@ export interface FontApplyResult {
 }
 
 let currentId: FontVariantId | null = null
+let currentCodeId: CodeFontId | null = null
 
 interface CachedCss {
   css: string
@@ -98,12 +144,19 @@ interface CachedCss {
 
 /** 变体模块缓存：rolldown 自己也缓存 dynamic import，这层是为了同步拿到 fromCache 指标 */
 const cssCache = new Map<FontVariantId, CachedCss>()
+const codeCssCache = new Map<CodeFontId, CachedCss>()
 
-function styleNode(): HTMLStyleElement {
-  let el = document.getElementById(STYLE_NODE_ID) as HTMLStyleElement | null
+/**
+ * 正文字体与代码区字体各占一个 style 节点。
+ *
+ * 不能共用：`applyFontVariant` 是整块替换（同名 @font-face 互相覆盖，见 R14），
+ * 而两个 family 必须同时驻留——正文用文楷、代码块用 Maple，缺一边就会掉回系统字体。
+ */
+function styleNode(id: string): HTMLStyleElement {
+  let el = document.getElementById(id) as HTMLStyleElement | null
   if (!el) {
     el = document.createElement('style')
-    el.id = STYLE_NODE_ID
+    el.id = id
     document.head.appendChild(el)
   }
   return el
@@ -144,10 +197,10 @@ export async function applyFontVariant(id: FontVariantId): Promise<FontApplyResu
     }
     cssBytes = entry.bytes
     faces = entry.faces
-    styleNode().textContent = entry.css
+    styleNode(STYLE_NODE_ID).textContent = entry.css
   } else {
     // 系统字体对照组：清空注入的声明，避免上一个变体残留
-    styleNode().textContent = ''
+    styleNode(STYLE_NODE_ID).textContent = ''
   }
 
   currentId = id
@@ -155,6 +208,9 @@ export async function applyFontVariant(id: FontVariantId): Promise<FontApplyResu
   const root = document.documentElement.style
   root.setProperty('--vela-font-editor', variant.stack)
   root.setProperty('--vela-font-ui', variant.uiStack)
+  // inherit 档的代码区字体栈就是正文字体栈，换正文必须跟着刷新，
+  // 否则代码区会停在上一个变体的 family 上。
+  syncCodeStack()
 
   return {
     id,
@@ -166,6 +222,83 @@ export async function applyFontVariant(id: FontVariantId): Promise<FontApplyResu
   }
 }
 
+/** 代码区实际生效的字体栈。inherit 档直接复用正文栈。 */
+function codeStack(): string {
+  const code = CODE_FONTS[currentCodeId ?? DEFAULT_CODE_FONT]
+  if (code.family) return `'${code.family}', ui-monospace, monospace`
+  const prose = FONT_VARIANTS[currentId ?? DEFAULT_VARIANT]
+  return prose.stack
+}
+
+function syncCodeStack() {
+  document.documentElement.style.setProperty('--vela-font-code', codeStack())
+}
+
+export interface CodeFontApplyResult {
+  id: CodeFontId
+  injected: boolean
+  cssBytes: number
+  faces: number
+  ms: number
+  fromCache: boolean
+  /** 实际写进 --vela-font-code 的字体栈，探针面板要把它和量到的度量一起报出来 */
+  stack: string
+}
+
+/**
+ * 切换代码区字体。与 `applyFontVariant` 互不干扰：两者写不同的 style 节点、
+ * 不同的 CSS 变量，因此可以各自独立切换、也可以同时驻留。
+ */
+export async function applyCodeFont(id: CodeFontId): Promise<CodeFontApplyResult> {
+  const t0 = performance.now()
+  const font = CODE_FONTS[id]
+  const cached = codeCssCache.get(id)
+  const fromCache = cached !== undefined
+  const already = currentCodeId === id
+
+  if (font.load && !already) {
+    let entry = cached
+    if (!entry) {
+      const css = (await font.load()).default
+      entry = { css, bytes: css.length, faces: css.split('@font-face').length - 1 }
+      codeCssCache.set(id, entry)
+    }
+    styleNode(CODE_STYLE_NODE_ID).textContent = entry.css
+    currentCodeId = id
+    syncCodeStack()
+    return {
+      id,
+      injected: true,
+      cssBytes: entry.bytes,
+      faces: entry.faces,
+      ms: performance.now() - t0,
+      fromCache,
+      stack: codeStack(),
+    }
+  }
+
+  if (!font.load) {
+    // inherit：不需要任何 @font-face，但要把上一次注入的代码字体声明留着——
+    // 清掉的话再切回来就得重新走一遍 dynamic import，白付一次异步成本。
+    currentCodeId = id
+    syncCodeStack()
+  }
+
+  return {
+    id,
+    injected: false,
+    cssBytes: cached?.bytes ?? 0,
+    faces: cached?.faces ?? 0,
+    ms: performance.now() - t0,
+    fromCache,
+    stack: codeStack(),
+  }
+}
+
 export function currentFontVariant(): FontVariantId | null {
   return currentId
+}
+
+export function currentCodeFont(): CodeFontId | null {
+  return currentCodeId
 }

@@ -1,6 +1,8 @@
-import { EditorState, type Extension } from '@codemirror/state'
+import { EditorState, RangeSetBuilder, type Extension } from '@codemirror/state'
 import {
+  Decoration,
   EditorView,
+  ViewPlugin,
   keymap,
   lineNumbers,
   highlightActiveLine,
@@ -11,6 +13,8 @@ import {
   highlightSpecialChars,
   dropCursor,
   scrollPastEnd,
+  type DecorationSet,
+  type ViewUpdate,
 } from '@codemirror/view'
 import {
   defaultKeymap,
@@ -27,6 +31,8 @@ import {
   bracketMatching,
   defaultHighlightStyle,
   syntaxHighlighting,
+  syntaxTree,
+  syntaxTreeAvailable,
   HighlightStyle,
   indentUnit,
 } from '@codemirror/language'
@@ -48,7 +54,11 @@ const noLigatures = EditorView.theme({
 })
 
 /**
- * 字体分区：编辑器用 Screen Mono（等宽变体），UI 用 Screen。
+ * 字体分区（PLAN.md D2「按内容分字体」）：
+ * - Markdown 正文 → `--vela-font-editor`（霞鹜文楷 Screen）
+ * - 代码块 / 表格 → `--vela-font-code`（Maple Mono CN，等宽 2:1）
+ * - UI → `--vela-font-ui`
+ *
  * 通过 CSS variable 暴露，M4 做主题系统时直接接管这里。
  */
 const fontTheme = EditorView.theme({
@@ -64,6 +74,137 @@ const fontTheme = EditorView.theme({
     caretColor: 'var(--vela-accent)',
   },
 })
+
+/**
+ * 非 Markdown 文档（.ts / .json / 纯文本…）整篇都是代码，不需要按节点分流。
+ *
+ * 刻意写成 fontTheme 的**完整替代**而不是只覆盖 fontFamily：两个主题同时挂载时
+ * 谁生效取决于 CM6 的样式模块顺序，那是个隐式契约，不如让调用方二选一。
+ */
+const codeDocFontTheme = EditorView.theme({
+  '&': {
+    fontFamily: 'var(--vela-font-code)',
+    fontSize: 'var(--vela-font-size, 14px)',
+    lineHeight: 'var(--vela-line-height, 1.7)',
+  },
+  '.cm-scroller': {
+    fontFamily: 'var(--vela-font-code)',
+  },
+  '.cm-content': {
+    caretColor: 'var(--vela-accent)',
+  },
+})
+
+/**
+ * 这些语法节点的内容按「代码」渲染。
+ *
+ * ⛔ 不能改用 CSS 按 token 分流：`@lezer/markdown` **没有任何 monospace 标签映射**
+ * （实测其 dist 里搜不到 `tags.monospace`），而且带语言标签的围栏会被 `codeLanguages`
+ * 嵌套子语言接管，内部 token 变成 keyword/string，`.tok-monospace` 压根不会出现。
+ * 唯一可靠的办法是按节点名匹配、给整行打装饰。
+ */
+const CODE_BLOCK_NODES = new Set(['FencedCode', 'CodeBlock', 'Table'])
+
+const codeLineDeco = Decoration.line({ class: 'vela-code' })
+
+/**
+ * 装饰范围向视口外扩的余量（像素）。
+ *
+ * 滚动时 `viewportChanged` **每帧都触发**，没有余量就得每帧重走一遍语法树、重建整个
+ * DecorationSet。有余量后视口在余量内移动一次都不重算，3000px/s 下约每滚过 4000px
+ * 才重建一次（每档 ~5 次而不是 ~180 次）。
+ *
+ * ⚠️ 别把这条当成 M0 #1 那个 60fps→55fps 退化的修复——它不是。节流把重建削掉了一个
+ * 数量级，帧率**一位小数都没动**（55.7/54.5/56.1/55.3 → 55.6/55.2/55.8/54.1）；再把本
+ * 插件整个摘掉也还是 55.70fps。两个组件都已排除，那次退化另有原因，见 PLAN.md §3.2 #1。
+ * 余量本身仍然该留：每帧重建一份用完就扔的 DecorationSet 是纯浪费。
+ */
+const DECO_MARGIN_PX = 2000
+
+/** 当前视口在文档里覆盖的区间。visibleRanges 可能分段（有折叠时），取首尾即可 */
+function visibleSpan(view: EditorView): { from: number; to: number } | null {
+  const ranges = view.visibleRanges
+  if (ranges.length === 0) return null
+  return { from: ranges[0].from, to: ranges[ranges.length - 1].to }
+}
+
+function buildCodeDecorations(view: EditorView, from: number, to: number): DecorationSet {
+  const builder = new RangeSetBuilder<Decoration>()
+  const marked = new Set<number>()
+  // 单个连续区间，而不是逐段遍历 visibleRanges：iterate 按文档顺序访问，
+  // 行号天然递增，RangeSetBuilder「必须升序 add」的要求自动满足，
+  // 不用再依赖「多段之间不会乱序」这个隐含前提。
+  syntaxTree(view.state).iterate({
+    from,
+    to,
+    enter: (node) => {
+      if (!CODE_BLOCK_NODES.has(node.name)) return
+      // 逐行盖过去而不是只标节点首行：代码块跨多行，每行都要换字体
+      for (let pos = node.from; pos <= node.to; ) {
+        const line = view.state.doc.lineAt(pos)
+        if (!marked.has(line.number)) {
+          marked.add(line.number)
+          builder.add(line.from, line.from, codeLineDeco)
+        }
+        pos = line.to + 1
+      }
+      // 子节点交给嵌套的子语言树，再往里走没有意义
+      return false
+    },
+  })
+  return builder.finish()
+}
+
+export const codeFontBySyntax = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet = Decoration.none
+    /** 已装饰的文档区间。视口仍在其中且文档没变时不重算 */
+    private coveredFrom = 0
+    private coveredTo = -1
+    /** 上次重建时语法树还没解析完，装饰是残缺的，等解析追上后要补一次 */
+    private parsePending = false
+
+    constructor(view: EditorView) {
+      this.rebuild(view)
+    }
+
+    update(u: ViewUpdate) {
+      if (u.docChanged) {
+        this.rebuild(u.view)
+        return
+      }
+      const span = visibleSpan(u.view)
+      if (u.viewportChanged && span && (span.from < this.coveredFrom || span.to > this.coveredTo)) {
+        this.rebuild(u.view)
+        return
+      }
+      // 语法树是后台增量解析的：重建那一刻可能还没解析到 coveredTo，那次装饰是残缺的。
+      // 视口不动也得等解析追上后补一次，否则用户停在一个没解析完的位置上，
+      // 代码块会一直显示成正文字体，直到他滚动才纠正。
+      if (this.parsePending && syntaxTreeAvailable(u.state, this.coveredTo)) this.rebuild(u.view)
+    }
+
+    private rebuild(view: EditorView) {
+      const doc = view.state.doc
+      const span = visibleSpan(view)
+      if (!span) {
+        this.coveredFrom = 0
+        this.coveredTo = -1
+        this.parsePending = false
+        this.decorations = Decoration.none
+        return
+      }
+      const margin = Math.ceil(DECO_MARGIN_PX / Math.max(1, view.defaultLineHeight))
+      const first = Math.max(1, doc.lineAt(span.from).number - margin)
+      const last = Math.min(doc.lines, doc.lineAt(span.to).number + margin)
+      this.coveredFrom = doc.line(first).from
+      this.coveredTo = doc.line(last).to
+      this.decorations = buildCodeDecorations(view, this.coveredFrom, this.coveredTo)
+      this.parsePending = !syntaxTreeAvailable(view.state, this.coveredTo)
+    }
+  },
+  { decorations: (v) => v.decorations },
+)
 
 /** M0 用的高亮配色。正式主题系统在 M4，这里只求能看清 token 边界。 */
 const m0Highlight = HighlightStyle.define([
@@ -130,7 +271,6 @@ export function buildExtensions(options: EditorSetupOptions = {}): Extension[] {
     highlightSelectionMatches(),
     syntaxHighlighting(m0Highlight),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-    fontTheme,
     noLigatures,
     scrollPastEnd(),
     keymap.of([
@@ -149,6 +289,10 @@ export function buildExtensions(options: EditorSetupOptions = {}): Extension[] {
   if (markdownMode) {
     // languages 提供子语言懒加载：代码块内的 ts/rust/json 按需解析
     exts.push(markdown({ base: markdownLanguage, codeLanguages: languages }))
+    // 正文用文楷，代码块/表格行由装饰换成等宽字体
+    exts.push(fontTheme, codeFontBySyntax)
+  } else {
+    exts.push(codeDocFontTheme)
   }
 
   if (lineWrap) {

@@ -241,18 +241,27 @@ interface ToolDefinition {
 >
 > ⚠️ **待决策**：D1 见 §5。
 
-#### 字体分工建议
+#### 字体分工（D2 已定并实施）
 
-| 区域 | 字体 | 理由 |
-|---|---|---|
-| 代码编辑区 | **Maple Mono CN**（可变字体，官方声明完美 **2:1** CJK:Latin，OFL 1.1） | 严格等宽，列对齐可靠 |
-| Markdown 正文 / 预览 | **LXGW WenKai Screen** | 楷体手感，长文阅读舒适 |
-| UI 界面 | LXGW WenKai Screen R（或系统字体，更省体积） | — |
-| ~~代码区备选~~ | ~~LXGW WenKai Screen **Mono**~~ | ❌ **无 webfont 包**（npm 404）。要用得自行从 24.44MB TTF 切分分片，M0 判定不划算 |
+| 区域 | 字体 | CSS 变量 | 实测依据 |
+|---|---|---|---|
+| Markdown 正文 / UI | **LXGW WenKai Screen**（GB 变体，97 分片 / 4.33MB） | `--vela-font-editor`、`--vela-font-ui` | 楷体手感，长文阅读舒适。⛔ 拉丁是**比例宽度**，不能用于代码区 |
+| 代码块 / 缩进代码 / 表格 | **Maple Mono CN**（`@automann/maple-mono-cn@7.9.2`，400 单字重，239 分片 / 9.33MB） | `--vela-font-code` | 官方声明 2:1 CJK:Latin；OFL-1.1 且**无 RFN**，分片分发不触发改名义务 |
+| ~~代码区备选~~ | ~~LXGW WenKai Screen **Mono**~~ | — | ❌ **无 webfont 包**（npm 404）。要用得自行从 24.44MB TTF 切分，且按 OFL FAQ 2.6 子集化触发改名义务 |
+
+**实现方式**（`src/fonts/loader.ts` + `src/editor/setup.ts`）：
+
+- 两套 `@font-face` 各占一个 `<style>` 节点（`vela-font-faces` / `vela-code-font-faces`）**同时驻留**。不能共用一个节点：正文变体是整块替换（R14 同名 family 冲突），共用会把代码字体一起冲掉。
+- 分流靠 ViewPlugin 按语法节点名 `FencedCode` / `CodeBlock` / `Table` 给整行打 `.vela-code` 行装饰。
+  ⛔ **不能按 token 走 CSS**：`@lezer/markdown` 里**没有任何 `tags.monospace` 映射**（实测其 dist 搜不到），且带语言标签的围栏被 `codeLanguages` 嵌套子语言接管后，内部 token 变成 keyword/string，`.tok-monospace` 压根不会出现。
+- 非 Markdown 文档（.ts / .json / 纯文本）整篇都是代码，直接挂 `codeDocFontTheme`，不走节点分流。
+- 工具栏两个下拉正交：代码区切到「跟随正文」时 #3 应立刻变红，这是分流生效的反向证据。
 
 > ⚠️ **重要澄清（M0 已结项）**：
-> - LXGW WenKai Screen 的拉丁字符基于 Inconsolata（等宽），但仓库 **README 未声明 CJK:Latin 是严格 2:1 比例**。因此非 Mono 变体用于代码区仍可能出现列对齐漂移 → 这正是 M0 验收项 #3「列对齐测试台」要人工判定的东西，`ProbePanel.tsx` 里已备好含制表符/歧义宽字符/生僻字/emoji 的对照样本。
-> - **字重问题已有答案：只有 `font-weight: 400`，没有 Bold**。原先两次抓取结论不一致的悬案结项。影响：Markdown 加粗只能伪粗，需在 M3 评估观感是否可接受，或改用主系列（Light/Regular/Medium，但那三个都没有 Screen 优化）。
+> - ⛔ **推翻一条旧认知**：先前记录的「文楷 Screen 拉丁基于 Inconsolata、是等宽的」与实测冲突。`measureAlignment()` 在 WKWebView 内直接量字形 advance width，实测 ASCII 逐字符步进极差 **8.6339px**（`i`=3.68 `W`=12.32），CJK/ASCII = **1.66639** 而非 2.0，50 个中文字累积漂移 **140.14px** —— 拉丁**根本不等宽**，性质比原判据「2:1 有细微偏差」严重得多。以实测为准。
+> - 量具自检可信：同一套量具跑系统等宽对照组（`ui-monospace`），ASCII 步进极差 **0.0002px**、`mono=true`。
+> - **#3 已全自动量化，无需人工判定**：字体切换、文档切换、窗口转为可见时自动重测，结果自动落盘 `.m0-align.json`。
+> - **字重问题已有答案：只有 `font-weight: 400`，没有 Bold**。影响：Markdown 加粗只能伪粗，需在 M3 评估观感是否可接受，或改用主系列（Light/Regular/Medium，但那三个都没有 Screen 优化）。→ R16
 
 #### 内置可切换字体清单
 
@@ -485,13 +494,13 @@ const vela = {
 
 | 指标 | 预算 | M0 实测 | 参照 |
 |---|---|---|---|
-| 安装包体积（.dmg） | **≤ 40MB** | 待 M6 | Tauri 空壳 8.6MB + 字体分片 **4.33MB** + 前端 ~2MB + Rust 二进制 ~8MB |
-| 冷启动到可输入 | **< 1s** | 待窗口实测 | — |
-| 空转常驻内存（macOS） | **< 200MB** | 待窗口实测 | Tauri 基准 ~172MB；Electron 为 ~409MB |
-| 打开 10 万行文件 | **< 2s**，滚动 60fps | 待窗口实测 | — |
+| 安装包体积（.app） | **≤ 40MB** | ✅ **23MB**（余量 42%）。D2 分字体前是 14MB，Maple Mono CN 的 239 个分片 +9.3MB | Tauri 空壳 8.6MB + 字体分片 **18.5MB**（文楷 GB 4.33 + R 4.87 + Maple 9.33）+ 前端 ~2MB + Rust 二进制 ~8MB |
+| 冷启动到可输入 | **< 1s** | ✅ **635ms**（余量 36%，Rust 进程时钟端到端） | — |
+| 空转常驻内存（macOS） | **< 200MB** | ✅ **均值 104MB / 峰值 109MB**（余量 46%，`phys_footprint` 口径，dPR=1） | Tauri 基准 ~172MB；Electron 为 ~409MB |
+| 打开 10 万行文件 | **< 2s**，滚动 60fps | 滚动已测：5 万行手感档 **60fps**（见 §3.2 #1）。10 万行未测 | — |
 | 全局搜索（10 万文件仓库） | **首批结果 < 2s** | M2 | ripgrep 级 |
-| 前端 bundle（gzip） | **≤ 300KB** | ✅ **218.5KB**（余量 27%，D7 实施前是 284.4KB / 余量 5%） | CM6 135KB + Solid 8.4KB + cmdk-solid 14.9KB + 业务代码 |
-| 按键到屏幕延迟 | **< 16ms** | 待窗口实测 | 不可感知 |
+| 前端 bundle（gzip） | **≤ 300KB** | ⚠️ **236.7KB**（余量 21%）。D7 基线是 218.5KB，**+18.1KB 全部来自 M0 探针脚手架**：`src/probe/sweep.ts`(17.5KB) 与 `ProbePanel.tsx`(46.9KB) 都是静态 import，落在入口 chunk 里。M0 收尾会整体删除，届时回落到 218KB 一线 | CM6 135KB + Solid 8.4KB + cmdk-solid 14.9KB + 业务代码 |
+| 按键到屏幕延迟 | **< 16ms** | 主线程事务派发 avg < 1ms（不含系统事件投递，仅作回归基线） | 不可感知 |
 
 **M0 构建产物明细**（`pnpm build`，D7 实施后）：
 
@@ -582,18 +591,18 @@ const vela = {
 
 | # | 验收项 | 通过标准 | 当前状态 | 不过的备选方案 |
 |---|---|---|---|---|
-| 1 | **WKWebView 滚动手感** | 万行文件滚动无肉眼卡顿，主观手感可接受 | ⏳ **待人工判定**（探针面板已备 5s FpsSampler + 10k/20k/50k 行 fixture + wrap 开关） | 存在 open issue（tauri-apps/discussions#8436）报告 macOS 上 Tauri 滚动有微延迟而 Safari 无，**无根因、无修复结论**。对策：试 `macOSPrivateApi`；把滚动容器交给原生；**极端情况下重估 Tauri 路线** |
+| 1 | **WKWebView 滚动手感** | 万行文件滚动无肉眼卡顿，主观手感可接受 | 🟡 **客观半 ✅ 通过（低负载下贴 vsync 上限），但读数对机器负载高度敏感；主观半仍需人滚 30s**。<br>**判据口径**：外接 1920×1080 **@60.00Hz**、`devicePixelRatio=1`，所以 **60fps 就是垂直同步上限**，不是「凑巧跑到 60」。<br><br>**低负载读数（run1/run2，06:00–06:01，机器空闲）**：手感档（3000px/s ≈ 每秒 214 行）四档 10k 换行开 **59.5fps**（p95 21ms，卡顿 2/179）｜10k 换行关 **60.3fps**（p95 23ms，**卡顿 0**）｜50k 换行开 **60.3fps**（p95 19ms，**卡顿 0**）｜50k 换行关 **60.1fps**（p95 23ms，**卡顿 0**）。p95 全部 ≤23ms（预算 33ms），**1 万行涨到 5 万行没有可测量的退化** → CM6 的视口虚拟化成立。压力档（全范围三角波，7.4万~63万 px/s）10k 56.2/59.1、50k 48.3/44.3fps；⛔ 压力档跑不满 60fps 是上界测试的正常结果，不能读成日常卡顿。<br><br>⛔ **撤回两个错误归因。** 06:25 起连续四轮全部掉到 53~57fps，我先后归因于「Maple 239 个冷分片」和「ViewPlugin 每帧重走语法树重建 DecorationSet」，**两次都错**：<br>· 把重建从每帧 ~180 次节流到每档 ~5 次（削掉一个数量级）→ 帧率 **55.6/55.2/55.8/54.1**，与节流前 **55.7/54.5/56.1/55.3** 一位小数都没差；<br>· 把插件整个摘掉（Maple 仍注入）→ 10k 换行开 **55.70fps**，而同一档装着插件是 **57.09 / 54.36**，**方向还是反的**；<br>· 关掉 Maple（`inherit`，插件照跑）→ **55.15fps**，与开着 Maple 的 55.70 差 0.55。<br>三个差值（≈0、−1.4、+0.55）**全部远小于下面量出来的 3.9fps 噪声带宽**，按本节方法论第 4 条不能报为结论。<br><br>**噪声带（同一个构建连跑三次，06:54–06:58，11 个有效样本）**：**53.16 ~ 57.09fps，均值 55.11，带宽 3.9fps**；卡顿帧 4~16；p95 28~48ms；单帧最低 **12.5fps**。<br>**形状判据（这条比均值更能定性）**：如果真是「每帧多算了一点东西」，均值会下移但分布仍然紧贴 vsync；实测是均值下移**并且**冒出 12.5fps 的离群帧、卡顿从 0~2 涨到 4~16 —— 这是**被外部抢占**的形状，不是稳态计算量上升的形状。<br>**同期机器负载**：`load averages 3.82 / 4.00 / 4.39`，WindowServer **14% CPU**（它就是逐帧合成的那一方）、一个 VM 9.1%、Qoder 10.0%、Codex Renderer 7.4%、kernel_task 5.7%。<br><br>📌 **结论**：60→55fps 这个差值**不能归因于分字体改造**，两个被怀疑的组件各自单独移除都是零效果；最可能是机器负载，但这是**强旁证而非直接证明**——我无法重建 run2 那一版代码，也无法让这台机器安静下来。<br>⚠️ **未闭合（必须在 M1 之前补）**：在安静机器（`load < 1`）上复跑**同一个构建**，确认回到 ~60fps。在此之前**不能把 `FPS_BUDGET=55` 的「超标」当成真实缺陷**——noise-3 的 50k 换行关 53.16fps 就低于 55，而那不是代码问题。<br><br>⚠️ **两档都是合成滚动**（程序化写 `scrollTop`），绕开了触控板惯性经 WKWebView 原生手势的那一段，而 discussions#8436 报告的微延迟恰好在那条路径上 → **「手感」这一半自动化不了，仍需人滚一次确认**。<br>📌 原计划的 Safari 对照组**不必做了**：低负载读数已贴在 60Hz 上限，没有「Tauri 比 Safari 差」的差值需要解释。<br>📌 矩阵的自检有效：瞬时遮挡/rAF 节流会被自动标 `aborted` 并排除，没有污染结论（三次连跑里作废 1 档）。<br>⚠️ **`caffeinate` 的坑（本轮白跑两次）**：`caffeinate -dimsu -w "$PID"` 在 `pgrep` 抓到错误 PID 时会**静默失效**，`displaysleep=10` 随即让显示器休眠、窗口转 `hidden`、rAF 冻结，矩阵在开跑 10 秒后就卡死。必须用**独立进程**持有断言（`caffeinate -dimsu -t 1200 &`）并在开跑前用 `pmset -g assertions | grep PreventUserIdleDisplaySleep` 确认读到 **1**。run4 之所以成功，是因为 `pgrep -f` 误抓到了长命的 shell，`-w` 反而一直挂着——**靠运气对的不算对**。<br>⚠️ 未闭合：`devicePixelRatio=1`，Retina（dPR=2）下每帧要画的像素是 4 倍，需复测；20k 档未单列（被 10k/50k 夹逼）。 | 存在 open issue（tauri-apps/discussions#8436）报告 macOS 上 Tauri 滚动有微延迟而 Safari 无，**无根因、无修复结论**。对策：试 `macOSPrivateApi`；把滚动容器交给原生；**极端情况下重估 Tauri 路线**。<br>📌 **客观数据没有触发这条备选**——低负载时帧计时贴着 vsync 上限，高负载时的掉帧有明确的外部抢占特征且与我们的代码无关。只有当人工滚动的「手感」判定不通过、且 Safari 对照组能复现同样负载下的顺滑差异时，才需要走 `macOSPrivateApi` / 原生滚动容器。 |
 | 2 | **中文 IME** | 输入无行跳动、候选框不错位、长句连续输入不丢字 | ⏳ **待人工判定**（已备原生 textarea 对照组，用于区分是 CM6 的问题还是 WKWebView 的问题） | 调整 CM6 `inputStyle`（`contenteditable` vs `textarea`）；参考 Monaco #4592 的教训 |
-| 3 | **字体列对齐** | ~~Screen Mono 下~~ 中英文表格 / ASCII art 对齐正确 | ⏳ **待人工判定**。⚠️ **原判据失效**：Screen Mono 无 webfont 包（R14 同源发现），改为直接测 Screen GB 的实际漂移量，据此定 D2 | 代码区换 Maple Mono CN（官方声明 2:1）—— **这已基本成为唯一可行解** |
-| 4 | **字体分片管线** | 首屏实际加载 **< 2MB**；随机生僻字能正确触发分片加载 | ✅ **通过**。懒加载生效：192 个 woff2 共 9.6MB 在盘，但首屏只请求实际用到的分片。探针用 `performance.getEntriesByType('resource')` 过滤 `.woff2` 求和，可量化。<br>⚠️ 附带发现 67.8KB gzip 的 `@font-face` CSS 开销 → R15 | 换精简子集方案（需改名 Vela Kai） |
+| 3 | **字体列对齐** | ~~Screen Mono 下~~ 中英文表格 / ASCII art 对齐正确 | ✅ **通过（D2「按内容分字体」实施后，全自动量化，两轮独立复现）**。<br>**判定对象是 CM6 里真实的 `.vela-code` 代码行**（不是测试台 div）——这一条是「语法节点 → 行装饰 → CSS → 解析字体 → 字形度量」整条链的终点，只有量到它才证明装饰真的把字体换掉了。实测 Maple Mono CN @14px：ASCII 步进 **8.4px**、CJK 步进 **16.8px**、框线 `│` 步进 **8.4px**，CJK/ASCII = **2.0000**（判据 2.0）、框线/ASCII = **1.0000**（判据 1.0）、ASCII 逐字符极差 **0.0001px**（`i`/`l`/`W`/`m`/`.`/`@` 全部 8.4~8.4001）、50 个中文字累积漂移 **0px**，`mono=true` `aligned=true` `cjkFaceLoaded=true`。<br>**链的另一端同时成立**：同一个 `contentDOM` 量出来的正文仍是 LXGW WenKai Screen，ASCII 极差 8.6339px、CJK/ASCII = 1.66639 —— 代码行是正文元素的**子孙节点**却报出另一个 family，这就是分字体生效的直接证据。<br>**量具自检**：系统等宽对照组（`ui-monospace`）ASCII 极差 0.0002px、`mono=true` → 量具可信。<br>📌 **对照组顺带推翻了一个备选方案**：`ui-monospace` 的 CJK/ASCII = **1.55079**，不是 2.0 —— SF Mono 没有中文字形，`中` 落到了 PingFang 上。所以「代码区退回系统等宽字体」从来就不是 #3 的可行补救，而对照组只能验 `mono`、**验不了 `aligned`**。<br>⚠️ **诚实标注**：两轮读数都记到 `visibility=hidden`（矩阵结束后的补测被收尾的 `pkill` 追上）。字形 advance width 与页面可见性无关，且 run3/run4 两次独立测量数值逐位相同、`fontsReady=true`，所以判定成立；但按本节方法论第 2 条，仍欠一次 `visible` 下的复测。<br><br>**以下是改造前的 ❌ 原始证据，保留说明为什么必须分字体**：LXGW WenKai Screen @14px 在 `visibility=visible` 下，代码区（CM6 `contentDOM`）与测试台 div 读数完全一致；ASCII 逐字符步进 `0`=8.4013 / `i`=3.6846 / `l`=3.6845 / `W`=12.3184 / `m`=11.4229 / `.`=4.9013 / `@`=10.9785，**极差 8.6339px** → 拉丁是**比例宽度，根本不等宽**；CJK 步进 14.0px（=1em），CJK/ASCII = 1.66639（须 2.0000）；框线 `│` 也是 14px，框线/ASCII = 1.66639（须 1.0000）；50 个中文字累积漂移 **140.14px**。⛔ 性质比原判据严重：不是「2:1 有细微偏差」而是**拉丁非等宽**——连纯英文代码的列都对不齐，文楷 Screen 只能用于 UI 与 Markdown 正文。<br>⚠️ 分片来自 npm 包 `lxgw-wenkai-screen-webfont@1.7.0`（chawyehsu 维护），我们的管线只做 CSS 注入、**没碰字形度量**，所以这是字体本身的属性而非构建 bug。原始读数存档 `.m0-align-lxgw.json`。<br>⚠️ 顺带推翻一条旧认知：先前记录的「文楷 Screen 拉丁基于 Inconsolata、是等宽的」与实测冲突，以实测为准。 | ~~代码区换真等宽 CJK 字体。~~ ✅ **已执行**，见 §5 D2。<br>⛔ **想保留文楷观感这条路当前走不通**：npm 上 `lxgw-wenkai-mono-webfont`、`@fontsource/lxgw-wenkai-mono`、`lxgw-wenkai-mono-web` **全部 404**，没有现成的 Mono 变体 webfont 包；要用就得自己从官方 TTF 建分片管线（而按 OFL FAQ 2.6，子集化触发 RFN 改名义务）。<br>⛔ **退回系统等宽也不行**：实测 `ui-monospace` 的 CJK/ASCII = 1.55079（SF Mono 无中文字形，回落到 PingFang），中文表格照样对不齐。<br>✅ 最终解：**Maple Mono CN**（官方声明 2:1，实测 2.0000），OFL-1.1 且**无 Reserved Font Name**，分片分发不触发改名义务。<br>📌 **一度怀疑的代价已排除**：同期滚动帧率从 ~60fps 掉到 ~55fps，我最初归因于这次分字体改造。连跑三次的噪声带（53.2~57.1fps，带宽 3.9fps）证明：关掉 Maple 的差值是 0.55fps、摘掉装饰插件的差值方向还是反的，两者都淹没在噪声里 → **分字体没有可测量的帧率成本**，那次掉帧另有原因（机器负载，详见 #1）。 |
+| 4 | **字体分片管线** | 首屏实际加载 **< 2MB**；随机生僻字能正确触发分片加载 | ⚠️ **复审后降级为「机制通过、数值待补」**。懒加载本身有独立佐证：`document.fonts` 报空转时只有 **30/97** 个 face 加载，灌入 1 万行中英混排后升到 **33/97**——说明新码点确实按需拉了分片，且常驻的 30 个是探针面板自己的界面文字而非文档。<br>⛔ 但**原判据的度量口径已失效**：`performance.getEntriesByType('resource')` 在 `tauri://` 协议下抓不到任何 `.woff2`（release 构建里恒为 0 条），原先的 ✅ 是在 dev 模式下测的。现在只能按「已加载 face 数 × 平均分片体积」估算 ≈ **1.40MB**，分片实际大小不均匀时上下可浮动 50%，**余量不足以判定 < 2MB**。<br>⚠️ 附带发现 67.8KB gzip 的 `@font-face` CSS 开销 → R15 | 补一个精确口径：构建期生成「分片序号 → 真实文件字节数」清单打进产物，用 `document.fonts` 的已加载序号去查表求和，绕开失效的 resource timing。<br>若实测确实超 2MB，换精简子集方案（需改名 Vela Kai） |
 | 5 | **生产构建** | `vite build` 后 CM6 **完全正常**（不是只在 dev 正常） | ✅ **通过，且这个验收项救了一次**。构建确实踩中三个坑（rolldown manualChunks 形式、esbuild 不再内置、粗分包摧毁懒加载），首屏 gzip 一度 623KB，修复后 **284.4KB / 114 chunk**。详见 §2.3 | 有已知「Tauri + Vite + CM6: Works in Dev, Breaks in Production Build」陷阱。排查分包、worker、动态 import 配置 |
-| 6 | **冷启动** | 空窗口到可输入 **< 1s** | ⏳ **待窗口实测**。已埋三段计时：Rust 进程启动（`PROCESS_START`）、`index.html` 内联 `__VELA_T0`、应用挂载 | 削减启动路径、延迟非关键扩展加载 |
-| 7 | **空转内存** | **< 200MB** | ⏳ **待窗口实测**。`probe_memory` 命令已实现（Rust 侧走 `ps -o rss=`，避免 M0 阶段引入 `sysinfo` 增加编译负担），前端侧读 `performance.memory` | 参照 Tauri 基准 ~172MB |
+| 6 | **冷启动** | 空窗口到可输入 **< 1s** | ✅ **通过：635ms**（预算 1000ms，余量 36%）。口径是端到端的 Rust 进程启动 → 编辑器可输入，由 `probe_ready` 命令返回 `PROCESS_START.elapsed()`，不是 `performance.now()`。<br>⚠️ 必须用进程时钟：`performance.now()` 的原点是**页面导航开始**，不含进程拉起与 WKWebView 创建，只用前端时钟会系统性低估冷启动，可能把不达标的读数读成达标。差值已单列在探针面板「进程拉起 + WKWebView 创建」一行 | 削减启动路径、延迟非关键扩展加载 |
+| 7 | **空转内存** | **< 200MB** | ✅ **通过：空转均值 104MB，峰值 109MB，余量 46%**。13 个样本全部 `visibility=visible` 且 `hasFocus=false`（在渲染、无人操作），其中 5 个是间隔 15s 的干净空转点：合计 97 / 104 / 109 / 104 / 106 MB；拆分 vela 21~22（全程不动）｜GPU 17~24｜WebContent 54~61｜Networking 5。冷启动 17s 的首个点 114MB 也在预算内。<br>⚠️ 口径必须用 `phys_footprint`（`footprint -p`，即活动监视器「内存」列），**不能用 `ps` 的 RSS 求和**——vela 与 3 个 WebKit XPC 进程共享 WebKit.framework/AppKit 页，RSS 会重复计数（实测主进程 RSS 87MB 而 footprint 仅 24MB，差 3.6 倍）。<br>⛔ 早先单点读到的 209MB 是**启动初期瞬态，干净一轮里没有复现**，不能作为判定依据。<br>⚠️ 未闭合：本轮 `devicePixelRatio = 1`，图形背板成本随 dPR 平方增长，**Retina 屏上可见态开销会被低估**，正式判定要在 dPR=2 下复测。<br>⛔ `performance.memory` 在 WKWebView 恒为 undefined，前端侧的 JS 堆读数不可用。<br>📌 **新发现（转 M1）**：灌过 1 万行文档后即使回落到空文档，WebContent 停在 113MB、比空转基线高 **~59MB 且不回落**（同期 Rust RSS 反而从 146MB 降到 63MB）。性质是 WebKit 侧的驻留字形/图层缓存，不是 CM6 泄漏；但「反复开关大文件是否阶梯式上涨」「内存压力下是否被回收」未验证 → M1 需补一条长会话内存曲线。<br>📌 **字体归因已结案**：`document.fonts` 显示 1 万行中英混排只比空文档多拉 **3 个分片**（30/97 → 33/97，估算 ≈140KB），常驻的 30 个 face 是探针面板自己的界面文字。mixed 与 ascii 的内存差落在 ±16MB 噪声带内、方向还会反转，**字体分片管线不是内存问题的主因**，此路不必再查。 | 参照 Tauri 基准 ~172MB（**该基准的度量口径不明，不能直接对齐**）。若 dPR=2 复测超标：削减常驻 face 数、把图形背板交给原生滚动容器、或收紧 200MB 预算的适用口径 |
 | 8 | **字体字重核实** | 确认 Screen 版实际提供几档字重（两次抓取结论冲突） | ✅ **已结项：只有 `font-weight: 400`，无 Bold**。97 个 face 全部 400 → 转为 R16 | 粗体需浏览器合成（faux bold）或改用主系列 LXGW WenKai |
 
 **产出**：一份《M0 验证报告》，逐项记录实测数据与结论。**这份报告决定项目是否继续按 Tauri 路线走。**
 
-#### 脚手架现状（工具链三条腿）
+#### 脚手架现状（工具链四条腿）
 
 | 检查 | 结果 |
 |---|---|
@@ -601,10 +610,25 @@ const vela = {
 | `cargo check` | ✅ EXIT=0，173 个 rlib 依赖 |
 | `pnpm build` | ✅ EXIT=0，538ms，首屏 284.4KB gzip |
 | `pnpm app:dev` | ✅ 27.21s 编译完成，窗口已启动 |
+| `pnpm tauri build` | ✅ EXIT=0，产出 `src-tauri/target/release/bundle/macos/Vela.app`（可执行体 14.6MB），M0 的实测数据全部取自这个打包产物 |
 
 **踩坑记录**：`bundle.icon: []` **不能**绕过图标要求——`tauri::generate_context!()` 在编译期无条件打开 `src-tauri/icons/icon.png`，缺失会让 proc macro panic。已用 `scripts/gen-icon.mjs`（纯 node+zlib 手写 PNG，512×512 船帆座图形，5.4KB）解决，避免为一个占位图标引入图像库依赖。
+> 后续：`pnpm tauri icon` 会生成 **52 个**文件（含 android/ios/Windows 磁贴），macOS 只需要 5 个（icns + 三张 png + icon.png），已裁剪。`bundle.active` 也由此改为 `true`。
 
-**剩余工作**：#1 #2 #3 #6 #7 五项需要**在真实 WKWebView 窗口里人工判定**——这几项恰恰是 M0 存在的理由（R1 是 🔴 高风险，动摇整个 Tauri 路线），不能用 Chromium 侧的自动化指标替代。注意窗口隐藏/最小化时 rAF 会被冻结，FpsSampler 读数会失真，测量时必须保持窗口可见。
+**剩余工作**：只有 **#1 #2 #3** 三项需要**在真实 WKWebView 窗口里人工判定**——这三项恰恰是 M0 存在的理由（R1 是 🔴 高风险，动摇整个 Tauri 路线），不能用 Chromium 侧的自动化指标替代。#6 #7 已在打包产物上实测完毕。
+
+**测量方法论（这几条是踩出来的，比数据本身更值钱）**：
+
+1. **必须打包成 `.app` 再用 `open` 启动。** 直接跑裸二进制（`target/release/vela`）拿不到正常的 NSApplication activation 与 LaunchServices 注册，窗口永远成不了前台，`document.visibilityState` 恒为 `hidden`——在这种状态下测出来的所有渲染相关数据都是废的。`tauri.conf.json` 里的 `focus: true` 加上 Rust 侧 `set_always_on_top` + `set_focus` 都**救不了**裸二进制。
+2. **每个样本都要记 `visibilityState` 和 `hasFocus`。** 窗口被完全遮挡时 WebKit 挂起渲染、释放图层与字形缓存，WebContent footprint 能从两百多 MB 掉到几十 MB。本项目因为漏记这个字段，白跑了两轮并得出过一个完全错误的归因结论（详见 `.m0-mem-ab.log` 的 B/C 段撤回记录）。
+3. **扫描时钟只累计「可见时间」。** 被遮挡时停走而不是继续采样，这样产出的样本天然干净，不用事后剔除。
+4. **`footprint` 绝不能高频循环。** 它要遍历进程的 VM region，本身就是重操作；每 4s 扫 4 个进程曾把机器推进交换态、连 shell 命令都超时。改成**阶段切换触发**（约 1 次/15s）。
+5. **外部快照与被测阶段之间有竞态。** footprint 脚本靠轮询报告文件感知阶段变化，最多滞后 2s，凡是紧跟文档切换的快照都已被下一阶段污染，必须丢弃。
+6. **A/B 之前先枚举两个基线之间**所有**变过的文件，不是只翻你怀疑的那一个。** 2026-09-14 的教训：滚动帧率从 60fps 掉到 55fps，我只把 `DEFAULT_CODE_FONT` 从 `maple-cn` 翻成 `inherit` 就当成了 A/B，但那一轮之间其实改了**四个**文件（`setup.ts` / `loader.ts` / `ProbePanel.tsx` / `App.tsx`），另外三个在两条腿里都在，于是被无声地算进了「插件的成本」。基于这个错误归因写了一整段节流代码，重新构建重跑后帧率**一位小数都没动**。
+   成本几乎为零的做法：`stat -f '%Sm %N' -t '%m-%d %H:%M:%S' <相关源文件>`，把 mtime 和每轮测量的时间戳并排看，落在好基线之后、坏基线之前的**全部**是嫌疑变量。
+   配套判据：**如果某个修复把开销削掉了一个数量级而指标完全没动，那不是「修复不够」，是「这个开销从来就不是成本」**——此时回到变量枚举，不要加大剂量。
+7. **绝对帧率跨时间窗不可比，先量噪声带再谈效应。** run1/run2（06:00）测到 59.5~60.4fps，此后四轮（06:25~06:45）全是 54~57fps，而期间被摘掉又装回的组件（字体、装饰插件）对读数**毫无影响**。同期的机器状态：`load averages 3.79/3.93/4.62`，WindowServer 9.5% CPU、一个 VM 11%、Qoder 13%、`kernel_task` 8%。WindowServer 是逐帧合成的那一方，它被抢走 CPU 会**整体压低 fps 并加宽尾部**——症状正好是「均值掉 4fps + p95 从 21ms 涨到 45ms + 出现 8.5fps 的离群帧」，与「代码里多了点每帧工作」的表现无法区分。
+   → 结论只能来自**同一负载窗口内的配对对比**，不能拿今天的读数去减一小时前另一负载下的读数。要判定某个改动值不值 4fps，就在同一个构建里做运行时开关、两条腿相隔十几秒各跑一次；并且**先连跑三次同一个构建**，把噪声带量出来，效应小于带宽就不能报为结论（同第 4 条）。
 
 ---
 
@@ -755,7 +779,7 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 | # | 决策 | 选项 | 建议 | 需何时定 |
 |---|---|---|---|---|
 | D1 | **字体分发策略** | (a) WOFF2 全量分片懒加载（**实测 4.33MB/变体**，不改名）<br>(b) 精简子集（4–6MB，须改名 "Vela Kai"，生僻字 fallback 系统字体） | **(a)** — M0 实测后优势从「略好」变「明显」：**两者体积已持平**，但 (a) 不改名、覆盖完整、无视觉断层。原先唯一的劣势（67.8KB gzip 的 `@font-face` 占首屏 CSS）**已被 D7 消掉**，现在 (a) 无短板 | **M0 已可定** |
-| D2 | **代码区默认字体** | (a) 全程 LXGW WenKai（尊重偏好，接受列对齐漂移；**且 Screen Mono 无 webfont 包，要等宽得自己从 24.44MB TTF 切分**）<br>(b) 代码区 Maple Mono CN + 正文 LXGW WenKai | **(b)** — M0 新发现让 (a) 成本上升：等宽变体拿不到现成分片。把 (a) 作为一键切换选项保留即可 | M0 人工判定列对齐后 |
+| D2 | **代码区默认字体** | (a) 全程 LXGW WenKai（尊重偏好，接受列对齐漂移；**且 Screen Mono 无 webfont 包，要等宽得自己从 24.44MB TTF 切分**）<br>(b) 代码区 Maple Mono CN + 正文 LXGW WenKai | ✅ **已定 (b) 并实施完成**（用户拍板「按内容分字体」）。#3 的量化结果让 (a) 直接出局：文楷 Screen 的拉丁**根本不是等宽**（ASCII 步进极差 8.63px），连纯英文代码都对不齐，不是「2:1 有细微偏差」。<br>**实现**：`--vela-font-editor`（正文/UI）与 `--vela-font-code`（代码区）两个变量正交，CM6 侧用 ViewPlugin 按语法节点名 `FencedCode`/`CodeBlock`/`Table` 给整行打 `.vela-code` 行装饰（⛔ 不能按 token 走 CSS：`@lezer/markdown` 没有任何 `tags.monospace` 映射）。两套 `@font-face` 各自一个 `<style>` 节点同时驻留。<br>**选包**：`@automann/maple-mono-cn@7.9.2`（精确锁版）。OFL-1.1 且**无 Reserved Font Name** → 分片不触发改名义务，这点与文楷不同。只引 400 一个字重：239 分片 / 9.33MB / CSS 156KB(gzip 55KB)，作为独立 lazy chunk。<br>**代价**：安装包 woff2 从 9.2MB → 18.5MB，见 §2.9。(a) 保留为工具栏一键切换「跟随正文」，切过去 #3 应立刻变红，这本身是分流生效的反向证据 | **已完成** |
 | D3 | 会话存储 | rusqlite（SQLite）vs sled（嵌入式 KV）vs JSON 文件 | SQLite — 结构化查询与迁移更省心 | M1 |
 | D4 | 前端框架最终确认 | Solid（推荐）vs Svelte 5 | Solid | 已定，除非 M0 发现问题 |
 | D5 | 是否内置 P1 工具集 | 全做 vs 只做 P0 | 先只做 P0，按用户反馈补 | M3 |

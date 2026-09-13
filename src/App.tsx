@@ -2,15 +2,23 @@ import { createSignal, onCleanup, onMount } from 'solid-js'
 import { EditorView } from '@codemirror/view'
 import { createEditor } from './editor/setup'
 import {
+  applyCodeFont,
   applyFontVariant,
+  CODE_FONTS,
+  DEFAULT_CODE_FONT,
   DEFAULT_VARIANT,
   FONT_VARIANTS,
+  type CodeFontApplyResult,
+  type CodeFontId,
   type FontApplyResult,
   type FontVariantId,
 } from './fonts/loader'
 import { generateAsciiFixture, generateFixture, type Fixture } from './probe/fixtures'
-import type { DocStats } from './probe/metrics'
+import { collectProcessUptime, type DocStats } from './probe/metrics'
 import ProbePanel from './probe/ProbePanel'
+// TODO(M0-自动扫描): src/probe/sweep.ts 是 M0 的自动化测量模块，验收收尾时整个删除。
+// 现在由 ProbePanel 调用：runScrollMatrix 跑 #1 的滚动矩阵（仓库根放 .m0-autotest 开关
+// 文件则启动时自动跑），runSweep 暂未接线但保留——#7 还需在 dPR=2 的显示器上复测一次。
 
 /** M0 主壳：一个编辑器 + 一个探针面板，不做任何业务功能。 */
 export default function App() {
@@ -20,11 +28,19 @@ export default function App() {
 
   const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
   const [fontResult, setFontResult] = createSignal<FontApplyResult | null>(null)
+  const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
+  const [codeFontResult, setCodeFontResult] = createSignal<CodeFontApplyResult | null>(null)
   const [fontSize, setFontSize] = createSignal(14)
   const [wrap, setWrap] = createSignal(true)
   const [panelOpen, setPanelOpen] = createSignal(true)
   const [stats, setStats] = createSignal<DocStats | null>(null)
   const [editorReadyMs, setEditorReadyMs] = createSignal(0)
+  /**
+   * 验收项 #6 的有效读数：Rust 进程启动 → 编辑器可输入，端到端。
+   * editorReadyMs 是 performance.now()，原点为导航开始，不含进程拉起与
+   * WKWebView 创建，会系统性低估真实冷启动。null 表示非 Tauri 环境取不到。
+   */
+  const [processToReadyMs, setProcessToReadyMs] = createSignal<number | null>(null)
   const [busy, setBusy] = createSignal(false)
 
   /** 供探针面板做编辑延迟测量 */
@@ -34,6 +50,12 @@ export default function App() {
   async function switchFont(id: FontVariantId) {
     setFontKey(id)
     setFontResult(await applyFontVariant(id))
+  }
+
+  /** 代码区字体与正文字体正交，独立切换、独立注入，两个 family 同时驻留 */
+  async function switchCodeFont(id: CodeFontId) {
+    setCodeFontKey(id)
+    setCodeFontResult(await applyCodeFont(id))
   }
 
   function applyFontSize() {
@@ -54,21 +76,41 @@ export default function App() {
       bytes: fixture.byteLength,
       longestLine: fixture.longestLine,
       loadMs: done - t0,
+      lineWrap: wrap(),
     })
     // 首次挂载的时间才是「冷启动到可交互」
-    if (editorReadyMs() === 0) setEditorReadyMs(done)
+    if (editorReadyMs() === 0) {
+      setEditorReadyMs(done)
+      // 同步发起、不 await：多等一拍就把后续渲染算进冷启动了
+      void collectProcessUptime().then((ms) => {
+        if (ms > 0) setProcessToReadyMs(ms)
+      })
+    }
   }
 
-  function load(kind: 'mixed-10k' | 'ascii-10k' | 'mixed-20k' | 'mixed-50k') {
-    setBusy(true)
-    // 让 UI 有机会先重绘，避免长时间同步生成阻塞按钮反馈
-    requestAnimationFrame(() => {
-      const t0 = performance.now()
-      const fixture =
-        kind === 'ascii-10k'
+  type DocKind = 'empty' | 'mixed-10k' | 'ascii-10k' | 'mixed-20k' | 'mixed-50k'
+
+  function loadSync(kind: DocKind) {
+    const t0 = performance.now()
+    // 空文档是验收项 #7「空转常驻内存」的判据前提。
+    // 没有它就只能测到「已加载万行文档」，而预算参照的是 Tauri 空壳 ~172MB。
+    const fixture: Fixture =
+      kind === 'empty'
+        ? { text: '', lineCount: 0, byteLength: 0, longestLine: 0 }
+        : kind === 'ascii-10k'
           ? generateAsciiFixture(10_000)
-          : generateFixture({ lines: kind === 'mixed-10k' ? 10_000 : kind === 'mixed-20k' ? 20_000 : 50_000 })
-      mount(fixture, kind, t0)
+          : generateFixture({
+              lines: kind === 'mixed-10k' ? 10_000 : kind === 'mixed-20k' ? 20_000 : 50_000,
+            })
+    mount(fixture, kind, t0)
+  }
+
+  function load(kind: DocKind) {
+    setBusy(true)
+    // 让 UI 有机会先重绘，避免长时间同步生成阻塞按钮反馈。
+    // 注意：自动扫描走 loadSync 而非这里——窗口被遮挡时 rAF 会冻结，扫描会卡死。
+    requestAnimationFrame(() => {
+      loadSync(kind)
       setBusy(false)
     })
   }
@@ -93,10 +135,12 @@ export default function App() {
   onMount(() => {
     applyFontSize()
     // 字体注入与编辑器挂载并行。编辑器不等字体：
-    // 冷启动计时（验收项 #6）不该被 30KB 的 CSS chunk 拖住，
+    // 冷启动计时（验收项 #6）不该被 CSS chunk 拖住，
     // 字体到达后浏览器自己会用 font-display: swap 重排。
+    // 代码区字体（Maple Mono CN，@font-face 声明 156KB）比正文的还大，同理走并行注入。
     void switchFont(DEFAULT_VARIANT)
-    load('mixed-10k')
+    void switchCodeFont(DEFAULT_CODE_FONT)
+    load('empty')
   })
 
   onCleanup(() => view?.destroy())
@@ -106,6 +150,9 @@ export default function App() {
       <div class="toolbar">
         <div class="toolbar-group">
           <span class="toolbar-label">文档</span>
+          <button onClick={() => load('empty')} disabled={busy()}>
+            空文档
+          </button>
           <button class="primary" onClick={() => load('mixed-10k')} disabled={busy()}>
             10k 混排
           </button>
@@ -134,8 +181,18 @@ export default function App() {
           <select
             value={fontKey()}
             onChange={(e) => void switchFont(e.currentTarget.value as FontVariantId)}
+            title="正文与 UI 字体"
           >
             {Object.values(FONT_VARIANTS).map((v) => (
+              <option value={v.id}>{v.label}</option>
+            ))}
+          </select>
+          <select
+            value={codeFontKey()}
+            onChange={(e) => void switchCodeFont(e.currentTarget.value as CodeFontId)}
+            title="代码区字体（代码块 / 表格）"
+          >
+            {Object.values(CODE_FONTS).map((v) => (
               <option value={v.id}>{v.label}</option>
             ))}
           </select>
@@ -172,7 +229,7 @@ export default function App() {
                   markdownMode: !prev.label.includes('ASCII'),
                 })
                 view.scrollDOM.scrollTop = scrollTop
-                setStats({ ...prev, loadMs: performance.now() - t0 })
+                setStats({ ...prev, lineWrap: next, loadMs: performance.now() - t0 })
               }
             }}
           >
@@ -206,8 +263,12 @@ export default function App() {
             getView={getView}
             stats={stats()}
             fontResult={fontResult()}
+            codeFontResult={codeFontResult()}
             editorReadyMs={editorReadyMs()}
+            processToReadyMs={processToReadyMs()}
             scriptStartMs={window.__VELA_T0 ?? 0}
+            // #1 滚动矩阵要自己切文档量与换行开关，这两个能力只有这里有
+            autotest={{ load: loadSync, setWrap: (v: boolean) => setWrap(v) }}
           />
         )}
       </div>
