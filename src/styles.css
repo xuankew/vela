@@ -1,0 +1,301 @@
+/*
+ * 字体不在这里引入。
+ *
+ * 单个变体的 @font-face 声明实测 104KB raw / 29.9KB gzip，两个变体就占掉首屏 CSS 的
+ * 59.8KB（应用自身样式只有 ~8KB）。改为由 src/fonts/loader.ts 动态 import + 运行时注入，
+ * 让这部分彻底离开首屏关键路径，且任一时刻只驻留一个变体。
+ *
+ * 仍然要记住的坑：绝不 import 包自带的 style.css —— 它把 4 个变体全拉进来，
+ * 而 lxgwwenkaiscreen.css 与 lxgwwenkaigbscreen.css 声明的是同一个 family 名
+ * 'LXGW WenKai Screen'，同时驻留会产生 194 条同名 @font-face 相互覆盖。
+ *
+ * 下面的 --vela-font-* 只是注入完成前的兜底值，loader 会用真实字体栈覆盖它们。
+ */
+
+:root {
+  /* 字体分区。M4 的主题系统会接管这三个变量。 */
+  --vela-font-editor: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --vela-font-ui: -apple-system, BlinkMacSystemFont, sans-serif;
+  --vela-font-size: 14px;
+  --vela-line-height: 1.75;
+
+  /* M0 临时暗色配色，正式主题系统在 M4 */
+  --vela-bg: #1a1b26;
+  --vela-bg-alt: #16161e;
+  --vela-bg-panel: #24283b;
+  --vela-fg: #c0caf5;
+  --vela-fg-dim: #565f89;
+  --vela-border: #3b4261;
+  --vela-accent: #7aa2f7;
+  --vela-ok: #9ece6a;
+  --vela-warn: #e0af68;
+  --vela-bad: #f7768e;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--vela-bg);
+  color: var(--vela-fg);
+  font-family: var(--vela-font-ui);
+  font-size: 13px;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+}
+
+/* ---------- 工具栏 ---------- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--vela-bg-alt);
+  border-bottom: 1px solid var(--vela-border);
+  flex-wrap: wrap;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-right: 8px;
+  border-right: 1px solid var(--vela-border);
+}
+
+.toolbar-group:last-child {
+  border-right: none;
+}
+
+.toolbar-label {
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+  margin-right: 2px;
+}
+
+button {
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  padding: 3px 9px;
+  background: var(--vela-bg-panel);
+  color: var(--vela-fg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover {
+  border-color: var(--vela-accent);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button.primary {
+  background: var(--vela-accent);
+  color: #1a1b26;
+  border-color: var(--vela-accent);
+  font-weight: 600;
+}
+
+button.recording {
+  background: var(--vela-bad);
+  border-color: var(--vela-bad);
+  color: #1a1b26;
+}
+
+select {
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  padding: 3px 6px;
+  background: var(--vela-bg-panel);
+  color: var(--vela-fg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+}
+
+/* ---------- 主体 ---------- */
+
+.body {
+  display: grid;
+  grid-template-columns: 1fr 380px;
+  min-height: 0;
+}
+
+.body.panel-closed {
+  grid-template-columns: 1fr 0;
+}
+
+.editor-host {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.editor-container {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* CM6 需要父容器有确定高度才能自己管滚动 */
+.editor-container .cm-editor {
+  height: 100%;
+}
+
+.editor-container .cm-scroller {
+  font-family: var(--vela-font-editor);
+}
+
+/* ---------- 探针面板 ---------- */
+
+.probe {
+  border-left: 1px solid var(--vela-border);
+  background: var(--vela-bg-alt);
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.probe-section {
+  border-bottom: 1px solid var(--vela-border);
+  padding: 10px 12px;
+}
+
+.probe-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--vela-accent);
+  margin-bottom: 8px;
+}
+
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+}
+
+.metric-key {
+  color: var(--vela-fg-dim);
+  flex-shrink: 0;
+}
+
+.metric-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: right;
+  word-break: break-all;
+}
+
+.metric-val.ok {
+  color: var(--vela-ok);
+}
+.metric-val.warn {
+  color: var(--vela-warn);
+}
+.metric-val.bad {
+  color: var(--vela-bad);
+}
+
+.checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.check-item {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.check-item input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.check-item label {
+  cursor: pointer;
+}
+
+.check-item .hint {
+  display: block;
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+}
+
+.check-item.done label {
+  color: var(--vela-fg-dim);
+  text-decoration: line-through;
+}
+
+/* ---------- 字体对齐测试台（验收项 #3）---------- */
+
+.align-test {
+  font-family: var(--vela-font-editor);
+  font-size: var(--vela-font-size);
+  line-height: var(--vela-line-height);
+  white-space: pre;
+  background: var(--vela-bg);
+  padding: 8px;
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.note {
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+  line-height: 1.6;
+  margin: 6px 0 0;
+}
+
+.ime-test {
+  width: 100%;
+  font-family: var(--vela-font-editor);
+  font-size: var(--vela-font-size);
+  padding: 6px 8px;
+  background: var(--vela-bg);
+  color: var(--vela-fg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  resize: vertical;
+  min-height: 54px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  background: var(--vela-bg-panel);
+  color: var(--vela-fg-dim);
+  border: 1px solid var(--vela-border);
+}

@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vela M0</title>
+    <script>
+      // 必须在任何模块加载前记录，用于测量「页面开始 → 应用代码执行」的分段耗时
+      window.__VELA_T0 = performance.now()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
