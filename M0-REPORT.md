@@ -381,7 +381,7 @@ M0 的探针是为了测量而生的脚手架，收尾时必须清理 —— 但
 
 - 前端：`src/probe/`（4 个文件）与 `src/global.d.ts` 经 `git rm` 删除；`App.tsx` 重写为无探针的编辑器外壳；`index.html` 去掉内联启动探针、标题 `Vela M0` → `Vela`；`src/index.tsx` 去掉 beats；`styles.css` 删掉探针面板/测试台样式，**保留 `.cm-line.vela-code`**；`setup.ts` / `loader.ts` 只清注释与命名（`m0Highlight` → `tokenHighlight`），**逻辑一行未动**
 - Rust：`lib.rs` 收敛成一个 bare `run()`——六个命令（含 `read_text_file` 这个任意路径读取原语）、`PROBE_SLOTS` / `PROBE_INPUT_SLOTS`、`diag_log`、`.setup()` 的强制置顶、`.on_page_load` 全部删除；`Cargo.toml` 随之去掉已无人使用的 `serde` / `serde_json`
-- 其他：`tauri.conf.json` 窗口标题去掉「M0 验证」（`identifier: "app.vela.m0"` 是 bundle ID，影响签名与 macOS 身份，**留给用户决定**）；`package.json` 描述去掉「M0 validation shell」；`.gitignore` 删掉已成死规则的 `.m0-*`
+- 其他：`tauri.conf.json` 窗口标题去掉「M0 验证」；`package.json` 描述去掉「M0 validation shell」；`.gitignore` 删掉已成死规则的 `.m0-*`。`identifier` 当时保留为 `app.vela.m0` 待用户拍板，**同日已改为 `app.vela.m1`**——注意 bundle ID 变更在 macOS 眼里就是另一个应用，旧 ID 的 TCC 授权与 `Application Support` 数据目录都不再适用（实测 `~/Library/Application Support/app.vela.m0` 从未生成，所以没有数据丢失）；正式发布前若还要再改一次，同理
 - ✅ **首屏体积已复测：236.92 → 219.58KB（gzip，-17.34KB）**，预算余量 21% → 27%。`pnpm typecheck` / `pnpm build` / `cargo check` / `cargo build` 全绿；产物里 grep 不到 `save_probe_slot` / `probe_ready` / `ProbePanel` / `__velaBoot`；首屏三个资源 HTTP 200；代码区字体机制完好（`regular-*.js` 懒加载 chunk 在、`.cm-line.vela-code{font-family:var(--vela-font-code)}` 在、433 片 woff2 / 18.07MB 未变）
 
 ⚠️ **两个必须如实交代的偏差**：
