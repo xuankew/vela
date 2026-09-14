@@ -22,7 +22,7 @@
   --vela-font-size: 14px;
   --vela-line-height: 1.75;
 
-  /* M0 临时暗色配色，正式主题系统在 M4 */
+  /* 临时暗色配色，正式主题系统在 M4 接管 */
   --vela-bg: #1a1b26;
   --vela-bg-alt: #16161e;
   --vela-bg-panel: #24283b;
@@ -121,12 +121,6 @@ button.primary {
   font-weight: 600;
 }
 
-button.recording {
-  background: var(--vela-bad);
-  border-color: var(--vela-bad);
-  color: #1a1b26;
-}
-
 select {
   font-family: var(--vela-font-ui);
   font-size: 12px;
@@ -141,12 +135,8 @@ select {
 
 .body {
   display: grid;
-  grid-template-columns: 1fr 380px;
+  grid-template-columns: 1fr;
   min-height: 0;
-}
-
-.body.panel-closed {
-  grid-template-columns: 1fr 0;
 }
 
 .editor-host {
@@ -172,133 +162,12 @@ select {
   font-family: var(--vela-font-editor);
 }
 
-/* ---------- 探针面板 ---------- */
-
-.probe {
-  border-left: 1px solid var(--vela-border);
-  background: var(--vela-bg-alt);
-  overflow-y: auto;
-  min-height: 0;
-}
-
-.probe-section {
-  border-bottom: 1px solid var(--vela-border);
-  padding: 10px 12px;
-}
-
-.probe-title {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--vela-accent);
-  margin-bottom: 8px;
-}
-
-.metric-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 8px;
-  padding: 2px 0;
-  font-size: 12px;
-}
-
-.metric-key {
-  color: var(--vela-fg-dim);
-  flex-shrink: 0;
-}
-
-.metric-val {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  text-align: right;
-  word-break: break-all;
-}
-
-.metric-val.ok {
-  color: var(--vela-ok);
-}
-.metric-val.warn {
-  color: var(--vela-warn);
-}
-.metric-val.bad {
-  color: var(--vela-bad);
-}
-
-.checklist {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.check-item {
-  display: flex;
-  gap: 7px;
-  align-items: flex-start;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.check-item input {
-  margin-top: 3px;
-  flex-shrink: 0;
-}
-
-.check-item label {
-  cursor: pointer;
-}
-
-.check-item .hint {
-  display: block;
-  color: var(--vela-fg-dim);
-  font-size: 11px;
-}
-
-.check-item.done label {
-  color: var(--vela-fg-dim);
-  text-decoration: line-through;
-}
-
-/* ---------- 字体对齐测试台（验收项 #3）---------- */
+/* ---------- 代码区字体（D2「按内容分字体」）---------- */
 
 /* editor/setup.ts 的语法装饰：围栏代码块 / 缩进代码 / Markdown 表格所在的行。
    只换字体不动行高——行高一变，CM6 的行高测量与滚动位置全会错。 */
 .cm-line.vela-code {
   font-family: var(--vela-font-code);
-}
-
-.align-test {
-  /* 跟代码区字体走而非正文字体：#3 量的是「代码区能不能对齐」，
-     指向 --vela-font-editor 的话切了代码字体这里量的还是文楷，结论会反。 */
-  font-family: var(--vela-font-code);
-  font-size: var(--vela-font-size);
-  line-height: var(--vela-line-height);
-  white-space: pre;
-  background: var(--vela-bg);
-  padding: 8px;
-  border: 1px solid var(--vela-border);
-  border-radius: 4px;
-  overflow-x: auto;
-}
-
-.note {
-  color: var(--vela-fg-dim);
-  font-size: 11px;
-  line-height: 1.6;
-  margin: 6px 0 0;
-}
-
-.ime-test {
-  width: 100%;
-  font-family: var(--vela-font-editor);
-  font-size: var(--vela-font-size);
-  padding: 6px 8px;
-  background: var(--vela-bg);
-  color: var(--vela-fg);
-  border: 1px solid var(--vela-border);
-  border-radius: 4px;
-  resize: vertical;
-  min-height: 54px;
 }
 
 .badge {

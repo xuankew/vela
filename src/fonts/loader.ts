@@ -68,7 +68,7 @@ export const DEFAULT_VARIANT: FontVariantId = 'screen-gb'
  * 与正文字体是**两个正交维度**：正文字体决定 Markdown 正文与 UI，
  * 代码区字体决定围栏代码块 / 缩进代码 / Markdown 表格。
  *
- * 为什么必须分开：M0 验收项 #3 实测 LXGW WenKai Screen 的拉丁是**比例宽度**
+ * 为什么必须分开：实测 LXGW WenKai Screen 的拉丁是**比例宽度**
  * （ASCII 步进极差 8.63px），CJK/ASCII = 1.666 而非 2.0，50 个中文字累积漂移 140px。
  * 文楷用于代码区连纯英文的列都对不齐，只能退回正文与 UI。
  *
@@ -90,9 +90,8 @@ export const CODE_FONTS: Record<CodeFontId, CodeFont> = {
     id: 'maple-cn',
     label: 'Maple Mono CN（等宽 2:1）',
     family: 'Maple Mono CN',
-    // 只发 400 一个字重：dist/fonts/400 下 239 个 woff2（8.87MB，由
-    // `node scripts/font-manifest.mjs` 逐片量出）。粗体走浏览器合成，
-    // 与文楷的 R16 现状一致，真要字重再加一档 CSS。
+    // 只发 400 一个字重：dist/fonts/400 下 239 个 woff2，合计 8.87MB。
+    // 粗体走浏览器合成，与文楷的 R16 现状一致，真要字重再加一档 CSS。
     // 路径不能写成 dist/regular.css：该包有 exports 白名单，只暴露 ./regular.css，
     // 写真实路径 dev 下可能侥幸通过但 rolldown 构建会直接失败。
     load: () => import('@automann/maple-mono-cn/regular.css?inline'),

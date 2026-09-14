@@ -3,47 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vela M0</title>
-    <script>
-      // 必须在任何模块加载前记录，用于测量「页面开始 → 应用代码执行」的分段耗时
-      window.__VELA_T0 = performance.now()
-
-      // 最低层的启动探针。放在内联脚本里是因为它在**所有模块之前**执行：
-      // bundle 加载失败、或 App.tsx 渲染阶段就抛错时，组件里的 onMount 探针
-      // 根本轮不到注册，外部只能看到「什么都不写」，与「页面被冻结」无法区分。
-      // 这里只用同步 IPC，不碰 setTimeout / rAF / document.fonts.ready。
-      // M0 收尾时和其余脚手架一起删。
-      window.__VELA_BOOT = []
-      window.__velaBoot = function (stage, extra) {
-        var rec = {
-          stage: stage,
-          at: new Date().toISOString(),
-          visibility: document.visibilityState,
-          hasFocus: document.hasFocus(),
-        }
-        for (var k in extra || {}) rec[k] = extra[k]
-        window.__VELA_BOOT.push(rec)
-        var t = window.__TAURI_INTERNALS__
-        if (!t || !t.invoke) return
-        t.invoke('save_probe_slot', {
-          slot: 'boot',
-          json: JSON.stringify({ events: window.__VELA_BOOT }, null, 2),
-        })
-      }
-      window.addEventListener('error', function (e) {
-        window.__velaBoot('window-error', {
-          message: String(e.message),
-          src: String(e.filename),
-          line: e.lineno,
-          col: e.colno,
-          stack: String((e.error && e.error.stack) || ''),
-        })
-      })
-      window.addEventListener('unhandledrejection', function (e) {
-        window.__velaBoot('unhandled-rejection', { reason: String(e.reason) })
-      })
-      window.__velaBoot('inline-html', { hasInternals: '__TAURI_INTERNALS__' in window })
-    </script>
+    <title>Vela</title>
   </head>
   <body>
     <div id="root"></div>

@@ -499,27 +499,27 @@ const vela = {
 | 空转常驻内存（macOS） | **< 200MB** | ✅ **均值 104MB / 峰值 109MB**（余量 46%，`phys_footprint` 口径，dPR=1） | Tauri 基准 ~172MB；Electron 为 ~409MB |
 | 打开 10 万行文件 | **< 2s**，滚动 60fps | 滚动已测：5 万行手感档 **60fps**（见 §3.2 #1）。10 万行未测 | — |
 | 全局搜索（10 万文件仓库） | **首批结果 < 2s** | M2 | ripgrep 级 |
-| 前端 bundle（gzip） | **≤ 300KB** | ⚠️ **236.92KB**（余量 21%）。D7 基线是 218.5KB，**+18.4KB 全部来自 M0 探针脚手架**：`src/probe/sweep.ts`(17.5KB) 与 `ProbePanel.tsx`(46.9KB) 都是静态 import，落在入口 chunk 里。M0 收尾会整体删除，届时回落到 218KB 一线 | CM6 135KB + Solid 8.4KB + cmdk-solid 14.9KB + 业务代码 |
+| 前端 bundle（gzip） | **≤ 300KB** | ✅ **219.58KB**（余量 27%）。M0 探针脚手架已于 2026-09-14 整体删除，从 236.92KB 回落 17.34KB；比 D7 基线 218.5KB 多的 1.08KB 是清理后 `App.tsx` 的工具栏与字体切换 UI | CM6 内核 108.50KB（modulepreload chunk）+ 入口 110.23KB（Solid + CM6 基础扩展 + 应用代码）+ 应用 CSS 0.85KB。⚠️ **命令面板的 `cmdk-solid` 等 M2 依赖还没进场，这 27% 不是永久空间** |
 | **首屏字体字节** | **< 2MB** | ❌ **2.219MB（超 11%）** —— M0 唯一超标的硬预算。1 万行常用字混排下加载 61 片：文楷 25 片 1.136MB + Maple 36 片 1.082MB。口径是构建期分片清单查表（`performance` 的 resource timing 在 `tauri://` 下恒为 0 条 woff2，不可用）。根因是分片按码位区块切、一屏汉字散落到 25~36 片；**M1 按字频重排可降到 1.0~1.2MB**（见 §3.3）。详见 §3.2 #4 | 饱和上界（滚完 5 万行）2.603MB；空文档 + 界面中文 0.49~1.07MB |
 | 按键到屏幕延迟 | **< 16ms** | 主线程事务派发 avg < 1ms（不含系统事件投递，仅作回归基线） | 不可感知 |
 
-**M0 构建产物明细**（`pnpm build`，D7 字体按需注入 + D2 代码区分字体后）：
+**M0 构建产物明细**（`pnpm build`，D7 字体按需注入 + D2 代码区分字体后；**2026-09-14 删除 M0 脚手架后复测**）：
 
 | 文件 | min | gzip | 说明 |
 |---|---|---|---|
-| `index-*.js` | 347.59K | **127.14 KB** | 入口：Solid + 应用代码 + CM6 基础扩展 + **M0 探针**（见下） |
+| `index-*.js` | 302.83K | **110.23 KB** | 入口：Solid + 应用代码 + CM6 基础扩展 |
 | `dist-*.js`（modulepreload） | 335.25K | **108.50 KB** | CM6 内核 |
-| `index-*.css` | 4.05K | **1.28 KB** | 应用自身样式（字体声明已移出） |
-| **首屏合计** | | **236.92 KB** | 预算 ≤300KB，余量 21% |
+| `index-*.css` | 2.29K | **0.85 KB** | 应用自身样式（字体声明已移出） |
+| **首屏合计** | | **219.58 KB** | 预算 ≤300KB，余量 27% |
 | `regular-*.js` | 155.91K | 55.36 KB | Maple Mono CN 的 CSS，**懒加载 chunk**，不进首屏 |
 | `lxgwwenkaigbscreen-*.js` | 92.73K | 33.36 KB | 字体变体 GB，**懒加载 chunk**，选中才拉 |
 | `lxgwwenkaiscreenr-*.js` | 92.83K | 33.36 KB | 字体变体 R，同上 |
 | 117 个 chunk（含子语言） | | | 懒加载，**不进首屏** |
 | 433 个 woff2 | | **18.1 MB** | 文楷 GB 97 片 / 4.33MB + 文楷 R 97 片 / 4.87MB + Maple 239 片 / ≈8.9MB（hash 命名） |
 | `dist/` 总计 | | 26 MB | |
-| `Vela.app` | | **23 MB** | 预算 ≤40MB |
+| `Vela.app` | | **23 MB** | 预算 ≤40MB。⚠️ 这是清理脚手架前那次 release 构建的读数；Rust 侧少了约 200 行探针，只会更小 |
 
-> **首屏比 D7 基线（218.5 KB）多了 18.4 KB，全部是 M0 探针脚手架**：`src/probe/sweep.ts`(17.5KB) 与 `ProbePanel.tsx`(46.9KB) 都是静态 import，被压进入口 chunk。M0 收尾整体删除后回落到 218 KB 一线。**别把这 18.4 KB 记成 D2 分字体的代价**——Maple 的 CSS 是 `?inline` 动态 import，独立成 `regular-*.js`，首屏一个字节都没碰。
+> ✅ **M0 探针脚手架已整体删除，首屏 gzip 236.92 → 219.58 KB**（-17.34 KB，2026-09-14 复测）。当初被压进入口 chunk 的是两个静态 import：`src/probe/sweep.ts`(17.5KB) 与 `ProbePanel.tsx`(46.9KB)。比 D7 基线（218.5 KB）多出的 1.08 KB 是清理后 `App.tsx` 的工具栏与字体切换 UI，不是残留脚手架。**别把当初那 18.4 KB 记成 D2 分字体的代价**——Maple 的 CSS 是 `?inline` 动态 import，独立成 `regular-*.js`，首屏一个字节都没碰。
 >
 > 注意 npm 包的 `exports` 白名单：`@automann/maple-mono-cn` 只暴露 `"./regular.css"`，必须 import `@automann/maple-mono-cn/regular.css?inline`；直接写包内的真实 `dist/` 路径会在构建期就报 "Package subpath is not defined"。
 
@@ -622,7 +622,7 @@ const vela = {
 |---|---|
 | `pnpm typecheck` | ✅ EXIT=0（修掉 5 个错误后） |
 | `cargo check` | ✅ EXIT=0，173 个 rlib 依赖 |
-| `pnpm build` | ✅ EXIT=0，538ms，首屏 gzip 当时 284.4KB → D7 字体注入改造后 **236.92KB**（当前明细见 §2.9） |
+| `pnpm build` | ✅ EXIT=0，671ms，首屏 gzip 演进：284.4KB → D7 字体注入 + M0 探针 236.92KB → **脚手架删除后 219.58KB**（当前明细见 §2.9） |
 | `pnpm app:dev` | ✅ 27.21s 编译完成，窗口已启动 |
 | `pnpm tauri build` | ✅ EXIT=0，产出 `src-tauri/target/release/bundle/macos/Vela.app`（可执行体 14.6MB），M0 的实测数据全部取自这个打包产物 |
 

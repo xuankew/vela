@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Vela · M0 验证",
+        "title": "Vela",
         "width": 1440,
         "height": 900,
         "minWidth": 900,

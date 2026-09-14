@@ -43,8 +43,8 @@ import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
 
 /**
- * PLAN.md R11：连字在 contenteditable 语境下会导致光标定位错乱，属浏览器级问题。
- * 默认关闭，M0 需要验证这一点是否真的复现。
+ * 连字在 contenteditable 语境下会导致光标定位错乱（PLAN.md R11），属浏览器级问题，
+ * 无法在编辑器层修，因此默认关闭。
  */
 const noLigatures = EditorView.theme({
   '&': {
@@ -112,12 +112,7 @@ const codeLineDeco = Decoration.line({ class: 'vela-code' })
  *
  * 滚动时 `viewportChanged` **每帧都触发**，没有余量就得每帧重走一遍语法树、重建整个
  * DecorationSet。有余量后视口在余量内移动一次都不重算，3000px/s 下约每滚过 4000px
- * 才重建一次（每档 ~5 次而不是 ~180 次）。
- *
- * ⚠️ 别把这条当成 M0 #1 那个 60fps→55fps 退化的修复——它不是。节流把重建削掉了一个
- * 数量级，帧率**一位小数都没动**（55.7/54.5/56.1/55.3 → 55.6/55.2/55.8/54.1）；再把本
- * 插件整个摘掉也还是 55.70fps。两个组件都已排除，那次退化另有原因，见 PLAN.md §3.2 #1。
- * 余量本身仍然该留：每帧重建一份用完就扔的 DecorationSet 是纯浪费。
+ * 才重建一次（每档 ~5 次而不是 ~180 次）——每帧重建一份用完就扔的 DecorationSet 是纯浪费。
  */
 const DECO_MARGIN_PX = 2000
 
@@ -206,8 +201,8 @@ export const codeFontBySyntax = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 )
 
-/** M0 用的高亮配色。正式主题系统在 M4，这里只求能看清 token 边界。 */
-const m0Highlight = HighlightStyle.define([
+/** 当前的 token 配色。正式主题系统在 M4 接管，这里只求能看清 token 边界。 */
+const tokenHighlight = HighlightStyle.define([
   { tag: tags.heading, color: '#7aa2f7', fontWeight: '700' },
   { tag: tags.heading1, fontSize: '1.4em' },
   { tag: tags.heading2, fontSize: '1.25em' },
@@ -235,18 +230,18 @@ const m0Highlight = HighlightStyle.define([
 ])
 
 export interface EditorSetupOptions {
-  /** 是否开启自动换行。M0 需要分别在开/关两种状态下测滚动抖动（风险 R9） */
+  /** 是否开启自动换行 */
   lineWrap?: boolean
-  /** 是否启用 Markdown + 子语言懒加载 */
+  /** 是否启用 Markdown + 子语言懒加载。关闭时整篇按代码渲染 */
   markdownMode?: boolean
   doc?: string
 }
 
 /**
- * 组装 M0 的编辑器扩展集。
+ * 组装编辑器扩展集。
  *
- * 刻意不使用 `basicSetup`：M0 要精确知道每一个扩展的成本，
- * 而且 basicSetup 里含 M0 不需要的部分（如 lint gutter）。
+ * 刻意不使用 `basicSetup`：要精确知道每一个扩展的成本，而且 basicSetup 里含不需要的
+ * 部分（如 lint gutter）。
  */
 export function buildExtensions(options: EditorSetupOptions = {}): Extension[] {
   const { lineWrap = true, markdownMode = true } = options
@@ -269,7 +264,7 @@ export function buildExtensions(options: EditorSetupOptions = {}): Extension[] {
     crosshairCursor(),
     highlightActiveLine(),
     highlightSelectionMatches(),
-    syntaxHighlighting(m0Highlight),
+    syntaxHighlighting(tokenHighlight),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     noLigatures,
     scrollPastEnd(),
