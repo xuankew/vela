@@ -1,10 +1,9 @@
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { createEffect, createSignal, For, onCleanup, onMount, Show, untrack } from 'solid-js'
 import type { EditorView } from '@codemirror/view'
 import { invoke } from '@tauri-apps/api/core'
 import {
   CODE_FONTS,
   DEFAULT_CODE_FONT,
-  DEFAULT_VARIANT,
   FONT_VARIANTS,
   type CodeFontApplyResult,
   type FontApplyResult,
@@ -12,17 +11,20 @@ import {
 import { runScrollMatrix, type ScrollSample, type SweepDoc } from './sweep'
 import {
   collectFontFaces,
-  collectFontShards,
   collectMemory,
   formatBytes,
   FpsSampler,
+  loadShardManifest,
   measureAlignment,
   measureEditLatency,
+  measureShardBytes,
   type AlignMetrics,
   type DocStats,
   type FontFaceInfo,
   type FpsStats,
   type MemoryMetrics,
+  type ShardManifest,
+  type ShardMeasure,
 } from './metrics'
 
 interface Props {
@@ -53,6 +55,23 @@ const STARTUP_BUDGET_MS = 1000
 const MEM_BUDGET_KB = 200 * 1024
 /** 验收项 #1：滚动帧率不低于此值算通过 */
 const FPS_BUDGET = 55
+
+/**
+ * 等一次绘制。字体分片是**布局触发**的，挂载完文档立刻量会少数几片、把 #4 读偏乐观。
+ *
+ * rAF 与 setTimeout 在页面 hidden 时都会被 WebKit 冻结，所以两条一起挂、谁先回来算谁：
+ * 窗口被遮挡时至少不会永久卡死在这里，而正常路径下拿到的是 rAF 那一条。
+ */
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    function done() {
+      window.clearTimeout(timer)
+      resolve()
+    }
+    const timer = window.setTimeout(done, 1000)
+    requestAnimationFrame(done)
+  })
+}
 
 /**
  * 一次帧率采样，连同**采样当时所处的状态**。
@@ -157,11 +176,8 @@ Emoji: 🚀 ⚡️ 🔥 📦 🧪 ✅ ❌ ⚠️
 
 export default function ProbePanel(props: Props) {
   const [fontFaces, setFontFaces] = createSignal<FontFaceInfo[]>([])
-  const [shards, setShards] = createSignal({
-    shardsLoaded: 0,
-    totalBytes: 0,
-    shardsAvailable: FONT_VARIANTS[DEFAULT_VARIANT].shards,
-  })
+  /** null = 清单还没读到（非 Tauri，或没跑 `node scripts/font-manifest.mjs`） */
+  const [shards, setShards] = createSignal<ShardMeasure | null>(null)
   const [mem, setMem] = createSignal<MemoryMetrics>({ rustRssKb: 0, rustUptimeMs: 0, jsHeapUsedBytes: 0 })
   const [fps, setFps] = createSignal<FpsSample | null>(null)
   const [fpsHistory, setFpsHistory] = createSignal<FpsSample[]>([])
@@ -174,21 +190,153 @@ export default function ProbePanel(props: Props) {
   const [checked, setChecked] = createSignal<Record<string, boolean>>({})
   const [inTauri, setInTauri] = createSignal(false)
   const [exportState, setExportState] = createSignal('')
+  const [shardsState, setShardsState] = createSignal('')
 
   const sampler = new FpsSampler()
   let memTimer = 0
   let alignRef: HTMLDivElement | undefined
-  /** 滚动矩阵期间挂起列对齐测量，理由见 runAlign。普通 let 即可——不参与渲染 */
-  let alignSuspended = false
+  /** 滚动矩阵期间挂起自动测量（#3 列对齐 + #4 分片落盘），理由见 runAlign。普通 let 即可——不参与渲染 */
+  let autoMeasureSuspended = false
+
+  /**
+   * 分片字节清单（`scripts/font-manifest.mjs` 生成，经 Rust 白名单槽位读回）。
+   *
+   * 300KB 的静态查表数据，整个会话不会变，所以读一次缓存住：每 3s 的轮询里再读一遍
+   * 等于把一次 300KB 的 IPC 塞进 #1 的采样窗口，那是探针自己在制造噪声。
+   */
+  let shardManifest: ShardManifest | null = null
+
+  async function loadManifest() {
+    shardManifest = await loadShardManifest()
+    refreshFonts()
+    setShardsState(
+      shardManifest
+        ? `清单已加载：${shardManifest.entries.length} 片（生成于 ${shardManifest.generatedAt}）`
+        : '⛔ 清单读取失败 —— 先跑 node scripts/font-manifest.mjs（需要 dist 已构建才能核对）',
+    )
+  }
+
+  /**
+   * 启动心跳。委托给 index.html 内联脚本里的全局写入器。
+   *
+   * 为什么不在组件里自己落盘：内联脚本在**所有模块之前**执行，bundle 加载失败或
+   * App.tsx 渲染阶段抛错时，组件的 onMount 根本轮不到运行——那正是最需要记录的
+   * 情况。两处各持一份事件数组写同一个文件还会互相覆盖，所以全局只留一份。
+   *
+   * 心跳只用同步 IPC，刻意不碰 setTimeout / rAF / document.fonts.ready：
+   * 外部观察下「页面被 WebKit 冻结」与「JS 没跑起来」是同一个现象（什么都不写），
+   * 靠猜已经白烧了好几轮启动，这条记录能把两者一次分开。
+   *
+   * M0 收尾时和其余脚手架一起删。
+   */
+  function writeBootRecord(stage: string, extra?: Record<string, unknown>) {
+    window.__velaBoot?.(stage, extra)
+  }
+
+  /**
+   * #4 的样本按时间累积落盘。
+   *
+   * 为什么不是一个数：判据「首屏实际加载 < 2MB」量的是**启动时**的已加载分片，
+   * 而「生僻字能正确触发分片加载」要看**灌过文档之后**的增量。单文件覆盖写会把
+   * 前一个判据点冲掉，所以这里存成数组、每次整体重写。
+   */
+  let shardSamples: unknown[] = []
+
+  async function captureShards() {
+    if (autoMeasureSuspended) return
+    if (!shardManifest) shardManifest = await loadShardManifest()
+    if (!shardManifest || !('__TAURI_INTERNALS__' in window)) return
+
+    // 分片下载是布局触发的异步过程，太早量会少数几片、把 #4 读得偏乐观。
+    // 但 `document.fonts.ready` 在分片持续加载时可能迟迟不 settle（#3 的补测就被它拖过），
+    // 所以给它 3s 上限：宁可记下「当时还没加载完」，也不要一个样本都拿不到。
+    let settled = true
+    let settleTimer = 0
+    await Promise.race([
+      document.fonts.ready.catch(() => undefined),
+      new Promise<void>((resolve) => {
+        settleTimer = window.setTimeout(() => {
+          settled = false
+          resolve()
+        }, 3000)
+      }),
+    ])
+    // 不清掉的话这个 timer 会在 race 结束后照样触发，把 settled 翻成 false
+    window.clearTimeout(settleTimer)
+
+    refreshFonts()
+    const s = shards()
+    if (!s) return
+
+    // 一个 face 都没注册 = 字体 CSS 还没注入完，这时量到的必然是 0 字节。
+    // 而且两个自检计数此时都平凡地为 0，样本会被误标成可信——实测已经这样
+    // 往 .m0-shards.json 里塞过一条空数据。宁可跳过，也不要一条看着像结论的废样本。
+    if (s.registeredFaces === 0) {
+      writeBootRecord('shards-skipped', { why: 'registeredFaces=0，字体尚未注入' })
+      setShardsState('字体尚未注入，本样本跳过（registeredFaces=0）')
+      return
+    }
+
+    const sample = {
+      at: new Date().toISOString(),
+      fontVariant: props.fontResult?.id ?? null,
+      // 分字体之后代码区那 239 片是 #4 的大头，不记这一项就分不清量的是哪套字体
+      codeFontVariant: props.codeFontResult?.id ?? null,
+      doc: props.stats?.label ?? null,
+      docLines: props.stats?.lines ?? null,
+      // 分片字节数由**首屏可见字符集**决定，而换行开关直接改变一屏能装下多少字符。
+      // 不记这一项，两个总量不同的样本事后分不出是内容变了还是排版变了。
+      lineWrap: props.stats?.lineWrap ?? null,
+      visibility: document.visibilityState,
+      devicePixelRatio: window.devicePixelRatio,
+      fontsSettled: settled,
+      // ⛔ 三种情况下字节数都不能用：两种连接方式打架、主连接（按 range 查表）
+      // 压根没命中、或者一个 face 都没量到。只查 indexDisagreements 会漏掉后两者：
+      // range 全军覆没时只剩「按出现顺序对齐」这条弱连接在出数，分歧数照样是 0；
+      // registeredFaces=0 时两个计数都平凡为 0，一次空测量会被当成可信。
+      // 写进文件里，免得事后有人只摘 totalBytes 一个数就当成结论。
+      trustworthy: s.indexDisagreements === 0 && s.rangeUnmatched === 0 && s.registeredFaces > 0,
+      budgetBytes: FONT_BUDGET_BYTES,
+      ...s,
+    }
+
+    // 同一个状态别重复记：字体切换的 effect 与 visibilitychange 会前后脚各触发一次
+    const prev = shardSamples[shardSamples.length - 1] as typeof sample | undefined
+    if (
+      prev &&
+      prev.fontVariant === sample.fontVariant &&
+      prev.codeFontVariant === sample.codeFontVariant &&
+      prev.doc === sample.doc &&
+      prev.loadedFaces === sample.loadedFaces &&
+      prev.totalBytes === sample.totalBytes
+    ) {
+      return
+    }
+    shardSamples.push(sample)
+
+    try {
+      const path = await invoke<string>('save_probe_slot', {
+        slot: 'shards',
+        json: JSON.stringify(
+          { manifestAt: shardManifest.generatedAt, budgetBytes: FONT_BUDGET_BYTES, samples: shardSamples },
+          null,
+          2,
+        ),
+      })
+      setShardsState(
+        `已落盘 ${shardSamples.length} 个样本 → ${path}` + (s.indexDisagreements ? '（⛔ 连接分歧，字节数作废）' : ''),
+      )
+    } catch (e) {
+      setShardsState(`失败：${String(e)}`)
+    }
+  }
 
   function refreshFonts() {
     // 不过滤 family：按内容分字体（D2）之后正文与代码区各驻留一套 webfont，
     // 只数 'lxgw' 会把代码字体那 239 个分片整块漏掉，#4 的比值就失真了。
     // document.fonts 只含 @font-face 注册项、不含系统字体，所以全量统计是安全的。
     setFontFaces(collectFontFaces())
-    const variant = FONT_VARIANTS[props.fontResult?.id ?? DEFAULT_VARIANT]
-    const code = CODE_FONTS[props.codeFontResult?.id ?? DEFAULT_CODE_FONT]
-    setShards({ ...collectFontShards(variant.shards + code.shards), shardsAvailable: variant.shards + code.shards })
+    setShards(shardManifest ? measureShardBytes(shardManifest) : null)
   }
 
   async function refreshMem() {
@@ -211,6 +359,9 @@ export default function ProbePanel(props: Props) {
   }
 
   onMount(() => {
+    // 心跳必须是第一件事：后面任何一行抛错，这条记录都是「JS 确实跑到了这里」的唯一证据。
+    // error / unhandledrejection 监听在 index.html 内联脚本里已注册，且注册得更早。
+    writeBootRecord('panel-mount')
     // 检测是否跑在 Tauri 里（纯浏览器下 Rust 探针取不到值）
     setInTauri('__TAURI_INTERNALS__' in window)
     const saved = localStorage.getItem('vela.m0.checklist')
@@ -222,6 +373,8 @@ export default function ProbePanel(props: Props) {
       }
     }
     refreshFonts()
+    // 清单是异步读回来的，到位后 loadManifest 内部会再刷一次
+    void loadManifest()
     void refreshMem()
     // 字体分片随滚动持续加载，定时刷新才能看到增长曲线
     startPolling()
@@ -231,10 +384,12 @@ export default function ProbePanel(props: Props) {
     if ('__TAURI_INTERNALS__' in window) {
       void invoke<boolean>('autotest_enabled')
         .then((on) => {
+          // 记下来是因为「开关读到 false」和「矩阵启动了但被冻结挂住」在外部同样是静默
+          void writeBootRecord('autotest-checked', { enabled: on })
           if (on) void runMatrix()
         })
-        .catch(() => {
-          /* 命令不可用时静默跳过，不影响面板其余功能 */
+        .catch((e) => {
+          void writeBootRecord('autotest-check-failed', { error: String(e) })
         })
     }
   })
@@ -269,6 +424,20 @@ export default function ProbePanel(props: Props) {
   }
 
   /**
+   * 等两套字体 CSS 都注入完。注入走的是动态 import，panel-mount 之后还要几百毫秒；
+   * 在这个窗口里采样会撞上 `registeredFaces=0` 的自检被静默挡掉——实测首屏样本
+   * 一次都没落盘，只留下四条 shards-skipped。
+   */
+  async function waitFontsInjected(timeoutMs = 10_000): Promise<boolean> {
+    const t0 = Date.now()
+    while (Date.now() - t0 < timeoutMs) {
+      if (props.fontResult && props.codeFontResult) return true
+      await new Promise((r) => window.setTimeout(r, 100))
+    }
+    return false
+  }
+
+  /**
    * #1 的客观一半：四个组合（10k/50k × 换行开/关）× 两种速度口径 = 八档，自动采齐。
    *
    * 复用面板自己的轮询开关——采样窗口内必须停掉 3s 轮询，否则 `probe_memory`
@@ -277,8 +446,36 @@ export default function ProbePanel(props: Props) {
   async function runMatrix() {
     const at = props.autotest
     if (!at) return
+
+    // #4 的判据是「**首屏** < 2MB」，而矩阵跑完那一刻的样本已经被滚动污染：
+    // 滚过的每一屏都会把新分片拉进来，那个总量说的是整篇文档的字符覆盖面。
+    // 所以滚动之前先单独取：等字体注入完、灌入文档、停在顶部、不滚。
+    // 必须放在 autoMeasureSuspended 之前——captureShards 第一行就会被那个标志挡掉。
+    //
+    // 两份文档，**顺序不能反**：face 一旦 loaded 就不会被卸载，先量含生僻字的那份
+    // 会把常用文档的读数一起抬上去。
+    //   mixed-10k-common —— 判 2MB 预算用这份（rareHan 关掉的常用字文档）。
+    //   mixed-10k        —— 验机制用这份：刻意塞了 30 个跨区块生僻字、一字一分片，
+    //                       是「分片确实按需加载」的强样本，但不是用户会打开的文档。
+    // 两份之差就是生僻字的代价。
+    const injected = await waitFontsInjected()
+    void writeBootRecord('firstscreen-fonts', { injected })
+    for (const doc of ['mixed-10k-common', 'mixed-10k'] as const) {
+      setMatrixNote(`首屏字体采样 — ${doc}，停在顶部不滚动`)
+      at.load(doc)
+      await nextPaint()
+      await captureShards()
+      // 实测 t+0 是 0.53MB、t+0.05s 是 2.16MB、t+3s 是 2.45MB——`document.fonts.ready`
+      // 会在加载波次之间提前 settle，单份读数说明不了「首屏已稳定」，必须看到平台期。
+      // captureShards 对完全相同的样本会去重，于是**日志里少掉的那几次落盘**就是收敛证据。
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => window.setTimeout(r, 3000))
+        await captureShards()
+      }
+    }
+
     setMatrixNote('滚动矩阵启动中 — 请别操作窗口，八档约 40s')
-    alignSuspended = true
+    autoMeasureSuspended = true
     const samples = await runScrollMatrix({
       load: at.load,
       setWrap: at.setWrap,
@@ -297,11 +494,15 @@ export default function ProbePanel(props: Props) {
     setMatrixNote(
       `完成 ${samples.length} 档 · 有效 ${samples.filter((s) => !s.aborted).length} 档 · 已写 .m0-scroll.json`,
     )
-    alignSuspended = false
+    autoMeasureSuspended = false
     // 矩阵结束时文档停在含围栏代码块的 fixture 上，这是唯一能拿到「CM6 里真实
     // .vela-code 行」读数的时机：启动文档是 empty，一个代码块都没有，只能退回测试台 div，
     // 而那条只是间接证据——证明不了语法节点真的把字体换掉了。
     await runAlign()
+    // #4 的另一半：这一份是**滚完全篇之后**的饱和总量。和上面那份停在顶部的首屏
+    // 样本对照，才说明得了「分片按需增长」而不是一上来就全量下载。
+    // ⛔ 别拿这个数去判 2MB 首屏预算——它统计的是整篇文档的字符覆盖面。
+    await captureShards()
   }
 
   function runLatency() {
@@ -321,7 +522,15 @@ export default function ProbePanel(props: Props) {
     // 量宽度，主线程上要花几十毫秒；落进滚动矩阵的采样窗口就会砸出 >33ms 的帧被记成
     // 卡顿——与 3s 轮询 fork `ps` 是同一类探针自我污染。
     // force 只豁免单次调用（导出报告），不去动全局标志，否则矩阵会在不知不觉中失去保护。
-    if (alignSuspended && !force) return
+    if (autoMeasureSuspended && !force) return
+    // 字体还没注入就测，量到的是 ui-monospace 回退栈，而且照样会落盘——
+    // 实测这样把一份有效的 Maple 测量覆盖成了废数据（cjkOverAscii 1.55、editor=null）。
+    // 覆盖是不可逆的，所以宁可这一次什么都不写。force 例外：那是人显式点的，
+    // 量回退栈本身也可能就是目的。
+    if (!props.fontResult && !force) {
+      writeBootRecord('align-skipped', { why: '字体尚未注入，量到的是回退栈' })
+      return
+    }
     setAlignBusy(true)
     try {
       const contentDOM = props.getView()?.contentDOM ?? null
@@ -383,13 +592,21 @@ export default function ProbePanel(props: Props) {
   // 而 empty 文档里一个代码块都没有，只能退回测试台 div 拿间接证据。
   // 任一下拉切换、或换成含围栏代码块的 fixture，都必须重测，
   // 否则面板会留着上一个状态的比值，而它看起来仍然像是当前读数。
+  // #4 挂同一批触发点：换字体/换文档正是分片加载量发生变化的时刻。
   createEffect(() => {
     props.fontResult?.id
     props.codeFontResult?.id
     props.codeFontResult?.stack
     props.stats?.label
     props.stats?.lineWrap
-    void runAlign()
+    // 必须 untrack：runAlign 第一行读 alignBusy()、captureShards 读 shards()，
+    // 在 effect 里同步读到就把它们登记成了依赖，而这两个信号又恰好在本次执行中被
+    // 写入 —— 实测形成约 230 次/秒的自我触发循环，90 秒把 align 落盘刷了 20776 次。
+    // 之前没暴露是因为矩阵挂起标志和 hidden 页面会让 measureAlignment 卡在 fonts.ready 上。
+    untrack(() => {
+      void runAlign()
+      void captureShards()
+    })
   })
 
   /**
@@ -400,7 +617,12 @@ export default function ProbePanel(props: Props) {
    * 两轮 A/B，所以这里不靠人守窗口，让测量自己等到干净状态。
    */
   function onVisibility() {
-    if (document.visibilityState === 'visible') void runAlign()
+    // 两个方向都记：一直 hidden 时这条不会出现，一旦出现了就说明窗口真的被看到过，
+    // 这是判断「冻结」假说唯一不依赖屏幕权限的证据。
+    void writeBootRecord('visibilitychange', { state: document.visibilityState })
+    if (document.visibilityState !== 'visible') return
+    void runAlign()
+    void captureShards()
   }
 
   function toggle(id: string, value: boolean) {
@@ -501,7 +723,18 @@ export default function ProbePanel(props: Props) {
   const startupMs = () => props.processToReadyMs ?? props.editorReadyMs
   const readyClass = () => (startupMs() < STARTUP_BUDGET_MS ? 'ok' : 'bad')
   const memClass = () => (mem().rustRssKb > 0 && mem().rustRssKb < MEM_BUDGET_KB ? 'ok' : mem().rustRssKb === 0 ? '' : 'bad')
-  const fontClass = () => (shards().totalBytes < FONT_BUDGET_BYTES ? 'ok' : 'warn')
+  /**
+   * #4 的判定色。**读数可信是达标的前提**：range 查表与顺序对齐两种方式打架时
+   * （`indexDisagreements > 0`）说明连接错了，此时无论标 ok 还是 warn 都是在撒谎，
+   * 只能不着色、让下面的自检行把问题喊出来。
+   * `rangeUnmatched > 0` 同理——主连接没命中时只剩顺序对齐这条弱连接在出数，
+   * 判据必须与落盘时的 `trustworthy` 字段一致，不能两边各说一套。
+   */
+  const fontClass = () => {
+    const s = shards()
+    if (!s || s.indexDisagreements > 0 || s.rangeUnmatched > 0) return ''
+    return s.totalBytes < FONT_BUDGET_BYTES ? 'ok' : 'warn'
+  }
   const fpsClass = () => (fps() && fps()!.avgFps >= FPS_BUDGET ? 'ok' : 'bad')
   /**
    * 按 family 分组统计 face。
@@ -669,16 +902,61 @@ export default function ProbePanel(props: Props) {
             <span class="metric-val">{props.codeFontResult!.stack}</span>
           </div>
         </Show>
-        <div class="metric-row">
-          <span class="metric-key">已加载 woff2 分片</span>
-          <span class={`metric-val ${fontClass()}`}>
-            {shards().shardsLoaded} / {shards().shardsAvailable}
-          </span>
-        </div>
-        <div class="metric-row">
-          <span class="metric-key">分片总字节</span>
-          <span class={`metric-val ${fontClass()}`}>{formatBytes(shards().totalBytes)}</span>
-        </div>
+        <Show
+          when={shards()}
+          fallback={
+            <div class="metric-row">
+              <span class="metric-key">分片总字节</span>
+              <span class="metric-val">清单未加载（非 Tauri，或没跑 node scripts/font-manifest.mjs）</span>
+            </div>
+          }
+        >
+          {(s) => (
+            <>
+              <div class="metric-row">
+                <span class="metric-key">已加载 face / 注册 face</span>
+                <span class={`metric-val ${fontClass()}`}>
+                  {s().loadedFaces} / {s().registeredFaces}
+                </span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-key">分片总字节（查清单）</span>
+                <span class={`metric-val ${fontClass()}`}>
+                  {formatBytes(s().totalBytes)} · 预算 {formatBytes(FONT_BUDGET_BYTES)}
+                </span>
+              </div>
+              <For each={s().byFamily}>
+                {(g) => (
+                  <div class="metric-row">
+                    <span class="metric-key">分片 · {g.family}</span>
+                    <span class="metric-val">
+                      {g.loaded} / {g.shards} 片 · {formatBytes(g.bytes)}
+                    </span>
+                  </div>
+                )}
+              </For>
+              {/* 自检行。这两个数非 0 就说明上面的字节数不能用 —— 宁可显示「测不准」 */}
+              <div class="metric-row">
+                <span class="metric-key">自检 · range 未匹配</span>
+                <span class={`metric-val ${s().rangeUnmatched === 0 ? 'ok' : 'bad'}`}>
+                  {s().rangeUnmatched}
+                  {s().rangeUnmatched === 0 ? '（WebKit 序列化与 CSS 源文本一致）' : '（已退化为顺序对齐）'}
+                </span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-key">自检 · 两种连接分歧</span>
+                <span class={`metric-val ${s().indexDisagreements === 0 ? 'ok' : 'bad'}`}>
+                  {s().indexDisagreements}
+                  {s().indexDisagreements === 0 ? '（互相印证，读数可信）' : '（⛔ 查表连错了，字节数作废）'}
+                </span>
+              </div>
+              <div class="metric-row">
+                <span class="metric-key">自检 · 清单外 family</span>
+                <span class="metric-val">{s().familyNotInManifest}</span>
+              </div>
+            </>
+          )}
+        </Show>
         <For each={facesByFamily()}>
           {(g) => (
             <div class="metric-row">
@@ -696,11 +974,25 @@ export default function ProbePanel(props: Props) {
           </span>
         </div>
         <button onClick={refreshFonts}>刷新字体统计</button>
+        <button onClick={() => void loadManifest()}>重载分片清单</button>
+        <button onClick={() => void captureShards()} disabled={!shards()}>
+          记一个 #4 样本
+        </button>
+        <Show when={shardsState()}>
+          <p class="note">{shardsState()}</p>
+        </Show>
         <p class="note">
           @font-face 是运行时按需注入的（D7）。按内容分字体（D2）之后**同时驻留两套**：正文文楷走
           <code>vela-font-faces</code>，代码区 Maple Mono CN 走独立的 <code>vela-code-font-faces</code>
           ——两个 style 节点缺一不可，合并会让后注入的把前一套整块冲掉。正文变体内部仍是整块替换，
-          避开包内 4 变体 family 同名冲突（R14）。所以上面分片分母是两者之和。
+          避开包内 4 变体 family 同名冲突（R14）。
+          <br />
+          ⛔ 字节数**不是** resource timing 来的：`performance.getEntriesByType('resource')` 在
+          <code>tauri://</code> 下抓不到任何 woff2（release 构建恒为 0 条），#4 原先的 ✅ 是在 dev
+          模式测的、口径不同。现在的口径是「<code>document.fonts</code> 里 status=loaded 的 face」去查
+          <code>.m0-font-manifest.json</code>（由 <code>scripts/font-manifest.mjs</code> 从 node_modules
+          生成，字节数与 dist 产物逐字节核对过 433/433）。
+          <br />
           生僻字（龘靐𠀀）落在不同分片，滚动到含它们的行后刷新，对应 family 的已加载数应上升。
           把正文切到「系统等宽」对照组、代码区切到「跟随正文」，应看到两组 family 都变空。
         </p>

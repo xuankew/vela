@@ -13,17 +13,25 @@
  * 拿它判 #7 会系统性偏乐观。与其事后剔除脏样本，不如让时钟在被遮挡时停走。
  */
 import { invoke } from '@tauri-apps/api/core'
-import { DEFAULT_VARIANT, FONT_VARIANTS, type FontApplyResult } from '../fonts/loader'
+import { type FontApplyResult } from '../fonts/loader'
 import {
   collectFontFaces,
-  collectFontShards,
   collectMemory,
   collectProcessUptime,
   FpsSampler,
+  loadShardManifest,
+  measureShardBytes,
   type FpsStats,
+  type ShardManifest,
 } from './metrics'
 
-export type SweepDoc = 'empty' | 'mixed-10k' | 'ascii-10k' | 'mixed-20k' | 'mixed-50k'
+export type SweepDoc =
+  | 'empty'
+  | 'mixed-10k'
+  | 'mixed-10k-common'
+  | 'ascii-10k'
+  | 'mixed-20k'
+  | 'mixed-50k'
 
 interface Stage {
   doc: SweepDoc
@@ -99,11 +107,19 @@ interface Hooks {
   processToReadyMs: () => number | null
 }
 
+/** 清单 300KB 且整个扫描期间不变，读一次就够；每个样本都读会把 IPC 开销算进采样窗口 */
+let shardManifest: ShardManifest | null = null
+
+async function manifest(): Promise<ShardManifest | null> {
+  if (!shardManifest) shardManifest = await loadShardManifest()
+  return shardManifest
+}
+
 async function sample(hooks: Hooks, phase: string, stage: Stage) {
-  const variant = FONT_VARIANTS[hooks.fontResult()?.id ?? DEFAULT_VARIANT]
   const [uptime, mem] = [await collectProcessUptime(), await collectMemory()]
-  const shards = collectFontShards(variant.shards)
-  const faces = collectFontFaces('lxgw')
+  const mf = await manifest()
+  // 不过滤 family：D2 之后代码区是 Maple Mono CN，只数 'lxgw' 会漏掉那 239 个分片
+  const faces = collectFontFaces()
   const facesLoaded = faces.filter((f) => f.status === 'loaded').length
   return {
     at: new Date().toISOString(),
@@ -119,16 +135,11 @@ async function sample(hooks: Hooks, phase: string, stage: Stage) {
     jsHeapUsedBytes: mem.jsHeapUsedBytes,
     font: {
       applied: hooks.fontResult(),
-      shards,
+      // #4 的判据值：查清单得到的真实字节数，不再是「face 数 × 平均体积」的估算
+      // （分片大小不均，那个口径能偏 ±50%）。清单没生成时报 null 而不是猜一个数。
+      shards: mf ? measureShardBytes(mf) : null,
       facesLoaded,
       facesTotal: faces.length,
-      // resource timing 在 tauri:// 协议下抓不到 woff2：实测 shards.shardsLoaded=0
-      // 而 document.fonts 报 30 个 face 已 loaded。两者矛盾说明**字节度量在 release
-      // 构建里失效**（验收 #4 原先的 ✅ 是在 dev 模式下测的，需要重审）。
-      // 这里改用「已加载 face 数 × 平均分片体积」估算，明确标注为估算值。
-      resourceTimingSawWoff2: shards.shardsLoaded > 0,
-      estimatedShardBytes:
-        variant.shards > 0 ? Math.round((facesLoaded / variant.shards) * variant.shardBytes) : 0,
     },
     docStats: hooks.stats(),
   }

@@ -6,13 +6,59 @@
  */
 import { invoke } from '@tauri-apps/api/core'
 
-export interface FontShardMetrics {
-  /** 实际发起请求的 woff2 分片数 */
-  shardsLoaded: number
-  /** 分片总传输字节 */
+/**
+ * 构建期清单里的一条：某个 family 的某个 unicode-range 分片实际有多少字节。
+ * 由 `scripts/font-manifest.mjs` 生成，字节数取自 node_modules 源文件
+ * （vite 只给资源改名加 hash、内容逐字节复制，脚本已核对 433/433 一致）。
+ */
+export interface ShardManifestEntry {
+  family: string
+  /** 已归一化的 unicode-range，与 `normRange(face.unicodeRange)` 同规则 */
+  range: string
+  name: string
+  bytes: number
+  weight: string
+}
+
+export interface ShardManifest {
+  generatedAt: string
+  note: string
+  families: Record<string, { shards: number; bytes: number }>
+  entries: ShardManifestEntry[]
+}
+
+export interface FamilyShardMeasure {
+  family: string
+  loaded: number
+  /** 该 family 在清单里的分片总数 */
+  shards: number
+  bytes: number
+}
+
+export interface ShardMeasure {
+  /** `document.fonts` 里 status === 'loaded' 的 face 数 */
+  loadedFaces: number
+  registeredFaces: number
+  /** 查表求和得到的真实字节数 —— 验收 #4 的判据值 */
   totalBytes: number
-  /** 字体包内可用分片总数（由调用方注入，用于对比） */
-  shardsAvailable: number
+  byFamily: FamilyShardMeasure[]
+  /**
+   * 已加载但在清单里找不到对应 family 的 face 数。
+   * 非 0 通常意味着注入了清单没覆盖的字体（例如切到对照组），不是错误。
+   */
+  familyNotInManifest: number
+  /**
+   * ⛔ 关键自检项：已加载 face 的 `unicodeRange` 归一化后与清单对不上的条数。
+   * **非 0 就说明 WebKit 的序列化与 CSS 源文本不一致，此时 totalBytes 已退化为
+   * index-join 的结果**，必须连带 `indexDisagreements` 一起看才能判断可不可信。
+   */
+  rangeUnmatched: number
+  /**
+   * 两条独立连接方式（按 range 查 vs 按 family 内出现顺序对齐）给出不同分片的条数。
+   * 0 = 两种方式互相印证，读数可信；非 0 = 至少有一条连接是错的，**数字不能用**。
+   */
+  indexDisagreements: number
+  manifestAt: string
 }
 
 export interface FontFaceInfo {
@@ -52,17 +98,114 @@ export interface DocStats {
 }
 
 /**
- * 统计已加载的 woff2 分片。
- * 这是 M0 验收项 #4（首屏字体加载 < 2MB）的量化手段。
+ * unicode-range 归一化。
+ *
+ * ⚠️ 必须与 `scripts/font-manifest.mjs` 里的 `normRange` **逐字一致**：
+ * 那边归一化 CSS 源文本，这边归一化 WebKit 从 CSSOM 回读的值，规则差一点就全部匹配不上。
+ * WebKit 会把 `U+1f300` 序列化成 `U+1F300`，所以大小写这一条不是可选的。
  */
-export function collectFontShards(shardsAvailable: number): FontShardMetrics {
-  const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[]
-  const shards = entries.filter((e) => e.name.includes('.woff2'))
-  const totalBytes = shards.reduce((sum, e) => sum + (e.transferSize || e.encodedBodySize || 0), 0)
+export function normRange(s: string): string {
+  return s.toUpperCase().replace(/\s+/g, '').replace(/;+$/, '')
+}
+
+/** CSSOM 回读的 family 可能带引号，清单里的不带 */
+function normFamily(s: string): string {
+  return s.replace(/^['"]+|['"]+$/g, '').trim()
+}
+
+/**
+ * 从 Rust 侧读回分片清单。走白名单槽位而不是让前端传路径。
+ * 非 Tauri 环境（`pnpm dev`）或清单未生成时返回 null，调用方要能优雅降级。
+ */
+export async function loadShardManifest(): Promise<ShardManifest | null> {
+  try {
+    const json = await invoke<string>('load_probe_slot', { slot: 'fonts' })
+    return JSON.parse(json) as ShardManifest
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 验收项 #4（首屏字体加载 < 2MB）的量化手段。
+ *
+ * ⛔ **为什么不是 resource timing**：`performance.getEntriesByType('resource')` 在
+ * `tauri://` 协议下抓不到任何 woff2，release 构建里恒为 0 条——#4 原先打的 ✅ 是在
+ * dev 模式下测的，口径根本不同。前端唯一可靠的信号是 `document.fonts` 里哪些 face
+ * 的 status 变成了 `loaded`，但 FontFace 不暴露 URL，所以字节数只能离线查表。
+ *
+ * 连接方式有两条，**互为校验**：
+ *   1. 按 `family + 归一化 unicode-range` 查表（主）；
+ *   2. 按 face 在同 family 内的出现顺序对齐清单顺序（`document.fonts` 的迭代顺序
+ *      就是 @font-face 的注册顺序，而每个 family 只由一个 style 节点注入）。
+ * 两者给出的分片不一致时计入 `indexDisagreements`。**这个数非 0 就说明连接错了，
+ * 求和结果不能用** —— 宁可报「测不准」，也不要报一个看着合理的错数字。
+ */
+export function measureShardBytes(manifest: ShardManifest): ShardMeasure {
+  const entriesByFamily = new Map<string, ShardManifestEntry[]>()
+  const byRange = new Map<string, ShardManifestEntry>()
+  for (const e of manifest.entries) {
+    const arr = entriesByFamily.get(e.family)
+    if (arr) arr.push(e)
+    else entriesByFamily.set(e.family, [e])
+    byRange.set(`${e.family}\u0000${e.range}`, e)
+  }
+
+  let loadedFaces = 0
+  let registeredFaces = 0
+  let totalBytes = 0
+  let familyNotInManifest = 0
+  let rangeUnmatched = 0
+  let indexDisagreements = 0
+  const seenPerFamily = new Map<string, number>()
+  const acc = new Map<string, FamilyShardMeasure>()
+
+  document.fonts.forEach((face) => {
+    registeredFaces++
+
+    const family = normFamily(face.family)
+    // 顺序对齐的下标必须覆盖**全部已注册** face，不能只数 loaded 的：
+    // 清单里 `known[]` 是整个 family 的 97/239 片，而 loaded 只有几十片，
+    // 在 status 检查之后才自增会让下标指向错误的那一段——之前 70 个 face 里
+    // 报出 67 个「分歧」纯粹是这个错位，不是 WebKit 的迭代顺序有问题。
+    const idx = seenPerFamily.get(family) ?? 0
+    seenPerFamily.set(family, idx + 1)
+
+    if (face.status !== 'loaded') return
+    loadedFaces++
+
+    const known = entriesByFamily.get(family)
+    if (!known) {
+      familyNotInManifest++
+      return
+    }
+
+    const hitByRange = byRange.get(`${family}\u0000${normRange(face.unicodeRange ?? '')}`)
+    if (!hitByRange) rangeUnmatched++
+    const hitByIndex = known[idx]
+    if (hitByRange && hitByIndex && hitByRange.name !== hitByIndex.name) indexDisagreements++
+
+    const hit = hitByRange ?? hitByIndex
+    if (!hit) return
+    totalBytes += hit.bytes
+    const a = acc.get(family)
+    if (a) {
+      a.loaded++
+      a.bytes += hit.bytes
+    } else {
+      acc.set(family, { family, loaded: 1, shards: known.length, bytes: hit.bytes })
+    }
+  })
+
   return {
-    shardsLoaded: shards.length,
+    loadedFaces,
+    registeredFaces,
     totalBytes,
-    shardsAvailable,
+    byFamily: [...acc.values()],
+    familyNotInManifest,
+    rangeUnmatched,
+    indexDisagreements,
+    manifestAt: manifest.generatedAt,
   }
 }
 

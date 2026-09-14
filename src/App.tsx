@@ -88,7 +88,7 @@ export default function App() {
     }
   }
 
-  type DocKind = 'empty' | 'mixed-10k' | 'ascii-10k' | 'mixed-20k' | 'mixed-50k'
+  type DocKind = 'empty' | 'mixed-10k' | 'mixed-10k-common' | 'ascii-10k' | 'mixed-20k' | 'mixed-50k'
 
   function loadSync(kind: DocKind) {
     const t0 = performance.now()
@@ -99,9 +99,13 @@ export default function App() {
         ? { text: '', lineCount: 0, byteLength: 0, longestLine: 0 }
         : kind === 'ascii-10k'
           ? generateAsciiFixture(10_000)
-          : generateFixture({
-              lines: kind === 'mixed-10k' ? 10_000 : kind === 'mixed-20k' ? 20_000 : 50_000,
-            })
+          : kind === 'mixed-10k-common'
+            ? // #4 判预算专用：mixed-10k 刻意塞了 30 个跨区块生僻字（一字一分片）来压
+              // 懒加载，那是机制样本、不是用户会打开的文档，拿它判 2MB 必然超标。
+              generateFixture({ lines: 10_000, rareHan: false })
+            : generateFixture({
+                lines: kind === 'mixed-10k' ? 10_000 : kind === 'mixed-20k' ? 20_000 : 50_000,
+              })
     mount(fixture, kind, t0)
   }
 

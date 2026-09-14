@@ -26,10 +26,6 @@ export interface FontVariant {
   stack: string
   /** UI 区字体栈 */
   uiStack: string
-  /** 包内分片总数，供探针核对懒加载比例 */
-  shards: number
-  /** 分片全量体积（字节），同上 */
-  shardBytes: number
   /**
    * 动态 import。路径必须写成字面量——rolldown 靠静态分析切 chunk，
    * 拼接字符串会让所有变体退回主 bundle，正好毁掉这次改造的目的。
@@ -44,8 +40,6 @@ export const FONT_VARIANTS: Record<FontVariantId, FontVariant> = {
     family: 'LXGW WenKai Screen',
     stack: "'LXGW WenKai Screen', ui-monospace, monospace",
     uiStack: "'LXGW WenKai Screen', -apple-system, sans-serif",
-    shards: 97,
-    shardBytes: 4.33 * 1024 * 1024,
     load: () => import('lxgw-wenkai-screen-webfont/lxgwwenkaigbscreen.css?inline'),
   },
   'screen-r': {
@@ -54,8 +48,6 @@ export const FONT_VARIANTS: Record<FontVariantId, FontVariant> = {
     family: 'LXGW WenKai Screen R',
     stack: "'LXGW WenKai Screen R', ui-monospace, monospace",
     uiStack: "'LXGW WenKai Screen R', -apple-system, sans-serif",
-    shards: 97,
-    shardBytes: 4.87 * 1024 * 1024,
     load: () => import('lxgw-wenkai-screen-webfont/lxgwwenkaiscreenr.css?inline'),
   },
   // 对照组：不注入任何 webfont，用于隔离「CJK webfont 对滚动性能的影响」
@@ -65,8 +57,6 @@ export const FONT_VARIANTS: Record<FontVariantId, FontVariant> = {
     family: null,
     stack: 'ui-monospace, SFMono-Regular, Menlo, monospace',
     uiStack: '-apple-system, BlinkMacSystemFont, sans-serif',
-    shards: 0,
-    shardBytes: 0,
   },
 }
 
@@ -92,8 +82,6 @@ export interface CodeFont {
   label: string
   /** 注入后声明的 CSS family 名；null 表示跟随正文字体，无需注入 */
   family: string | null
-  shards: number
-  shardBytes: number
   load?: () => Promise<{ default: string }>
 }
 
@@ -102,16 +90,15 @@ export const CODE_FONTS: Record<CodeFontId, CodeFont> = {
     id: 'maple-cn',
     label: 'Maple Mono CN（等宽 2:1）',
     family: 'Maple Mono CN',
-    // 只发 400 一个字重：dist/fonts/400 下 239 个 woff2。
-    // 粗体走浏览器合成，与文楷的 R16 现状一致，真要字重再加一档 CSS。
-    shards: 239,
-    shardBytes: 9.3 * 1024 * 1024,
+    // 只发 400 一个字重：dist/fonts/400 下 239 个 woff2（8.87MB，由
+    // `node scripts/font-manifest.mjs` 逐片量出）。粗体走浏览器合成，
+    // 与文楷的 R16 现状一致，真要字重再加一档 CSS。
     // 路径不能写成 dist/regular.css：该包有 exports 白名单，只暴露 ./regular.css，
     // 写真实路径 dev 下可能侥幸通过但 rolldown 构建会直接失败。
     load: () => import('@automann/maple-mono-cn/regular.css?inline'),
   },
   // D2 的选项 (a)：代码区也用文楷，接受列对齐漂移。保留成一键切换而非删掉。
-  inherit: { id: 'inherit', label: '跟随正文（文楷，不对齐）', family: null, shards: 0, shardBytes: 0 },
+  inherit: { id: 'inherit', label: '跟随正文（文楷，不对齐）', family: null },
 }
 
 export const DEFAULT_CODE_FONT: CodeFontId = 'maple-cn'
