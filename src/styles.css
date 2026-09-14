@@ -60,7 +60,9 @@ body {
 
 .app {
   display: grid;
-  grid-template-rows: auto 1fr;
+  /* 三行：工具栏 / 提示条容器 / 正文区。提示容器是常驻的（空时高度 0），
+     行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上 */
+  grid-template-rows: auto auto 1fr;
   height: 100%;
 }
 
@@ -121,6 +123,17 @@ button.primary {
   font-weight: 600;
 }
 
+/* 文档按钮在 IO 期间是真的 disabled，必须有视觉反馈：
+   看起来能点却点不动，比灰掉更让人困惑。只改透明度与光标，不动尺寸，避免禁用时工具栏抖动 */
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button:disabled:hover {
+  border-color: var(--vela-border);
+}
+
 select {
   font-family: var(--vela-font-ui);
   font-size: 12px;
@@ -178,4 +191,44 @@ select {
   background: var(--vela-bg-panel);
   color: var(--vela-fg-dim);
   border: 1px solid var(--vela-border);
+}
+
+/* ---------- 提示条（有损解码 / 保存失败 / 编码装不下）---------- */
+
+.notices {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 用左侧色条 + 语义色文字区分级别。刻意不调色（不做半透明底）：主题变量都是固定 hex，
+   混色会让「暗色主题换成亮色」时这两条提示的对比度失控 */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  font-size: 12px;
+  background: var(--vela-bg-alt);
+  border-bottom: 1px solid var(--vela-border);
+  border-left: 3px solid var(--vela-fg-dim);
+}
+
+.notice.warning {
+  color: var(--vela-warn);
+  border-left-color: var(--vela-warn);
+}
+
+.notice.error {
+  color: var(--vela-bad);
+  border-left-color: var(--vela-bad);
+}
+
+.notice-close {
+  margin-left: auto;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
 }

@@ -1,9 +1,11 @@
 [package]
 name = "vela"
-version = "0.0.1"
 description = "Vela - lightweight editor"
-edition = "2021"
-rust-version = "1.77.2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [lib]
 name = "vela_lib"
@@ -14,10 +16,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = "s"
-panic = "abort"
-strip = true
+# 原生「打开 / 另存为」对话框。用 JS 侧的 plugin-dialog 调用（前端本来就需要拿到路径
+# 去做窗口标题、脏标记与后续保存），所以 Rust 侧只需要把插件注册进 Builder。
+tauri-plugin-dialog = "2"
+# 文件 IO 的真正实现住在框架无关的 vela-core 里，这一层只是 Tauri command 适配器
+vela-core = { path = "../crates/vela-core" }

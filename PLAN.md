@@ -375,9 +375,17 @@ vela-core/
 ├── watcher/     notify + notify-debouncer-full，事件合并与抖动抑制
 ├── project/     多根工作区、.vela/settings.json 分层合并、最近项目
 ├── session/     会话持久化（标签/光标/滚动/未保存草稿）
-├── tools/       重计算工具的 Rust 实现：哈希、图片处理、编码转换
-└── ipc/         Tauri command / event 定义，与前端共享 TS 类型生成
+└── tools/       重计算工具的 Rust 实现：哈希、图片处理、编码转换
 ```
+
+> **M1-B 实测修正**：原计划的 `ipc/` 模块**没有**放进 vela-core。Tauri command 住在
+> `src-tauri/src/commands.rs`（一层薄适配器），vela-core 只导出框架无关的 `fs::read_text`
+> / `fs::write_text_atomic`。理由：一旦 vela-core 依赖 `tauri`，它的测试就需要 `AppHandle`，
+> 而且再也不能被 CLI 工具或无头批处理复用——那正是「框架无关」这一层要保住的东西。
+> 线上数据结构（`FileFormat` / `TextFile` / `WriteReport` / `ReadError` / `WriteError`）就
+> 定义在 `fs` 模块内，由 command 层原样返回，不另设 `types/`。
+>
+> 上面这棵树目前**只有 `fs/` 落地**（M1-B），其余是 M1-C 之后的规划。
 
 **值得借鉴的架构模式**（借鉴思想，不复制代码）：
 - **Lapce**（Apache-2.0）：`lapce-app` / `lapce-proxy` / `lapce-rpc` 的前后端分离 + RPC 分层。注意其 tree-sitter 锁在 0.22.6（当前 0.27.0），且最近提交几乎全是依赖 bump 与 CI 修复 → 已进入维护模式，**不要依赖其演进**。
@@ -395,7 +403,13 @@ vela-core/
 
 **设计约束**：
 1. 单次 IPC payload **上限 4MB**。超出必须分片或走流式 event。
-2. 所有 command 生成对应的 TypeScript 类型（用 `specta` + `tauri-specta`，或手写 codegen），杜绝前后端类型漂移。
+2. 前后端类型不得漂移。**M1-B 实测修正**：原计划用 `specta` + `tauri-specta` 生成 TS 类型，
+   实际改为「手写 `src/ipc/fs.ts` + 两侧黄金 JSON 契约测试」：
+   `crates/vela-core/tests/wire_contract.rs` 钉住 Rust 的序列化输出，
+   `src/ipc/fs.test.ts` 用同一份黄金字符串钉住 TS 侧的解析与字段名，两边任一处改了字段
+   都会红。理由：当前只有 2 个 command / 5 个类型，codegen 要引入一个构建期步骤和一层
+   宏（宏展开报错的排查成本远高于手写），不划算。**重估点在 M1-H**：等 command 数量涨到
+   两位数（搜索、工具、会话）再上 codegen，届时黄金 JSON 测试可以直接退役。
 3. 长任务（全局搜索、大文件读取）一律返回 `taskId`，通过 event 推进度，支持前端取消。
 4. 文件内容传输统一走 **字节 + 编码元信息**，不在 Rust 侧强行转 String（避免非法 UTF-8 崩溃）。
 

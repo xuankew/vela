@@ -11,7 +11,10 @@ function event(key: string, mods: Partial<Omit<KeyEventLike, 'key'>> = {}): KeyE
 
 function makeHooks(): BuiltinHooks {
   return {
+    newDocument: vi.fn(),
     openFile: vi.fn(),
+    saveFile: vi.fn(),
+    saveFileAs: vi.fn(),
     applyLineWrap: vi.fn(),
     adjustFontSize: vi.fn(),
     resetFontSize: vi.fn(),
@@ -31,10 +34,13 @@ function makeRegistry(editor: EditorController | null) {
 }
 
 describe('内置命令', () => {
-  it('七条命令全部注册成功，且互不抢占快捷键', () => {
+  it('十条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     expect(registry.list().map((c) => c.id)).toEqual([
+      'file.new',
       'file.open',
+      'file.save',
+      'file.saveAs',
       'editor.foldAll',
       'editor.toggleLineWrap',
       'editor.unfoldAll',
@@ -45,13 +51,54 @@ describe('内置命令', () => {
     expect(registry.conflicts()).toEqual([])
   })
 
-  it('编辑器类命令在没有编辑器时不可用，文件/视图类始终可用', () => {
+  it('Mod+S 与 Mod+Shift+S 各走各的，不会被对方吃掉', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    // matchesKeybinding 对 shift 是严格相等，所以 Mod+S 不会匹配到按着 Shift 的事件
+    expect(registry.findForKey(event('s', { metaKey: true }))?.id).toBe('file.save')
+    expect(registry.findForKey(event('S', { metaKey: true, shiftKey: true }))?.id).toBe('file.saveAs')
+    expect(registry.findForKey(event('n', { metaKey: true }))?.id).toBe('file.new')
+    expect(registry.findForKey(event('o', { metaKey: true }))?.id).toBe('file.open')
+
+    await registry.execute('file.new')
+    await registry.execute('file.save')
+    await registry.execute('file.saveAs')
+    expect(hooks.newDocument).toHaveBeenCalledOnce()
+    expect(hooks.saveFile).toHaveBeenCalledOnce()
+    expect(hooks.saveFileAs).toHaveBeenCalledOnce()
+  })
+
+  it('命令的 Promise 会等到 hook 的 IO 结束', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    let settled = false
+    hooks.saveFile = vi.fn(async () => {
+      await Promise.resolve()
+      settled = true
+    })
+    await registry.execute('file.save')
+    // 命令面板与忙碌态要靠这个：execute 返回时必须真的写完了
+    expect(settled).toBe(true)
+  })
+
+  it('没有编辑器时：新建/打开/视图可用，保存类与编辑器类不可用', () => {
     const { registry } = makeRegistry(null)
     const enabled = new Map(registry.list().map((c) => [c.id, c.enabled]))
+    // 保存类被挡是应该的：没有编辑器就没有文档，让 Cmd+S 静默成功比报错更糟
+    expect(enabled.get('file.save')).toBe(false)
+    expect(enabled.get('file.saveAs')).toBe(false)
     expect(enabled.get('editor.foldAll')).toBe(false)
     expect(enabled.get('editor.toggleLineWrap')).toBe(false)
+    // 新建与打开恰恰是在「什么都没有」时最该能用的两条
+    expect(enabled.get('file.new')).toBe(true)
     expect(enabled.get('file.open')).toBe(true)
     expect(enabled.get('view.resetFontSize')).toBe(true)
+  })
+
+  it('编辑器挂上之后保存类立即可用', () => {
+    const { registry } = makeRegistry(fakeController(true))
+    const enabled = new Map(registry.list().map((c) => [c.id, c.enabled]))
+    expect(enabled.get('file.save')).toBe(true)
+    expect(enabled.get('file.saveAs')).toBe(true)
+    expect(enabled.get('editor.foldAll')).toBe(true)
   })
 
   it('Alt+Z 取反当前换行状态，落值交给宿主', async () => {

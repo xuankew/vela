@@ -8,8 +8,12 @@ import type { CommandRegistry } from './registry'
  * 一旦反向依赖具体组件，就没法单测、也没法在将来的插件宿主里复用。
  */
 export interface BuiltinHooks {
-  /** 打开文件。M1-B 换成 Rust 侧原生对话框，当前仍走 `<input type=file>` */
-  openFile: () => void
+  newDocument: () => void
+  /** 弹原生「打开」对话框并读入选中的文件 */
+  openFile: () => void | Promise<void>
+  /** 写回当前路径；没有路径时由宿主自行落到「另存为」 */
+  saveFile: () => void | Promise<void>
+  saveFileAs: () => void | Promise<void>
   /**
    * 切换自动换行。
    *
@@ -32,11 +36,38 @@ export interface BuiltinHooks {
 export function registerBuiltinCommands(registry: CommandRegistry, hooks: BuiltinHooks): () => void {
   const dispose = [
     registry.register({
+      id: 'file.new',
+      title: '新建',
+      category: '文件',
+      keybinding: 'Mod+N',
+      run: () => hooks.newDocument(),
+    }),
+    registry.register({
       id: 'file.open',
       title: '打开文件…',
       category: '文件',
       keybinding: 'Mod+O',
       run: () => hooks.openFile(),
+    }),
+    registry.register({
+      id: 'file.save',
+      title: '保存',
+      category: '文件',
+      keybinding: 'Mod+S',
+      when: (ctx) => ctx.editor !== null,
+      run: async () => {
+        await hooks.saveFile()
+      },
+    }),
+    registry.register({
+      id: 'file.saveAs',
+      title: '另存为…',
+      category: '文件',
+      keybinding: 'Mod+Shift+S',
+      when: (ctx) => ctx.editor !== null,
+      run: async () => {
+        await hooks.saveFileAs()
+      },
     }),
 
     registry.register({

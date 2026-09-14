@@ -1,8 +1,9 @@
-import { createSignal, onCleanup, onMount } from 'solid-js'
+import { createSignal, onCleanup, onMount, Show } from 'solid-js'
 import { registerBuiltinCommands } from './commands/builtins'
 import { attachKeybindingDispatch } from './commands/dispatch'
 import { detectPlatform } from './commands/keybinding'
 import { createCommandRegistry, type AppContext } from './commands/registry'
+import { createDocumentModel, UNTITLED_LABEL } from './doc/document'
 import type { EditorController } from './editor/controller'
 import { EditorPane } from './editor/EditorPane'
 import {
@@ -20,7 +21,6 @@ const FONT_SIZES = [12, 13, 14, 15, 16, 18, 20]
 const DEFAULT_FONT_SIZE = 14
 
 export default function App() {
-  let fileEl!: HTMLInputElement
   let disposeCommands: (() => void) | undefined
   let detachKeys: (() => void) | undefined
 
@@ -35,10 +35,18 @@ export default function App() {
   const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
   const [fontSize, setFontSize] = createSignal(DEFAULT_FONT_SIZE)
   const [wrap, setWrap] = createSignal(true)
-  const [docLabel, setDocLabel] = createSignal('空文档')
   const [docLines, setDocLines] = createSignal(0)
   const [docChars, setDocChars] = createSignal(0)
-  const [busy, setBusy] = createSignal(false)
+
+  /**
+   * 文档模型。宿主能力通过闭包**惰性**读 `editor`：模型在组件体里就要建好（渲染要读它的
+   * signal），而编辑器实例要到 `EditorPane` 的 onReady 才存在。
+   */
+  const doc = createDocumentModel({
+    getText: () => editor?.doc ?? '',
+    setText: (text) => editor?.setDoc(text),
+    focus: () => editor?.focus(),
+  })
 
   const registry = createCommandRegistry({
     platform: detectPlatform(),
@@ -69,36 +77,16 @@ export default function App() {
     await applyCodeFont(id)
   }
 
-  // 文档生命周期（新建/打开/保存/脏标记）等 M1-B 有了真正的文档模型再统一成命令，
-  // 现在只有「打开文件」有后端可接，所以只把它注册成了 file.open。
-  function newDocument() {
-    editor?.setDoc('')
-    setDocLabel('空文档')
-    editor?.focus()
-  }
-
-  async function onPickFile(files: FileList | null) {
-    const file = files?.[0]
-    if (!file || !editor) return
-    // 先清空 value：否则连续两次选同一个文件不会触发 change
-    fileEl.value = ''
-    setBusy(true)
-    try {
-      editor.setDoc(await file.text())
-      setDocLabel(file.name)
-      editor.focus()
-    } finally {
-      setBusy(false)
-    }
-  }
-
   onMount(() => {
     applyFontSize()
     // 字体注入与编辑器挂载并行：编辑器不等字体，到达后浏览器自己用 font-display: swap 重排
     void switchFont(DEFAULT_VARIANT)
     void switchCodeFont(DEFAULT_CODE_FONT)
     disposeCommands = registerBuiltinCommands(registry, {
-      openFile: () => fileEl.click(),
+      newDocument: doc.newDocument,
+      openFile: doc.openViaDialog,
+      saveFile: doc.save,
+      saveFileAs: doc.saveAs,
       applyLineWrap: (on) => {
         setWrap(on)
         editor?.setLineWrap(on)
@@ -122,18 +110,23 @@ export default function App() {
       <div class="toolbar">
         <div class="toolbar-group">
           <span class="toolbar-label">文档</span>
-          <button onClick={newDocument} disabled={busy()}>
-            空文档
+          <button onClick={() => void registry.execute('file.new')} disabled={doc.busy()} title="Mod+N">
+            新建
           </button>
-          <button class="primary" onClick={() => void registry.execute('file.open')} disabled={busy()}>
-            打开文件…
+          <button
+            class="primary"
+            onClick={() => void registry.execute('file.open')}
+            disabled={doc.busy()}
+            title="Mod+O"
+          >
+            打开…
           </button>
-          <input
-            ref={fileEl}
-            type="file"
-            style="display:none"
-            onChange={(e) => void onPickFile(e.currentTarget.files)}
-          />
+          <button onClick={() => void registry.execute('file.save')} disabled={doc.busy()} title="Mod+S">
+            保存
+          </button>
+          <button onClick={() => void registry.execute('file.saveAs')} disabled={doc.busy()} title="Mod+Shift+S">
+            另存为…
+          </button>
         </div>
 
         <div class="toolbar-group">
@@ -178,11 +171,33 @@ export default function App() {
         </div>
 
         <div class="toolbar-group" style="margin-left:auto;border-right:none">
-          <span class="badge">{busy() ? '加载中…' : docLabel()}</span>
+          <span class="badge" title={doc.path() ?? UNTITLED_LABEL}>
+            {doc.busy() ? '读写中…' : `${doc.dirty() ? '● ' : ''}${doc.name()}`}
+          </span>
           <span class="badge">
             {docLines().toLocaleString()} 行 · {docChars().toLocaleString()} 字符
           </span>
         </div>
+      </div>
+
+      {/* 常驻容器：.app 是 grid，行数必须固定。两条提示各自当 grid item 的话，
+          出现 0/1/2 条时 1fr 会落到不同的行上，正文区被挤掉 */}
+      <div class="notices">
+        <Show when={doc.lossy()}>
+          <div class="notice warning">
+            这个文件没能完整解码，正文里的 U+FFFD 是替换字符。<strong>原样保存会永久损坏它</strong>——请另存为一份新文件。
+          </div>
+        </Show>
+        <Show when={doc.notice()}>
+          {(n) => (
+            <div class={`notice ${n().level}`}>
+              <span>{n().text}</span>
+              <button class="notice-close" onClick={() => doc.dismissNotice()} title="关闭">
+                ×
+              </button>
+            </div>
+          )}
+        </Show>
       </div>
 
       <div class="body">
@@ -194,6 +209,8 @@ export default function App() {
               onUpdate: (info) => {
                 setDocLines(info.lines)
                 setDocChars(info.chars)
+                // 脏标记只认正文变化：光标移动不该让文件变成「未保存」
+                if (info.docChanged) doc.markChanged()
               },
             }}
             onReady={(c) => {

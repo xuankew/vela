@@ -8,6 +8,8 @@ export default defineConfig({
   plugins: [solid()],
   test: {
     environment: 'node',
+    // 补丁自己用 `typeof Range` 守卫，所以跑在 node 环境的测试文件上也不会炸
+    setupFiles: ['src/test/setup.ts'],
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
   },
 })

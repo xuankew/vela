@@ -1,0 +1,17 @@
+[package]
+name = "vela-core"
+description = "Vela 的框架无关内核：文件 IO、编码探测、行尾、原子写入"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# 只用于「线上契约」黄金 JSON 测试，不是运行时依赖
+serde_json.workspace = true
+tempfile.workspace = true
