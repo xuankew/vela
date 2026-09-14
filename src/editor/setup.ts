@@ -1,4 +1,4 @@
-import { EditorState, RangeSetBuilder, type Extension } from '@codemirror/state'
+import { Compartment, EditorState, RangeSetBuilder, type Extension } from '@codemirror/state'
 import {
   Decoration,
   EditorView,
@@ -234,7 +234,13 @@ export interface EditorSetupOptions {
   lineWrap?: boolean
   /** 是否启用 Markdown + 子语言懒加载。关闭时整篇按代码渲染 */
   markdownMode?: boolean
-  doc?: string
+  /**
+   * 自动换行的开关槽位，由调用方（`EditorController`）持有。
+   *
+   * 用 Compartment 而不是「改选项再重建视图」：重建会丢掉选区、滚动位置与撤销历史，
+   * 而 `lineWrapping` 只是众多扩展里的一个，reconfigure 就够了。
+   */
+  lineWrapSlot: Compartment
 }
 
 /**
@@ -243,8 +249,8 @@ export interface EditorSetupOptions {
  * 刻意不使用 `basicSetup`：要精确知道每一个扩展的成本，而且 basicSetup 里含不需要的
  * 部分（如 lint gutter）。
  */
-export function buildExtensions(options: EditorSetupOptions = {}): Extension[] {
-  const { lineWrap = true, markdownMode = true } = options
+export function buildExtensions(options: EditorSetupOptions): Extension[] {
+  const { lineWrap = true, markdownMode = true, lineWrapSlot } = options
 
   const exts: Extension[] = [
     lineNumbers(),
@@ -290,19 +296,8 @@ export function buildExtensions(options: EditorSetupOptions = {}): Extension[] {
     exts.push(codeDocFontTheme)
   }
 
-  if (lineWrap) {
-    exts.push(EditorView.lineWrapping)
-  }
+  // 槽位必须始终在扩展集里：关闭换行时塞空数组，否则之后 reconfigure 无处生效
+  exts.push(lineWrapSlot.of(lineWrap ? [EditorView.lineWrapping] : []))
 
   return exts
-}
-
-export function createEditor(parent: HTMLElement, options: EditorSetupOptions = {}): EditorView {
-  return new EditorView({
-    parent,
-    state: EditorState.create({
-      doc: options.doc ?? '',
-      extensions: buildExtensions(options),
-    }),
-  })
 }

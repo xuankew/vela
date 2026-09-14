@@ -9,6 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build"
@@ -34,8 +35,10 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
+    "jsdom": "^30.0.1",
     "typescript": "^5.9.3",
     "vite": "^8.3.0",
-    "vite-plugin-solid": "^2.11.14"
+    "vite-plugin-solid": "^2.11.14",
+    "vitest": "^5.0.0"
   }
 }

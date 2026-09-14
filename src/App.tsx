@@ -1,6 +1,10 @@
 import { createSignal, onCleanup, onMount } from 'solid-js'
-import { EditorView } from '@codemirror/view'
-import { createEditor } from './editor/setup'
+import { registerBuiltinCommands } from './commands/builtins'
+import { attachKeybindingDispatch } from './commands/dispatch'
+import { detectPlatform } from './commands/keybinding'
+import { createCommandRegistry, type AppContext } from './commands/registry'
+import type { EditorController } from './editor/controller'
+import { EditorPane } from './editor/EditorPane'
 import {
   applyCodeFont,
   applyFontVariant,
@@ -12,24 +16,46 @@ import {
   type FontVariantId,
 } from './fonts/loader'
 
-interface DocStats {
-  label: string
-  lines: number
-  bytes: number
-  longestLine: number
-}
+const FONT_SIZES = [12, 13, 14, 15, 16, 18, 20]
+const DEFAULT_FONT_SIZE = 14
 
 export default function App() {
-  let containerEl!: HTMLDivElement
   let fileEl!: HTMLInputElement
-  let view: EditorView | undefined
+  let disposeCommands: (() => void) | undefined
+  let detachKeys: (() => void) | undefined
+
+  /**
+   * 当前编辑器实例。刻意不是 signal：眼下没有任何渲染依赖它，命令的 `when` 在被调用时
+   * 读一次就够。**命令面板落地时必须改成 signal**，否则面板里 `editor.*` 的置灰状态
+   * 不会跟着焦点走（`list()` 求值 `when` 的时刻比焦点变化早）。
+   */
+  let editor: EditorController | null = null
 
   const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
   const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
-  const [fontSize, setFontSize] = createSignal(14)
+  const [fontSize, setFontSize] = createSignal(DEFAULT_FONT_SIZE)
   const [wrap, setWrap] = createSignal(true)
-  const [stats, setStats] = createSignal<DocStats | null>(null)
+  const [docLabel, setDocLabel] = createSignal('空文档')
+  const [docLines, setDocLines] = createSignal(0)
+  const [docChars, setDocChars] = createSignal(0)
   const [busy, setBusy] = createSignal(false)
+
+  const registry = createCommandRegistry({
+    platform: detectPlatform(),
+    getContext: (): AppContext => ({ editor }),
+  })
+
+  function applyFontSize() {
+    document.documentElement.style.setProperty('--vela-font-size', `${fontSize()}px`)
+  }
+
+  /** 只在预设档位之间走：字号同时被工具栏的 select 显示，冒出 17px 这种档外值会让 select 变空白 */
+  function stepFontSize(delta: number) {
+    const index = FONT_SIZES.indexOf(fontSize())
+    const next = index < 0 ? DEFAULT_FONT_SIZE : FONT_SIZES[Math.min(FONT_SIZES.length - 1, Math.max(0, index + delta))]!
+    setFontSize(next)
+    applyFontSize()
+  }
 
   /** 字体是动态 import，切换有真实异步成本，所以要 await 完再让 UI 认为切换结束 */
   async function switchFont(id: FontVariantId) {
@@ -43,60 +69,63 @@ export default function App() {
     await applyCodeFont(id)
   }
 
-  function applyFontSize() {
-    document.documentElement.style.setProperty('--vela-font-size', `${fontSize()}px`)
-  }
-
-  function mount(text: string, label: string) {
-    view?.destroy()
-    view = createEditor(containerEl, { doc: text, lineWrap: wrap() })
-    let longest = 0
-    for (const line of text.split('\n')) if (line.length > longest) longest = line.length
-    setStats({
-      label,
-      lines: text === '' ? 0 : text.split('\n').length,
-      bytes: text.length,
-      longestLine: longest,
-    })
-  }
-
-  /** lineWrapping 是 extension，切换必须重建视图；重建前抓走文档与滚动位置 */
-  function remountWithWrap(next: boolean) {
-    if (!view) return
-    const doc = view.state.doc.toString()
-    const scrollTop = view.scrollDOM.scrollTop
-    view.destroy()
-    view = createEditor(containerEl, { doc, lineWrap: next })
-    view.scrollDOM.scrollTop = scrollTop
+  // 文档生命周期（新建/打开/保存/脏标记）等 M1-B 有了真正的文档模型再统一成命令，
+  // 现在只有「打开文件」有后端可接，所以只把它注册成了 file.open。
+  function newDocument() {
+    editor?.setDoc('')
+    setDocLabel('空文档')
+    editor?.focus()
   }
 
   async function onPickFile(files: FileList | null) {
     const file = files?.[0]
-    if (!file) return
+    if (!file || !editor) return
+    // 先清空 value：否则连续两次选同一个文件不会触发 change
+    fileEl.value = ''
     setBusy(true)
-    mount(await file.text(), file.name)
-    setBusy(false)
+    try {
+      editor.setDoc(await file.text())
+      setDocLabel(file.name)
+      editor.focus()
+    } finally {
+      setBusy(false)
+    }
   }
 
   onMount(() => {
     applyFontSize()
-    // 字体注入与编辑器挂载并行：编辑器不等字体，到达后浏览器自己用 font-display: swap 重排。
+    // 字体注入与编辑器挂载并行：编辑器不等字体，到达后浏览器自己用 font-display: swap 重排
     void switchFont(DEFAULT_VARIANT)
     void switchCodeFont(DEFAULT_CODE_FONT)
-    mount('', '空文档')
+    disposeCommands = registerBuiltinCommands(registry, {
+      openFile: () => fileEl.click(),
+      applyLineWrap: (on) => {
+        setWrap(on)
+        editor?.setLineWrap(on)
+      },
+      adjustFontSize: stepFontSize,
+      resetFontSize: () => {
+        setFontSize(DEFAULT_FONT_SIZE)
+        applyFontSize()
+      },
+    })
+    detachKeys = attachKeybindingDispatch(registry)
   })
 
-  onCleanup(() => view?.destroy())
+  onCleanup(() => {
+    detachKeys?.()
+    disposeCommands?.()
+  })
 
   return (
     <div class="app">
       <div class="toolbar">
         <div class="toolbar-group">
           <span class="toolbar-label">文档</span>
-          <button onClick={() => mount('', '空文档')} disabled={busy()}>
+          <button onClick={newDocument} disabled={busy()}>
             空文档
           </button>
-          <button class="primary" onClick={() => fileEl.click()} disabled={busy()}>
+          <button class="primary" onClick={() => void registry.execute('file.open')} disabled={busy()}>
             打开文件…
           </button>
           <input
@@ -133,8 +162,9 @@ export default function App() {
               setFontSize(Number(e.currentTarget.value))
               applyFontSize()
             }}
+            title="字号（也可用 Cmd/Ctrl + = / - / 0）"
           >
-            {[12, 13, 14, 15, 16, 18, 20].map((s) => (
+            {FONT_SIZES.map((s) => (
               <option value={s}>{s}px</option>
             ))}
           </select>
@@ -142,31 +172,36 @@ export default function App() {
 
         <div class="toolbar-group">
           <span class="toolbar-label">换行</span>
-          <button
-            onClick={() => {
-              const next = !wrap()
-              setWrap(next)
-              remountWithWrap(next)
-            }}
-          >
+          <button onClick={() => void registry.execute('editor.toggleLineWrap')} title="Alt+Z">
             {wrap() ? '开' : '关'}
           </button>
         </div>
 
         <div class="toolbar-group" style="margin-left:auto;border-right:none">
-          <span class="badge">{busy() ? '加载中…' : (stats()?.label ?? '空')}</span>
-          {stats() && (
-            <span class="badge">
-              {stats()!.lines.toLocaleString()} 行 · {(stats()!.bytes / 1024).toFixed(0)} KB · 最长{' '}
-              {stats()!.longestLine} 字符
-            </span>
-          )}
+          <span class="badge">{busy() ? '加载中…' : docLabel()}</span>
+          <span class="badge">
+            {docLines().toLocaleString()} 行 · {docChars().toLocaleString()} 字符
+          </span>
         </div>
       </div>
 
       <div class="body">
         <div class="editor-host">
-          <div class="editor-container" ref={containerEl} />
+          <EditorPane
+            options={{
+              doc: '',
+              lineWrap: true,
+              onUpdate: (info) => {
+                setDocLines(info.lines)
+                setDocChars(info.chars)
+              },
+            }}
+            onReady={(c) => {
+              editor = c
+              setDocLines(c.lines)
+              setDocChars(c.chars)
+            }}
+          />
         </div>
       </div>
     </div>
