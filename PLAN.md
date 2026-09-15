@@ -73,9 +73,9 @@
 
 | 能力 | 说明 |
 |---|---|
-| 多光标 / 多选区 | `Cmd+D` 逐词选中下一个匹配、`Cmd+Shift+L` 全展开、`Alt+Click` 添加光标、列块选择（`Cmd+Shift+L/R` 或鼠标拖拽） |
+| 多光标 / 多选区 | `Cmd+D` 逐词选中下一个匹配、`Cmd+Shift+L` 全展开、`Option+Click` 添加光标、`Option+Shift+拖拽` 列块选择（修饰键归属的取舍见 §3.3「M1-C 实施修正」1、2） |
 | 命令面板 | `Cmd+Shift+P`，**所有**编辑器操作与内置工具的唯一入口 |
-| Goto Anything | `Cmd+P` 模糊找文件、`Cmd+R` 文件内符号、`Cmd+G` 跳转行号 |
+| Goto Anything | `Cmd+P` 模糊找文件、`Cmd+R` 文件内符号、`Cmd+Alt+G` 跳转行号（`Cmd+G` 已归「查找下一个」，见 §3.3「M1-C 实施修正」5） |
 | 查找替换 | 单文件（含正则、整词、保留大小写替换）、查找选中词的下一个/上一个 |
 | 语法高亮 | 主流 30+ 语言，Lezer 增量解析，子语言懒加载 |
 | 括号与缩进 | 括号/标签匹配高亮、自动缩进、缩进引导线、Tab 宽度切换 |
@@ -705,6 +705,36 @@ const vela = {
 
 **验收**：能用它替代 Sublime 完成「改配置文件、看日志、快速搜索替换」的日常闭环。冷启动 < 1s，空转内存 < 200MB，**首屏字体字节 < 2MB**（M0 #4 的口径：清单查表，不是 resource timing）。
 
+> **M1-C 实施修正**（编辑基本功 / 多光标 / 查找替换落地时与本节及 §2 功能清单的偏离）：
+>
+> 1. **列块选择改绑 `Option+Shift+拖拽`，`Option+Click` 让给「添加光标」。** §2 的功能清单把这两项并列却没写修饰键，而 CM6 的 `rectangularSelection` 默认触发条件**就是** `Option+拖拽`，两者直接抢键。取舍：加光标的频率远高于列块，所以列块多按一个 Shift。
+>    连带两个坑记在 `src/editor/multiCursor.ts`：`EditorView.clickAddsSelectionRange` 这个 facet **一注册就完全接管**（不与平台默认合并），所以 macOS 的 `Cmd+Click` 加光标是在那里自己重写一遍的；`crosshairCursor()` 只认单个修饰键，会在「单纯加光标」时也显示十字（错误提示），换成了自研的 `ColumnSelectHint` 插件。
+> 2. **`Cmd+Shift+L` 用的是自研 `selectAllOccurrences`，不是 CM6 的 `selectSelectionMatches`。** 后者在已有多个选区时**直接返回 false**，于是「`Cmd+D` 按几下再 `Cmd+Shift+L`」是条死路。自研版先把选区收敛到第一处再重试，且**只在所有选区文本完全相同时**才这么做——否则等于悄悄丢掉用户已有的光标。
+> 3. **「保留大小写替换」只支持普通字符串查询，正则模式下复选框是禁用的**（不是假装能用）。CM6 的 `RegExpQuery.getReplacement` 要展开 `$1` / `$&`，依赖匹配结果上的捕获组，而公开 API 的 `getCursor` 只给 `{from, to}`；自己重跑一遍正则去凑捕获组，会在锚点、环视与跨行正则上与 CM6 的结果分叉。
+> 4. **查找面板是自建的**，走 `search({ createPanel })` 这个官方扩展点，不是 DOM hack。理由：CM6 的面板没有「保留大小写」的位置，而一个看不见的开关等于没有。结构刻意照抄 CM6 的 `SearchPanel`（`.cm-search` / `.cm-textfield` / `[main-field]` / 六个 `button[name=…]`），于是 `search()` 自带的 `baseTheme` 直接适用，只多出一个复选框。
+> 5. **`Cmd+G` 归「查找下一个」，§3.4 里 Goto Anything 的跳行改用 `Cmd+Alt+G`**（CM6 `searchKeymap` 本来就绑在那里）。Vela 的手感对标 Sublime，而 Sublime 的 `Cmd+G` 是查找下一个；跳行让位。
+> 6. **补了一个 bug：`search()` 之前压根没挂。** 扩展集里只有 `searchKeymap` 而没有 `search()`，`searchState` 字段不存在，`getSearchQuery` 会直接抛异常——也就是说查找替换在 M1-C 之前是坏的，只是没有任何入口能触发到它。
+>
+> 刻意**不做**的：不注册绑 `Escape` 的命令（`closeSearchPanel` / `simplifySelection`），因为全局捕获监听看不到 CM6 的 scope，注册上去会在查找面板打开时把「关闭面板」吞掉；面板上不做匹配计数（CM6 原面板也没有，且那意味着每敲一个字符就全文扫一遍）。
+
+> **M1-D 实施修正**（标签页 / 关闭确认 / 分屏落地时与本节及 §2 功能清单的偏离）：
+>
+> 1. **架构改成「一个标签一份 `EditorState`，一个分屏一个 `EditorView`」。** 切换标签是 `view.setState(tab.state)`，不是重建编辑器。`updateListener` 被**烘进 state**（`editor/setup.ts` 的 `createEditorState`），于是切完之后收到更新通知的天然就是新标签自己那个监听器，路由不需要任何判断。滚动位置不属于 state，单独存在 `EditorSnapshot` 里，且必须在 `setState` **之后**赋值——setState 会重建整个 docView，先赋的值会被新布局冲掉。
+> 2. **换行偏好是全局视图设置，不是每标签一个。** CM6 的 `Compartment` 按**实例**寻址，共享同一个实例就能用一次 `reconfigure` 同时作用于「正在显示的 view」与「存着的所有 state」，工具栏那个开关因此不可能与屏幕上的状态不一致。显示中的走 `view.dispatch`，其余走 `state.update`——前者用 `setState` 会销毁视图插件、丢焦点与滚动位置。分屏之后「显示中的」是**每一块**分屏的 view，循环 dispatch。`markdownMode` 眼下也是全局的，M1-E 做「按扩展名分语言」时要挪到 Tab 上。
+> 3. **`Cmd+N` 的语义从「新建文档」变成「新建标签」**，`DocumentModel` 上的 `newDocument` 与 `openViaDialog` 两个方法被删掉了：它们都要先回答「落到哪个标签上」，那是 workspace 的知识，文档模型只剩 `openAt(path)`。
+> 4. **打开文件的路由规则**：同一路径只开一个标签（再开一次会丢掉已有改动，还让用户在两份内容里猜哪份是真的）；当前标签是**干净的无名标签**时就地复用，否则新开一个。「当前标签」= **聚焦分屏**显示的那个。打开**失败**时错误落在新开的空标签上，原来的草稿一动不动——这是行为变更，`App.test.tsx` 里那条用例已按新契约重写。
+> 5. **`tabs()` 与 `panes()` 永远非空**：关掉最后一个标签时补一个空的进来。允许「零」的话所有 `editor.*` 命令的 `when` 会同时失效、状态栏没有可显示的对象、`activeTab()` 变成 nullable 并传染给每一个调用点。
+> 6. **关闭确认用自建模态，不是原生对话框**——M1-B 遗留项「capabilities 必须补 `dialog:allow-confirm`」因此**作废，capabilities 无需任何改动**。理由：`plugin-dialog` 只有 `message`/`ask`/`confirm`，全是**两个**按钮，而这里必须有三条出路（保存 / 不保存 / 取消）；少掉「取消」，Esc（rfd 上映射到 cancel 那一支）就成了「直接扔掉改动」。副产物是这个对话框能在 jsdom 里测，原生对话框只能 mock 掉、分支覆盖全是假的。默认焦点落在「保存」上：什么都不看直接按回车不该是丢数据。
+> 7. **关窗拦截有两个入口，只拦 `CloseRequested` 在 macOS 上等于没拦。** 点红绿灯走 `CloseRequested`，而 `Cmd+Q` 与菜单里的「退出 Vela」走 `ExitRequested`，压根不经过窗口。两者一律 prevent + 发事件，决定权整个交给前端；前端答「可以关」之后调 `close_window`（Rust 侧是 `Window::destroy()`，不是 `close()`——后者会再触发一次 `CloseRequested`，死循环）。`ExitRequested { code: None }` 必须放行，那是我们自己 destroy 窗口引发的正常退场。事件名两边手写各一份，靠 `lib.rs` 与 `windowClose.test.ts` 的两个契约快照钉住（与 `wire_contract.rs` 同一套路数）。
+> 8. **`promptDiscard` 由宿主注入，缺省答「取消」。** 这个缺省看着反常（没接 UI 就关不掉标签），但另一头是静默丢数据；宁可什么都别关。注入而不是直接调对话框，是为了让「保存 / 不保存 / 取消」三条分支真的可测。
+> 9. **首屏 gzip 227.10 → 231.60 KB**（`index-*.js` 121.86 + `dist-*.js` 108.31 + `index-*.css` 1.43），预算 300 KB，余量 22.8%。M1-D 的标签条、workspace、模态对话框与分屏合计 +4.50 KB。
+> 10. **分屏模型是扁平的**：`panes: Pane[]` + 一个全局 `direction` + `focusedPaneId`，上限 `MAX_PANES = 4`。刻意不做 VS Code 那种嵌套分组（左右各再上下分）——那要求一棵布局树、每个节点各自的方向与比例，而轻量编辑器里真正高频的只有「左右并排看两个文件」与「上下对照」，扁平模型下这两个都是一次点击。§2 功能清单里的「水平/垂直分屏」按这个口径算完成。
+> 11. **一个标签同时只显示在一个分屏里**（可以有标签谁都不显示，比如它的分屏被合并掉了）。允许两块分屏显示同一个标签的话，`Tab.snapshot` 就不再是「没显示时的唯一真相」，撤销历史与滚动位置会分叉成两份。两条连带后果：`split` 给新分屏装的是**新空标签**而不是当前标签的副本；`closeTab` 挑「右邻居」时必须跳过正被别的分屏显示着的标签，一个都挑不出来就补一个空标签——这条是分屏落地时才暴露的，`dropTab` 已重写并有专门用例钉住。
+> 12. **⛔ 「合并分屏」不绑 `Mod+W`**：macOS 的原生菜单快捷键等价物在事件到达 webview 之前就被系统吃掉了，绑在注册表里根本收不到按键。入口只有工具栏的「合并」按钮与命令面板（与 `foldAll` / `unfoldAll` 同一条理由）。分屏的其余四条绑 `Mod+\`（右分屏）、`Mod+Shift+\`（下分屏）、`Mod+Alt+←/→`（切焦点），沿用 VS Code 约定。
+> 13. **焦点与拆卸都由 `EditorPane` 自己上报**，App 不再持有单个 controller：`onFocusIn`（focusin 会冒泡，容器收得到 `.cm-content` 的聚焦）→ `ws.focusPane(paneId)`，`onCleanup` 里的 `onDestroy` → `ws.detach(paneId)`。**onDestroy 必须在 `controller.destroy()` 之前调用**——workspace 要趁 view 还活着 capture 现场，顺序反了合并分屏就会把没存盘的正文一起扔掉（`EditorPane.test.tsx` 有专门用例）。`AppContext.editor` 相应变成 `ws.focusedEditor()`。
+>
+> **待人工验**（启动真实 app 被拦，自动化到不了）：标签条的观感与拖拽重排手感、模态对话框的视觉、**分屏的观感**（1px 分隔线、聚焦块的 accent 描边、`.tab.shown` 的顶部灰条是否够明显）、以及**真的点一次红绿灯与 Cmd+Q** 确认关窗握手在 Tauri 运行时里通。
+
 ---
 
 ### 3.4 M2 · 项目与搜索（8–10 人日）
@@ -717,7 +747,7 @@ const vela = {
 | 文件树前端 | 2 | 虚拟化列表、展开折叠状态持久化、`node_modules`/`.git`/`dist` 默认折叠、右键菜单（新建/重命名/删除/在 Finder 中显示/复制路径） |
 | 全局搜索 | 2.5 | `grep-searcher` + `grep-regex`，**流式 event 推送**，按文件分组、上下文预览、include/exclude glob、可取消 |
 | 全局替换 | 1 | 预览所有变更 → 确认 → 批量应用，支持正则 |
-| Goto Anything | 1 | `Cmd+P` 模糊找文件（fuzzy match + 最近使用加权）、`Cmd+R` 文件内符号（Lezer AST）、`Cmd+G` 跳行 |
+| Goto Anything | 1 | `Cmd+P` 模糊找文件（fuzzy match + 最近使用加权）、`Cmd+R` 文件内符号（Lezer AST）、`Cmd+Alt+G` 跳行（**原写 `Cmd+G`，已被 M1-C 的「查找下一个」占用**，见 §3.3「M1-C 实施修正」5） |
 | 工作区管理 | 1 | 多根工作区、`.vela/settings.json` 分层合并、最近项目、`Cmd+Shift+O` |
 | 文件监听 | 1 | `notify` 8.2.0 + `notify-debouncer-full` 抖动合并，外部改动提示重载，冲突处理 |
 | 大文件只读分片 | 1 | `ropey` 持有全文，前端按可视窗口请求分片，禁用编辑并给出提示 |

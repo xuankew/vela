@@ -1,17 +1,20 @@
 import { createSignal, type Accessor } from 'solid-js'
-import { open as pickToOpen, save as pickToSave } from '@tauri-apps/plugin-dialog'
+import { save as pickToSave } from '@tauri-apps/plugin-dialog'
 import { describeFsError, ENCODING_LABELS, openFile, saveFile, type FileFormat } from '../ipc/fs'
 
 /**
  * 单个文档的生命周期：路径、格式、脏标记，以及打开/保存/另存为。
  *
- * 为什么现在就要把它从 `App.tsx` 里拆出来：M1-D 的标签页是「每个标签一份这套状态」，
- * 如果它继续以 signal 的形式散在 App 里，那一步就得把 App 整个重写一遍。
- * 现在拆成一个工厂函数，M1-D 只是把它变成数组。
+ * M1-D 之后这是**每个标签一份**：`src/doc/workspace.ts` 为每个标签调一次这个工厂，
+ * 标签条上的名字、脏标记、提示条都直接读它。
  *
- * **刻意不包含**：未保存改动的关窗拦截。那需要 Rust 侧的 `on_window_event` 拦
- * `CloseRequested` 再回调前端确认，是一次双向握手，放在 M1-D（多标签时它还要
- * 变成「逐个标签确认」）。现在只有脏标记，没有拦截。
+ * **刻意不包含**：
+ * - 「弹对话框选文件」与「新建文档」。两者都要先回答「落到哪个标签上」——复用当前
+ *   干净的空标签、激活已打开同路径的标签、还是新建一个——那是 workspace 的知识。
+ *   这里只保留 `openAt(path)`：给我一个路径，我负责读进来。
+ * - 未保存改动的关闭拦截。这一层只负责**如实报告** `dirty`，拦不拦、怎么问都不归它：
+ *   标签级在 `workspace.ts` 的 `closeTab`，窗口级在 `workspace.ts` 的 `requestWindowClose`
+ *   + `ipc/windowClose.ts` + Rust 侧 `src-tauri/src/lib.rs` 的双向握手。
  */
 
 /** 文档模型需要的宿主能力。注入而不是直接持有 `EditorController`，这样单测不用起 CM6 */
@@ -49,8 +52,6 @@ export interface DocumentModel {
   /** 编辑器正文变化时由宿主调用 */
   markChanged: () => void
   dismissNotice: () => void
-  newDocument: () => void
-  openViaDialog: () => Promise<void>
   /** 打开一个已知路径。将来的「最近文件」与拖拽落文件都走这里 */
   openAt: (path: string) => Promise<void>
   save: () => Promise<void>
@@ -136,13 +137,6 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     }
   }
 
-  async function openViaDialog() {
-    // 不设扩展名过滤器：编辑器要能打开 LICENSE、Makefile、无后缀的配置文件，
-    // 过滤器只会让人以为文件不存在
-    const picked = await pickToOpen({ multiple: false, directory: false })
-    if (typeof picked === 'string') await openAt(picked)
-  }
-
   async function saveAs() {
     const picked = await pickToSave({ defaultPath: path() ?? undefined })
     if (typeof picked === 'string') await writeTo(picked)
@@ -154,16 +148,6 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     const current = path()
     if (current === null) await saveAs()
     else await writeTo(current)
-  }
-
-  function newDocument() {
-    replaceText('')
-    setPath(null)
-    setFormat(DEFAULT_FORMAT)
-    setDirty(false)
-    setLossy(false)
-    setNotice(null)
-    host.focus()
   }
 
   return {
@@ -179,8 +163,6 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     notice,
     markChanged,
     dismissNotice: () => setNotice(null),
-    newDocument,
-    openViaDialog,
     openAt,
     save,
     saveAs,

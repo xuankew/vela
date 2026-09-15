@@ -1,73 +1,40 @@
-import { Compartment, EditorState, type Extension } from '@codemirror/state'
+import type { EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
-import { buildExtensions } from './setup'
+import { lineWrapEnabled } from './setup'
 
-export interface EditorUpdateInfo {
-  docChanged: boolean
-  selectionChanged: boolean
-  lines: number
-  chars: number
-}
-
-export interface EditorOptions {
-  doc?: string
-  lineWrap?: boolean
-  markdownMode?: boolean
-  /** CM6 → 外部的唯一出口。Solid 侧只在这里把状态推进 signal */
-  onUpdate?: (info: EditorUpdateInfo) => void
+/**
+ * 一个标签的完整可复原状态。
+ *
+ * state 本身不含滚动位置——那是 view 的几何属性，不是文档的属性。切换标签时两样都得
+ * 存，否则切回来视口跳回顶部：文档没变，但用户「读到哪儿了」丢了。
+ */
+export interface EditorSnapshot {
+  state: EditorState
+  scrollTop: number
+  scrollLeft: number
 }
 
 /**
- * 一个编辑器实例的生命周期持有者。
+ * 一块可见编辑区（分屏）的生命周期持有者。
  *
  * 存在的理由是把 CM6 的两条硬约束关在一个地方：
  * 1. **扩展是 state 的一部分**，改扩展要么 reconfigure（Compartment）要么换 state，
  *    不能像改 DOM 属性那样随手赋值；
  * 2. **`view.destroy()` 必须被调用**，否则 ResizeObserver 与 DOM 事件监听会跟着
- *    标签页一起泄漏——M1-D 的多标签/分屏会反复创建销毁实例，这条是硬要求。
+ *    标签页一起泄漏——多标签/分屏会反复创建销毁实例，这条是硬要求。
+ *
+ * ⛔ **这里刻意不持有「当前文档」的概念。** 正文、撤销历史、换行偏好都属于**标签**
+ * （见 `src/doc/tab.ts`），一个分屏只是轮流显示它们。把 setDoc / setLineWrap 放在这里
+ * 是 M1-C 之前的单文档形态留下的形状：多标签下它无处安放——「改文档」要先回答
+ * 「改哪个标签的」，而这个问题只有 workspace 答得上来。
  */
 export class EditorController {
   view: EditorView
 
-  private readonly onUpdate?: (info: EditorUpdateInfo) => void
-  /** 自动换行的开关槽位。用 Compartment 才能不重建视图就切换，选区与滚动位置都不丢 */
-  private readonly lineWrapSlot = new Compartment()
-  private wrap: boolean
-  private markdown: boolean
   private disposed = false
 
-  constructor(host: HTMLElement, options: EditorOptions = {}) {
-    this.onUpdate = options.onUpdate
-    this.wrap = options.lineWrap ?? true
-    this.markdown = options.markdownMode ?? true
-    this.view = new EditorView({
-      parent: host,
-      state: EditorState.create({ doc: options.doc ?? '', extensions: this.assemble() }),
-    })
-  }
-
-  private assemble(): Extension[] {
-    const exts = buildExtensions({
-      lineWrap: this.wrap,
-      markdownMode: this.markdown,
-      lineWrapSlot: this.lineWrapSlot,
-    })
-    if (this.onUpdate) {
-      const notify = this.onUpdate
-      exts.push(
-        EditorView.updateListener.of((u) => {
-          // 视口/几何变化也会触发 updateListener，只在真正关心的两类变化上回调
-          if (!u.docChanged && !u.selectionSet) return
-          notify({
-            docChanged: u.docChanged,
-            selectionChanged: u.selectionSet,
-            lines: u.state.doc.lines,
-            chars: u.state.doc.length,
-          })
-        }),
-      )
-    }
-    return exts
+  constructor(host: HTMLElement, state: EditorState) {
+    this.view = new EditorView({ parent: host, state })
   }
 
   private assertAlive() {
@@ -87,35 +54,27 @@ export class EditorController {
   }
 
   get lineWrap(): boolean {
-    return this.wrap
+    return lineWrapEnabled(this.view.state)
   }
 
-  setLineWrap(on: boolean) {
+  /** 把当前显示的 state 与滚动位置取走，好让 view 去显示别的东西 */
+  capture(): EditorSnapshot {
     this.assertAlive()
-    if (on === this.wrap) return
-    this.wrap = on
-    this.view.dispatch({
-      effects: this.lineWrapSlot.reconfigure(on ? [EditorView.lineWrapping] : []),
-    })
+    const { scrollDOM } = this.view
+    return { state: this.view.state, scrollTop: scrollDOM.scrollTop, scrollLeft: scrollDOM.scrollLeft }
   }
 
   /**
-   * 整篇换文档（打开文件、切换标签）。
+   * `capture` 的逆操作：把某个标签的 state 装回 view，并复原视口。
    *
-   * 走 `setState` 换掉整个 state 而不是 dispatch 一个覆盖全文的变更：撤销历史属于
-   * state，dispatch 会让 Cmd+Z 把**上一个文件**的内容拉回来。换文档就该是新文档。
+   * 滚动位置在 `setState` **之后**赋值：setState 会重建整个 docView，先赋的值会被新内容的
+   * 布局冲掉。
    */
-  setDoc(text: string) {
+  restore(snapshot: EditorSnapshot) {
     this.assertAlive()
-    this.view.setState(EditorState.create({ doc: text, extensions: this.assemble() }))
-    // setState 不产生事务，updateListener 收到的 docChanged / selectionSet 都是 false，
-    // 会被守卫挡掉。但换文档正是状态栏最该知道的事，所以这里显式补一次回调。
-    this.onUpdate?.({
-      docChanged: true,
-      selectionChanged: true,
-      lines: this.lines,
-      chars: this.chars,
-    })
+    this.view.setState(snapshot.state)
+    this.view.scrollDOM.scrollTop = snapshot.scrollTop
+    this.view.scrollDOM.scrollLeft = snapshot.scrollLeft
   }
 
   focus() {

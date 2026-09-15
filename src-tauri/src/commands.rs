@@ -3,9 +3,10 @@
 //! 这一层刻意薄到只有签名转换：真正的实现在框架无关的 `vela-core` 里，
 //! 这样单测不需要 `AppHandle`，将来做 CLI 或 headless 工具也能直接复用。
 //!
-//! **只暴露两个命令**，因为编辑器对文件系统的需求就只有「读一个文本文件」和
+//! **文件系统命令只有两个**，因为编辑器对文件系统的需求就只有「读一个文本文件」和
 //! 「把一个文本文件写回去」。另存为不是第三个命令——它是前端先用 dialog 插件
 //! 拿到新路径，再调同一个 `save_file`。命令越多，权限面越大，越难审计。
+//! 第三个命令 `close_window` 不碰文件系统，只是关窗握手的回执（见 `lib.rs`）。
 //!
 //! ⚠️ 信任边界：这两个命令接受**任意路径**，等于给了 webview 一个读写本地文件的
 //! 原语。这在 Vela 里是可接受的，前提是 webview 只加载第一方打包产物：没有远程
@@ -37,4 +38,18 @@ pub async fn open_file(path: String) -> Result<TextFile, ReadError> {
 #[command]
 pub async fn save_file(path: String, text: String, format: FileFormat) -> Result<WriteReport, WriteError> {
     write_text_atomic(Path::new(&path), &text, format)
+}
+
+/// 关窗握手的回执：前端说「可以关了」之后调这个。
+///
+/// 用 `destroy()` 而不是 `close()`——`close()` 会再触发一次 `CloseRequested`，
+/// `lib.rs` 又会 prevent + 发事件，变成「问用户 → 用户同意 → 再问一遍」的死循环。
+/// `destroy()` 直接拆窗口，随后 Tauri 以 `ExitRequested { code: None }` 退场，
+/// 那一种 `lib.rs` 是放行的。
+///
+/// 这是本层唯一需要 `Window` 的命令，也就是文件头「单测不需要 AppHandle」那条的例外：
+/// 它没有可以下沉到 `vela-core` 的实现，本体就是框架调用，也没什么可单测的。
+#[command]
+pub fn close_window(window: tauri::Window) {
+    let _ = window.destroy();
 }

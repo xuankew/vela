@@ -29,6 +29,10 @@
   --vela-fg: #c0caf5;
   --vela-fg-dim: #565f89;
   --vela-border: #3b4261;
+  /* 缩进引导线。刻意比 border 更暗：引导线是背景纹理，不该跟面板边框抢视觉层级。
+     用固定 hex 而不是半透明色——主题变量都是实色，而且现在没有视觉验证通道，
+     半透明叠在不同背景上的实际结果我没法自动确认。 */
+  --vela-guide: #262a3d;
   --vela-accent: #7aa2f7;
   --vela-ok: #9ece6a;
   --vela-warn: #e0af68;
@@ -60,9 +64,10 @@ body {
 
 .app {
   display: grid;
-  /* 三行：工具栏 / 提示条容器 / 正文区。提示容器是常驻的（空时高度 0），
-     行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上 */
-  grid-template-rows: auto auto 1fr;
+  /* 四行：工具栏 / 标签条 / 提示条容器 / 正文区。提示容器是常驻的（空时高度 0），
+     行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上。
+     标签条放在提示条**上面**：提示条出现或消失时只推动正文区，标签条不跟着跳 */
+  grid-template-rows: auto auto auto 1fr;
   height: 100%;
 }
 
@@ -144,20 +149,130 @@ select {
   border-radius: 4px;
 }
 
+/* ---------- 标签条 ---------- */
+
+.tab-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 6px 0;
+  background: var(--vela-bg-alt);
+  border-bottom: 1px solid var(--vela-border);
+  /* 标签多到放不下时横向滚，而不是把正文区挤窄。刻意不换行：换行会让标签条高度不定，
+     而 .app 的 grid 行数固定、每行 auto，高度一跳正文区就跟着跳 */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  max-width: 200px;
+  padding: 4px 5px 4px 10px;
+  font-size: 12px;
+  color: var(--vela-fg-dim);
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  cursor: default;
+  /* 标签是 draggable 的：不关掉文本选择，拖动的第一下会变成选中文字 */
+  user-select: none;
+}
+
+.tab:hover {
+  color: var(--vela-fg);
+  background: var(--vela-bg-panel);
+}
+
+/* 激活标签用正文区同色，并且靠 strip 的 border-bottom 收口：
+   它要和下面的编辑器在视觉上连成一块，而不是一个独立的按钮 */
+.tab.active {
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border-color: var(--vela-border);
+}
+
+/* 显示在**别的**分屏里的标签，与 .active 互斥。
+   点它是把焦点交给那块分屏，而不是把它搬到当前分屏来（见 workspace.activateTab）——
+   长得和后台标签一样的话，这次点击看着就像随机行为 */
+.tab.shown {
+  color: var(--vela-fg);
+  /* inset 阴影不参与布局：换成 border 会让它比邻居宽 2px */
+  box-shadow: inset 0 2px 0 var(--vela-fg-dim);
+}
+
+.tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  padding: 0 3px;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.5;
+}
+
+.tab-close:hover {
+  border: none;
+  opacity: 1;
+}
+
+.tab-new {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-left: 4px;
+  padding: 2px 7px;
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.tab-new:hover {
+  border: none;
+  color: var(--vela-fg);
+}
+
 /* ---------- 主体 ---------- */
 
 .body {
-  display: grid;
-  grid-template-columns: 1fr;
+  display: flex;
+  /* 分隔线用 gap 露出底色，不给分屏加 border：border 会参与盒模型，
+     而 CM6 靠父容器的 clientHeight 算可视行数，多一条边框就少算一行 */
+  gap: 1px;
+  background: var(--vela-border);
   min-height: 0;
 }
 
+.body.column {
+  flex-direction: column;
+}
+
 .editor-host {
+  flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
   position: relative;
+  /* 不透明：否则上面 .body 的分隔线底色会透过来 */
+  background: var(--vela-bg);
+}
+
+/* 聚焦的那块分屏。outline 不占布局——用 border 的话两块分屏会差 2px 宽，
+   等分就成了肉眼可见的不等分 */
+.editor-host.focused {
+  outline: 1px solid var(--vela-accent);
+  outline-offset: -1px;
 }
 
 .editor-container {
@@ -181,6 +296,16 @@ select {
    只换字体不动行高——行高一变，CM6 的行高测量与滚动位置全会错。 */
 .cm-line.vela-code {
   font-family: var(--vela-font-code);
+}
+
+/* ---------- 缩进引导线（editor/indentGuides.ts）---------- */
+
+/* 每个 mark 包住「一档缩进」的行首空白，左边框就是那条引导线。
+   ⚠️ 绝不能给它加 padding / width / background-clip 之类会改变盒模型的属性：
+   mark 包住的是真实空白字符，一旦撑宽，CM6 的行宽测量、光标定位与滚动位置全会偏。
+   1px border 会占掉 1px 宽——这是引导线唯一可接受的代价，也是各编辑器通用的做法。 */
+.vela-indent-guide {
+  border-left: 1px solid var(--vela-guide);
 }
 
 .badge {
@@ -231,4 +356,50 @@ select {
   color: inherit;
   font-size: 15px;
   line-height: 1;
+}
+
+/* ---------- 模态对话框（未保存改动的关闭确认）---------- */
+
+/* fixed 而不是 absolute：`.app` 是行数固定的 grid，绝对定位的子元素不是 grid item，
+   遮罩因此不会挤出一行来。z-index 要盖住 CM6——查找面板那些浮层自带层叠上下文。 */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 遮罩可以用 rgba：它不承载语义色，只是压暗背景，换主题时对比度不会失控
+     （提示条那一段刻意不混色，理由不同） */
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 10;
+}
+
+.modal {
+  min-width: 320px;
+  max-width: 460px;
+  padding: 14px 16px;
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+}
+
+.modal-title {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+/* 关窗口时可能一次列出十几个文件，给个上限让它自己滚，别把对话框顶出屏幕 */
+.modal-list {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  max-height: 160px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: var(--vela-fg-dim);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }

@@ -1,16 +1,27 @@
 // @vitest-environment jsdom
 import { undo } from '@codemirror/commands'
-import { EditorSelection } from '@codemirror/state'
+import { Compartment, EditorSelection, type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { EditorController, type EditorUpdateInfo } from './controller'
+import { EditorController } from './controller'
+import { createEditorState, type EditorUpdateInfo } from './setup'
 
 let host: HTMLElement
 
 /**
- * 换行是否生效，读 state 上的 facet 而不是 `view.lineWrapping`：
- * 后者读的是 heightOracle，只在 measure 阶段刷新，而 jsdom 没有真实布局、measure 跑不动。
+ * 一个可复用的换行槽位。
+ *
+ * 真实应用里它由 workspace 持有、被所有标签共享（见 src/doc/tab.ts 的 ViewConfig）；
+ * 这里每个用例自己造一个就够。
  */
+function makeSlot() {
+  return new Compartment()
+}
+
+function stateFor(doc = '', lineWrap = true, slot = makeSlot(), onUpdate?: (info: EditorUpdateInfo) => void) {
+  return createEditorState({ doc, lineWrap, markdownMode: true, lineWrapSlot: slot, onUpdate })
+}
+
 function wrapEnabled(view: EditorView): boolean {
   return view.state
     .facet(EditorView.contentAttributes)
@@ -24,92 +35,124 @@ beforeEach(() => {
 
 describe('EditorController 文档度量', () => {
   it('构造后暴露 doc / lines / chars', () => {
-    const c = new EditorController(host, { doc: '第一行\n第二行\n第三行' })
+    const c = new EditorController(host, stateFor('第一行\n第二行\n第三行'))
     expect(c.doc).toBe('第一行\n第二行\n第三行')
     expect(c.lines).toBe(3)
     expect(c.chars).toBe(11)
     c.destroy()
   })
 
-  it('lineWrap 选项真的落到视图，而不只是缓存字段', () => {
-    const on = new EditorController(host, { lineWrap: true })
+  it('传进来的 state 原样成为 view.state，中间不做任何加工', () => {
+    const state = stateFor('alpha')
+    const c = new EditorController(host, state)
+    expect(c.view.state).toBe(state)
+    c.destroy()
+  })
+
+  it('lineWrap 读的是当前 state 的 facet，而不是构造时的缓存', () => {
+    const on = new EditorController(host, stateFor('', true))
+    expect(on.lineWrap).toBe(true)
     expect(wrapEnabled(on.view)).toBe(true)
     on.destroy()
 
-    const off = new EditorController(host, { lineWrap: false })
+    const off = new EditorController(host, stateFor('', false))
+    expect(off.lineWrap).toBe(false)
     expect(wrapEnabled(off.view)).toBe(false)
     off.destroy()
   })
-})
 
-describe('setLineWrap（Compartment 重配）', () => {
-  it('切换后 view.lineWrapping 跟着变，选区不丢', () => {
-    const c = new EditorController(host, { doc: 'alpha\nbeta\ngamma', lineWrap: true })
-    c.view.dispatch({ selection: EditorSelection.create([EditorSelection.cursor(7)]) })
+  it('restore 之后 lineWrap 跟着新 state 走——它是查询，不是设置', () => {
+    // 这条是 M1-D 的硬要求：换行偏好属于标签，切换标签时读到的必须是**新标签**的值。
+    // 之前 controller 自己缓存一个 wrap 字段，restore 之后缓存就成了谎话，
+    // 而 editor.toggleLineWrap 正是拿它决定往哪边切。
+    const slot = makeSlot()
+    const c = new EditorController(host, stateFor('', true, slot))
+    const wrapped = c.capture()
 
-    c.setLineWrap(false)
+    c.view.dispatch({ effects: slot.reconfigure([]) })
     expect(c.lineWrap).toBe(false)
-    expect(wrapEnabled(c.view)).toBe(false)
-    expect(c.view.state.selection.main.head).toBe(7)
 
-    c.setLineWrap(true)
-    expect(wrapEnabled(c.view)).toBe(true)
-    expect(c.view.state.selection.main.head).toBe(7)
-    c.destroy()
-  })
-
-  it('传入相同值时不派发事务（state 对象保持同一个）', () => {
-    const c = new EditorController(host, { lineWrap: true })
-    const before = c.view.state
-    c.setLineWrap(true)
-    expect(c.view.state).toBe(before)
-    c.destroy()
-  })
-
-  it('setDoc 之后仍保留当前换行设置', () => {
-    const c = new EditorController(host, { doc: 'a', lineWrap: true })
-    c.setLineWrap(false)
-    c.setDoc('换了一篇文档')
-    expect(c.lineWrap).toBe(false)
-    expect(wrapEnabled(c.view)).toBe(false)
+    c.restore(wrapped)
+    expect(c.lineWrap).toBe(true)
     c.destroy()
   })
 })
 
-describe('setDoc（换文档）', () => {
-  it('整篇替换，并且不带入上一篇的撤销历史', () => {
-    const c = new EditorController(host, { doc: '旧文档' })
-    c.view.dispatch({ changes: { from: 0, to: 3, insert: '改过的旧文档' } })
+describe('capture / restore（标签切换的地基）', () => {
+  it('取走的快照装回去，正文、选区、滚动位置一样不少', () => {
+    const c = new EditorController(host, stateFor('alpha\nbeta\ngamma'))
+    c.view.dispatch({ selection: EditorSelection.cursor(9) })
+    c.view.scrollDOM.scrollTop = 42
+    c.view.scrollDOM.scrollLeft = 7
+
+    const snap = c.capture()
+    expect(snap.state.doc.toString()).toBe('alpha\nbeta\ngamma')
+    expect(snap.scrollTop).toBe(42)
+    expect(snap.scrollLeft).toBe(7)
+
+    c.restore({ state: stateFor('别的文档'), scrollTop: 0, scrollLeft: 0 })
+    c.restore(snap)
+    expect(c.doc).toBe('alpha\nbeta\ngamma')
+    expect(c.view.state.selection.main.head).toBe(9)
+    expect(c.view.scrollDOM.scrollTop).toBe(42)
+    expect(c.view.scrollDOM.scrollLeft).toBe(7)
+    c.destroy()
+  })
+
+  it('装回的是快照里那个 state 对象本身，不是内容相同的新 state', () => {
+    const c = new EditorController(host, stateFor('x'))
+    const snap = c.capture()
+    c.restore({ state: stateFor('y'), scrollTop: 0, scrollLeft: 0 })
+    c.restore(snap)
+    expect(c.view.state).toBe(snap.state)
+    c.destroy()
+  })
+
+  it('两个标签来回切，各自的正文与撤销历史互不污染', () => {
+    const c = new EditorController(host, stateFor('A 的正文'))
+    c.view.dispatch({ changes: { from: 0, to: 0, insert: 'A 加的' } })
+    const tabA = c.capture()
+
+    c.restore({ state: stateFor('B 的正文'), scrollTop: 0, scrollLeft: 0 })
+    c.view.dispatch({ changes: { from: 0, to: 0, insert: 'B 加的' } })
+    const tabB = c.capture()
+    expect(c.doc).toBe('B 加的B 的正文')
+
+    c.restore(tabA)
+    expect(c.doc).toBe('A 加的A 的正文')
+    // 撤销历史属于 state：切到 A 时 Cmd+Z 只能撤 A 自己的改动
     expect(undo(c.view)).toBe(true)
-    expect(c.doc).toBe('旧文档')
+    expect(c.doc).toBe('A 的正文')
 
-    c.setDoc('新文档\n第二行')
-    expect(c.doc).toBe('新文档\n第二行')
-    expect(c.lines).toBe(2)
-    // 关键不变量：Cmd+Z 不能把上一个文件的内容拉回来
-    expect(undo(c.view)).toBe(false)
-    expect(c.doc).toBe('新文档\n第二行')
+    c.restore(tabB)
+    expect(c.doc).toBe('B 加的B 的正文')
+    expect(undo(c.view)).toBe(true)
+    expect(c.doc).toBe('B 的正文')
     c.destroy()
   })
 
-  it('换文档后 onUpdate 报告新的行数与字符数（否则状态栏会停在上一个文件）', () => {
-    const onUpdate = vi.fn()
-    const c = new EditorController(host, { doc: 'a', onUpdate })
-    onUpdate.mockClear()
-
-    c.setDoc('一二三\n四五六\n七八九')
-    const last = onUpdate.mock.calls.at(-1)?.[0] as EditorUpdateInfo | undefined
-    expect(last).toBeDefined()
-    expect(last?.lines).toBe(3)
-    expect(last?.chars).toBe(11)
+  it('快照是那一瞬间的 state：capture 之后继续编辑不会反过来改掉它', () => {
+    const c = new EditorController(host, stateFor('原文'))
+    const snap = c.capture()
+    c.view.dispatch({ changes: { from: 2, insert: '追加' } })
+    expect(snap.state.doc.toString()).toBe('原文')
+    expect(c.doc).toBe('原文追加')
     c.destroy()
+  })
+
+  it('销毁后 capture / restore 都抛错', () => {
+    const c = new EditorController(host, stateFor('x'))
+    const snap = c.capture()
+    c.destroy()
+    expect(() => c.capture()).toThrow(/已销毁/)
+    expect(() => c.restore(snap)).toThrow(/已销毁/)
   })
 })
 
-describe('onUpdate 回调边界', () => {
+describe('state 里的 onUpdate 是 CM6 → 外部的唯一回路', () => {
   it('文档变更时回调，带上新的度量', () => {
     const onUpdate = vi.fn()
-    const c = new EditorController(host, { doc: 'abc', onUpdate })
+    const c = new EditorController(host, stateFor('abc', true, makeSlot(), onUpdate))
     c.view.dispatch({ changes: { from: 3, insert: '\ndef' } })
     expect(onUpdate).toHaveBeenCalledTimes(1)
     expect(onUpdate.mock.calls[0][0]).toEqual({
@@ -123,7 +166,7 @@ describe('onUpdate 回调边界', () => {
 
   it('纯视口/几何类更新不回调（否则每次滚动都会刷状态栏）', () => {
     const onUpdate = vi.fn()
-    const c = new EditorController(host, { doc: 'abc', onUpdate })
+    const c = new EditorController(host, stateFor('abc', true, makeSlot(), onUpdate))
     c.view.dispatch({})
     expect(onUpdate).not.toHaveBeenCalled()
     c.destroy()
@@ -131,26 +174,42 @@ describe('onUpdate 回调边界', () => {
 
   it('选区变化也回调，因为状态栏要显示行列', () => {
     const onUpdate = vi.fn()
-    const c = new EditorController(host, { doc: 'abc', onUpdate })
+    const c = new EditorController(host, stateFor('abc', true, makeSlot(), onUpdate))
     c.view.dispatch({ selection: EditorSelection.cursor(2) })
     expect(onUpdate).toHaveBeenCalledTimes(1)
     expect(onUpdate.mock.calls[0][0]).toMatchObject({ docChanged: false, selectionChanged: true })
     c.destroy()
   })
+
+  it('回调属于 state，所以 restore 之后收到通知的是**新标签**的那个', () => {
+    // 多标签下这条最容易被忽略：监听器如果挂在 view 上，切标签就得手动改路由。
+    // 烘进 state 之后，换 state 就等于换了监听器，压根不存在「通知发错标签」这条路。
+    const onA = vi.fn()
+    const onB = vi.fn()
+    const a = new EditorController(host, stateFor('A', true, makeSlot(), onA))
+    const stateB: EditorState = stateFor('B', true, makeSlot(), onB)
+
+    a.restore({ state: stateB, scrollTop: 0, scrollLeft: 0 })
+    a.view.dispatch({ changes: { from: 1, insert: '改' } })
+
+    expect(onB).toHaveBeenCalledTimes(1)
+    expect(onA).not.toHaveBeenCalled()
+    a.destroy()
+  })
 })
 
 describe('destroy', () => {
   it('销毁后再操作会抛错，且重复销毁是安全的', () => {
-    const c = new EditorController(host, { doc: 'x' })
+    const c = new EditorController(host, stateFor('x'))
+    const snap = c.capture()
     c.destroy()
     expect(() => c.destroy()).not.toThrow()
-    expect(() => c.setDoc('y')).toThrow(/已销毁/)
-    expect(() => c.setLineWrap(false)).toThrow(/已销毁/)
+    expect(() => c.restore(snap)).toThrow(/已销毁/)
     expect(() => c.focus()).toThrow(/已销毁/)
   })
 
   it('销毁后 DOM 里的编辑器被摘掉', () => {
-    const c = new EditorController(host, { doc: 'x' })
+    const c = new EditorController(host, stateFor('x'))
     expect(host.querySelector('.cm-editor')).not.toBeNull()
     c.destroy()
     expect(host.querySelector('.cm-editor')).toBeNull()

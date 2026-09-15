@@ -83,6 +83,69 @@ describe('matchesKeybinding', () => {
   })
 })
 
+describe('物理键位（event.code）', () => {
+  /** macOS 上 Option+z 真实产生的事件：key 是特殊字符，只有 code 还认得出是 Z 键 */
+  const macOptionZ: KeyEventLike = { key: 'Ω', code: 'KeyZ', ctrlKey: false, altKey: true, shiftKey: false, metaKey: false }
+
+  it('Alt+字母在 macOS 上必须能匹配——这是回归测试', () => {
+    // 修好之前这里返回 'ω'，与声明的 'z' 永远对不上，Alt+Z 在真机上是死的
+    expect(keyFromEvent(macOptionZ)).toBe('z')
+    expect(matchesKeybinding(macOptionZ, parseKeybinding('Alt+Z', 'macos'))).toBe(true)
+  })
+
+  it('Option+Shift+字母同理（sortLines 那类绑定靠它）', () => {
+    const macOptionShiftS: KeyEventLike = { key: 'Á', code: 'KeyS', ctrlKey: false, altKey: true, shiftKey: true, metaKey: false }
+    expect(matchesKeybinding(macOptionShiftS, parseKeybinding('Alt+Shift+S', 'macos'))).toBe(true)
+  })
+
+  it('code 优先于 key：两者矛盾时信 code', () => {
+    expect(keyFromEvent({ key: 'Ω', code: 'KeyZ', ctrlKey: false, altKey: true, shiftKey: false, metaKey: false })).toBe('z')
+  })
+
+  it('纯修饰键的 code（AltLeft 等）不算主键，单敲 Option 仍然不触发命令', () => {
+    expect(keyFromEvent(event('Alt', { altKey: true }) as KeyEventLike)).toBeNull()
+    expect(
+      keyFromEvent({ key: 'Alt', code: 'AltLeft', ctrlKey: false, altKey: true, shiftKey: false, metaKey: false }),
+    ).toBeNull()
+    expect(
+      matchesKeybinding(
+        { key: 'Alt', code: 'AltLeft', ctrlKey: false, altKey: true, shiftKey: false, metaKey: false },
+        parseKeybinding('Alt+Z', 'macos'),
+      ),
+    ).toBe(false)
+  })
+
+  it("输入法接管时（key === 'Process'）放弃匹配，即使 code 报得出物理字母", () => {
+    // 中文候选过程中 code 仍是 'KeyZ'，照常用它匹配就会把键从 IME 手里抢走。
+    // M0 #2 的中文 IME 判定是按「不抢键」通过的，这条钉住那个前提。
+    expect(
+      keyFromEvent({ key: 'Process', code: 'KeyZ', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false }),
+    ).toBeNull()
+  })
+
+  it('没有 code 时退回 key，老路径不受影响', () => {
+    expect(keyFromEvent(event('ArrowUp', { altKey: true }))).toBe('arrowup')
+    expect(keyFromEvent(event('P', { metaKey: true, shiftKey: true }))).toBe('p')
+  })
+
+  it('code 表里没有的键位退回 key（小键盘、IntlBackslash 等）', () => {
+    expect(
+      keyFromEvent({ key: '+', code: 'NumpadAdd', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false }),
+    ).toBe('+')
+  })
+
+  it('带 Shift 的标点：key 是 "+" 而 code 是 Equal，按 "=" 匹配', () => {
+    const shiftEqual: KeyEventLike = { key: '+', code: 'Equal', ctrlKey: false, altKey: false, shiftKey: true, metaKey: true }
+    expect(matchesKeybinding(shiftEqual, parseKeybinding('Mod+Shift+=', 'macos'))).toBe(true)
+    expect(matchesKeybinding(shiftEqual, parseKeybinding('Mod+=', 'macos'))).toBe(false)
+  })
+
+  it('数字与功能键走规律命名，不必逐个列表', () => {
+    expect(keyFromEvent({ key: '0', code: 'Digit0', ctrlKey: false, altKey: false, shiftKey: false, metaKey: true })).toBe('0')
+    expect(keyFromEvent({ key: 'F5', code: 'F5', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false })).toBe('f5')
+  })
+})
+
 describe('formatKeybinding', () => {
   it('macOS 出符号，其余平台出文字', () => {
     expect(formatKeybinding(parseKeybinding('Mod+Shift+P', 'macos'), 'macos')).toBe('⇧⌘P')

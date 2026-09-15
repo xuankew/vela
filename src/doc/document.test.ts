@@ -60,7 +60,7 @@ beforeEach(() => {
   ipc.saveFile.mockResolvedValue(OK_REPORT)
 })
 
-describe('初始状态与新建', () => {
+describe('初始状态', () => {
   it('一开始是无名空文档，不脏', () => {
     const { doc } = harness()
     expect(doc.path()).toBeNull()
@@ -69,27 +69,6 @@ describe('初始状态与新建', () => {
     expect(doc.lossy()).toBe(false)
     expect(doc.notice()).toBeNull()
     expect(doc.busy()).toBe(false)
-    expect(doc.format()).toEqual(DEFAULT_FORMAT)
-  })
-
-  it('新建文档清空正文、路径与所有警告', async () => {
-    const { doc, state } = harness()
-    ipc.openFile.mockResolvedValue(textFile({ lossy: true }))
-    await doc.openAt('/a/b.txt')
-    state.text = '改过了'
-    doc.markChanged()
-    ipc.saveFile.mockResolvedValue({ bytesWritten: 1, unmappable: true })
-    await doc.save()
-    expect(doc.notice()).not.toBeNull()
-    expect(doc.dirty()).toBe(false)
-
-    doc.newDocument()
-    expect(state.text).toBe('')
-    expect(doc.path()).toBeNull()
-    expect(doc.name()).toBe(UNTITLED_LABEL)
-    expect(doc.dirty()).toBe(false)
-    expect(doc.lossy()).toBe(false)
-    expect(doc.notice()).toBeNull()
     expect(doc.format()).toEqual(DEFAULT_FORMAT)
   })
 })
@@ -168,22 +147,8 @@ describe('打开', () => {
     expect(state.focuses).toBe(0)
   })
 
-  it('对话框取消时什么都不发生', async () => {
-    const { doc, state } = harness()
-    dialog.open.mockResolvedValue(null)
-    await doc.openViaDialog()
-    expect(ipc.openFile).not.toHaveBeenCalled()
-    expect(state.focuses).toBe(0)
-  })
-
-  it('对话框选中文件后走 openAt', async () => {
-    const { doc } = harness()
-    dialog.open.mockResolvedValue('/picked/file.md')
-    ipc.openFile.mockResolvedValue(textFile())
-    await doc.openViaDialog()
-    expect(dialog.open).toHaveBeenCalledWith({ multiple: false, directory: false })
-    expect(doc.path()).toBe('/picked/file.md')
-  })
+  // 「弹对话框选文件」的两条用例（取消 / 选中后走 openAt）在 workspace.test.ts 里：
+  // 打开一个文件先要决定它落到哪个标签，那是 workspace 的职责，不再是文档模型的。
 })
 
 describe('保存与另存为', () => {

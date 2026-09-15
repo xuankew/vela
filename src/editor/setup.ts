@@ -8,8 +8,6 @@ import {
   highlightActiveLine,
   highlightActiveLineGutter,
   drawSelection,
-  rectangularSelection,
-  crosshairCursor,
   highlightSpecialChars,
   dropCursor,
   scrollPastEnd,
@@ -36,11 +34,15 @@ import {
   HighlightStyle,
   indentUnit,
 } from '@codemirror/language'
-import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
+import { search, searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
+import { createFindReplacePanel, preserveCase } from './findReplace'
+import { indentGuides } from './indentGuides'
+import { mouseGestures } from './multiCursor'
+import { coveredRange, escapesCoverage } from './viewport'
 
 /**
  * 连字在 contenteditable 语境下会导致光标定位错乱（PLAN.md R11），属浏览器级问题，
@@ -107,22 +109,6 @@ const CODE_BLOCK_NODES = new Set(['FencedCode', 'CodeBlock', 'Table'])
 
 const codeLineDeco = Decoration.line({ class: 'vela-code' })
 
-/**
- * 装饰范围向视口外扩的余量（像素）。
- *
- * 滚动时 `viewportChanged` **每帧都触发**，没有余量就得每帧重走一遍语法树、重建整个
- * DecorationSet。有余量后视口在余量内移动一次都不重算，3000px/s 下约每滚过 4000px
- * 才重建一次（每档 ~5 次而不是 ~180 次）——每帧重建一份用完就扔的 DecorationSet 是纯浪费。
- */
-const DECO_MARGIN_PX = 2000
-
-/** 当前视口在文档里覆盖的区间。visibleRanges 可能分段（有折叠时），取首尾即可 */
-function visibleSpan(view: EditorView): { from: number; to: number } | null {
-  const ranges = view.visibleRanges
-  if (ranges.length === 0) return null
-  return { from: ranges[0].from, to: ranges[ranges.length - 1].to }
-}
-
 function buildCodeDecorations(view: EditorView, from: number, to: number): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>()
   const marked = new Set<number>()
@@ -168,8 +154,7 @@ export const codeFontBySyntax = ViewPlugin.fromClass(
         this.rebuild(u.view)
         return
       }
-      const span = visibleSpan(u.view)
-      if (u.viewportChanged && span && (span.from < this.coveredFrom || span.to > this.coveredTo)) {
+      if (u.viewportChanged && escapesCoverage(u.view, this.coveredFrom, this.coveredTo)) {
         this.rebuild(u.view)
         return
       }
@@ -180,22 +165,18 @@ export const codeFontBySyntax = ViewPlugin.fromClass(
     }
 
     private rebuild(view: EditorView) {
-      const doc = view.state.doc
-      const span = visibleSpan(view)
-      if (!span) {
+      const covered = coveredRange(view)
+      if (!covered) {
         this.coveredFrom = 0
         this.coveredTo = -1
         this.parsePending = false
         this.decorations = Decoration.none
         return
       }
-      const margin = Math.ceil(DECO_MARGIN_PX / Math.max(1, view.defaultLineHeight))
-      const first = Math.max(1, doc.lineAt(span.from).number - margin)
-      const last = Math.min(doc.lines, doc.lineAt(span.to).number + margin)
-      this.coveredFrom = doc.line(first).from
-      this.coveredTo = doc.line(last).to
-      this.decorations = buildCodeDecorations(view, this.coveredFrom, this.coveredTo)
-      this.parsePending = !syntaxTreeAvailable(view.state, this.coveredTo)
+      this.coveredFrom = covered.from
+      this.coveredTo = covered.to
+      this.decorations = buildCodeDecorations(view, covered.from, covered.to)
+      this.parsePending = !syntaxTreeAvailable(view.state, covered.to)
     }
   },
   { decorations: (v) => v.decorations },
@@ -260,19 +241,35 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     foldGutter(),
     drawSelection(),
     dropCursor(),
+    // 多光标与列块选择的总开关。默认是 false，关掉时多选区会被**静默塌成主选区**——
+    // 不报错，只是光标少了一堆，所以 Option+Click / Option+Shift+拖拽 全指着这一条。
     EditorState.allowMultipleSelections.of(true),
     indentOnInput(),
     indentUnit.of('  '),
     bracketMatching(),
     closeBrackets(),
     autocompletion(),
-    rectangularSelection(),
-    crosshairCursor(),
+    // 列块选择改绑 Option+Shift+拖拽，Option+Click 让给「加光标」，十字提示也跟着只认这两个键。
+    // 手势矩阵与「facet 一注册就完全接管」这个坑记在 ./multiCursor
+    mouseGestures,
     highlightActiveLine(),
+    // 查找替换。`search()` 注册的是 searchState 字段与匹配高亮——只有 searchKeymap 而没有它时
+    // 字段压根不存在，`getSearchQuery` 会直接抛。`createPanel` 是官方扩展点，面板换成自己的
+    // （多一个「保留大小写」开关），缘由见 ./findReplace 的模块文档。
+    // 刻意不传 `top`：面板自己声明了 `readonly top = true`，两处都写只会让配置与实现分叉。
+    search({ createPanel: createFindReplacePanel }),
+    preserveCase,
     highlightSelectionMatches(),
+    // 缩进引导线对正文与代码都生效，所以放在基础列表里而不是 markdownMode 分支内
+    indentGuides,
     syntaxHighlighting(tokenHighlight),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     noLigatures,
+    // 整个应用是暗色的（styles.css：`color-scheme: dark`、`--vela-bg: #1a1b26`），
+    // 但从没人设过这个 facet，于是 CM6 base theme 的 `&dark` 规则一条都没生效：
+    // 光标是黑的、选区是亮色、gutters 是 #f5f5f5，自动补全 tooltip 与查找面板都是浅底。
+    // M4 做可切换主题时这一条要换成 Compartment（现在只有暗色，不值得先搭槽位）。
+    EditorView.darkTheme.of(true),
     scrollPastEnd(),
     keymap.of([
       ...closeBracketsKeymap,
@@ -300,4 +297,60 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   exts.push(lineWrapSlot.of(lineWrap ? [EditorView.lineWrapping] : []))
 
   return exts
+}
+
+export interface EditorUpdateInfo {
+  docChanged: boolean
+  selectionChanged: boolean
+  lines: number
+  chars: number
+}
+
+export interface EditorStateOptions extends EditorSetupOptions {
+  doc?: string
+  /** state → 外部的唯一出口。回调闭包被烘进 state，所以「哪个 state 在变」天然不会串 */
+  onUpdate?: (info: EditorUpdateInfo) => void
+}
+
+/**
+ * 造一个可独立存活的编辑器状态。
+ *
+ * M1-D 的多标签是「一个标签一份 state、一个分屏一个 view」：标签切走时它的 state 被
+ * 存起来，切回来时 `view.setState` 塞回去。所以「组装 state」必须是能脱离 view 调用的
+ * 一步，而不是 `EditorController` 的私有方法。
+ *
+ * onUpdate 烘进 state 而不是挂在 view 上，是这套架构成立的关键：切换标签只换 state，
+ * 换完之后触发更新的监听器就是新标签自己那个，路由不需要任何额外的判断。
+ */
+export function createEditorState(options: EditorStateOptions): EditorState {
+  const { doc = '', onUpdate, ...setup } = options
+  const extensions = buildExtensions(setup)
+  if (onUpdate) {
+    extensions.push(
+      EditorView.updateListener.of((u) => {
+        // 视口/几何变化也会触发 updateListener，只在真正关心的两类变化上回调
+        if (!u.docChanged && !u.selectionSet) return
+        onUpdate({
+          docChanged: u.docChanged,
+          selectionChanged: u.selectionSet,
+          lines: u.state.doc.lines,
+          chars: u.state.doc.length,
+        })
+      }),
+    )
+  }
+  return EditorState.create({ doc, extensions })
+}
+
+/**
+ * 换行当前是否生效。
+ *
+ * 读 state 上的 facet 而不是 `view.lineWrapping`：后者读的是 heightOracle，只在 measure
+ * 阶段刷新——没有真实布局时（jsdom）压根不更新，刚 `setState` 完时也是过期的。
+ * facet 是 state 的一部分，与配置永远同步。
+ */
+export function lineWrapEnabled(state: EditorState): boolean {
+  return state
+    .facet(EditorView.contentAttributes)
+    .some((attrs) => typeof attrs !== 'function' && attrs.class === 'cm-lineWrapping')
 }
