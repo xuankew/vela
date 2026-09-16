@@ -1,3 +1,4 @@
+import { type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { indentUnit, type LanguageSupport } from '@codemirror/language'
 import { createSignal, type Accessor, type Setter } from 'solid-js'
@@ -165,7 +166,9 @@ export interface WorkspaceOptions {
 }
 
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
-  const config: ViewConfig = createViewConfig(options.lineWrap ?? true)
+  // liveStates 声明在后面，但这里只是把引用存进 config，真正调用发生在补全请求时——
+  // 那时 tabs 信号早就建好了，不会撞上 TDZ
+  const config: ViewConfig = createViewConfig(options.lineWrap ?? true, liveStates)
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
   const [tabs, setTabs] = createSignal<Tab[]>([])
@@ -208,6 +211,17 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
    */
   function viewOf(tab: Tab): EditorController | null {
     return paneOfTab(tab.id)?.controller ?? null
+  }
+
+  /**
+   * 所有标签**活的** state，给词补全当「其他打开的文档」。
+   *
+   * 口径与 `syncMetrics` / `host.getText` 是同一条：显示中的标签读 `view.state`，
+   * 没显示的读 `snapshot.state`。读错来源的后果在这里是「补全给出的是切走那一刻的
+   * 旧词」——不致命，但正打字的那份文档如果读成 snapshot，刚敲进去的词一个都补不出来。
+   */
+  function liveStates(): EditorState[] {
+    return tabs().map((tab) => viewOf(tab)?.view.state ?? tab.snapshot.state)
   }
 
   function syncMetrics(tab: Tab) {

@@ -1,3 +1,4 @@
+import { startCompletion } from '@codemirror/autocomplete'
 import { addCursorAbove, addCursorBelow, copyLineDown, copyLineUp, deleteLine, moveLineDown, moveLineUp } from '@codemirror/commands'
 import { foldAll, unfoldAll } from '@codemirror/language'
 // selectNextOccurrence 与查找替换那几个都住在 search 包里，不在 commands 包
@@ -159,6 +160,13 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       when: (ctx) => ctx.editor !== null,
       run: (ctx) => hooks.applyLineWrap(!ctx.editor!.lineWrap),
     }),
+    // 词补全的显式入口。自动触发不需要命令：autocompletion 的 activateOnTyping 默认开着，
+    // 打满两个字符就自己弹（见 editor/wordSource 的 MIN_TYPED）。
+    // ⛔ 不绑 Ctrl+Space（CM6 completionKeymap 里那条）：macOS 上它是系统的「切换到上一个
+    // 输入法」，与 Mod+W 同一条道理——系统级快捷键在事件到达 webview 之前就被吃掉了，
+    // 绑在注册表里收不到按键。Alt+/ 是 Sublime 的既有约定，CM6 没有占用它；Option+/ 打出
+    // 的是 ÷，但我们的解析走 event.code 的物理键位（见 commands/keybinding.ts），所以能匹配。
+    registry.register(cmCommand('editor.startCompletion', '触发词补全', startCompletion, 'Alt+/')),
 
     // 分屏。快捷键沿用 VS Code 的既有约定（`Mod+\` 右分屏、`Mod+Shift+\` 下分屏、
     // `Mod+Alt+←→` 切焦点），不另发明。

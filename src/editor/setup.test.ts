@@ -4,6 +4,7 @@ import { getSearchQuery } from '@codemirror/search'
 import { EditorView } from '@codemirror/view'
 import { describe, expect, it } from 'vitest'
 import { buildExtensions, createEditorState, INDENT_UNIT, indentLabel } from './setup'
+import { completeWords, wordDict, wordPeers } from './wordSource'
 
 /**
  * 扩展集的几条「错了也不会报错，只会让功能静默失效」的不变式。
@@ -49,6 +50,43 @@ describe('buildExtensions：静默失效类的不变式', () => {
 
   it('缩进单位装上的是 INDENT_UNIT——状态栏报的那一格取值于 state 上的 facet', () => {
     expect(stateFor().facet(indentUnit)).toBe(INDENT_UNIT)
+  })
+})
+
+/**
+ * M1-E-3 词补全的接线。同属「错了也不报错、只会静默失效」那一类：
+ * `autocompletion()` 装上但**一个词源都没有**时，打字永远不弹补全，而控制台干干净净。
+ * M1-E-3 之前的扩展集就正是这个样子——`completeAnyWord` 不是默认装的，接的语言包也都不带词源。
+ */
+describe('M1-E-3：词补全的接线', () => {
+  function stateWith(peerStates?: () => Iterable<EditorState>) {
+    return EditorState.create({
+      doc: 'alpha beta',
+      extensions: buildExtensions({
+        lineWrap: true,
+        lineWrapSlot: new Compartment(),
+        languageSlot: new Compartment(),
+        ...(peerStates === undefined ? {} : { peerStates }),
+      }),
+    })
+  }
+
+  it('词源注册在语言数据的 autocomplete 键上——override 会顶掉语言包自带的源', () => {
+    // languageDataAt 正是 autocompletion 默认的取源处。走 override 的话 lang-css /
+    // lang-html / lang-javascript 那些源就全没了（理由写在 wordSource.ts 的模块末尾）
+    expect(stateWith().languageDataAt('autocomplete', 0)).toContain(completeWords)
+  })
+
+  it('词典字段随扩展一起装上，且建 state 时就扫完了全文', () => {
+    // 少了 wordDict 这个 StateField，state.field() 会直接抛——这一条至少让它响亮地失败
+    expect(stateWith().field(wordDict).size).toBe(2)
+  })
+
+  it('注入的 peerStates 原样落到 wordPeers facet 上；缺省为空', () => {
+    const peers = () => [] as EditorState[]
+    expect(stateWith(peers).facet(wordPeers)).toEqual([peers])
+    // 缺省不装：facet 是空数组，词典退化成只有当前文档那一份，跨标签补全自然没有
+    expect(stateWith().facet(wordPeers)).toEqual([])
   })
 })
 

@@ -119,7 +119,7 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('三十三条命令全部注册成功，且互不抢占快捷键', () => {
+  it('三十四条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     expect(registry.list().map((c) => c.id)).toEqual([
       'file.new',
@@ -150,6 +150,7 @@ describe('内置命令', () => {
       'editor.sortLinesDesc',
       'editor.splitDown',
       'editor.splitRight',
+      'editor.startCompletion',
       'editor.toggleLineWrap',
       'editor.unfoldAll',
       'view.decreaseFontSize',
@@ -415,5 +416,78 @@ describe('M1-D-5：分屏命令的接线', () => {
       expect(await registry.execute(id), `${id} 应当 no-op`).toBe(false)
     }
     expect(hooks.splitRight).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * 只假掉 `startCompletion` 一个函数，其余全用真的。
+ *
+ * 它要读真实的 DOM（补全面板是 tooltip，挂在 document.body 上），node 环境造不出来；
+ * 而这里要验的是「命令确实把 view 递给了 CM6 的入口」，不是补全面板长什么样。
+ * ⚠️ 整体替换成假对象会连带删掉本模块其它导出，见 PLAN.md M1-E 实施修正 #33。
+ */
+const { autocomplete } = vi.hoisted(() => ({ autocomplete: { startCompletion: vi.fn() } }))
+
+vi.mock('@codemirror/autocomplete', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@codemirror/autocomplete')>()),
+  startCompletion: (...args: unknown[]) => autocomplete.startCompletion(...args),
+}))
+
+describe('M1-E-3：词补全命令的接线', () => {
+  it('标题与快捷键声明：命令面板里要能看出这条是干什么的、怎么按', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.get('editor.startCompletion')?.title).toBe('触发词补全')
+    expect(registry.get('editor.startCompletion')?.keybinding).toBe('Alt+/')
+
+    // 展示名分平台。注册表的缺省平台是写死的 'macos'（registry.ts:90，项目 macOS 优先），
+    // 所以 makeRegistry 建出来的那个本来就出符号；文字形式要显式要一个别的平台才看得到
+    expect(registry.list().find((c) => c.id === 'editor.startCompletion')?.keybindings).toEqual(['⌥/'])
+    const linux = createCommandRegistry({
+      platform: 'linux',
+      getContext: (): AppContext => ({ editor: fakeController(false) }),
+    })
+    const disposeLinux = registerBuiltinCommands(linux, makeHooks())
+    expect(linux.list().find((c) => c.id === 'editor.startCompletion')?.keybindings).toEqual(['Alt+/'])
+    disposeLinux()
+  })
+
+  it('Option+/ 在 macOS 上是 `÷`，命令仍然命中——与 Alt+Z 同一类回归', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    // 只靠 event.key 永远匹配不到：Option 会把 `/` 转成 `÷`。
+    // 靠的是 event.code 报的物理键位 `Slash`（见 keybinding.ts 的 CODE_ALIASES）
+    expect(registry.findForKey(macOptionEvent('Slash', '÷'))?.id).toBe('editor.startCompletion')
+    // 另一条路也要通：其余平台上 Alt+/ 给的 key 就是 `/`。两边都命中才说明匹配走的是
+    // 物理键位，而不是碰巧某一种事件形状
+    expect(registry.findForKey(event('/', { altKey: true }))?.id).toBe('editor.startCompletion')
+  })
+
+  it('Ctrl+Space 刻意没被占用——那是 macOS 的「切换到上一个输入法」', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    // 与 Mod+W 同一条道理：系统级快捷键在事件到达 webview 之前就被吃掉了，绑了也收不到。
+    // 断言它没被绑，是钉住「别以为 CM6 completionKeymap 里那条在这儿有效」
+    expect(registry.findForKey(event(' ', { ctrlKey: true }))).toBeNull()
+  })
+
+  it('执行时把 view 递给 CM6 的 startCompletion', async () => {
+    // startCompletion 的签名收 EditorView 而不是 { state, dispatch }，所以钉的是
+    // 「递过去的就是那个 view 对象本身」。就地造，不从 fakeEditorWithDoc 里反着掏
+    const view = { state: EditorState.create({ doc: 'alpha' }) }
+    const controller = { lineWrap: true, view } as unknown as EditorController
+    const registry = createCommandRegistry({ getContext: (): AppContext => ({ editor: controller }) })
+    const dispose = registerBuiltinCommands(registry, makeHooks())
+    autocomplete.startCompletion.mockClear()
+
+    await registry.execute('editor.startCompletion')
+    expect(autocomplete.startCompletion).toHaveBeenCalledOnce()
+    expect(autocomplete.startCompletion.mock.calls[0]![0]).toBe(view)
+    dispose()
+  })
+
+  it('没有编辑器时置灰，执行返回 false 而不是抛错', async () => {
+    const { registry } = makeRegistry(null)
+    autocomplete.startCompletion.mockClear()
+    expect(registry.list().find((c) => c.id === 'editor.startCompletion')?.enabled).toBe(false)
+    expect(await registry.execute('editor.startCompletion')).toBe(false)
+    expect(autocomplete.startCompletion).not.toHaveBeenCalled()
   })
 })

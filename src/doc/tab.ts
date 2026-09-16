@@ -29,10 +29,21 @@ import { createDocumentModel, type DocumentModel } from './document'
 export interface ViewConfig {
   lineWrap: boolean
   readonly lineWrapSlot: Compartment
+  /**
+   * 词补全的「其他文档」来源，工作区内所有标签共用同一个 getter。
+   *
+   * 放在这儿而不是每标签一个：同伴关系是**工作区**的性质（每个标签都该看到同一批
+   * 别的标签），跟 `lineWrapSlot` 同一条理由。缺省返回空，于是没有工作区兜着的时候
+   * 词补全只用当前文档自己那份词典。
+   */
+  readonly peerStates: () => Iterable<EditorState>
 }
 
-export function createViewConfig(lineWrap = true): ViewConfig {
-  return { lineWrap, lineWrapSlot: new Compartment() }
+export function createViewConfig(
+  lineWrap = true,
+  peerStates: () => Iterable<EditorState> = () => [],
+): ViewConfig {
+  return { lineWrap, lineWrapSlot: new Compartment(), peerStates }
 }
 
 export interface Tab {
@@ -91,6 +102,7 @@ export function buildState(
     lineWrap: config.lineWrap,
     lineWrapSlot: config.lineWrapSlot,
     languageSlot,
+    peerStates: config.peerStates,
     onUpdate,
   })
 }

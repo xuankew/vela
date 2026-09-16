@@ -46,10 +46,12 @@ vi.mock('../editor/language', async (importOriginal) => {
 })
 
 import { EditorSelection, type EditorState } from '@codemirror/state'
+import { CompletionContext } from '@codemirror/autocomplete'
 import { indentUnit, language, type LanguageSupport } from '@codemirror/language'
 import { EditorController } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
 import { codeFontBySyntax, indentLabel, lineWrapEnabled } from '../editor/setup'
+import { completeWords, wordPeers } from '../editor/wordSource'
 import type { TextFile, WriteReport } from '../ipc/fs'
 import { tabText } from './tab'
 import {
@@ -81,6 +83,17 @@ const OK_REPORT: WriteReport = { bytesWritten: 6, unmappable: false }
  */
 function languageName(state: EditorState): string | null {
   return state.facet(language)?.name ?? null
+}
+
+/**
+ * 在文档末尾请求一次词补全，返回候选的文字。
+ *
+ * 光标放在末尾是因为 `mounted()` 的 `type()` 就是这么落光标的；`explicit` 默认关，
+ * 于是走的是「至少打满两个字符」那条自动触发的路径。
+ */
+function completionLabels(state: EditorState, explicit = false): string[] {
+  const result = completeWords(new CompletionContext(state, state.doc.length, explicit))
+  return result?.options.map((o) => o.label) ?? []
 }
 
 function sleep(ms: number): Promise<void> {
@@ -549,6 +562,54 @@ describe('M1-E-1：语言按扩展名分派', () => {
 
     expect(languageName(pane.state)).toBe('markdown')
     expect(pane.ws.activeTab().language?.label).toBe('Markdown')
+  })
+})
+
+describe('M1-E-3：词补全跨标签', () => {
+  /**
+   * PLAN.md §2 那句「项目词典」在 M1 的落地形态是**所有打开的标签**（文件树是 M2 的事）。
+   * 这组用例走的是 workspace 真的注入给 `createViewConfig` 的那个 `liveStates`，
+   * 不是单测里手搓的 peers 闭包——wordSource.test.ts 已经单独钉过词源本身了。
+   */
+  it('别的标签里的词也能补出来', () => {
+    const pane = mounted()
+    pane.type('zephyr')
+    // 注入的 getter 就一个：liveStates。少了它补全退化成只有当前文档，且不会报错
+    expect(pane.state.facet(wordPeers)).toHaveLength(1)
+
+    const right = pane.splitPane()
+    right.type(' ze')
+
+    expect(completionLabels(right.controller.view.state)).toEqual(['zephyr'])
+  })
+
+  it('谁都不显示的标签也算——读的是它自己那份 snapshot', () => {
+    const pane = mounted()
+    pane.type('zephyr')
+    const right = pane.splitPane()
+    right.type('quartz')
+    // 合并掉右边那块分屏：标签留在标签条上，只是不再被任何分屏显示。
+    // liveStates 的口径与 syncMetrics / host.getText 是同一条——显示中读 view.state，
+    // 没显示读 snapshot.state；读错来源的话这里的词就补不出来了
+    pane.ws.closePane(right.id)
+    expect(pane.ws.panes()).toHaveLength(1)
+    expect(pane.ws.tabs()).toHaveLength(2)
+
+    pane.type(' qu')
+
+    expect(completionLabels(pane.state)).toEqual(['quartz'])
+  })
+
+  it('同一个词在两个标签里都出现时只出一次', () => {
+    const pane = mounted()
+    pane.type('omega')
+    const right = pane.splitPane()
+    right.type('omega')
+
+    right.type(' om')
+
+    // 两份词典里都有 omega，跨词典的 seen 集合负责去重
+    expect(completionLabels(right.controller.view.state)).toEqual(['omega'])
   })
 })
 

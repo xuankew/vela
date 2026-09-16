@@ -45,6 +45,7 @@ import { indentGuides } from './indentGuides'
 import type { LanguageChoice } from './language'
 import { mouseGestures } from './multiCursor'
 import { coveredRange, escapesCoverage } from './viewport'
+import { wordCompletions, wordPeers } from './wordSource'
 
 /**
  * 连字在 contenteditable 语境下会导致光标定位错乱（PLAN.md R11），属浏览器级问题，
@@ -54,6 +55,38 @@ const noLigatures = EditorView.theme({
   '&': {
     fontVariantLigatures: 'none',
     fontFeatureSettings: '"liga" 0, "calt" 0',
+  },
+})
+
+/**
+ * 词补全的弹出列表。
+ *
+ * `darkTheme.of(true)` 已经让 CM6 的 `&dark` 规则生效了，弹层不是浅底——但它用的是
+ * **写死的** `#333338`、没有边框、选中行是 `#347`，列表字体是笼统的 `monospace`，
+ * 与这个应用里其余每一处面板（`--vela-bg-panel` + `--vela-border`）都不是一回事。
+ *
+ * 用 `EditorView.theme` 而不是写进 styles.css：theme 模块的优先级天然高于 baseTheme，
+ * 而 styles.css 里同等特异度的选择器会被 CM6 运行时注入的样式表按顺序压过去。
+ * M4 做主题系统时这一条跟着 CSS 变量一起换，不需要动。
+ */
+const completionTheme = EditorView.theme({
+  '.cm-tooltip.cm-tooltip-autocomplete': {
+    background: 'var(--vela-bg-panel)',
+    border: '1px solid var(--vela-border)',
+    color: 'var(--vela-fg)',
+    '& > ul': {
+      // 列表里是标识符，按「代码」渲染（D2 按内容分字体），与它来自的那段正文一致
+      fontFamily: 'var(--vela-font-code)',
+      fontSize: 'var(--vela-font-size, 14px)',
+    },
+    '& > ul > li[aria-selected]': {
+      background: 'var(--vela-border)',
+      color: 'var(--vela-fg)',
+    },
+    // 分组分隔线原本是 `1px solid silver`，在暗底上是一道亮边
+    '& > ul > completion-section': {
+      borderBottomColor: 'var(--vela-border)',
+    },
   },
 })
 
@@ -250,6 +283,17 @@ export interface EditorSetupOptions {
    * 建 state 那一刻拿不到 `LanguageSupport`，只能先装上同步部分、等 import 落地再补。
    */
   languageSlot: Compartment
+  /**
+   * 词补全的「其他文档」来源，由 workspace 注入所有标签的活 state。
+   *
+   * M1 没有项目概念（文件树是 M2 的事），所以 PLAN.md §2 那句「项目词典」在这一版
+   * 落地成**所有打开的标签**。缺省为空——`createEditorState` 被单独调用时（测试、
+   * 将来的复用）就只有当前文档自己那份词典，行为完全可预期。
+   *
+   * 注入而不是让 `wordSource` 直接 import workspace：那一层不该知道标签与分屏的存在，
+   * 而且注入之后「跨文档取词」能在 node 环境里拿两个裸 state 测出来。
+   */
+  peerStates?: () => Iterable<EditorState>
 }
 
 /**
@@ -279,7 +323,7 @@ export function languageExtensions(choice: LanguageChoice, support: LanguageSupp
  * 部分（如 lint gutter）。
  */
 export function buildExtensions(options: EditorSetupOptions): Extension[] {
-  const { lineWrap = true, language, lineWrapSlot, languageSlot } = options
+  const { lineWrap = true, language, lineWrapSlot, languageSlot, peerStates } = options
 
   const exts: Extension[] = [
     lineNumbers(),
@@ -296,7 +340,14 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     indentUnit.of(INDENT_UNIT),
     bracketMatching(),
     closeBrackets(),
+    // 补全面板与键位。⚠️ 光有 autocompletion() 是**一个词源都没有**的：completeAnyWord
+    // 不是默认装的，我们接的语言包也都不带词源，所以 M1-E-3 之前打字从来不会弹补全。
     autocompletion(),
+    // 词补全的词典（StateField，增量维护）与词源。词源注册进语言数据而不是 override，
+    // 免得把语言包自带的那些源顶掉——理由写在 ./wordSource 的模块末尾
+    wordCompletions,
+    // 弹层的外观：CM6 的 &dark 基础主题给的是写死的灰底无边框，与本应用的面板不是一套
+    completionTheme,
     // 列块选择改绑 Option+Shift+拖拽，Option+Click 让给「加光标」，十字提示也跟着只认这两个键。
     // 手势矩阵与「facet 一注册就完全接管」这个坑记在 ./multiCursor
     mouseGestures,
@@ -337,6 +388,8 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   exts.push(languageSlot.of(language === undefined ? [] : languageExtensions(language, null)))
   // 换行槽位同理：关闭换行时塞空数组，否则之后 reconfigure 无处生效
   exts.push(lineWrapSlot.of(lineWrap ? [EditorView.lineWrapping] : []))
+  // 词补全的「其他文档」。没传就不装：facet 缺省是空的，词典退化成只有当前文档那一份
+  if (peerStates !== undefined) exts.push(wordPeers.of(peerStates))
 
   return exts
 }
