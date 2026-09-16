@@ -57,11 +57,6 @@ impl std::fmt::Display for WriteError {
 impl std::error::Error for WriteError {}
 
 pub fn write_text_atomic(path: &Path, text: &str, format: FileFormat) -> Result<WriteReport, WriteError> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| WriteError::NoParent { path: path.display().to_string() })?;
-
     // 先归一化再还原行尾。`apply_eol` 要求入参不含 `\r`，而这里的 text 来自 IPC
     // 另一侧的前端——是个系统边界，不能假定它已经归一化过。真递进来带 CRLF 的正文
     // （比如从别处粘贴的内容），CRLF 档会把它写成 `\r\r\n`，读回来每行多一个空行，
@@ -70,16 +65,34 @@ pub fn write_text_atomic(path: &Path, text: &str, format: FileFormat) -> Result<
     let payload = apply_eol(&normalized, format.eol);
     let encoded = encode(&payload, format.encoding, format.bom);
 
+    write_bytes_atomic(path, &encoded.bytes)?;
+
+    Ok(WriteReport { bytes_written: encoded.bytes.len() as u64, unmappable: encoded.unmappable })
+}
+
+/// 把一段**已经是最终字节**的数据原子写入 `path`。
+///
+/// 与 `write_text_atomic` 的区别是它不做任何文本变换：没有行尾还原、没有编码转换、
+/// 没有 BOM。会话存档这类「Rust 侧自己序列化出来的 UTF-8 JSON」必须走这一条——
+/// 走另一条的话 CRLF 档会把 JSON 里的 `\n` 转义序列之外的真换行改掉，
+/// GBK 档更是会把中文直接写坏，而两者都不会报错。
+///
+/// 临时文件的创建、权限继承、`sync_all`、rename、父目录 fsync 这一整套只在这里存在一份，
+/// 两条路径共用。
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| WriteError::NoParent { path: path.display().to_string() })?;
+
     let tmp = tmp_path(parent, path);
-    let written = write_and_rename(&tmp, parent, path, &encoded.bytes);
+    let written = write_and_rename(&tmp, parent, path, bytes);
     if written.is_err() {
         // 失败也要把临时文件清掉，否则用户目录里会攒一堆 .vela-tmp-* 垃圾。
         // 清理本身的错误忽略：它只是掩盖了真正的那个错误
         let _ = fs::remove_file(&tmp);
     }
-    written?;
-
-    Ok(WriteReport { bytes_written: encoded.bytes.len() as u64, unmappable: encoded.unmappable })
+    written
 }
 
 fn write_and_rename(tmp: &Path, parent: &Path, dest: &Path, bytes: &[u8]) -> Result<(), WriteError> {
@@ -222,6 +235,41 @@ mod tests {
         assert_ne!(a, b, "同一个目标文件生成了相同的临时名");
         assert!(a.starts_with(dir.path()));
         assert!(a.file_name().unwrap().to_string_lossy().contains(".vela-tmp-"));
+    }
+
+    /// `write_bytes_atomic` 存在的全部理由：一个字节都不许动。
+    ///
+    /// 如果哪天有人「统一一下入口」把会话 JSON 也塞进 `write_text_atomic`，
+    /// 这条会红——CRLF 档会把真换行写成 `\r\n`，读回来 JSON 直接解析失败。
+    #[test]
+    fn 字节写入不做任何行尾或编码变换() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        // 不能用 br#"…"#：字节串字面量要求纯 ASCII，而这里正是要验证中文原样落地
+        let payload = r#"{"a":"第一行\n第二行"}"#.as_bytes();
+        write_bytes_atomic(&path, payload).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), payload);
+    }
+
+    #[test]
+    fn 字节写入同样拒绝裸文件名() {
+        match write_bytes_atomic(Path::new("bare.bin"), b"x") {
+            Err(WriteError::NoParent { path }) => assert_eq!(path, "bare.bin"),
+            other => panic!("期望 NoParent，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 字节写入成功后不留临时文件() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        write_bytes_atomic(&path, b"{}").unwrap();
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "s.json")
+            .collect();
+        assert!(leftovers.is_empty(), "残留了 {leftovers:?}");
     }
 
     /// 只读目标（比如权限 0444 的目录里的文件）必须报错而不是静默成功。

@@ -292,7 +292,7 @@ interface ToolDefinition {
 | 目录监听 | **notify** | 8.2.0 | CC0-1.0 | 9.0.0-rc.5 有三项 macOS FSEvents 专项优化，M4 评估切换 |
 | 遍历与忽略 | **ignore** | 0.4.33 | Unlicense OR MIT | ripgrep 同款 `WalkBuilder` |
 | 全文搜索 | **grep-searcher / grep-regex / grep-matcher / grep-cli** | 0.1.x | Unlicense OR MIT | crate 源码仅 16–74KB，体积影响可忽略 |
-| 会话存储 | **rusqlite** 或 **sled** | — | MIT / Apache | M1 决定 |
+| 会话存储 | **无**（`app_data_dir()/session.json` 单个 JSON 文件 + 复用已有的原子写） | — | — | ✅ M1-F 已定：**rusqlite / sled 都没加**，理由与重估点见 §3.3「M1-F 实施修正」1 |
 | 异步 | **tokio** | — | MIT | — |
 
 ### 2.2 为什么是 CodeMirror 6（两路调研结论冲突的裁决）
@@ -698,7 +698,7 @@ const vela = {
 | 编辑基本功 | 1 | 括号匹配、自动缩进、缩进引导线、代码折叠、行操作、排序去重 |
 | 词补全 | 0.5 | 当前文档 + 项目词典（M1 没有项目概念，「项目词典」落地成**所有打开的标签**，见下面 M1-E 修正 35） |
 | 标签页 + 分屏 | 1.5 | 多标签、拖拽重排、水平/垂直分屏、聚焦切换 |
-| 会话恢复 | 1 | 标签、光标、滚动位置、未保存草稿持久化（rusqlite/sled） |
+| 会话恢复 | 1 | 标签、光标、滚动位置、未保存草稿持久化（**原写 rusqlite/sled，落地改成 `app_data_dir()` 下的单个 JSON 文件**，取舍与重估点见 §3.3「M1-F 实施修正」1） |
 | 语言高亮 | 0.5 | `@codemirror/language-data` 接入，子语言懒加载 |
 | 状态栏 + 基础 UI | 0.5 | 行列、编码、换行符、语言、缩进、字数 |
 | **字体分片按字频重排** | 0.5 | **M0 #4 的遗留超标项**。现状：分片按码位区块切，一屏汉字散落到 25~36 片，首屏实测 **2.219MB**（预算 2MiB，超 11%）。改为把常用 ~3500 字集中到头 1~2 片、其余照旧按码位切，粗估降到 1.0~1.2MB。⛔ **不要改用精简子集**——子集化触发 OFL 的 Reserved Font Name 改名义务（霞鹜 / LXGW 等）。Maple Mono CN 无 RFN，不受此限。详见 M0-REPORT §2 #4 |
@@ -793,6 +793,30 @@ const vela = {
 > 47. **测试口径再加两处**：① **`CompletionContext.matchBefore(re)` 取的是光标前那一段连续的词字符**，所以用例里插入的正文前面必须留空格——在 `'hello world'` 末尾直接插 `'wo'` 得到的是 `'worldwo'`，前缀成了 `worldwo` 而不是 `wo`，看起来像词源坏了，其实是光标位置算错了。② **注册表的缺省平台是写死的 `'macos'`**（`registry.ts`，项目 macOS 优先），不是 `detectPlatform()`；node 环境里也照样出 `⌥/` 这种符号形式，想看 `Alt+/` 那种文字形式得显式要一个别的平台。
 >
 > **待人工验**：真的各打开一个 `.md` / `.json` / `.ts` / `.log`，肉眼确认高亮与字体分区对——jsdom 里只能读 facet（语言名、装饰插件在不在），**读不到算出来的字体**，那一层自动化到不了。状态栏另需肉眼过一遍：22px 的条压在正文下面、路径过长时省略号截断、选中与多光标那两格是否只在需要时出现。**M1-E-2b 新增**：两个下拉塞进 22px 的条里撑没撑高整条、原生下拉面板在 `color-scheme: dark` 下是不是暗的、hover 时看不看得出能点、以及**拿一个真的 GBK 文件走一遍「以 GBK 重新打开」**（这条在 jsdom 里是 mock 的，真 IPC 只由 Rust 侧的单测覆盖）。**M1-E-3 新增**：打两个字母时弹层**出没出**、长得对不对（`--vela-bg-panel` 的底 + 边框、选中行不是 CM6 那个 `#347`、列表是 Maple Mono 而不是笼统的 monospace）、**中文输入法组字时会不会被弹层打扰**（这条是第 39 条那个取舍的真正验收，自动化压根测不到）、以及 **`Alt+/` 在真 macOS 键盘上按不按得到**（`Option+/` 出 `÷`，靠 `event.code` 才命中，与 `Alt+Z` 同一类风险）。
+
+> **M1-F 实施修正**（会话恢复落地时与本节及 §2 功能清单的偏离）：
+>
+> 1. **存储介质从 rusqlite/sled 改成 `app_data_dir()` 下的单个 `session.json`。** 表格里那句「rusqlite/sled」是按「会话可能要增量写、可能要按窗口分档」估的，落地时发现两个前提都不成立：会话是**整体读写**的（启动读一次、运行期每 5 秒最多写一次、关窗写一次），而且 M1 只有一个窗口。单文件 + `write_bytes_atomic`（临时文件 + `rename`）就够了，而代价是**少两个依赖、少一层 FFI、少一套迁移**。两个候选的许可证本来都没问题（rusqlite MIT、sled Apache-2.0），所以这个决定是成本/复杂度上的，不是合规上的。
+>    - **重估点**：出现下面任何一条就换回「元信息 + `drafts/<id>` 分文件」——① 每窗口一份会话；② 命名会话（工作区）；③ 草稿要增量写而不是整篇重写。真到了要 SQL 查询的那天再上 rusqlite，届时 `session` 模块的公开面（`load` / `save` / `Session`）不用动。
+> 2. **4MiB 硬上限，超了从最大的草稿开始丢，但 ⚠️ 绝不能静默丢。** `SessionReport.droppedDrafts > 0` 时前端必须在提示条上说一句。用户以为稿子存下来了、下次启动发现没了，比一开始就不存更糟。丢光草稿还超预算就说明**元信息本身**超了 4MiB，那种情况整份报错——而它本该被第 3 条拦住。上限来自 PLAN §2.6 修正 1（单次 IPC payload 4MB）。
+> 3. **`MAX_SESSION_TABS = 64` 有两个身份：前端是「存」的预算，Rust 是「读」的闸。** 两边各写一份、各有一条契约测试钉住，没有代码生成。光靠 4MiB 拦不住标签数——一个标签的元信息只有一百来字节，一份手改过但结构合法的存档能塞进几万个，而前端会照着它建几万个 CodeMirror state，启动直接卡死。前端超出部分从**最后**截断（标签条按最近使用排，越靠右越可能是顺手开一眼的），但**分屏正在显示的标签一定留住**：截掉它会让 `panes` 里的下标悬空，Rust 因此拒掉整份存档。
+> 4. **⚠️ 存档路径由 Rust 从 `app_data_dir()` 算，`load_session` / `save_session` 都不接受路径参数。** 让它变成参数等于给 webview 再添一个「写任意路径」的原语，而写的内容是用户未保存的草稿（`src-tauri/src/commands.rs` 的 `session_path`）。这与 M0 删掉 `read_text_file(path)` 探针是同一条理由。
+> 5. **干净又有路径的标签不存正文，恢复时重新读盘。** Vela 关着的时候文件可能被别的程序改过，拿存档里的旧正文盖上去等于悄悄回退用户的文件。存草稿的条件因此是「脏 **或** 未命名」。
+> 6. **`format` 与 `lossy` 是必填字段，⛔ 不加 `#[serde(default)]`。** 未命名文档也带一份 `format`：它是**那个文档**的属性、决定它的字节怎么写回去，不是「有没有路径」的附属品——用户在没落过盘的文档上选了 GBK+CRLF，这个决定只能存在这里。`lossy` 的全部作用是拦住「原样保存会永久损坏原文件」，重启后把它丢了等于把那条警告连同它要防的事故一起删掉。加了 `default` 之后旧存档会被解析成 `lossy: false` + UTF-8/LF，于是一个本该警告的文档安安静静地按 UTF-8 写回去。会话格式有 `version` 兜着，不认识的整份作废，用不着靠默认值硬吃旧文件。`wire_contract.rs` 里有一条用例专门把这两个 key 抠掉、断言整份被拒。
+> 7. **`version` 由 Rust 存盘时强行覆写成自己的 `SESSION_VERSION`，不接受调用方传的值。** 前端把它当不透明数据往返，让它能写这个字段等于让它能伪造一份「看起来是新格式」的旧数据。
+> 8. **恢复时选区必须夹到文档长度以内。** CM6 的 `checkSelection` 对越界位置直接抛 `RangeError`，而磁盘上的文件可能在 Vela 关着的时候被截短了，存档里的光标位置就成了非法值。夹是单调的，所以选区之间的先后顺序不会被打乱。`main`（主选区下标）也夹一次：Rust 侧校验过，但 `restoreSession` 是公开方法，测试与将来的调用方都可能递进来一份手搓的存档。
+> 9. **多光标整个数组都存**（每项 `[anchor, head]`），不是只存一个光标位置。M1-C 把多光标做成了一等公民，恢复时把 5 个光标变成 1 个是明显的手感倒退，代价只是一个数组。
+> 10. **`focused` 是 `panes` 的下标，不是 `tabs` 的下标**——两者只有一个标签时才碰巧相同。`panes` 存的也是 `tabs` 的下标而不是运行期的标签 id（id 是前端递增分配的，重启后对不上），且**不允许重复**：`workspace.ts` 的不变量 2 规定一个标签同时只显示在一个分屏里。`validate` 挂在手写的 `Deserialize` 上，所以坏存档在**解析阶段**就被拒，不会变成一个「下次启动才炸」的文件。
+> 11. **⛔ 偏好设置不进会话存档。** 字体、字号、换行开关、主题属于 settings（M2），混进会话的话「换一次字体」就会触发一次会话写盘，而且两个来源会互相覆盖。会话只存**这一次的现场**。
+> 12. **节流用「定时轮询 + 比对序列化结果」，不是「改动时打个标记」。** 标记要挂在每一个会改现场的地方：输入、切标签、开文件、另存为、换编码、分屏、合并、聚焦、**滚动**、拖拽重排……漏一个的后果是存档悄悄停在旧状态，而且没有任何报错（滚动尤其容易漏：它是纯视口更新，连 `onUpdate` 都不触发）。比对不会漏，代价是每 5 秒多算一次 `serializeSession`——几十个标签一两毫秒，换来「不可能漏」。
+> 13. **关窗放行之后必须再存一次。** 节流那一轮最长要等 5 秒，而 `close_window` 是 `Window::destroy()`，webview 当场就没了。接线方式是把这个动作塞进 `attachWindowCloseGuard` 的回调里（`requestWindowClose()` 答 true 之后 `await saveNow()`），于是 `windowClose.ts` 一行都不用改。`saveNow` 写失败也**不往上抛**：抛出去的后果是那条 promise 链 reject，`close_window` 永远不被调用，应用变成一个关不掉的窗口——而用户的**文档**已经由 `requestWindowClose` 那一步保住了，存档是尽力而为的。
+> 14. **答「不保存」必须真的把改动清掉（新增 `DocumentModel.discardChanges`）。** 这是 M1-F 与 M1-D 的接缝：M1-F 之前「不保存」等于「窗口一关内存就没了」，是免费的；有了存档之后，存档收草稿的条件就是脏标记，不清掉它，用户刚刚明确扔掉的稿子下次启动会原样端回来——那个确认对话框就成了在撒谎。有路径的只清脏标记（存档于是收 `draft: null`，恢复时重读磁盘，用户看到的正是他要的「磁盘上的样子」）；未命名文档还得把正文清空，因为磁盘上没有它、正文就是唯一的副本。⚠️ 有路径时**刻意不回滚编辑器里的正文**：真回滚要重新读一次盘，而这条路跑在关窗/关标签的半路上，读失败会把一个已经放行了的关闭又卡住。
+> 15. **顺带修掉一个从 M1-D 就在的 bug：启动、新建分屏、恢复会话之后都得先点一下编辑器才能打字。** `split` 里的 `focusPane` 跑的时候新分屏的 `controller` 还是 null，那一次 `controller?.focus()` 是静默空操作。修在 `workspace.attach` 里：聚焦的那块挂上 controller 时补一次 `focus()`。同处还要补一次 `applyScroll`——恢复出来的标签带着非零滚动，而新 view 是从 0 起的。`applyScroll` 因此成为 `EditorController` 上一个**独立于 `restore` 的方法**：`attach` 那一刻 view 是刚用这个标签的 state 建起来的，再 `setState` 一次等于把一个全新视图的 docView 拆了重建。
+> 16. **`restoreDraft` 不复用 `openAt`。** 后者走 fs 层并且把 `dirty` 强制设成 false，而恢复出来的草稿按定义就是脏的——标成干净的话，下一次关窗的确认会直接放行，用户的稿子没了。它内部用 `replaceText` 而不是 `setText`：整篇替换会触发 `docChanged`，不挡住的话「装进去」这个动作会自己把文档再标脏一次，而 `dirty` 该由存档说了算。也刻意**不 `host.focus()`**：恢复好几个标签时，焦点不该落在「恰好最后处理的那个」上。
+> 17. **首屏 gzip 233.88 → 235.01 KB**（`index-*.js` 124.02→125.15、`dist-*.js` 108.31 与 `index-*.css` 1.55 都不变），预算 300 KB，余量 **21.7%**。chunk 仍 **117** 个，`index.html` 仍只引三个（⛔ `manualChunks` 一条都没加）。前端 **495** 个用例（+73）、Rust **90** 个（75 lib + 14 wire-contract + 1 契约）全绿。
+> 18. **测试口径再加三处**：① `session.test.ts` 的黄金 JSON 与 Rust 侧**只差三处** `0.0` → `0`（serde 给 `f64` 一律带小数点，`JSON.stringify` 不带；同一个 JSON 数字，两边各自钉住自己的字面量）。`SessionReport` 那条用例里的 `bytesWritten: 437` 是**由黄金会话现算出来的**（`new TextEncoder().encode(GOLDEN_SESSION).length`），于是改了会话却忘了改报告数字会当场红。② 会话层的单测**不用 `vi.useFakeTimers()`**：假表会把 `requestAnimationFrame` 一起冻住，而 CM6 的 measure/read 两阶段调度正跑在 rAF 上，挂真编辑器的用例会连带变成一个时序谜团。调度器改成注入的（`Scheduler`），用例手动点一轮就跑一轮。③ `document.test.ts` 与 `App.test.tsx` 的 `beforeEach` 都只 `mockReset` 了 `openFile`、**没给默认返回值**，于是任何走 `openAt` 的新用例都会静默失败（拿到 `undefined` 后在 `file.text` 上抛、路径留在 null、错误落在 notice 上）——写恢复类用例时必须自己 `mockResolvedValue(textFile())`。
+>
+> **待人工验**（启动真实 app 被拦，自动化到不了）：**重启一次 Vela**，确认标签、正文、光标、多光标、滚动位置、分屏布局与聚焦的那块都回来了；干净的文件是**重新读盘**的（关机期间用别的编辑器改一下那个文件，再启动 Vela，看到的应该是改后的内容）；未命名文档的草稿原样回来而且仍然标着 ●；**恢复完直接打字打得进去**（第 15 条那个修复，不用先点一下编辑器）；关窗时答「不保存」再启动，那份稿子**不该**回来；把 `session.json` 手改坏一次，启动应该看到「上次的会话没能读回来」而不是白屏。存档位置：`~/Library/Application Support/app.vela.m1/session.json`。
 
 ---
 
@@ -921,7 +945,7 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 |---|---|---|---|---|
 | D1 | **字体分发策略** | (a) WOFF2 全量分片懒加载（**实测 4.33MB/变体**，不改名）<br>(b) 精简子集（4–6MB，须改名 "Vela Kai"，生僻字 fallback 系统字体） | **(a)** — M0 实测后优势从「略好」变「明显」：**两者体积已持平**，但 (a) 不改名、覆盖完整、无视觉断层。原先唯一的劣势（67.8KB gzip 的 `@font-face` 占首屏 CSS）**已被 D7 消掉**，现在 (a) 无短板 | **M0 已可定** |
 | D2 | **代码区默认字体** | (a) 全程 LXGW WenKai（尊重偏好，接受列对齐漂移；**且 Screen Mono 无 webfont 包，要等宽得自己从 24.44MB TTF 切分**）<br>(b) 代码区 Maple Mono CN + 正文 LXGW WenKai | ✅ **已定 (b) 并实施完成**（用户拍板「按内容分字体」）。#3 的量化结果让 (a) 直接出局：文楷 Screen 的拉丁**根本不是等宽**（ASCII 步进极差 8.63px），连纯英文代码都对不齐，不是「2:1 有细微偏差」。<br>**实现**：`--vela-font-editor`（正文/UI）与 `--vela-font-code`（代码区）两个变量正交，CM6 侧用 ViewPlugin 按语法节点名 `FencedCode`/`CodeBlock`/`Table` 给整行打 `.vela-code` 行装饰（⛔ 不能按 token 走 CSS：`@lezer/markdown` 没有任何 `tags.monospace` 映射）。两套 `@font-face` 各自一个 `<style>` 节点同时驻留。<br>**选包**：`@automann/maple-mono-cn@7.9.2`（精确锁版）。OFL-1.1 且**无 Reserved Font Name** → 分片不触发改名义务，这点与文楷不同。只引 400 一个字重：239 分片 / 9.33MB / CSS 156KB(gzip 55KB)，作为独立 lazy chunk。<br>**代价**：安装包 woff2 从 9.2MB → 18.5MB，见 §2.9。(a) 保留为工具栏一键切换「跟随正文」，切过去 #3 应立刻变红，这本身是分流生效的反向证据 | **已完成** |
-| D3 | 会话存储 | rusqlite（SQLite）vs sled（嵌入式 KV）vs JSON 文件 | SQLite — 结构化查询与迁移更省心 | M1 |
+| D3 | **会话存储介质** | rusqlite（SQLite）vs sled（嵌入式 KV）vs JSON 文件 | ✅ **已定 JSON 文件并实施完成**，**推翻原建议的 SQLite**。会话是「一份 64 个标签以内的整体快照」，读一次写一次、没有查询也没有单条更新，SQLite 的结构化查询与迁移能力全用不上，却要背 FFI 编译、`bundled` 体积和一层 schema 迁移。sled 同理，且仍在 beta。<br>**实现**：`crates/vela-core/src/session/` 序列化 + `write_bytes_atomic`（与 `fs` 共用同一条临时文件+rename 路径），落点是 Rust 侧从 `app_data_dir()` 算出来的 `session.json`，⛔ **不作为 command 参数**。<br>**重估点**：出现「每窗口独立会话」「具名会话」或「草稿增量写」任一需求时，改成「元信息 JSON + `drafts/<id>` 分文件」，而不是回到 SQLite。详见 §3.3「M1-F 实施修正」1 | **已完成** |
 | D4 | 前端框架最终确认 | Solid（推荐）vs Svelte 5 | Solid | 已定，除非 M0 发现问题 |
 | D5 | 是否内置 P1 工具集 | 全做 vs 只做 P0 | 先只做 P0，按用户反馈补 | M3 |
 | D6 | Sarasa Gothic 是否纳入 | 需人工核对 LICENSE 全文 | 核对通过再纳入，否则用 Maple Mono 替代 | M4 |

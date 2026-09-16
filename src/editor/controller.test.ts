@@ -148,12 +148,27 @@ describe('capture / restore（标签切换的地基）', () => {
     c.destroy()
   })
 
-  it('销毁后 capture / restore 都抛错', () => {
+  it('applyScroll 只动视口，state 对象原样不动', () => {
+    // 这条是 `applyScroll` 存在的理由：workspace.attach 面对的是**刚用这个标签的 state
+    // 建起来的** view，走 restore 会 setState 一次，把一个全新视图的 docView 拆了重建
+    const c = new EditorController(host, stateFor('alpha\nbeta\ngamma'))
+    const before = c.view.state
+
+    c.applyScroll({ scrollTop: 42, scrollLeft: 7 })
+
+    expect(c.view.scrollDOM.scrollTop).toBe(42)
+    expect(c.view.scrollDOM.scrollLeft).toBe(7)
+    expect(c.view.state).toBe(before)
+    c.destroy()
+  })
+
+  it('销毁后 capture / restore / applyScroll 都抛错', () => {
     const c = new EditorController(host, stateFor('x'))
     const snap = c.capture()
     c.destroy()
     expect(() => c.capture()).toThrow(/已销毁/)
     expect(() => c.restore(snap)).toThrow(/已销毁/)
+    expect(() => c.applyScroll(snap)).toThrow(/已销毁/)
   })
 })
 

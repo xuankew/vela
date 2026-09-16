@@ -1,4 +1,4 @@
-import { type EditorState } from '@codemirror/state'
+import { EditorSelection, type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { indentUnit, type LanguageSupport } from '@codemirror/language'
 import { createSignal, type Accessor, type Setter } from 'solid-js'
@@ -6,6 +6,7 @@ import { open as pickToOpen } from '@tauri-apps/plugin-dialog'
 import type { EditorController } from '../editor/controller'
 import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../editor/language'
 import { INDENT_UNIT, indentLabel, languageExtensions } from '../editor/setup'
+import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
 import {
   applyViewConfig,
   createTab,
@@ -152,6 +153,15 @@ export interface Workspace {
    * 返回 true 表示「可以真的关了」，调用方负责去拆窗口（见 `src/ipc/windowClose.ts`）。
    */
   requestWindowClose: () => Promise<boolean>
+  /** 把当前现场写成一份会话存档（M1-F）。**纯读**，不改任何状态 */
+  serializeSession: () => Session
+  /**
+   * 用一份存档整个换掉当前现场。
+   *
+   * ⚠️ **只在启动时用一次**：它会扔掉现在开着的所有标签，而且不问未保存的改动。
+   * 运行期「换一个会话」是另一件事（得先走 `requestWindowClose` 那套确认），不在这里做。
+   */
+  restoreSession: (session: Session) => Promise<void>
 }
 
 export interface WorkspaceOptions {
@@ -346,8 +356,17 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     const pane = paneById(paneId)
     if (!pane) return
     pane.controller = controller
-    // 视图就是用这个标签的 state 挂起来的，不需要 restore；只要把度量对上
-    if (paneId === focusedPaneId()) syncMetrics(activeTab())
+    // 视图就是用这个标签的 state 挂起来的，不需要 restore（那会把一个全新视图的 docView
+    // 拆了重建）；但滚动位置得补上——会话恢复出来的标签带着非零滚动，新 view 是从 0 起的
+    const tab = tabById(pane.tabId())
+    if (tab) controller.applyScroll(tab.snapshot)
+    if (paneId === focusedPaneId()) {
+      syncMetrics(activeTab())
+      // 聚焦的那块要真的能打字。`split` 里的 `focusPane` 跑的时候新分屏的 controller
+      // 还是 null，那一次 `controller?.focus()` 是静默空操作——不补这一下，
+      // 启动、恢复、新建分屏之后都得让用户先点一下编辑器才能开始打字
+      controller.focus()
+    }
   }
 
   function detach(paneId: number) {
@@ -431,7 +450,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     if (dirty.length === 0) return true
     const decision = await promptDiscard(dirty.map((t) => t.doc.name()))
     if (decision === 'cancel') return false
-    if (decision === 'discard') return true
+    if (decision === 'discard') {
+      // 「不保存」= 这些改动不要了。M1-F 之后光放着不管是不够的：会话存档收草稿的
+      // 条件就是「脏」，不把它们清干净，用户刚刚明确扔掉的稿子下次启动会原样回来
+      for (const tab of dirty) tab.doc.discardChanges()
+      return true
+    }
     for (const tab of dirty) {
       await tab.doc.save()
       if (tab.doc.dirty()) return false
@@ -548,6 +572,128 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     }
   }
 
+  /**
+   * 要存进会话的标签。超出 `MAX_SESSION_TABS` 时从后面截断，但**正在显示的标签一个都不丢**。
+   *
+   * 丢一个显示中的标签会让 `panes` 里的一个下标悬空，而 Rust 侧的 `validate` 会因此
+   * 拒掉**整份**存档——为了少存几个标签把整个会话弄没了，是最坏的一笔交换。
+   */
+  function tabsForSession(): Tab[] {
+    const list = tabs()
+    if (list.length <= MAX_SESSION_TABS) return list
+    const shown = new Set(panes().map((p) => p.tabId()))
+    const budget = MAX_SESSION_TABS - shown.size
+    const kept: Tab[] = []
+    // 按原顺序遍历，于是 kept 也是原顺序：截断不该把标签条的顺序打乱
+    for (const tab of list) {
+      if (shown.has(tab.id) || kept.length < budget) kept.push(tab)
+    }
+    return kept
+  }
+
+  function serializeTab(tab: Tab): SessionTab {
+    // 活的现场。显示中的标签 `snapshot` 是**旧的**（只在切走那一刻更新），必须读 view
+    const live = viewOf(tab)?.capture() ?? tab.snapshot
+    const { state } = live
+    const path = tab.doc.path()
+    const dirty = tab.doc.dirty()
+    return {
+      path,
+      format: tab.doc.format(),
+      dirty,
+      lossy: tab.doc.lossy(),
+      // 干净且有路径的标签不存正文：Vela 关着的时候文件可能被别的程序改过，
+      // 恢复时重新读盘才是对的。存了反而会在恢复时把用户的文件悄悄回退
+      draft: dirty || path === null ? state.doc.toString() : null,
+      // 存整个选区数组而不是一个光标：M1-C 把多光标做成了一等公民，
+      // 恢复时把 5 个光标变成 1 个是明显的手感倒退
+      selection: state.selection.ranges.map((r): [number, number] => [r.anchor, r.head]),
+      main: state.selection.mainIndex,
+      scrollTop: live.scrollTop,
+      scrollLeft: live.scrollLeft,
+    }
+  }
+
+  function serializeSession(): Session {
+    const list = tabsForSession()
+    const indexOf = new Map<number, number>()
+    list.forEach((tab, i) => indexOf.set(tab.id, i))
+    const paneList = panes()
+    return {
+      version: SESSION_VERSION,
+      direction: direction(),
+      // 夹到 0：`findIndex` 落空时返回 -1，而 -1 对 serde 的 `usize` 是非法值，
+      // 整份存档会解析失败。`focusedPane()` 本来也是「找不到就退回第一块」这个口径
+      focused: Math.max(0, paneList.findIndex((p) => p.id === focusedPaneId())),
+      tabs: list.map(serializeTab),
+      // 下标一定取得到：tabsForSession 保证了显示中的标签一个都没被截掉
+      panes: paneList.map((p) => indexOf.get(p.tabId())!),
+    }
+  }
+
+  /**
+   * 把存档里的光标与滚动位置装回一个标签的 snapshot。
+   *
+   * 只写 snapshot、不走 dispatch：调用它的时候这些标签**还没被任何分屏显示**
+   * （`panes()` 里还是旧的那批记录），压根没有 view 可 dispatch。
+   */
+  function applyRestoredPosition(tab: Tab, saved: SessionTab) {
+    const state = tab.snapshot.state
+    const len = state.doc.length
+    // 必须夹到文档长度以内：CM6 的 checkSelection 对越界位置直接抛 RangeError，
+    // 而 Vela 关着的时候磁盘上的文件可能被截短了，存档里的光标位置就成了非法值。
+    // 夹是单调的，所以选区之间的先后顺序不会被打乱
+    const clamp = (n: number) => Math.min(Math.max(0, n), len)
+    const ranges = saved.selection.map(([anchor, head]) => EditorSelection.range(clamp(anchor), clamp(head)))
+    tab.snapshot = {
+      // main 也夹一次：Rust 侧校验过，但 restoreSession 是公开方法，
+      // 测试与将来的调用方都可能递进来一份手搓的存档
+      state: state.update({ selection: EditorSelection.create(ranges, Math.min(saved.main, ranges.length - 1)) }).state,
+      scrollTop: saved.scrollTop,
+      scrollLeft: saved.scrollLeft,
+    }
+  }
+
+  async function restoreSession(session: Session): Promise<void> {
+    // 先一次建好所有标签，再灌内容：panes 用的是 session 里的下标，靠 `fresh[i]` 对齐，
+    // 边建边插会让下标错位
+    const fresh = session.tabs.map(() => makeTab())
+
+    // 有草稿的同步装进来；干净又有路径的**重新读盘**。并行读——
+    // 几十个文件串行读会把启动拖成好几秒，而它们之间没有任何依赖
+    await Promise.all(
+      session.tabs.map(async (saved, i) => {
+        const tab = fresh[i]!
+        if (saved.draft !== null) {
+          tab.doc.restoreDraft({
+            path: saved.path,
+            text: saved.draft,
+            format: saved.format,
+            dirty: saved.dirty,
+            lossy: saved.lossy,
+          })
+          return
+        }
+        // 干净又没路径 = 一个空文档，没什么可恢复的
+        if (saved.path === null) return
+        // 读失败不往上抛：`document.ts` 已经把错误落在这个标签自己的 notice 上了，
+        // 一个打不开的文件不该让整份会话恢复失败
+        await tab.doc.openAt(saved.path)
+      }),
+    )
+
+    session.tabs.forEach((saved, i) => applyRestoredPosition(fresh[i]!, saved))
+
+    const freshPanes = session.panes.map((tabIndex) => makePane(fresh[tabIndex]!.id))
+    setDirection(session.direction)
+    setTabs(fresh)
+    // 旧的那批分屏由 Solid 卸载 EditorPane 时自己收尾：`detach` 在 panes() 里找不到
+    // 旧记录会直接返回，controller 由 EditorPane 的 onCleanup 销毁，不会泄漏
+    setPanes(freshPanes)
+    setFocusedPaneId(freshPanes[session.focused]!.id)
+    syncMetrics(activeTab())
+  }
+
   // 起始的那一个空标签与那一块分屏。放在所有函数声明之后：
   // makeTab 要用 host，host 要用 activeTab，activeTab 要用 focusedPane
   const firstTab = makeTab()
@@ -586,5 +732,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     anyDirty: () => tabs().some((t) => t.doc.dirty()),
     // 一次问完所有脏标签，而不是一个一个弹：关窗口时弹五次对话框没人受得了
     requestWindowClose: () => settle(tabs().filter((t) => t.doc.dirty())),
+    serializeSession,
+    restoreSession,
   }
 }

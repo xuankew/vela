@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use encoding::{decode, decode_as, encode, Decoded, Encoding};
 pub use eol::{apply_eol, detect_eol, normalize_to_lf, LineEnding};
 pub use read::{read_text, read_text_as, ReadError, MAX_INLINE_BYTES};
-pub use write::{write_text_atomic, WriteError, WriteReport};
+pub use write::{write_bytes_atomic, write_text_atomic, WriteError, WriteReport};
 
 /// 把一个文档还原成原样所需的全部格式信息。
 ///

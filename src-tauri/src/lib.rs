@@ -12,7 +12,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::save_file,
-            commands::close_window
+            commands::close_window,
+            commands::load_session,
+            commands::save_session
         ])
         // 未保存改动的关闭拦截（PLAN.md M1-D-4）。
         //

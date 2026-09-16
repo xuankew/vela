@@ -65,6 +65,18 @@ export class EditorController {
   }
 
   /**
+   * 只复原视口，不动 state。
+   *
+   * 与 `restore` 分开是因为 `workspace.attach` 需要它：那一刻 view 是**刚用这个标签的
+   * state 建起来的**，再 `setState` 一次等于把一个全新视图的 docView 拆了重建。
+   */
+  applyScroll(snapshot: Pick<EditorSnapshot, 'scrollTop' | 'scrollLeft'>) {
+    this.assertAlive()
+    this.view.scrollDOM.scrollTop = snapshot.scrollTop
+    this.view.scrollDOM.scrollLeft = snapshot.scrollLeft
+  }
+
+  /**
    * `capture` 的逆操作：把某个标签的 state 装回 view，并复原视口。
    *
    * 滚动位置在 `setState` **之后**赋值：setState 会重建整个 docView，先赋的值会被新内容的
@@ -73,8 +85,7 @@ export class EditorController {
   restore(snapshot: EditorSnapshot) {
     this.assertAlive()
     this.view.setState(snapshot.state)
-    this.view.scrollDOM.scrollTop = snapshot.scrollTop
-    this.view.scrollDOM.scrollLeft = snapshot.scrollLeft
+    this.applyScroll(snapshot)
   }
 
   focus() {

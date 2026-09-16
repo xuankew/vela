@@ -61,6 +61,28 @@ export interface DocumentModel {
   dismissNotice: () => void
   /** 打开一个已知路径。将来的「最近文件」与拖拽落文件都走这里 */
   openAt: (path: string) => Promise<void>
+  /**
+   * 会话恢复：把一份完整的文档现场（正文、路径、格式、脏标记、lossy）一次装进来，
+   * **不碰磁盘**。
+   *
+   * 不能复用 `openAt`：那条路走 fs 层并且把 `dirty` 强制设成 false，而恢复出来的草稿
+   * 按定义就是脏的——把它标成干净，下一次关窗口的确认就会直接放行，用户的稿子没了。
+   */
+  restoreDraft: (init: {
+    path: string | null
+    text: string
+    format: FileFormat
+    dirty: boolean
+    lossy: boolean
+  }) => void
+  /**
+   * 用户在关闭确认里答了「不保存」：把这些改动当成从来没发生过。
+   *
+   * M1-F 之前这一步是免费的——窗口一关，内存里的东西自然就没了。有了会话存档之后
+   * 它变成必须的：存档收草稿的条件是「这个文档是脏的」，不清脏标记，用户刚刚明确
+   * 扔掉的稿子下次启动会原样端回来，比一开始不问他还糟。
+   */
+  discardChanges: () => void
   save: () => Promise<void>
   saveAs: () => Promise<void>
   /**
@@ -137,6 +159,35 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     } finally {
       setBusy(false)
     }
+  }
+
+  function restoreDraft(init: {
+    path: string | null
+    text: string
+    format: FileFormat
+    dirty: boolean
+    lossy: boolean
+  }) {
+    // replaceText 而不是 setText：整篇替换会触发 docChanged，不挡住的话恢复出来的
+    // 草稿会被再标一次脏——dirty 该由存档说了算，不该由「装进去」这个动作决定
+    replaceText(init.text)
+    setPath(init.path)
+    // 必须在 replaceText 之后：重建 state 把语言槽位清空了
+    host.pathChanged()
+    setFormat(init.format)
+    setDirty(init.dirty)
+    setLossy(init.lossy)
+    setNotice(null)
+    // 刻意不 host.focus()：恢复好几个标签时，焦点不该落在「恰好最后处理的那个」上。
+    // 聚焦哪块分屏是 workspace 在装分屏时决定的
+  }
+
+  function discardChanges() {
+    // 未命名文档必须连正文一起清掉：磁盘上没有它，正文就是它唯一的副本，
+    // 而存档对未命名文档是无条件收草稿的（不收就等于重启后这个标签凭空变空）。
+    // 有路径的不用动正文——清了脏标记存档就不收它，下次启动重新读盘
+    if (path() === null) replaceText('')
+    setDirty(false)
   }
 
   function changeFormat(patch: Partial<FileFormat>) {
@@ -227,6 +278,8 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     markChanged,
     dismissNotice: () => setNotice(null),
     openAt,
+    restoreDraft,
+    discardChanges,
     save,
     saveAs,
     changeFormat,

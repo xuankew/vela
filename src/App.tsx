@@ -5,6 +5,7 @@ import { attachKeybindingDispatch } from './commands/dispatch'
 import { detectPlatform } from './commands/keybinding'
 import { createCommandRegistry, type AppContext } from './commands/registry'
 import { DiscardDialog } from './doc/DiscardDialog'
+import { createSessionSync, type SessionSync } from './doc/sessionSync'
 import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
 import { createWorkspace, MAX_PANES, type DiscardDecision, type Pane } from './doc/workspace'
@@ -30,10 +31,19 @@ export default function App() {
   let detachCloseGuard: (() => void) | undefined
   /** 卸载比 `listen` 的 promise 先落地时，拿到的注销函数要立刻用掉，见 onMount */
   let tornDown = false
+  let sync: SessionSync | undefined
 
   const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
   const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
   const [fontSize, setFontSize] = createSignal(DEFAULT_FONT_SIZE)
+
+  /**
+   * 会话这一层的提示：存档读不回来、写不下去、草稿超预算被丢。
+   *
+   * 不塞进 `doc.notice()`：这些话说的都不是**某一个文档**，挂在活动文档上会在用户
+   * 切标签时跟着消失，看起来像那条警告只关乎他刚切走的那个文件。
+   */
+  const [sessionWarning, setSessionWarning] = createSignal<string | null>(null)
 
   /**
    * 正在等用户裁决的关闭请求。`null` = 没有对话框。
@@ -134,7 +144,16 @@ export default function App() {
       focusPreviousPane: () => ws.cyclePane(-1),
     })
     detachKeys = attachKeybindingDispatch(registry)
-    void attachWindowCloseGuard(() => ws.requestWindowClose()).then((unlisten) => {
+    sync = createSessionSync({ workspace: ws, onWarn: setSessionWarning })
+    // 不 await：读存档与重新读盘可能要几百毫秒，编辑器该先出来给用户看
+    void sync.start()
+    void attachWindowCloseGuard(async () => {
+      const ok = await ws.requestWindowClose()
+      // 放行之后必须立刻补一次：节流那一轮最长要等 5 秒，而 close_window 是
+      // Window::destroy()，webview 当场就没了，最后 5 秒里敲的字会全丢
+      if (ok) await sync?.saveNow()
+      return ok
+    }).then((unlisten) => {
       if (tornDown) unlisten()
       else detachCloseGuard = unlisten
     })
@@ -142,6 +161,7 @@ export default function App() {
 
   onCleanup(() => {
     tornDown = true
+    sync?.stop()
     detachCloseGuard?.()
     detachKeys?.()
     disposeCommands?.()
@@ -244,6 +264,16 @@ export default function App() {
       {/* 常驻容器：.app 是 grid，行数必须固定。两条提示各自当 grid item 的话，
           出现 0/1/2 条时 1fr 会落到不同的行上，正文区被挤掉 */}
       <div class="notices">
+        <Show when={sessionWarning()}>
+          {(text) => (
+            <div class="notice warning">
+              <span>{text()}</span>
+              <button class="notice-close" onClick={() => setSessionWarning(null)} title="关闭">
+                ×
+              </button>
+            </div>
+          )}
+        </Show>
         <Show when={activeDoc().lossy()}>
           <div class="notice warning">
             这个文件没能完整解码，正文里的 U+FFFD 是替换字符。<strong>原样保存会永久损坏它</strong>

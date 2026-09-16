@@ -371,3 +371,198 @@ describe('编码与换行符切换（M1-E-2b）', () => {
     expect(doc.busy()).toBe(false)
   })
 })
+
+describe('restoreDraft（M1-F 会话恢复）', () => {
+  /** 正文一落地就同步回调 markChanged 的宿主：`replacing` 标志只有在这种宿主下才真的被考验 */
+  function eagerHarness() {
+    const state = { text: '', focuses: 0, pathChanges: 0, textAtPathChange: [] as string[] }
+    let doc!: DocumentModel
+    const host: DocumentHost = {
+      getText: () => state.text,
+      setText: (t) => {
+        state.text = t
+        doc.markChanged()
+      },
+      focus: () => {
+        state.focuses += 1
+      },
+      pathChanged: () => {
+        state.pathChanges += 1
+        // 记下这一刻的正文，用来验证「先换正文，再报路径变了」这个顺序
+        state.textAtPathChange.push(state.text)
+      },
+    }
+    doc = createDocumentModel(host)
+    return { doc, state }
+  }
+
+  it('整份现场来自入参，一次磁盘都不碰', () => {
+    const { doc, state } = eagerHarness()
+
+    doc.restoreDraft({
+      path: '/notes/draft.md',
+      text: '恢复出来的正文',
+      format: { encoding: 'gbk', bom: false, eol: 'crlf' },
+      dirty: true,
+      lossy: false,
+    })
+
+    expect(ipc.openFile).not.toHaveBeenCalled()
+    expect(state.text).toBe('恢复出来的正文')
+    expect(doc.path()).toBe('/notes/draft.md')
+    expect(doc.name()).toBe('draft.md')
+    expect(doc.format()).toEqual({ encoding: 'gbk', bom: false, eol: 'crlf' })
+    expect(doc.busy()).toBe(false)
+  })
+
+  it('dirty 由存档说了算：true 保得住，false 也不会被替换动作弄脏', () => {
+    const dirtyOne = eagerHarness()
+    dirtyOne.doc.restoreDraft({ path: '/a.txt', text: 'x', format: DEFAULT_FORMAT, dirty: true, lossy: false })
+    expect(dirtyOne.doc.dirty()).toBe(true)
+
+    // 干净的存档（有路径、内容能从磁盘读回来）恢复出来必须还是干净的，
+    // 否则下次关窗口的确认会为一个其实没改过的文件弹一次
+    const cleanOne = eagerHarness()
+    cleanOne.doc.restoreDraft({ path: '/a.txt', text: 'x', format: DEFAULT_FORMAT, dirty: false, lossy: false })
+    expect(cleanOne.doc.dirty()).toBe(false)
+    // 而宿主确实回调过 markChanged：挡住它的是 replacing 标志，不是「没人调」
+    expect(cleanOne.state.text).toBe('x')
+  })
+
+  it('未命名文档也恢复得回来：path 是 null，正文与格式照旧落地', () => {
+    const { doc, state } = eagerHarness()
+
+    doc.restoreDraft({
+      path: null,
+      text: '还没落过盘的稿子',
+      format: { encoding: 'utf16_le', bom: true, eol: 'lf' },
+      dirty: true,
+      lossy: false,
+    })
+
+    expect(doc.path()).toBeNull()
+    expect(doc.name()).toBe(UNTITLED_LABEL)
+    expect(state.text).toBe('还没落过盘的稿子')
+    // 未命名文档的格式决定只能存在会话里，丢了就等于把用户选的编码扔了
+    expect(doc.format()).toEqual({ encoding: 'utf16_le', bom: true, eol: 'lf' })
+  })
+
+  it('pathChanged 报一次，而且是在正文已经就位之后', () => {
+    const { doc, state } = eagerHarness()
+
+    doc.restoreDraft({ path: '/a.ts', text: 'const a = 1', format: DEFAULT_FORMAT, dirty: true, lossy: false })
+
+    // 重建 state 会把语言槽位清空，所以必须报；报两次会让宿主白重装一次语言
+    expect(state.pathChanges).toBe(1)
+    // 反过来的话语言会装到一个马上被丢弃的 state 上，而且静默无报错
+    expect(state.textAtPathChange).toEqual(['const a = 1'])
+  })
+
+  it('lossy 跟着存档走：丢了它就等于把「原样保存会损坏这个文件」的警告删掉', () => {
+    const { doc } = eagerHarness()
+
+    doc.restoreDraft({ path: '/broken.bin', text: '有\uFFFD', format: DEFAULT_FORMAT, dirty: false, lossy: true })
+
+    expect(doc.lossy()).toBe(true)
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('不抢焦点：恢复好几个标签时，焦点不该落在恰好最后处理的那个上', () => {
+    const { doc, state } = eagerHarness()
+
+    doc.restoreDraft({ path: '/a.txt', text: 'x', format: DEFAULT_FORMAT, dirty: false, lossy: false })
+
+    // openAt 会 host.focus()，restoreDraft 刻意不会——聚焦哪块分屏是 workspace 的事
+    expect(state.focuses).toBe(0)
+  })
+
+  it('覆盖掉原来那份文档，连通知一起清掉', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockRejectedValue({ kind: 'io', reason: 'NotFound', message: '没了' })
+    await doc.openAt('/gone.txt')
+    expect(doc.notice()?.level).toBe('error')
+
+    doc.restoreDraft({ path: '/real.txt', text: '真的', format: DEFAULT_FORMAT, dirty: true, lossy: false })
+
+    expect(doc.notice()).toBeNull()
+    expect(state.text).toBe('真的')
+    expect(doc.path()).toBe('/real.txt')
+  })
+})
+
+describe('discardChanges（M1-F：答了「不保存」之后）', () => {
+  /** 正文一落地就同步回调 markChanged 的宿主：`replacing` 标志只有在这种宿主下才真的被考验 */
+  function eagerHarness() {
+    const state = { text: '' }
+    let doc!: DocumentModel
+    const host: DocumentHost = {
+      getText: () => state.text,
+      setText: (t) => {
+        state.text = t
+        doc.markChanged()
+      },
+      focus: () => {},
+      pathChanged: () => {},
+    }
+    doc = createDocumentModel(host)
+    return { doc, state }
+  }
+
+  it('有路径的：清脏标记，正文与路径都不动，也不去重读磁盘', async () => {
+    const { doc, state } = harness()
+    // beforeEach 只 reset 了 openFile、没给默认返回值，不补的话 openAt 会静默失败、路径留在 null
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '正文改'
+    doc.markChanged()
+    expect(doc.dirty()).toBe(true)
+
+    doc.discardChanges()
+
+    expect(doc.dirty()).toBe(false)
+    // 刻意不回滚正文：真回滚要重新读一次盘，而这条路跑在关窗/关标签的半路上，
+    // 读失败会把一个已经放行了的关闭又卡住。调用方紧接着就把窗口拆了
+    expect(state.text).toBe('正文改')
+    expect(doc.path()).toBe('/a.txt')
+    expect(ipc.openFile).toHaveBeenCalledTimes(1)
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+  })
+
+  it('未命名的：正文一起清空——磁盘上没有它，正文就是唯一的副本', () => {
+    const { doc, state } = harness()
+    state.text = '从没落过盘的稿子'
+    doc.markChanged()
+
+    doc.discardChanges()
+
+    expect(doc.dirty()).toBe(false)
+    expect(state.text).toBe('')
+    expect(doc.path()).toBeNull()
+  })
+
+  it('清正文这个动作本身不会又把文档标脏', () => {
+    const { doc, state } = eagerHarness()
+    state.text = '稿子'
+    doc.markChanged()
+    expect(doc.dirty()).toBe(true)
+
+    doc.discardChanges()
+
+    // setText 同步回调了 markChanged，靠 `replacing` 标志挡住；挡不住的话
+    // 「不保存」就变成了「把文档标脏再清空」，存档照样会收下这个空草稿
+    expect(doc.dirty()).toBe(false)
+    expect(state.text).toBe('')
+  })
+
+  it('本来就干净的文档上是空操作', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+
+    doc.discardChanges()
+
+    expect(doc.dirty()).toBe(false)
+    expect(state.text).toBe('正文')
+    expect(doc.notice()).toBeNull()
+  })
+})

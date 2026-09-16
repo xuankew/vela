@@ -16,7 +16,7 @@ import { detectPlatform } from './commands/keybinding'
  * 或者等 M1-H 的 CI 里加一个 Tauri driver。
  */
 
-const { ipc, dialog, tauriEvent, tauriCore } = vi.hoisted(() => ({
+const { ipc, dialog, tauriEvent, tauriCore, sessionCmd } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn(),
     saveFile: vi.fn(),
@@ -28,6 +28,17 @@ const { ipc, dialog, tauriEvent, tauriCore } = vi.hoisted(() => ({
   // 不 mock 的话 `listen` 会在 onMount 里抛，变成一个没人管的 rejection。
   tauriEvent: { listen: vi.fn() },
   tauriCore: { invoke: vi.fn() },
+  /**
+   * 会话存档这一头（M1-F）。App 一挂载就会 `load_session`，关窗放行后会 `save_session`，
+   * 所以这两个 command 的返回值必须有明确的形状：`load_session` 答 `undefined` 会被当成
+   * 一份存档喂给 restoreSession，然后在提示条上留一句谁也看不懂的「undefined」。
+   */
+  sessionCmd: {
+    archive: null as unknown,
+    loadError: null as unknown,
+    saved: [] as unknown[],
+    droppedDrafts: 0,
+  },
 }))
 
 // 只假掉三个函数，**其余用真的**：状态栏要遍历 ENCODING_CHOICES / ENCODING_IDS /
@@ -68,19 +79,53 @@ beforeEach(async () => {
   tauriCore.invoke.mockReset()
   listeners.clear()
   ipc.saveFile.mockResolvedValue({ bytesWritten: 6, unmappable: false })
-  tauriCore.invoke.mockResolvedValue(undefined)
+  sessionCmd.archive = null
+  sessionCmd.loadError = null
+  sessionCmd.saved = []
+  sessionCmd.droppedDrafts = 0
+  tauriCore.invoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === 'load_session') {
+      if (sessionCmd.loadError !== null) throw sessionCmd.loadError
+      return sessionCmd.archive
+    }
+    if (cmd === 'save_session') {
+      sessionCmd.saved.push(args?.session)
+      return { bytesWritten: 120, droppedDrafts: sessionCmd.droppedDrafts }
+    }
+    return undefined
+  })
   tauriEvent.listen.mockImplementation(async (name: string, handler: (payload: unknown) => void) => {
     listeners.set(name, handler)
     return () => {
       listeners.delete(name)
     }
   })
-  container = document.createElement('div')
-  document.body.appendChild(container)
-  dispose = render(() => <App />, container)
+  mountApp()
   // 关窗守卫的注册要等 `listen` 的 promise 落地，不然 listeners 还是空的
   await flush()
 })
+
+function mountApp() {
+  container = document.createElement('div')
+  document.body.appendChild(container)
+  dispose = render(() => <App />, container)
+}
+
+/**
+ * 换一份存档，重新走一遍启动。
+ *
+ * 会话只在挂载时读一次，所以改完 mock 必须重挂——直接在跑着的 App 上改
+ * `sessionCmd.archive` 什么都不会发生，用例会绿得毫无意义。
+ */
+async function restartWith(archive: unknown, loadError: unknown = null) {
+  dispose()
+  container.remove()
+  sessionCmd.archive = archive
+  sessionCmd.loadError = loadError
+  sessionCmd.saved = []
+  mountApp()
+  await flush()
+}
 
 afterEach(() => {
   dispose()
@@ -732,5 +777,181 @@ describe('分屏接线', () => {
     button('合并').click()
     expect(hosts()).toHaveLength(1)
     expect(button('合并').disabled).toBe(true)
+  })
+})
+
+describe('会话恢复接线（M1-F）', () => {
+  /**
+   * 存档里的一个标签。字段形状由 `src/ipc/session.ts` 与 Rust 侧的契约测试钉住，
+   * 这里只负责填内容——重复写全 14 个字段会让每条用例的重点淹在样板里。
+   */
+  function savedTab(over: Record<string, unknown> = {}) {
+    return {
+      path: null,
+      format: { encoding: 'utf8', bom: false, eol: 'lf' },
+      dirty: false,
+      lossy: false,
+      draft: null,
+      selection: [[0, 0]],
+      main: 0,
+      scrollTop: 0,
+      scrollLeft: 0,
+      ...over,
+    }
+  }
+
+  function savedSession(tabs: unknown[], over: Record<string, unknown> = {}) {
+    return { version: 1, direction: 'row', focused: 0, tabs, panes: [0], ...over }
+  }
+
+  /** 最近一次写出去的存档 */
+  function lastArchive(): {
+    tabs: { path: string | null; draft: string | null; dirty: boolean }[]
+    panes: number[]
+    focused: number
+  } {
+    const last = sessionCmd.saved[sessionCmd.saved.length - 1]
+    if (!last) throw new Error('还没有写过存档')
+    return last as {
+      tabs: { path: string | null; draft: string | null; dirty: boolean }[]
+      panes: number[]
+      focused: number
+    }
+  }
+
+  /** 打开一个文件并把正文改成脏的。关窗确认会拦住它，用例自己决定怎么答 */
+  async function dirtyFileTab(path = '/a.txt', extra = '改') {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text: '正文' }))
+    button('打开…').click()
+    await flush()
+    typeText(extra)
+  }
+
+  it('启动时把上次的标签读回来：干净的重读磁盘，脏的照抄草稿', async () => {
+    // beforeEach 只 reset 了 openFile、没给默认返回值：恢复干净标签走的正是这条路
+    ipc.openFile.mockResolvedValue(textFile({ text: '磁盘上的样子' }))
+    await restartWith(
+      savedSession([savedTab({ path: '/a.txt' }), savedTab({ draft: '没存过的稿子', dirty: true })], {
+        focused: 1,
+        panes: [0, 1],
+      }),
+    )
+
+    expect(tabs()).toHaveLength(2)
+    expect(tabs()[0]!.textContent).toContain('a.txt')
+    expect(tabs()[1]!.textContent).toContain('● 空文档')
+    expect(hosts()).toHaveLength(2)
+    // 干净又有路径的那个是**重新读盘**的：Vela 关着的时候文件可能被别的程序改过
+    expect(views()[0]!.state.doc.toString()).toBe('磁盘上的样子')
+    expect(ipc.openFile).toHaveBeenCalledWith('/a.txt')
+    expect(views()[1]!.state.doc.toString()).toBe('没存过的稿子')
+    // focused: 1 是**分屏**下标，所以状态栏报的是第二个标签
+    expect(statusName()).toBe('● 空文档')
+    expect(hosts()[1]!.classList.contains('focused')).toBe(true)
+  })
+
+  it('存档读不回来：提示条说一句，编辑器照常能用', async () => {
+    await restartWith(null, { kind: 'corrupt', message: '第 2 个标签没有选区' })
+
+    const [notice] = notices()
+    expect(notice!.level).toBe('warning')
+    expect(notice!.text).toContain('上次的会话没能读回来')
+    expect(notice!.text).toContain('第 2 个标签没有选区')
+    // 关键是应用没死：留着初始那个空标签，还能打字
+    expect(tabs()).toHaveLength(1)
+    typeText('还能打字')
+    expect(statusCounts()).toBe('1 行 · 4 字符')
+  })
+
+  it('关窗放行后把会话写下去：分屏布局与聚焦的分屏都进存档', async () => {
+    button('右分屏').click()
+    expect(hosts()).toHaveLength(2)
+
+    await rustRequestsClose()
+
+    expect(tauriCore.invoke).toHaveBeenCalledWith('close_window')
+    expect(sessionCmd.saved).toHaveLength(1)
+    expect(lastArchive().tabs).toHaveLength(2)
+    expect(lastArchive().panes).toEqual([0, 1])
+    expect(lastArchive().focused).toBe(1)
+  })
+
+  it('答「不保存」：被扔掉的稿子不会跟着存档回来', async () => {
+    // 这条是 M1-F 与 M1-D 的接缝。有了会话存档之后，「不保存」不再等于「窗口一关就没了」：
+    // 存档收草稿的条件就是脏标记，不清掉它，用户刚刚明确扔掉的东西下次启动会原样端回来
+    await dirtyFileTab()
+
+    await rustRequestsClose()
+    expect(sessionCmd.saved).toHaveLength(0) // 没放行之前一个字节都不写
+    modalButton('不保存').click()
+    await flush()
+
+    expect(tauriCore.invoke).toHaveBeenCalledWith('close_window')
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+    expect(lastArchive().tabs[0]!.path).toBe('/a.txt')
+    expect(lastArchive().tabs[0]!.dirty).toBe(false)
+    expect(lastArchive().tabs[0]!.draft).toBeNull()
+  })
+
+  it('答「保存」：先落盘，存档里那个文档是干净的，下次启动重新读盘', async () => {
+    await dirtyFileTab()
+
+    await rustRequestsClose()
+    modalButton('保存').click()
+    await flush()
+
+    expect(ipc.saveFile).toHaveBeenCalledWith('/a.txt', '正文改', { encoding: 'utf8', bom: false, eol: 'lf' })
+    expect(tauriCore.invoke).toHaveBeenCalledWith('close_window')
+    expect(lastArchive().tabs[0]!.draft).toBeNull()
+    expect(lastArchive().tabs[0]!.dirty).toBe(false)
+  })
+
+  it('答「取消」时一个字节都不写：用户没同意关，现场不该被当成已经存好了', async () => {
+    await dirtyFileTab('/a.txt', '不想丢的稿子')
+
+    await rustRequestsClose()
+    modalButton('取消').click()
+    await flush()
+
+    expect(tauriCore.invoke).not.toHaveBeenCalledWith('close_window')
+    expect(sessionCmd.saved).toHaveLength(0)
+    // 稿子还在，脏标记也还在
+    expect(statusName()).toBe('● a.txt')
+  })
+
+  it('现场没变过就不重复写：关两次也只存一份', async () => {
+    await rustRequestsClose()
+    await rustRequestsClose()
+
+    expect(sessionCmd.saved).toHaveLength(1)
+  })
+
+  it('草稿超预算被丢掉时说出来，而且可以关掉', async () => {
+    sessionCmd.droppedDrafts = 2
+    button('右分屏').click()
+
+    await rustRequestsClose()
+
+    const [notice] = notices()
+    expect(notice!.level).toBe('warning')
+    expect(notice!.text).toContain('2 个文档')
+    expect(notice!.text).toContain('没能存进会话')
+
+    container.querySelector<HTMLButtonElement>('.notice-close')!.click()
+    expect(container.querySelector('.notice')).toBeNull()
+  })
+
+  it('卸载时把节流定时器停掉：组件没了它还每 5 秒醒一次就是泄漏', async () => {
+    // 这条盯的是 App 有没有接 `stop()`。真的 setInterval 在 jsdom 里是活的，
+    // 不停掉的话它会在这个用例结束之后继续跑，把断言写到别的用例的存档里
+    const before = sessionCmd.saved.length
+    dispose()
+    container.remove()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(sessionCmd.saved).toHaveLength(before)
+    // afterEach 还会 dispose 一次，重复调用必须安全
+    mountApp()
   })
 })

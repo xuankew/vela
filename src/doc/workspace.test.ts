@@ -53,6 +53,7 @@ import type { LanguageChoice } from '../editor/language'
 import { codeFontBySyntax, indentLabel, lineWrapEnabled } from '../editor/setup'
 import { completeWords, wordPeers } from '../editor/wordSource'
 import type { TextFile, WriteReport } from '../ipc/fs'
+import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
 import { tabText } from './tab'
 import {
   createWorkspace,
@@ -1313,5 +1314,300 @@ describe('关闭确认', () => {
       expect(pane.ws.tabs()).toHaveLength(2)
       expect(pane.ws.anyDirty()).toBe(true)
     })
+  })
+})
+
+/**
+ * M1-F-4：会话的序列化与恢复。
+ *
+ * 这一组必须挂**真的** controller：`serializeSession` 读的是活的 `view.state` 与
+ * `scrollDOM`，`attach` 要把滚动位置与焦点落到刚建起来的 view 上——拿替身这两条都验不出来，
+ * 而「读错来源」正是这一层最容易犯、又最不容易被发现的错。
+ */
+describe('M1-F-4：会话序列化与恢复', () => {
+  function sessionTab(overrides: Partial<SessionTab> = {}): SessionTab {
+    return {
+      path: null,
+      format: { encoding: 'utf8', bom: false, eol: 'lf' },
+      dirty: true,
+      lossy: false,
+      draft: '',
+      selection: [[0, 0]],
+      main: 0,
+      scrollTop: 0,
+      scrollLeft: 0,
+      ...overrides,
+    }
+  }
+
+  function sessionOf(tabs: SessionTab[], overrides: Partial<Session> = {}): Session {
+    return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], ...overrides }
+  }
+
+  /**
+   * 模拟 Solid 在 `restoreSession` 换掉 pane 记录之后做的事：为每块新分屏挂一个 EditorPane。
+   *
+   * 不模拟这一步的话，恢复出来的标签永远停在 snapshot 上，`attach` 里的滚动与焦点
+   * 压根不会被执行到——而那正是「恢复完还得先点一下编辑器才能打字」这个 bug 的所在。
+   */
+  function remountAll(ws: Workspace) {
+    for (const p of ws.panes()) {
+      if (p.controller) continue
+      const host = document.createElement('div')
+      document.body.appendChild(host)
+      const tab = ws.tabs().find((t) => t.id === p.tabId())!
+      const controller = new EditorController(host, tab.snapshot.state)
+      liveEditors.push({ controller, host })
+      ws.attach(p.id, controller)
+    }
+  }
+
+  it('serializeSession 是纯读：调完之后现场一点没变', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    pane.type('x')
+    const stateBefore = pane.state
+    const tabsBefore = pane.ws.tabs()
+    const panesBefore = pane.ws.panes()
+
+    pane.ws.serializeSession()
+
+    expect(pane.state).toBe(stateBefore)
+    expect(pane.ws.tabs()).toBe(tabsBefore)
+    expect(pane.ws.panes()).toBe(panesBefore)
+  })
+
+  it('读的是活的 view，不是切走那一刻的旧 snapshot', async () => {
+    // 显示期间 `tab.snapshot` 一直是旧的（只在 capture 时更新）。读错来源的后果是
+    // **存档里存的是打开文件那一刻的正文**，用户最后敲的那些字全丢，而且不报错
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    pane.type('刚敲进去的')
+    // snapshot 停在打开那一刻：里面有文件正文，但没有刚敲进去的那些字
+    expect(tabText(pane.ws.activeTab())).toBe('正文')
+
+    const saved = pane.ws.serializeSession()
+
+    expect(saved.tabs[0]!.draft).toBe('正文刚敲进去的')
+  })
+
+  it('draft 的口径：干净又有路径的不存正文，脏的与未命名的存', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    expect(pane.ws.serializeSession().tabs[0]!).toMatchObject({ path: '/a.txt', dirty: false, draft: null })
+
+    pane.type('改')
+    expect(pane.ws.serializeSession().tabs[0]!).toMatchObject({ dirty: true, draft: '正文改' })
+
+    pane.ws.newTab()
+    pane.type('还没落盘')
+    const untitled = pane.ws.serializeSession().tabs[1]!
+    expect(untitled).toMatchObject({ path: null, dirty: true, draft: '还没落盘' })
+    // 未命名文档的格式决定也只能存在这儿
+    expect(untitled.format).toEqual({ encoding: 'utf8', bom: false, eol: 'lf' })
+  })
+
+  it('多光标、主选区下标与滚动位置都进存档', async () => {
+    const pane = mounted()
+    pane.type('alpha\nbeta\ngamma')
+    pane.controller.view.dispatch({
+      selection: EditorSelection.create([EditorSelection.cursor(2), EditorSelection.range(6, 9)], 1),
+    })
+    pane.setScroll(120, 5)
+
+    const saved = pane.ws.serializeSession()
+
+    expect(saved.tabs[0]!.selection).toEqual([
+      [2, 2],
+      [6, 9],
+    ])
+    expect(saved.tabs[0]!.main).toBe(1)
+    expect(saved.tabs[0]!.scrollTop).toBe(120)
+    expect(saved.tabs[0]!.scrollLeft).toBe(5)
+  })
+
+  it('存下来再恢复回来：正文、脏标记、布局、方向、聚焦、滚动一样不少', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.md')
+    pane.type('# 标题')
+    pane.setScroll(80)
+    const right = pane.splitPane('column')
+    await pane.ws.openAt('/b.txt')
+    right.type('右边的草稿')
+    const saved = pane.ws.serializeSession()
+    expect(saved).toMatchObject({ direction: 'column', focused: 1, panes: [0, 1] })
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+    remountAll(fresh.ws)
+
+    expect(fresh.ws.tabs().map((t) => t.doc.path())).toEqual(['/a.md', '/b.txt'])
+    expect(tabText(fresh.ws.tabs()[0]!)).toBe('正文# 标题')
+    expect(tabText(fresh.ws.tabs()[1]!)).toBe('正文右边的草稿')
+    expect(fresh.ws.tabs().map((t) => t.doc.dirty())).toEqual([true, true])
+    expect(fresh.ws.direction()).toBe('column')
+    expect(fresh.ws.panes()).toHaveLength(2)
+    expect(fresh.ws.activeTab().doc.path()).toBe('/b.txt')
+    // 滚动位置由 attach 落到刚建起来的 view 上
+    expect(fresh.ws.panes()[0]!.controller!.view.scrollDOM.scrollTop).toBe(80)
+  })
+
+  it('干净又有路径的标签恢复时重新读盘：关机期间被改过的文件以磁盘为准', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    const saved = pane.ws.serializeSession()
+    expect(saved.tabs[0]!.draft).toBeNull()
+
+    ipc.openFile.mockResolvedValue(textFile({ text: '关机期间被别的程序改过了' }))
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    expect(ipc.openFile).toHaveBeenCalledWith('/a.txt')
+    expect(tabText(fresh.ws.activeTab())).toBe('关机期间被别的程序改过了')
+    expect(fresh.ws.activeTab().doc.dirty()).toBe(false)
+  })
+
+  it('脏标签的草稿原样回来，一次磁盘都不碰', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    pane.type('改过了')
+    const saved = pane.ws.serializeSession()
+
+    ipc.openFile.mockClear()
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    expect(ipc.openFile).not.toHaveBeenCalled()
+    expect(tabText(fresh.ws.activeTab())).toBe('正文改过了')
+    expect(fresh.ws.activeTab().doc.dirty()).toBe(true)
+    expect(fresh.ws.activeTab().doc.path()).toBe('/a.txt')
+  })
+
+  it('一个文件读不回来不影响其余标签：错误落在那个标签自己的提示条上', async () => {
+    ipc.openFile.mockImplementation(async (path: string) => {
+      if (path === '/gone.txt') throw { kind: 'io', reason: 'NotFound', message: '没了' }
+      return textFile({ text: `${path} 的正文` })
+    })
+    const saved = sessionOf(
+      [
+        sessionTab({ path: '/gone.txt', dirty: false, draft: null }),
+        sessionTab({ path: '/ok.txt', dirty: false, draft: null }),
+      ],
+      // 一块分屏显示第二个标签：panes 不需要覆盖所有标签
+      { panes: [1] },
+    )
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    const [broken, ok] = fresh.ws.tabs()
+    expect(broken!.doc.notice()?.level).toBe('error')
+    expect(ok!.doc.notice()).toBeNull()
+    expect(tabText(ok!)).toBe('/ok.txt 的正文')
+    expect(fresh.ws.activeTab()).toBe(ok)
+  })
+
+  it('存档里的光标越界时被夹住，而不是让 CM6 抛 RangeError', async () => {
+    // Vela 关着的时候文件可能被截短：存档里的 cursor=999，恢复回来正文只有 2 个字符。
+    // 不夹的话 checkSelection 直接抛，整个启动恢复都完不成
+    const saved = sessionOf([sessionTab({ draft: '短文', selection: [[999, 999]], main: 0 })])
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    const state = fresh.ws.activeTab().snapshot.state
+    expect(state.selection.main.head).toBe(2)
+    expect(state.doc.toString()).toBe('短文')
+  })
+
+  it('恢复出来的语言跟着路径走', async () => {
+    const saved = sessionOf([
+      sessionTab({ path: '/notes.md', draft: '# 标题' }),
+      sessionTab({ path: '/var/app.log', draft: '一行日志' }),
+    ])
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+    remountAll(fresh.ws)
+
+    const [md, log] = fresh.ws.tabs()
+    expect(languageName(md!.snapshot.state)).toBe('markdown')
+    // 没匹配上的扩展名不挂语言，与 M1-E-1 那条口径一致
+    expect(languageName(log!.snapshot.state)).toBe(null)
+  })
+
+  it('恢复完聚焦的那块分屏直接能打字，不用先点一下', async () => {
+    const pane = mounted()
+    pane.splitPane('column')
+    const saved = pane.ws.serializeSession()
+    expect(saved.focused).toBe(1)
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+    remountAll(fresh.ws)
+
+    const focused = fresh.ws.panes()[saved.focused]!
+    const other = fresh.ws.panes()[0]!
+    expect(focused.controller).not.toBeNull()
+    expect(focused.controller!.view.dom.contains(document.activeElement)).toBe(true)
+    // 没聚焦的那块不该抢走焦点
+    expect(other.controller!.view.dom.contains(document.activeElement)).toBe(false)
+  })
+
+  it('恢复会整个换掉现在的现场', async () => {
+    const fresh = mounted()
+    fresh.type('要被扔掉的')
+    expect(fresh.ws.anyDirty()).toBe(true)
+
+    await fresh.ws.restoreSession(sessionOf([sessionTab({ path: '/a.txt', draft: '存档里的' })]))
+
+    expect(fresh.ws.tabs()).toHaveLength(1)
+    expect(tabText(fresh.ws.activeTab())).toBe('存档里的')
+    expect(fresh.ws.activeTab().doc.path()).toBe('/a.txt')
+  })
+
+  it('标签数超过上限时从后面截断，但分屏正在显示的那个一定留住', async () => {
+    // 截掉一个显示中的标签会让 panes 里的下标悬空，Rust 侧因此拒掉**整份**存档
+    const ws = createWorkspace()
+    for (let i = 0; i < MAX_SESSION_TABS + 3; i++) ws.newTab()
+    const last = ws.tabs()[ws.tabs().length - 1]!
+    ws.activateTab(last.id)
+    await ws.openAt('/last.txt')
+
+    const saved = ws.serializeSession()
+
+    expect(saved.tabs).toHaveLength(MAX_SESSION_TABS)
+    // 最后那个标签被留下来了，而且落在末尾——panes 指得过去
+    expect(saved.panes).toEqual([MAX_SESSION_TABS - 1])
+    expect(saved.tabs[MAX_SESSION_TABS - 1]!.path).toBe('/last.txt')
+    expect(saved.focused).toBe(0)
+  })
+
+  it('关窗时答「不保存」：被扔掉的草稿不会从存档里回来', async () => {
+    // M1-F 与 M1-D 的接缝。存档收草稿的条件就是脏标记，所以「不保存」必须真的把
+    // 文档清干净——否则那个确认对话框在撒谎：用户点了「不保存」，稿子下次启动照样在
+    const pane = mounted({ promptDiscard: async () => 'discard' })
+    await pane.ws.openAt('/a.txt')
+    pane.type('不要了')
+    expect(pane.ws.serializeSession().tabs[0]!.draft).toBe('正文不要了')
+
+    expect(await pane.ws.requestWindowClose()).toBe(true)
+
+    const saved = pane.ws.serializeSession()
+    expect(saved.tabs[0]!.dirty).toBe(false)
+    // 是 null 而不是空串：恢复时会重新读盘，用户看到的就是他要的那个「磁盘上的样子」
+    expect(saved.tabs[0]!.draft).toBeNull()
+  })
+
+  it('未命名文档答「不保存」：正文一起清空，磁盘上没有它、正文就是唯一的副本', async () => {
+    const pane = mounted({ promptDiscard: async () => 'discard' })
+    pane.type('从没落过盘')
+    expect(pane.ws.anyDirty()).toBe(true)
+
+    expect(await pane.ws.requestWindowClose()).toBe(true)
+
+    expect(pane.ws.anyDirty()).toBe(false)
+    expect(pane.doc).toBe('')
+    expect(pane.ws.serializeSession().tabs[0]!.draft).toBe('')
   })
 })
