@@ -33,6 +33,7 @@ function makeTab(text = '', config: ViewConfig = createViewConfig(), onUpdate?: 
     getText: (tab) => tabText(tab),
     setText: (tab, next) => replaceTabText(tab, next, config),
     focus: () => {},
+    pathChanged: () => {},
   }
   return createTab({ id: idSeq++, text, config, host, ...(onUpdate ? { onUpdate } : {}) })
 }
@@ -59,7 +60,7 @@ describe('createTab', () => {
     expect(lineWrapEnabled(off.snapshot.state)).toBe(false)
   })
 
-  it('host 的三个方法收到的都是标签自己，不是某个全局的当前标签', () => {
+  it('host 的四个方法收到的都是标签自己，不是某个全局的当前标签', () => {
     // 这条防的是「所有标签共用一个 host 闭包」：那样的话打开文件会把内容写进
     // 当前活动标签而不是发起打开的那个，而且不报错。
     const seen: Tab[] = []
@@ -76,6 +77,9 @@ describe('createTab', () => {
       focus: (tab) => {
         seen.push(tab)
       },
+      pathChanged: (tab) => {
+        seen.push(tab)
+      },
     }
     const a = createTab({ id: 1, text: 'A', config, host })
     const b = createTab({ id: 2, text: 'B', config, host })
@@ -83,10 +87,11 @@ describe('createTab', () => {
     host.setText(a, 'A2')
     host.setText(b, 'B2')
     host.focus(a)
+    host.pathChanged(b)
     expect(tabText(a)).toBe('A2')
     expect(tabText(b)).toBe('B2')
     expect(host.getText(b)).toBe('B2')
-    expect(seen).toEqual([a, b, a, b])
+    expect(seen).toEqual([a, b, a, b, b])
   })
 
   it('文档模型的操作只脏自己那个标签', () => {

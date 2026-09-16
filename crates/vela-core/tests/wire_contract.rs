@@ -46,6 +46,25 @@ fn file_format_的字段名与枚举值() {
     assert_eq!(serde_json::to_string(&Encoding::Gbk).unwrap(), r#""gbk""#);
 }
 
+/// `open_file` 的第二个参数是 `Option<Encoding>`：`null` 走探测，字符串则跳过探测。
+///
+/// 前端**总是**带上这个 key（不覆写时传 `null`），所以「key 整个缺失」不在契约里——
+/// Tauri 对缺失参数与 `null` 的处理并不显然一致，不依赖它就不必去赌。
+#[test]
+fn 编码覆写参数用_null_表示走探测() {
+    assert_eq!(serde_json::from_str::<Option<Encoding>>("null").unwrap(), None);
+    assert_eq!(serde_json::from_str::<Option<Encoding>>(r#""gbk""#).unwrap(), Some(Encoding::Gbk));
+    assert_eq!(
+        serde_json::from_str::<Option<Encoding>>(r#""utf16_le""#).unwrap(),
+        Some(Encoding::Utf16Le)
+    );
+
+    // 前端只可能发那四个值。拼错了必须**报错**而不是静默当成 None：
+    // 后者会让「以 GBK 重新打开」变成「再探测一次」，用户看到的还是同一屏乱码，
+    // 而且没有任何提示告诉他刚才那一下没生效
+    assert!(serde_json::from_str::<Option<Encoding>>(r#""gb2312""#).is_err());
+}
+
 /// 用真实文件产出 `TextFile`，而不是手搓一个：这样钉住的是产品真正会发出去的字节。
 #[test]
 fn text_file_的线上形状() {

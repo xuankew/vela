@@ -4,12 +4,15 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 /**
  * workspace 的单测：标签之间怎么调度。
  *
- * **假的只有 IPC 与原生对话框**（jsdom 里没有 Tauri 运行时）。那一块可见编辑区用的是
- * 真的 `EditorController`：`onUpdate` 是 view 插件，只有真 view 会触发它，
+ * **假的是 IPC、原生对话框，以及子语言懒加载的时机**（前两个：jsdom 里没有 Tauri 运行时）。
+ * 那一块可见编辑区用的是真的 `EditorController`：`onUpdate` 是 view 插件，只有真 view 会触发它，
  * 拿替身的话「输入 → 度量 → 脏标记」这条链就全是假象。
+ *
+ * 懒加载闸门默认**关着**，走真的动态 import。只有「加载回来时语言已经换过了」那条用例把它闸住：
+ * 晚到的结果什么时候落地由 import 决定，不闸住的话那条用例就是掷硬币——过与不过都说明不了什么。
  */
 
-const { ipc, dialog } = vi.hoisted(() => ({
+const { ipc, dialog, lazyLoad } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn(),
     saveFile: vi.fn(),
@@ -17,14 +20,36 @@ const { ipc, dialog } = vi.hoisted(() => ({
     ENCODING_LABELS: { utf8: 'UTF-8', utf16_le: 'UTF-16 LE', utf16_be: 'UTF-16 BE', gbk: 'GBK' },
   },
   dialog: { open: vi.fn(), save: vi.fn() },
+  lazyLoad: { held: false, parked: [] as (() => void)[], landings: [] as (LanguageSupport | null)[] },
 }))
 
 vi.mock('../ipc/fs', () => ipc)
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
+vi.mock('../editor/language', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../editor/language')>()
+  return {
+    ...real,
+    loadSupport: (choice: LanguageChoice) =>
+      lazyLoad.held
+        ? new Promise<LanguageSupport | null>((resolve) => {
+            lazyLoad.parked.push(() =>
+              void real.loadSupport(choice).then((support) => {
+                // 记一笔「晚到的结果真的落地了」：断言的是「落地了却没被采用」，
+                // 没这一笔就只能靠 sleep 猜，猜短了用例就是空跑
+                lazyLoad.landings.push(support)
+                resolve(support)
+              }),
+            )
+          })
+        : real.loadSupport(choice),
+  }
+})
 
-import type { EditorState } from '@codemirror/state'
+import { EditorSelection, type EditorState } from '@codemirror/state'
+import { indentUnit, language, type LanguageSupport } from '@codemirror/language'
 import { EditorController } from '../editor/controller'
-import { lineWrapEnabled } from '../editor/setup'
+import type { LanguageChoice } from '../editor/language'
+import { codeFontBySyntax, indentLabel, lineWrapEnabled } from '../editor/setup'
 import type { TextFile, WriteReport } from '../ipc/fs'
 import { tabText } from './tab'
 import {
@@ -47,6 +72,36 @@ function textFile(overrides: Partial<TextFile> = {}): TextFile {
 }
 
 const OK_REPORT: WriteReport = { bytesWritten: 6, unmappable: false }
+
+/**
+ * state 上真正装着的语言：`markdown` / `json` / …，没挂语言（纯文本）时是 null。
+ *
+ * 读 facet 而不是读 `tab.language`：后者是模型的自述，装没装进 state 是另一回事。
+ * M1-E-1 之前没有任何一条用例验证过这一步，整个特性其实是没人看着的。
+ */
+function languageName(state: EditorState): string | null {
+  return state.facet(language)?.name ?? null
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/** 子语言靠动态 import 落地，什么时候回来不由测试决定，只能轮询 */
+async function waitFor(pred: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 400 && !pred(); i++) await sleep(5)
+  if (!pred()) throw new Error(`等了 2 秒还没等到：${what}`)
+}
+
+/** 闸住子语言加载：之后的 loadSupport 停在门口，等 `releaseSupportLoads` 放行 */
+function holdSupportLoads() {
+  lazyLoad.held = true
+}
+
+function releaseSupportLoads() {
+  lazyLoad.held = false
+  for (const go of lazyLoad.parked.splice(0)) go()
+}
 
 /** 建过的真编辑器，测试结束后统一 destroy。不叫 panes：那是 workspace 里「分屏」的名字 */
 const liveEditors: { controller: EditorController; host: HTMLElement }[] = []
@@ -134,6 +189,10 @@ beforeEach(() => {
   dialog.save.mockReset()
   ipc.openFile.mockResolvedValue(textFile())
   ipc.saveFile.mockResolvedValue(OK_REPORT)
+  // 闸门是模块级的，不复位的话某条用例闸住了会一路漏到后面的用例里
+  lazyLoad.held = false
+  lazyLoad.parked.length = 0
+  lazyLoad.landings.length = 0
 })
 
 afterEach(() => {
@@ -154,7 +213,10 @@ describe('起始状态', () => {
 
   it('度量报的是空文档：1 行 0 字符（CM6 把空文档算作一行空行）', () => {
     const ws = createWorkspace()
-    expect(ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    // 本文件里的度量断言一律 toMatchObject：这些用例要验的是行数与字符数，
+    // 而 DocMetrics 还带着行列/选区/缩进（状态栏要的），用 toEqual 的话每加一个字段
+    // 就得改十几处断言，改的人只会照抄实际值，断言就退化成「快照」了
+    expect(ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
   })
 
   it('换行偏好取自构造参数，并且真的落进了 state', () => {
@@ -267,7 +329,7 @@ describe('closeTab', () => {
     expect(pane.ws.tabs()).toHaveLength(1)
     expect(pane.ws.activeTab().id).not.toBe(doomed.id)
     expect(pane.doc).toBe('')
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
   })
 
   it('关掉一个不存在的 id 是安全的空操作', async () => {
@@ -332,7 +394,7 @@ describe('openAt：文件落到哪个标签', () => {
     expect(pane.ws.activeTab()).toBe(before)
     expect(before.doc.path()).toBe('/a.txt')
     expect(pane.doc).toBe('正文')
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 2 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 2 })
   })
 
   it('活动标签已经脏了就新建一个，不动用户手上的东西', async () => {
@@ -385,6 +447,108 @@ describe('openAt：文件落到哪个标签', () => {
     expect(pane.ws.activeTab().doc.notice()?.level).toBe('error')
     expect(pane.doc).toBe('')
     expect(tabText(pane.ws.tabs()[0]!)).toBe('手稿')
+  })
+})
+
+/**
+ * 语言落到 state 里的证据链。
+ *
+ * 这一组之前是**完全没人看着的**：`language.test.ts` 只验「路径算出哪个语言」，
+ * 装配那一步（syncLanguage → Compartment → state）一条断言都没有，345 个用例全绿也
+ * 说明不了语法高亮是不是真的在工作。
+ */
+describe('M1-E-1：语言按扩展名分派', () => {
+  it('新标签没有路径 → Markdown（M1-E 之前全局 markdownMode = true 就是这个行为）', () => {
+    const pane = mounted()
+
+    expect(languageName(pane.state)).toBe('markdown')
+    expect(pane.ws.activeTab().language?.label).toBe('Markdown')
+    // 代码块与表格换等宽字体靠的是这个装饰插件，它要读语法树，只在 Markdown 下挂
+    expect(pane.controller.view.plugin(codeFontBySyntax)).not.toBe(null)
+  })
+
+  it('没匹配上的扩展名不挂语言：日志不再被当成 Markdown 解析', async () => {
+    // M1-E 之前 markdownMode 是全局且默认开的，于是 .json / .ts / .log 一律按 Markdown
+    // 解析、一律用正文字体。这条钉住那个行为已经没了
+    const pane = mounted()
+
+    await pane.ws.openAt('/var/app.log')
+
+    expect(languageName(pane.state)).toBe(null)
+    expect(pane.ws.activeTab().language).toMatchObject({ kind: 'plain', label: '纯文本' })
+    expect(pane.controller.view.plugin(codeFontBySyntax)).toBe(null)
+  })
+
+  it('代码语言的语法树是懒加载的：同步就知道是哪种语言，树随后补上', async () => {
+    const pane = mounted()
+
+    await pane.ws.openAt('/out/pkg.json')
+
+    // 标签与字体分区同步就位（状态栏不必等 import），语法树等动态 import 落地后补
+    expect(pane.ws.activeTab().language).toMatchObject({ kind: 'code', label: 'JSON' })
+    await waitFor(() => languageName(pane.state) === 'json', 'json 子语言落地')
+  })
+
+  it('语言是标签自己的属性：改一个标签不波及另一个', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/notes.md')
+    const mdTab = pane.ws.activeTab()
+    await pane.ws.openAt('/var/app.log') // 活动标签已有路径 → 落到新标签上
+    const logTab = pane.ws.activeTab()
+    expect(logTab).not.toBe(mdTab)
+
+    // 显示中的读 view.state，没显示的读它自己那份 snapshot
+    expect(languageName(pane.state)).toBe(null)
+    expect(languageName(mdTab.snapshot.state)).toBe('markdown')
+
+    pane.ws.activateTab(mdTab.id)
+    expect(languageName(pane.state)).toBe('markdown')
+    expect(languageName(logTab.snapshot.state)).toBe(null)
+  })
+
+  it('两块分屏各显示一个标签时，语言互不干扰', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/notes.md')
+    const mdTab = pane.ws.activeTab()
+
+    const right = pane.splitPane()
+    await pane.ws.openAt('/var/app.log')
+
+    expect(languageName(pane.state)).toBe('markdown')
+    expect(languageName(right.controller.view.state)).toBe(null)
+    expect(mdTab.doc.path()).toBe('/notes.md')
+  })
+
+  it('另存为换了扩展名 → 语言跟着换', async () => {
+    const pane = mounted()
+    expect(languageName(pane.state)).toBe('markdown')
+    dialog.save.mockResolvedValue('/out/pkg.json')
+
+    await pane.ws.saveAs()
+
+    expect(pane.ws.activeTab().doc.path()).toBe('/out/pkg.json')
+    await waitFor(() => languageName(pane.state) === 'json', 'json 子语言落地')
+  })
+
+  it('加载回来时语言已经换过了：晚到的结果被丢掉', async () => {
+    // 不丢的话，快速连开两个文件会让前一个文件的语法树盖到后一个上，且不报错
+    holdSupportLoads()
+    const pane = mounted()
+    dialog.save.mockResolvedValue('/out/pkg.json')
+    // 不 await：json 的加载得停在门口，才能在它落地之前把语言换成 Markdown
+    const pending = pane.ws.saveAs()
+    dialog.save.mockResolvedValue('/out/notes.md')
+    await pane.ws.saveAs()
+    await pending
+    expect(languageName(pane.state)).toBe('markdown')
+
+    releaseSupportLoads()
+    await waitFor(() => lazyLoad.landings.length > 0, 'json 子语言落地')
+    // 落地的是**能用的** json 语法，不是 null：否则「没被采用」就没有意义
+    expect(lazyLoad.landings[0]?.language.name).toBe('json')
+
+    expect(languageName(pane.state)).toBe('markdown')
+    expect(pane.ws.activeTab().language?.label).toBe('Markdown')
   })
 })
 
@@ -468,8 +632,48 @@ describe('度量与脏标记', () => {
   it('输入经 state 里的 onUpdate 推到 metrics，并且只脏自己', () => {
     const pane = mounted()
     pane.type('三行\n第二\n第三')
-    expect(pane.ws.metrics()).toEqual({ lines: 3, chars: 8 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 3, chars: 8 })
     expect(pane.ws.activeTab().doc.dirty()).toBe(true)
+  })
+
+  it('行列跟着主光标走，从 1 开始数', () => {
+    const pane = mounted()
+    pane.type('第一行\n第二行\n第三行')
+    // type 把光标落在插入文本之后：第三行末尾 = 3 行 4 列
+    expect(pane.ws.metrics()).toMatchObject({ lines: 3, chars: 11, line: 3, col: 4 })
+
+    // 「第二行」的第二个字之后（偏移 5，第二行从 4 开始）
+    pane.controller.view.dispatch({ selection: { anchor: 5 } })
+    expect(pane.ws.metrics()).toMatchObject({ line: 2, col: 2 })
+  })
+
+  it('选中报出字符数、多光标报出选区个数，纯光标时是 1 个选区 0 字符', () => {
+    const pane = mounted()
+    pane.type('abcdef')
+
+    pane.controller.view.dispatch({ selection: { anchor: 1, head: 4 } })
+    expect(pane.ws.metrics()).toMatchObject({ selections: 1, selectedChars: 3 })
+
+    // 收敛成光标：选区数还是 1（CM6 把光标当空选区），选中字符数归零
+    pane.controller.view.dispatch({ selection: { anchor: 2 } })
+    expect(pane.ws.metrics()).toMatchObject({ selections: 1, selectedChars: 0 })
+
+    // ⛔ 不能写成 `selection: { ranges: [...] }`：TransactionSpec 只认 `EditorSelection`
+    // 或**单个** `{anchor, head}`，写错不报错，会变成 undefined 位置一路炸到第三方帧里
+    pane.controller.view.dispatch({
+      selection: EditorSelection.create([EditorSelection.range(0, 2), EditorSelection.range(3, 6)]),
+    })
+    // 列报的是**主选区**的 head，而 `EditorSelection.create` 不传 mainIndex 时主选区是第一个
+    expect(pane.ws.metrics()).toMatchObject({ selections: 2, selectedChars: 5, line: 1, col: 3 })
+  })
+
+  it('缩进报的是这个标签 state 上的 indentUnit，不是写死的字符串', () => {
+    const pane = mounted()
+    const state = pane.controller.view.state
+    expect(pane.ws.metrics().indent).toBe(indentLabel(state.facet(indentUnit)))
+    expect(pane.ws.metrics().indent).toBe('2 空格')
+    // 换行符与缩进都是「配置变了显示就得跟着变」的东西，但眼下没有改缩进的入口，
+    // 所以这里只钉住取值来源。indentLabel 本身的分支在 setup.test.ts 里测
   })
 
   it('整篇替换正文（打开文件）不算用户改动，敲一个字才算', async () => {
@@ -489,13 +693,13 @@ describe('度量与脏标记', () => {
     pane.type('aaaa')
     const first = pane.ws.activeTab()
     const second = pane.ws.newTab()
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
 
     pane.ws.activateTab(first.id)
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 4 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 4 })
 
     pane.ws.activateTab(second.id)
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
   })
 
   it('后台标签的 state 变了也不会污染 metrics（状态栏只显示最新那个）', () => {
@@ -506,7 +710,7 @@ describe('度量与脏标记', () => {
       ...first.snapshot,
       state: first.snapshot.state.update({ changes: { from: 0, insert: '偷偷改的' } }).state,
     }
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
     expect(pane.doc).toBe('')
   })
 
@@ -529,7 +733,7 @@ describe('度量与脏标记', () => {
     const pane = mounted()
     pane.controller.view.dispatch({ selection: { anchor: 0 } })
     expect(pane.ws.activeTab().doc.dirty()).toBe(false)
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
   })
 })
 
@@ -604,7 +808,7 @@ describe('未挂编辑器时也能工作（挂载前的那一小段时间）', (
 
     ws.attach(ws.panes()[0]!.id, controller)
 
-    expect(ws.metrics()).toEqual({ lines: 1, chars: 6 })
+    expect(ws.metrics()).toMatchObject({ lines: 1, chars: 6 })
   })
 
   it('分屏的增删与聚焦也不需要 controller 在场', () => {
@@ -652,7 +856,7 @@ describe('M1-D-5：分屏', () => {
     // 左边那份正文一动没动
     expect(pane.controller.doc).toBe('左边')
     // 度量跟着焦点走，焦点在新分屏上，所以是空文档的度量
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 0 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
   })
 
   it('direction 由最后一次 split 决定，且到 MAX_PANES 之后只改方向不再加分屏', () => {
@@ -697,16 +901,16 @@ describe('M1-D-5：分屏', () => {
     right.type('BBBBB')
     const leftId = pane.ws.panes()[0]!.id
 
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 5 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 5 })
 
     pane.ws.focusPane(leftId)
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 3 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 3 })
     expect(pane.ws.activeTab()).toBe(leftTab)
     expect(right.controller.doc).toBe('BBBBB')
 
     // 幂等：重复聚焦同一块不该把正文或度量搅乱
     pane.ws.focusPane(leftId)
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 3 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 3 })
   })
 
   it('cyclePane 两个方向都回绕', () => {
@@ -753,7 +957,7 @@ describe('M1-D-5：分屏', () => {
     // 焦点落回剩下那块，活动标签也跟着回去
     expect(pane.ws.focusedPaneId()).toBe(leftId)
     expect(pane.ws.activeTab()).toBe(leftTab)
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 2 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 2 })
     expect(pane.ws.focusedEditor()).toBe(pane.controller)
   })
 
@@ -802,7 +1006,7 @@ describe('M1-D-5：分屏', () => {
 
     expect(pane.ws.panes()[0]!.tabId()).toBe(orphan.id)
     expect(pane.controller.doc).toBe('孤儿')
-    expect(pane.ws.metrics()).toEqual({ lines: 1, chars: 2 })
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 2 })
   })
 
   it('setLineWrap 落到每一块分屏的 view 上，也落到没显示着的标签上', () => {

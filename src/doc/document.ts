@@ -1,6 +1,6 @@
 import { createSignal, type Accessor } from 'solid-js'
 import { save as pickToSave } from '@tauri-apps/plugin-dialog'
-import { describeFsError, ENCODING_LABELS, openFile, saveFile, type FileFormat } from '../ipc/fs'
+import { describeFsError, ENCODING_LABELS, openFile, saveFile, type EncodingId, type FileFormat } from '../ipc/fs'
 
 /**
  * 单个文档的生命周期：路径、格式、脏标记，以及打开/保存/另存为。
@@ -22,6 +22,13 @@ export interface DocumentHost {
   getText: () => string
   setText: (text: string) => void
   focus: () => void
+  /**
+   * 路径刚变过（打开文件、另存为）。
+   *
+   * 路径是语言的唯一依据，而语言槽位归宿主（workspace）管，所以每次 `setPath` 之后
+   * 都得说一声。这一层刻意不自己算语言：它连 CM6 都不该知道。
+   */
+  pathChanged: () => void
 }
 
 /** 新建文档的默认格式：macOS 上最不可能出错的组合 */
@@ -56,6 +63,20 @@ export interface DocumentModel {
   openAt: (path: string) => Promise<void>
   save: () => Promise<void>
   saveAs: () => Promise<void>
+  /**
+   * 改「保存时用的格式」（编码 / BOM / 行尾）。**这算一次未保存的改动**，会把文档标脏。
+   *
+   * 不标脏的后果很实在：用户把编码从 UTF-8 改成 GBK，然后直接关窗——关闭确认看
+   * `dirty` 是 false 就放行了，磁盘上还是 UTF-8，那个决定被静默扔掉。
+   */
+  changeFormat: (patch: Partial<FileFormat>) => void
+  /**
+   * 用指定编码**重新解码磁盘上的同一份字节**——「以某编码重新打开」。
+   *
+   * 存在的理由：探测会静默地错。一份 GBK 文件如果字节恰好是合法 UTF-8，读进来是乱码
+   * 而 `lossy` 为 false，提示条一个字都不会说（见 `vela-core::fs::encoding::decode_as`）。
+   */
+  reopenWith: (encoding: EncodingId) => Promise<void>
 }
 
 function baseName(path: string): string {
@@ -103,6 +124,9 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
       const file = await openFile(target)
       replaceText(file.text)
       setPath(target)
+      // 必须在 replaceText 之后：重建 state 会把语言槽位清空，这里再把新语言装进去。
+      // 反过来的话语言会装到一个马上被丢弃的 state 上，且静默无报错
+      host.pathChanged()
       setFormat(file.format)
       setDirty(false)
       setLossy(file.lossy)
@@ -115,11 +139,50 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     }
   }
 
+  function changeFormat(patch: Partial<FileFormat>) {
+    setFormat({ ...format(), ...patch })
+    setDirty(true)
+  }
+
+  async function reopenWith(encoding: EncodingId) {
+    const target = path()
+    if (target === null) return
+    if (dirty()) {
+      // 不复用 `promptDiscard` 那套：它的语义是「这个文档还要不要」，而这里用户想要的
+      // 恰恰是留住文档、只换一种读法。给一句提示让他自己决定先保存还是先撤销，
+      // 比弹一个语义不对的模态框诚实
+      setNotice({
+        level: 'warning',
+        text: '有未保存的改动，重新解码会把它们扔掉。先保存，或者撤销到干净状态再换编码。',
+      })
+      return
+    }
+    setBusy(true)
+    try {
+      const file = await openFile(target, encoding)
+      // 不调 host.pathChanged()：路径没变，语言也就没变。宿主的 setText 本来就会
+      // 重跑一次 syncLanguage（replaceTabText 把标签上的语言清了），不用这里再催
+      replaceText(file.text)
+      setFormat(file.format)
+      setDirty(false)
+      setLossy(file.lossy)
+      setNotice(null)
+      host.focus()
+    } catch (err) {
+      setNotice({ level: 'error', text: `重新打开失败：${describeFsError(err)}` })
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function writeTo(target: string) {
     setBusy(true)
     try {
       const report = await saveFile(target, host.getText(), format())
       setPath(target)
+      // 另存为会把无名文档（默认当 Markdown）换成别的扩展名，语言得跟着走。
+      // 保存不重建 state，所以这里只能靠槽位 reconfigure
+      host.pathChanged()
       setDirty(false)
       setNotice(
         report.unmappable
@@ -166,5 +229,7 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     openAt,
     save,
     saveAs,
+    changeFormat,
+    reopenWith,
   }
 }

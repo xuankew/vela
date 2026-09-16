@@ -39,7 +39,7 @@ const OK_REPORT: WriteReport = { bytesWritten: 6, unmappable: false }
 
 /** 假宿主：一个正文字符串 + 一个焦点计数器，不起 CM6 */
 function harness() {
-  const state = { text: '', focuses: 0 }
+  const state = { text: '', focuses: 0, pathChanges: 0 }
   const host: DocumentHost = {
     getText: () => state.text,
     setText: (t) => {
@@ -47,6 +47,9 @@ function harness() {
     },
     focus: () => {
       state.focuses += 1
+    },
+    pathChanged: () => {
+      state.pathChanges += 1
     },
   }
   return { doc: createDocumentModel(host), state, host }
@@ -107,6 +110,7 @@ describe('打开', () => {
       focus: () => {
         state.focuses += 1
       },
+      pathChanged: () => {},
     }
     doc = createDocumentModel(host)
     ipc.openFile.mockResolvedValue(textFile({ text: '新正文' }))
@@ -255,5 +259,115 @@ describe('保存与另存为', () => {
     expect(doc.notice()).toBeNull()
     expect(doc.lossy()).toBe(true)
     expect(doc.dirty()).toBe(true)
+  })
+})
+
+describe('编码与换行符切换（M1-E-2b）', () => {
+  it('changeFormat 合并进现有格式，并且**算一次未保存的改动**', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile({ format: { encoding: 'utf8', bom: false, eol: 'lf' } }))
+    await doc.openAt('/a.txt')
+    expect(doc.dirty()).toBe(false)
+
+    doc.changeFormat({ encoding: 'gbk', bom: false })
+
+    expect(doc.format()).toEqual({ encoding: 'gbk', bom: false, eol: 'lf' })
+    // 不标脏的话：用户改成 GBK 之后直接关窗，关闭确认看 dirty 是 false 就放行，
+    // 磁盘上还是 UTF-8——这个决定被静默扔掉
+    expect(doc.dirty()).toBe(true)
+    // 改的是「怎么写出去」，正文一个字节都不该动
+    expect(state.text).toBe('正文')
+  })
+
+  it('只改换行符时编码与 BOM 保持原样', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockResolvedValue(textFile({ format: { encoding: 'utf16_le', bom: true, eol: 'lf' } }))
+    await doc.openAt('/a.txt')
+
+    doc.changeFormat({ eol: 'crlf' })
+
+    expect(doc.format()).toEqual({ encoding: 'utf16_le', bom: true, eol: 'crlf' })
+  })
+
+  it('改过的格式会被 save 原样传下去', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+
+    doc.changeFormat({ encoding: 'gbk', bom: false })
+    doc.changeFormat({ eol: 'crlf' })
+    await doc.save()
+
+    expect(ipc.saveFile).toHaveBeenCalledWith('/a.txt', '正文', { encoding: 'gbk', bom: false, eol: 'crlf' })
+    expect(doc.dirty()).toBe(false)
+  })
+
+  it('reopenWith 把编码传给 openFile，并采纳后端给的正文与格式', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValueOnce(textFile({ lossy: true }))
+    await doc.openAt('/misdetected.txt')
+    expect(state.text).toBe('正文')
+    expect(doc.lossy()).toBe(true)
+
+    ipc.openFile.mockResolvedValueOnce(
+      textFile({ text: '模', format: { encoding: 'gbk', bom: false, eol: 'lf' }, lossy: false }),
+    )
+    await doc.reopenWith('gbk')
+
+    // 第二个参数就是这条方法的全部内容：漏了它后端收到 None，「重新打开」静默退化成
+    // 「再探测一次」，用户看到的还是同一屏乱码
+    expect(ipc.openFile).toHaveBeenLastCalledWith('/misdetected.txt', 'gbk')
+    expect(state.text).toBe('模')
+    expect(doc.format()).toEqual({ encoding: 'gbk', bom: false, eol: 'lf' })
+    // 重读一遍不算用户的改动；lossy 也跟着后端重算，原来那条警告该消失
+    expect(doc.dirty()).toBe(false)
+    expect(doc.lossy()).toBe(false)
+    expect(doc.notice()).toBeNull()
+    expect(doc.busy()).toBe(false)
+    // 路径没变 → 语言没变，不该报 pathChanged（那会让宿主白重装一次语言槽位）
+    expect(state.pathChanges).toBe(1) // 只有最初那次 openAt 报过
+    expect(state.focuses).toBe(2)
+  })
+
+  it('有未保存的改动时拒绝重开：一次 IO 都不发', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '改过了'
+    doc.markChanged()
+
+    await doc.reopenWith('gbk')
+
+    // 重新解码是从磁盘重读，会把改动整个扔掉，所以这里必须什么都不做
+    expect(ipc.openFile).toHaveBeenCalledTimes(1)
+    expect(state.text).toBe('改过了')
+    expect(doc.dirty()).toBe(true)
+    expect(doc.notice()?.level).toBe('warning')
+    expect(doc.notice()?.text).toContain('未保存的改动')
+    expect(doc.busy()).toBe(false)
+  })
+
+  it('无名文档上 reopenWith 是空操作：磁盘上没有字节可重读', async () => {
+    const { doc } = harness()
+
+    await expect(doc.reopenWith('gbk')).resolves.toBeUndefined()
+
+    expect(ipc.openFile).not.toHaveBeenCalled()
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('重开失败时报错，正文与格式都保持原样', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/a.txt')
+    ipc.openFile.mockRejectedValueOnce({ kind: 'io', reason: 'PermissionDenied', message: '权限不够' })
+
+    await doc.reopenWith('gbk')
+
+    expect(state.text).toBe('正文')
+    expect(doc.format()).toEqual({ encoding: 'utf8', bom: false, eol: 'lf' })
+    expect(doc.notice()?.level).toBe('error')
+    expect(doc.notice()?.text).toContain('权限不够')
+    expect(doc.busy()).toBe(false)
   })
 })

@@ -5,13 +5,21 @@ import { render } from 'solid-js/web'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createEditorState, type EditorUpdateInfo } from './setup'
 import type { EditorController } from './controller'
+import { languageFor } from './language'
 import { EditorPane } from './EditorPane'
 
 let container: HTMLDivElement
 let cleanups: (() => void)[]
 
 function stateFor(doc = '', onUpdate?: (info: EditorUpdateInfo) => void): EditorState {
-  return createEditorState({ doc, lineWrap: true, markdownMode: true, lineWrapSlot: new Compartment(), onUpdate })
+  return createEditorState({
+    doc,
+    lineWrap: true,
+    language: languageFor(null),
+    lineWrapSlot: new Compartment(),
+    languageSlot: new Compartment(),
+    onUpdate,
+  })
 }
 
 beforeEach(() => {

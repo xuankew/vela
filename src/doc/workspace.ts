@@ -1,7 +1,10 @@
 import { EditorView } from '@codemirror/view'
+import { indentUnit, type LanguageSupport } from '@codemirror/language'
 import { createSignal, type Accessor, type Setter } from 'solid-js'
 import { open as pickToOpen } from '@tauri-apps/plugin-dialog'
 import type { EditorController } from '../editor/controller'
+import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../editor/language'
+import { INDENT_UNIT, indentLabel, languageExtensions } from '../editor/setup'
 import {
   applyViewConfig,
   createTab,
@@ -35,9 +38,37 @@ import {
  * 「哪一行是新增的」——引用一换，整块编辑器就会被重建。
  */
 
+/**
+ * 状态栏要报的度量。**只反映聚焦分屏显示的那个标签**，不是全文档的汇总。
+ *
+ * 行列从 1 开始（这是给人看的，不是给算法用的），列按**字符**计而不是按字素：
+ * 与 CM6 自己的 `lineAt`/偏移量口径一致，一个 emoji 会算成 2 列。要按字素就得
+ * 引入 grapheme 分段，而状态栏的列号没人拿它做精确排版。
+ */
 export interface DocMetrics {
   lines: number
   chars: number
+  /** 主光标所在行 */
+  line: number
+  /** 主光标所在列 */
+  col: number
+  /** 选区个数。1 = 只有一个光标、没选中任何内容 */
+  selections: number
+  /** 所有选区加起来的字符数 */
+  selectedChars: number
+  /** 缩进设置的展示名，如「2 空格」/「Tab」 */
+  indent: string
+}
+
+/** 还没有任何编辑器挂上来时的度量：空文档 = 1 行 0 字符，光标在 1:1 */
+const EMPTY_METRICS: DocMetrics = {
+  lines: 1,
+  chars: 0,
+  line: 1,
+  col: 1,
+  selections: 1,
+  selectedChars: 0,
+  indent: indentLabel(INDENT_UNIT),
 }
 
 /** 面对「有未保存的改动」时的三条出路 */
@@ -124,7 +155,6 @@ export interface Workspace {
 
 export interface WorkspaceOptions {
   lineWrap?: boolean
-  markdownMode?: boolean
   /**
    * 缺省时一律答「取消」。
    *
@@ -135,7 +165,7 @@ export interface WorkspaceOptions {
 }
 
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
-  const config: ViewConfig = createViewConfig(options.lineWrap ?? true, options.markdownMode ?? true)
+  const config: ViewConfig = createViewConfig(options.lineWrap ?? true)
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
   const [tabs, setTabs] = createSignal<Tab[]>([])
@@ -143,7 +173,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   const [focusedPaneId, setFocusedPaneId] = createSignal(-1)
   const [direction, setDirection] = createSignal<SplitDirection>('row')
   const [wrap, setWrap] = createSignal(config.lineWrap)
-  const [metrics, setMetrics] = createSignal<DocMetrics>({ lines: 1, chars: 0 })
+  const [metrics, setMetrics] = createSignal<DocMetrics>(EMPTY_METRICS)
 
   let nextTabId = 1
   let nextPaneId = 1
@@ -183,11 +213,53 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   function syncMetrics(tab: Tab) {
     const view = viewOf(tab)
     const state = view ? view.view.state : tab.snapshot.state
-    setMetrics({ lines: state.doc.lines, chars: state.doc.length })
+    const { main, ranges } = state.selection
+    const line = state.doc.lineAt(main.head)
+    let selectedChars = 0
+    for (const range of ranges) selectedChars += range.to - range.from
+    setMetrics({
+      lines: state.doc.lines,
+      chars: state.doc.length,
+      line: line.number,
+      col: main.head - line.from + 1,
+      selections: ranges.length,
+      selectedChars,
+      indent: indentLabel(state.facet(indentUnit)),
+    })
   }
 
   /**
-   * 标签要的三个宿主能力。全都要先回答「这个标签此刻显示在哪个分屏里」，
+   * 按标签当前的路径把语言装进它自己的槽位。
+   *
+   * 三个调用点：标签刚建好、`setText` 重建了 state（新 state 的槽位是空的）、
+   * 路径变了（打开文件、另存为）。语言没变时直接返回——否则每次保存都会把所有
+   * 标签的 state 对象换一遍，内容虽然没变，但靠 `===` 判断「state 没动过」的地方会失准。
+   */
+  function syncLanguage(tab: Tab) {
+    const choice = languageFor(tab.doc.path())
+    if (tab.language !== null && sameLanguage(tab.language, choice)) return
+    tab.language = choice
+    // 代号先自增再发请求：加载回来时对不上就说明期间又换过语言，那次结果必须丢掉。
+    // 不丢的话，快速连开两个文件会让前一个文件的语法树盖到后一个上
+    const token = ++tab.languageToken
+    installLanguage(tab, choice, null)
+    if (choice.description === null) return
+    void loadSupport(choice).then((support) => {
+      if (support === null || token !== tab.languageToken) return
+      installLanguage(tab, choice, support)
+    })
+  }
+
+  /** 显示中的走 dispatch，没显示的走 state.update——与 `setLineWrap` 同一套路 */
+  function installLanguage(tab: Tab, choice: LanguageChoice, support: LanguageSupport | null) {
+    const effects = tab.languageSlot.reconfigure(languageExtensions(choice, support))
+    const view = viewOf(tab)
+    if (view) view.view.dispatch({ effects })
+    else tab.snapshot = { ...tab.snapshot, state: tab.snapshot.state.update({ effects }).state }
+  }
+
+  /**
+   * 标签要的四个宿主能力。全都要先回答「这个标签此刻显示在哪个分屏里」，
    * 所以只能由 workspace 来实现、再反向注入给 `createTab`。
    */
   const host: TabHost = {
@@ -196,10 +268,17 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       replaceTabText(tab, text, config)
       // 显示中的标签光改 snapshot 没用：屏幕上是 view 的 state，得整个换掉
       viewOf(tab)?.restore(tab.snapshot)
+      // 必须在 restore 之后：重建把语言槽位清空了（见 replaceTabText），而显示中的标签
+      // 走 dispatch、dispatch 不回写 snapshot。先装语言再 restore 的话，restore 用的
+      // 还是那个没装语言的 snapshot，语言会被整个冲掉
+      syncLanguage(tab)
       if (tab.id === activeTab().id) syncMetrics(tab)
     },
     focus: (tab) => {
       viewOf(tab)?.focus()
+    },
+    pathChanged: (tab) => {
+      syncLanguage(tab)
     },
   }
 
@@ -214,10 +293,13 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         // 脏标记只认正文变化：光标移动不该让文件变成「未保存」
         if (info.docChanged) tab.doc.markChanged()
         // 只有正在显示的那个标签会收到事务（没显示在任何分屏里的标签没有 view，
-        // 压根不产生 update），但度量属于状态栏，状态栏只跟着聚焦的分屏走，所以还是要判一次
-        if (tab.id === activeTab().id) setMetrics({ lines: info.lines, chars: info.chars })
+        // 压根不产生 update），但度量属于状态栏，状态栏只跟着聚焦的分屏走，所以还是要判一次。
+        // 走 syncMetrics 而不是直接用 info 带的那两个数：行列与选区只有 state 上有
+        if (tab.id === activeTab().id) syncMetrics(tab)
       },
     })
+    // 新标签没有路径 → Markdown（M1-E 之前全局 markdownMode = true 就是这个行为）
+    syncLanguage(tab)
     return tab
   }
 

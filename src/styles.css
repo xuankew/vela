@@ -64,10 +64,11 @@ body {
 
 .app {
   display: grid;
-  /* 四行：工具栏 / 标签条 / 提示条容器 / 正文区。提示容器是常驻的（空时高度 0），
+  /* 五行：工具栏 / 标签条 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
      行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上。
-     标签条放在提示条**上面**：提示条出现或消失时只推动正文区，标签条不跟着跳 */
-  grid-template-rows: auto auto auto 1fr;
+     标签条放在提示条**上面**：提示条出现或消失时只推动正文区，标签条不跟着跳。
+     状态栏在最后，高度由自己定（22px），不参与 1fr 的分配 */
+  grid-template-rows: auto auto auto 1fr auto;
   height: 100%;
 }
 
@@ -308,14 +309,78 @@ select {
   border-left: 1px solid var(--vela-guide);
 }
 
-.badge {
-  display: inline-block;
-  padding: 0 5px;
-  border-radius: 3px;
-  font-size: 10px;
-  background: var(--vela-bg-panel);
+/* ---------- 状态栏 ---------- */
+
+/* 放在 grid 最后一行（`.app` 的行数因此是 5）。用 --vela-bg-alt 而不是面板色：
+   状态栏是「贴着窗口边缘的一条」，与工具栏同色会让正文区看起来被上下夹住 */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  height: 22px;
+  padding: 0 8px;
+  background: var(--vela-bg-alt);
+  border-top: 1px solid var(--vela-border);
   color: var(--vela-fg-dim);
-  border: 1px solid var(--vela-border);
+  font-size: 11px;
+  line-height: 1;
+  /* 单元格合计超宽时不许把状态栏撑高：正文区的高度是靠 1fr 算出来的，
+     状态栏一跳高，编辑器就跟着跳一次布局 */
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.status-cell {
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border-right: 1px solid var(--vela-border);
+}
+
+.status-cell:last-child {
+  border-right: none;
+}
+
+/* 路径是唯一需要伸缩的一格：窗口窄时先把省略号让给它，而不是把右边的编码/语言挤掉。
+   min-width:0 是必要的——flex 子项默认的 min-width:auto 会让它拒绝收缩到内容宽度以下 */
+.status-path {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--vela-fg);
+}
+
+.status-spacer {
+  flex: 1 1 auto;
+}
+
+/* 编码与换行符两格是 <select>。全局的 select 规则（边框 + 底色 + 3px 内边距）是给工具栏
+   那种 28px 高的控件写的，塞进 22px 的条里会把整条撑高——而状态栏一跳高，靠 1fr 算出来的
+   正文区就跟着跳一次布局。所以这里把装饰全抹平，只留文字与浏览器自己的下拉箭头 */
+.status-pick {
+  display: flex;
+  align-items: center;
+  padding: 0 4px 0 8px;
+}
+
+.statusbar select {
+  height: 20px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+}
+
+/* 静态时它和旁边几格长得一样，靠 hover 变色来暗示「这两格能点」 */
+.statusbar select:hover:not(:disabled) {
+  color: var(--vela-fg);
+}
+
+.statusbar select:disabled {
+  opacity: 0.5;
 }
 
 /* ---------- 提示条（有损解码 / 保存失败 / 编码装不下）---------- */

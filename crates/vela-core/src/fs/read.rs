@@ -5,9 +5,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use super::encoding::decode;
+use super::encoding::{decode, decode_as};
 use super::eol::{detect_eol, normalize_to_lf};
-use super::{FileFormat, TextFile};
+use super::{Encoding, FileFormat, TextFile};
 
 /// 单次 IPC 能传的正文上限（PLAN.md §2.6 定的 4MB）。
 ///
@@ -58,6 +58,19 @@ impl std::error::Error for ReadError {}
 /// 先看 metadata 再读内容：这样「文件太大」能在**不把它读进内存**的前提下拒掉。
 /// 反过来先 read 再判断大小的话，50MB 的文件已经咬掉一口内存了。
 pub fn read_text(path: &Path) -> Result<TextFile, ReadError> {
+    read_with(path, None)
+}
+
+/// 同 `read_text`，但**跳过编码探测**，用调用方指定的编码解。
+///
+/// 这是「以某编码重新打开」的实现：探测会静默地错（一份 GBK 文件如果字节恰好是
+/// 合法 UTF-8，会被判成 utf8 且 `lossy = false`，UI 无从警告），得留一条让用户
+/// 自己改判的路。BOM 与 lossy 的语义见 `encoding::decode_as`。
+pub fn read_text_as(path: &Path, encoding: Encoding) -> Result<TextFile, ReadError> {
+    read_with(path, Some(encoding))
+}
+
+fn read_with(path: &Path, forced: Option<Encoding>) -> Result<TextFile, ReadError> {
     let meta = fs::metadata(path).map_err(ReadError::io)?;
     if meta.is_dir() {
         return Err(ReadError::Directory { path: path.display().to_string() });
@@ -68,7 +81,10 @@ pub fn read_text(path: &Path) -> Result<TextFile, ReadError> {
     }
 
     let raw = fs::read(path).map_err(ReadError::io)?;
-    let decoded = decode(&raw);
+    let decoded = match forced {
+        Some(encoding) => decode_as(&raw, encoding),
+        None => decode(&raw),
+    };
     // 行尾必须在归一化**之前**探测，否则就再也分不出原文件是 LF 还是 CRLF 了
     let eol = detect_eol(&decoded.text);
     let text = normalize_to_lf(&decoded.text).into_owned();
@@ -84,7 +100,7 @@ pub fn read_text(path: &Path) -> Result<TextFile, ReadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::{write_text_atomic, Encoding, LineEnding};
+    use crate::fs::{write_text_atomic, LineEnding};
 
     #[test]
     fn 读出一个_crlf_文件时正文是_lf_而元信息记着_crlf() {
@@ -150,6 +166,67 @@ mod tests {
         let path = dir.path().join("broken.bin");
         fs::write(&path, &[0x61, 0xFF, 0xFF, 0x62]).unwrap();
         assert!(read_text(&path).unwrap().lossy);
+    }
+
+    /// `read_text_as` 存在的理由：探测判错的字节，用户能自己改判。
+    #[test]
+    fn 显式指定编码时跳过探测() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("misdetected.txt");
+        // C4 A3 既是合法 UTF-8（"ģ"）也是合法 GBK（"模"）——探测报 utf8 且 lossy = false，
+        // 也就是「看起来完全正常，但正文是错的」，UI 无从警告
+        fs::write(&path, &[0xC4u8, 0xA3]).unwrap();
+
+        let guessed = read_text(&path).unwrap();
+        assert_eq!(guessed.format.encoding, Encoding::Utf8);
+        assert!(!guessed.lossy);
+
+        let forced = read_text_as(&path, Encoding::Gbk).unwrap();
+        assert_eq!(forced.format.encoding, Encoding::Gbk);
+        assert_eq!(forced.text, "模");
+        assert!(!forced.lossy);
+        // 字节数与走不走探测无关
+        assert_eq!(forced.bytes, guessed.bytes);
+    }
+
+    /// 换编码只换「怎么解字节」，行尾那一半规矩一条都不能少。
+    #[test]
+    fn 显式指定编码时行尾照样探测并归一化() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gbk-crlf.txt");
+        write_text_atomic(
+            &path,
+            "第一行\n第二行\n",
+            FileFormat { encoding: Encoding::Gbk, bom: false, eol: LineEnding::Crlf },
+        )
+        .unwrap();
+
+        let f = read_text_as(&path, Encoding::Gbk).unwrap();
+        assert_eq!(f.text, "第一行\n第二行\n");
+        assert_eq!(f.format.eol, LineEnding::Crlf);
+        assert!(!f.lossy);
+        // 原样写回去字节不变，与探测路径同一条不变量
+        let original = fs::read(&path).unwrap();
+        write_text_atomic(&path, &f.text, f.format).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    /// 两条路径共用同一个 helper，所以「目录」与「太大」这两道闸对显式编码同样生效。
+    /// 漏掉的话「以某编码重新打开」就成了绕过 4MB 上限的后门。
+    #[test]
+    fn 显式指定编码时目录与超大文件照样被拒() {
+        let dir = tempfile::tempdir().unwrap();
+        match read_text_as(dir.path(), Encoding::Gbk) {
+            Err(ReadError::Directory { .. }) => {}
+            other => panic!("期望 Directory 错误，实际 {other:?}"),
+        }
+
+        let path = dir.path().join("big.txt");
+        fs::write(&path, vec![b'a'; (MAX_INLINE_BYTES + 1) as usize]).unwrap();
+        match read_text_as(&path, Encoding::Gbk) {
+            Err(ReadError::TooLarge { .. }) => {}
+            other => panic!("期望 TooLarge 错误，实际 {other:?}"),
+        }
     }
 
     #[test]

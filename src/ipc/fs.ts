@@ -8,6 +8,10 @@
  * - Rust：`crates/vela-core/tests/wire_contract.rs`
  * - 前端：`src/ipc/fs.test.ts`
  *
+ * **命令的参数名同样在契约里**：Tauri 按名字去 invoke 的 payload 里取值，`openFile`
+ * 少传或拼错 `encoding`，Rust 那边拿到的就是 `None`——「以 GBK 重新打开」会静默变成
+ * 「再探测一次」，用户看到的还是同一屏乱码。
+ *
  * 真要上代码生成（tauri-specta）是 M1-H 的事——那会引入一个 build 步骤和一层宏，
  * 眼下两个 command、五个类型的规模还不值当。
  */
@@ -43,6 +47,48 @@ export const ENCODING_LABELS: Record<EncodingId, string> = {
 export const LINE_ENDING_LABELS: Record<LineEndingId, string> = {
   lf: 'LF',
   crlf: 'CRLF',
+}
+
+export const ENCODING_IDS: EncodingId[] = ['utf8', 'utf16_le', 'utf16_be', 'gbk']
+
+export const LINE_ENDING_IDS: LineEndingId[] = ['lf', 'crlf']
+
+/** 下拉里的一项：编码 + 有没有 BOM + 给人看的名字 */
+export interface EncodingChoice {
+  encoding: EncodingId
+  bom: boolean
+  label: string
+}
+
+/**
+ * 编码 + BOM 的**合法**组合，给状态栏的下拉用。
+ *
+ * 七个而不是八个：GBK 没有 BOM 这回事（Rust 侧 `Encoding::supports_bom`），
+ * 写了也不会被任何工具认出来，`encode` 还会直接忽略它。UI 不提供不可能的组合，
+ * 比提供了再在下游兜住要便宜。
+ */
+// 回调的返回类型必须显式标出来：ternary 两支的元素类型不同（一支只剩 "gbk" 字面量），
+// flatMap 会把 U 推成其中一支，再跟这里的注解打起来（TS2322）
+export const ENCODING_CHOICES: EncodingChoice[] = ENCODING_IDS.flatMap(
+  (encoding): EncodingChoice[] =>
+    encoding === 'gbk'
+      ? [{ encoding, bom: false, label: ENCODING_LABELS[encoding] }]
+      : [
+          { encoding, bom: false, label: ENCODING_LABELS[encoding] },
+          { encoding, bom: true, label: `${ENCODING_LABELS[encoding]} BOM` },
+        ],
+)
+
+const BOM_SUFFIX = '-bom'
+
+/** `<select>` 的 value 只能是一个字符串，而编码与 BOM 是两个字段，于是压成一个 */
+export function encodingChoiceId(choice: { encoding: EncodingId; bom: boolean }): string {
+  return choice.bom ? `${choice.encoding}${BOM_SUFFIX}` : choice.encoding
+}
+
+export function parseEncodingChoice(id: string): { encoding: EncodingId; bom: boolean } {
+  const bom = id.endsWith(BOM_SUFFIX)
+  return { encoding: (bom ? id.slice(0, id.length - BOM_SUFFIX.length) : id) as EncodingId, bom }
 }
 
 /** Rust `fs::TextFile`，`#[serde(rename_all = "camelCase")]`（字段名本来就都是单词） */
@@ -95,8 +141,15 @@ export function describeFsError(err: unknown): string {
   }
 }
 
-export function openFile(path: string): Promise<TextFile> {
-  return invoke<TextFile>('open_file', { path })
+/**
+ * @param encoding 跳过探测、直接用这个编码解——状态栏的「以…重新打开」。
+ *
+ * ⚠️ 不覆写时也必须把 key 传过去（值为 `null`）。Tauri 对「参数整个缺失」与「参数是
+ * null」的处理并不显然一致，而 `Option<Encoding>` 反序列化 `null` 恒为 `None`——
+ * 传 null 就不用去赌前一种。契约钉在 `crates/vela-core/tests/wire_contract.rs`。
+ */
+export function openFile(path: string, encoding?: EncodingId): Promise<TextFile> {
+  return invoke<TextFile>('open_file', { path, encoding: encoding ?? null })
 }
 
 export function saveFile(path: string, text: string, format: FileFormat): Promise<WriteReport> {

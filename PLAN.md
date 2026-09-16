@@ -720,7 +720,7 @@ const vela = {
 > **M1-D 实施修正**（标签页 / 关闭确认 / 分屏落地时与本节及 §2 功能清单的偏离）：
 >
 > 1. **架构改成「一个标签一份 `EditorState`，一个分屏一个 `EditorView`」。** 切换标签是 `view.setState(tab.state)`，不是重建编辑器。`updateListener` 被**烘进 state**（`editor/setup.ts` 的 `createEditorState`），于是切完之后收到更新通知的天然就是新标签自己那个监听器，路由不需要任何判断。滚动位置不属于 state，单独存在 `EditorSnapshot` 里，且必须在 `setState` **之后**赋值——setState 会重建整个 docView，先赋的值会被新布局冲掉。
-> 2. **换行偏好是全局视图设置，不是每标签一个。** CM6 的 `Compartment` 按**实例**寻址，共享同一个实例就能用一次 `reconfigure` 同时作用于「正在显示的 view」与「存着的所有 state」，工具栏那个开关因此不可能与屏幕上的状态不一致。显示中的走 `view.dispatch`，其余走 `state.update`——前者用 `setState` 会销毁视图插件、丢焦点与滚动位置。分屏之后「显示中的」是**每一块**分屏的 view，循环 dispatch。`markdownMode` 眼下也是全局的，M1-E 做「按扩展名分语言」时要挪到 Tab 上。
+> 2. **换行偏好是全局视图设置，不是每标签一个。** CM6 的 `Compartment` 按**实例**寻址，共享同一个实例就能用一次 `reconfigure` 同时作用于「正在显示的 view」与「存着的所有 state」，工具栏那个开关因此不可能与屏幕上的状态不一致。显示中的走 `view.dispatch`，其余走 `state.update`——前者用 `setState` 会销毁视图插件、丢焦点与滚动位置。分屏之后「显示中的」是**每一块**分屏的 view，循环 dispatch。`markdownMode` 眼下也是全局的，M1-E 做「按扩展名分语言」时要挪到 Tab 上（**已兑现**，见下面 M1-E 修正 1）。
 > 3. **`Cmd+N` 的语义从「新建文档」变成「新建标签」**，`DocumentModel` 上的 `newDocument` 与 `openViaDialog` 两个方法被删掉了：它们都要先回答「落到哪个标签上」，那是 workspace 的知识，文档模型只剩 `openAt(path)`。
 > 4. **打开文件的路由规则**：同一路径只开一个标签（再开一次会丢掉已有改动，还让用户在两份内容里猜哪份是真的）；当前标签是**干净的无名标签**时就地复用，否则新开一个。「当前标签」= **聚焦分屏**显示的那个。打开**失败**时错误落在新开的空标签上，原来的草稿一动不动——这是行为变更，`App.test.tsx` 里那条用例已按新契约重写。
 > 5. **`tabs()` 与 `panes()` 永远非空**：关掉最后一个标签时补一个空的进来。允许「零」的话所有 `editor.*` 命令的 `when` 会同时失效、状态栏没有可显示的对象、`activeTab()` 变成 nullable 并传染给每一个调用点。
@@ -734,6 +734,48 @@ const vela = {
 > 13. **焦点与拆卸都由 `EditorPane` 自己上报**，App 不再持有单个 controller：`onFocusIn`（focusin 会冒泡，容器收得到 `.cm-content` 的聚焦）→ `ws.focusPane(paneId)`，`onCleanup` 里的 `onDestroy` → `ws.detach(paneId)`。**onDestroy 必须在 `controller.destroy()` 之前调用**——workspace 要趁 view 还活着 capture 现场，顺序反了合并分屏就会把没存盘的正文一起扔掉（`EditorPane.test.tsx` 有专门用例）。`AppContext.editor` 相应变成 `ws.focusedEditor()`。
 >
 > **待人工验**（启动真实 app 被拦，自动化到不了）：标签条的观感与拖拽重排手感、模态对话框的视觉、**分屏的观感**（1px 分隔线、聚焦块的 accent 描边、`.tab.shown` 的顶部灰条是否够明显）、以及**真的点一次红绿灯与 Cmd+Q** 确认关窗握手在 Tauri 运行时里通。
+
+> **M1-E 实施修正**（语言高亮与状态栏落地时与本节及 §2 功能清单的偏离。**目前覆盖 M1-E-1「语言按扩展名分派」与 M1-E-2「状态栏：只读显示 + 编码/换行符切换」**，词补全落地后继续往下加）：
+>
+> 1. **`markdownMode` 这个全局选项被删掉了，语言变成 Tab 的属性**——兑现 M1-D 修正 2 末尾那句「M1-E 时要挪到 Tab 上」。`Compartment` 按**实例**寻址，所以这里的做法与 `lineWrapSlot` **正好相反**：换行槽位全局共享一个实例（一次 `reconfigure` 拨动所有标签），语言槽位每标签一个实例（改一个标签的语言不该波及别的）。
+> 2. **顺带修掉一个一直存在的 bug：M1-E 之前所有文件都被当成 Markdown 解析。** `markdownMode` 默认开且全局，于是 `.json` / `.ts` / `.log` 一律拿 Markdown 的语法树与正文字体。现在 `.log` 这类没匹配上的扩展名**不挂任何语言**（`state.facet(language)` 为 null）。
+> 3. **没匹配上的扩展名给等宽字体，不给正文字体。** 取舍：等宽对日志与表格的列对齐是刚需，正文字体对纯散文只是好看；两边只能保一个时保对齐。
+> 4. **语言只有一条安装路径**：`buildState` 刻意**不传** `language`（槽位建出来是空的），一律由 workspace 的 `syncLanguage` 装。理由是子语言靠动态 import 懒加载，建 state 那一刻拿不到 `LanguageSupport`；只留一条路径，加载回来时就不必判断「这个 state 是哪条路建的」。
+> 5. **`syncLanguage` 必须在 `restore(snapshot)` 之后调用**（`workspace.ts` 的 `host.setText`）。显示中的标签走 `view.dispatch`，而 dispatch **不回写** `snapshot`；先装语言再 restore，restore 用的还是那个没装语言的 snapshot，语言会被整个冲掉——静默，不报错。
+> 6. **新增宿主钩子 `pathChanged`**：路径是语言的唯一依据，而语言槽位归 workspace 管，所以 `document.ts` 每次 `setPath` 之后都得说一声（打开文件、另存为两处）。这一层刻意**不自己算语言**：它连 CM6 都不该知道。
+> 7. **异步竞态用 `tab.languageToken`**：代号先自增再发请求，加载回来时对不上就丢掉结果。不丢的话「快速连开两个文件」会让前一个文件的语法树盖到后一个上，同样静默。连带的坑：`replaceTabText` 之后必须把 `tab.language` 归零，否则 `syncLanguage` 认为「语言没变」直接跳过，打开文件后既没有高亮也没有字体分区。
+> 8. **`Makefile` 落到纯文本是上游行为，不是 bug**：`language-data` 的 filename 模式清单里压根没有 Makefile（有 `Dockerfile` / `CMakeLists.txt` / `Jenkinsfile` / `Gemfile` / `Rakefile` / `PKGBUILD` / `BUCK` / `BUILD` / `nginx*.conf` / `extensions.conf`）。另一个坑：`LanguageDescription.matchFilename` 要的是**文件名**，喂全路径会让锚定的模式（`/^Dockerfile$/`）失配。两条都写进 `language.test.ts` 钉住了，别再当 bug 重开。
+> 9. **无名文档 → Markdown**，保持 M1-E 之前 `markdownMode = true` 的行为，不因为「没路径」就退化成纯文本。
+> 10. **⛔ `manualChunks` 仍然一条都不能加。** 本次构建 117 个 chunk，而 `index.html` 只引三个（入口 + CM6 内核 + 应用 CSS），语言包全部按需。一旦手动分包，`legacy-modes` 那几十种语言会全部塌进首屏——`vite.config.ts` 里的注释就是为这一刻写的。
+> 11. **首屏 gzip 231.60 → 232.35 KB**（`index-*.js` 122.61 + `dist-*.js` 108.31 + `index-*.css` 1.43），预算 300 KB，余量 22.6%。**接进 30+ 种语言只涨 0.75 KB**：涨的是 language-data 的描述表，语法本体一个字节都没进首屏。
+> 12. **测试口径变了一处**：`workspace.test.ts` 文件头原本写「假的只有 IPC 与原生对话框」，现在多了一个——**子语言懒加载的时机闸门**（默认关着走真 import，只有「晚到的结果被丢弃」那条用例闸住）。不闸住的话晚到与否由 import 决定，那条用例就是掷硬币，过与不过都说明不了什么。
+> 13. **度量从两个数扩成七个字段**（`DocMetrics`：`lines` / `chars` / `line` / `col` / `selections` / `selectedChars` / `indent`），统一由 workspace 的 `syncMetrics` 算。**列数按字符数报，不按字素报**：CM6 的位置就是 UTF-16 code unit 偏移，一个 emoji 会显示成 2 列。要按字素报得自己切分，不值这个成本。
+> 14. **`metrics()` 的口径是「聚焦分屏里那个标签」**，与命令的口径一致。显示中的标签读 `view.state`，没显示的读 `snapshot.state`——沿用 M1-D 那条「snapshot 是没显示时的唯一真相」。
+> 15. **缩进报的是 state 上的 `indentUnit` facet，不是常量。** `INDENT_UNIT` 导出成常量只为给 `indentLabel` 一个默认值，取值一律走 facet。缩进菜单最终没做（第 29 条），但**将来要做时这条自动生效**，不必回头改状态栏。
+> 16. **语言那一格读 `languageFor(doc().path())`，不读 `tab.language`**：后者是普通字段不是 signal，另存为换了扩展名也不会重渲染，状态栏会一直报旧语言。代价是「模型自己算的那份」与「显示的那份」成了两个来源，但两边调的是同一个 `languageFor`，分叉不了。
+> 17. **编码 / 换行符 / 缩进三格在 M1-E-2a 是 `<span>`**，M1-E-2b 把前两格换成了原生 `<select>`（第 21 条起）。当时留的那个问题——「改了编码算不算未保存的改动」——答案是**算**：`format` 变了不标脏，关窗时这个决定会被静默扔掉，用户拿到的还是旧编码的文件。**缩进那一格刻意没做**，理由见第 29 条。
+> 18. **工具栏右侧那两个 badge 删掉了**（文件名 + 行数字符数），信息全数搬进状态栏，一处不重复。`.app` 的 grid 因此从 4 行变 5 行。
+> 19. **首屏 gzip 232.35 → 232.84 KB**（`index-*.js` 122.61→123.04、`index-*.css` 1.43→1.49），预算 300 KB，余量 22.4%。chunk 仍 117 个，`index.html` 仍只引三个。
+> 20. **测试口径再加两处**：状态栏的**格子按 `title` 精确查**（中间几格是条件渲染的，下标不稳），于是 **tooltip 文案成了契约**——改文案就得改测试，这是故意的，那几行字就是给用户看的说明。另外 16 处既有的度量断言从 `toEqual` 改成 `toMatchObject`：`DocMetrics` 每加一个字段，`toEqual` 都要改十几处，改的人只会照抄实际值，断言就退化成快照了。
+>
+> **M1-E-2b（编码 / 换行符切换，含「以另一种编码重新解码」）：**
+>
+> 21. **编码那一格是「一个下拉里两组」，不是两个入口。**「以…保存」7 项（改写盘格式）+「以…重新打开」4 项（换一种读法把同一份字节再读一遍）。这是**两个不同的操作**，但是同一个决定，所以放一处。用原生 `<select>` + `<optgroup>` 而不是自绘弹层：不用写 click-outside、不用管焦点、不多一个组件——「不加交互复杂度」比「好看」优先。
+> 22. **GBK 只有不带 BOM 的那一项**（7 项而不是 8 项）。Rust 侧 `Encoding::supports_bom` 排除了 `gbk + bom`，`encode` 还会直接忽略它；UI 不提供不可能的组合，比提供了再在下游兜住要便宜。`StatusBar.test.tsx` 里显式断言了 `'GBK BOM'` **不在**选项里。
+> 23. **`<select>` 的 value 只能是一个字符串，而编码是「encoding + bom」两个字段**，于是压成 `utf16_le-bom` 这种 id，`encodingChoiceId` / `parseEncodingChoice` 一对互逆函数管这件事，两侧都有测试（穷举 7 个组合来回压一遍）。
+> 24. **改格式算脏**（兑现第 17 条）：`changeFormat` 只动 `format` 不动正文，但必须 `setDirty(true)`。换行符同理，而且它是**写盘时**才生效的——正文在内存里始终是 LF，所以改 EOL 之后 `getText()` 里一个 `\r` 都不该有，这条也有测试钉住。
+> 25. **「以…重新打开」在有未保存改动时拒绝执行，只给一条提示，不弹模态框。** 不复用 `promptDiscard`：那个对话框的语义是「这个文档还要不要」，而这里用户想要的恰恰是**留住文档**、只换一种读法，弹它等于问错问题。无名文档（没有路径）上它是个 no-op。
+> 26. **`open_file` 因此多了一个参数 `encoding: Option<Encoding>`**，前端**恒传**这个 key（不覆写时传 `null`）。理由是一个静默的数据完整性洞：探测顺序是 BOM → 是合法 UTF-8 就判 utf8 → 否则 GBK，于是**一份 GBK 文件只要字节恰好是合法 UTF-8，就会被解成 UTF-8 且 `lossy = false`**——正文看起来完全正常，UI 里没有任何东西能警告用户。`C4 A3` 这组字节就是实例：UTF-8 读出来是 "ģ"，GBK 读出来是 "模"。没有覆写参数，用户就没有任何办法把它读对。
+>     - 刻意**不省略**这个 key：Tauri 对「参数缺失」与「参数为 null」的处理并不显然一致，而 `Option<Encoding>` 反序列化 `null` 恒为 `None`，传 null 就不用去赌前一种。两侧都用 golden 测试钉住了（`fs.test.ts` 与 `wire_contract.rs`），拼错的枚举值必须**报错**而不是静默当成 `None`。
+> 27. **⚠️ `encoding_rs` 的 `decode()` 会先做 BOM sniffing。** `GBK.decode()` 遇到开头的 `EF BB BF` 会自动改用 UTF-8 解码，并把「实际用的编码」放进返回值的第二项——而那一项我们本来就没读（写成 `_`）。于是显式指定编码在带 BOM 的文件上会**静默失效**：测试现象是 `left: "正文" right: "正文"`，两边一模一样、`lossy` 还是 false，看起来像断言写错了。修法是 `decode_as` 走 **`decode_without_bom_handling`**，BOM 的剥离由调用方负责，且**只剥属于该编码的那一种**（GBK 的 `bom()` 是空切片，而 `strip_prefix(&[])` 恒成功——不先判空就会让 `bom = true` 凭空成立）。探测路径撞不到这个坑，因为它总是先自己把 BOM 剥掉。
+> 28. **显式指定编码时，目录拒绝与 4MB 上限照样生效**——漏掉的话「以某编码重新打开」就成了绕过上限的后门。
+> 29. **缩进那一格刻意没做成菜单**（推翻第 17 条里的计划）。要支持它得给 `indentUnit` 开一个**每标签**的 Compartment（与语言槽位同一条理由），再从 `EditorSetupOptions` → `tab.ts` → `workspace.ts` 一路串下来；而「在轻量编辑器里从状态栏改缩进」本身不是刚需。第 15 条那个「取值一律走 facet」的决定仍然成立，将来要做不用回头改状态栏。
+> 30. **状态栏的 `<select>` 必须把全局 select 样式抹平**：全局那条规则（边框 + 底色 + 3px 内边距）是给工具栏那种 28px 高的控件写的，塞进 22px 的条里会把整条撑高——而状态栏一跳高，靠 `1fr` 算出来的正文区就跟着跳一次布局。
+> 31. **「重新打开」拨完必须手动把下拉复位。** 它是一次性动作不是一个状态，而在**拒绝执行**（有未保存改动）或失败时都不会改 `format()`，于是没有任何重渲染会把 `<select>` 拨回去——不复位的话它会一直显示「以 GBK 重新打开」，看起来像是已经生效了。
+> 32. **首屏 gzip 232.84 → 233.66 KB**（`index-*.js` 123.04→123.80、`index-*.css` 1.49→1.55），预算 300 KB，余量 **22.1%**。chunk 仍 **117** 个，`index.html` 仍只引三个。Rust 侧 53 lib + 6 wire-contract、前端 **386** 个用例全绿。
+> 33. **测试口径再加两处**：① **整体替换模块的 mock（`vi.mock('./ipc/fs', () => ipc)`）在模块长出新的常量导出时会把整份文件一起挂**，而且报出来的错是 `dispose is not a function`——真凶是 render 里对 `undefined` 调 `.map`，栈里根本看不到。改成 `importOriginal` 展开 + 只覆写要假的那几个函数（标签表本来也该是真的：那正是要显示给用户看的东西，mock 掉等于自己给自己判卷）。② jsdom 里驱动 `<select>` 要先设 `.value` 再 `dispatchEvent(new Event('change', {bubbles:true}))`；读显示值必须读 `selectedOptions[0].textContent`，整个元素的 `textContent` 会把所有 option 的文字拼成「UTF-8UTF-8 BOMUTF-16 LE…」。
+>
+> **待人工验**：真的各打开一个 `.md` / `.json` / `.ts` / `.log`，肉眼确认高亮与字体分区对——jsdom 里只能读 facet（语言名、装饰插件在不在），**读不到算出来的字体**，那一层自动化到不了。状态栏另需肉眼过一遍：22px 的条压在正文下面、路径过长时省略号截断、选中与多光标那两格是否只在需要时出现。**M1-E-2b 新增**：两个下拉塞进 22px 的条里撑没撑高整条、原生下拉面板在 `color-scheme: dark` 下是不是暗的、hover 时看不看得出能点、以及**拿一个真的 GBK 文件走一遍「以 GBK 重新打开」**（这条在 jsdom 里是 mock 的，真 IPC 只由 Rust 侧的单测覆盖）。
 
 ---
 

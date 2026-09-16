@@ -20,10 +20,8 @@ const { ipc, dialog, tauriEvent, tauriCore } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn(),
     saveFile: vi.fn(),
-    // 换成假的：它自己另有测试，这里只关心错误能落到提示条上
+    // 换成假的：它自己另有测试，这里只关心错误能落到提示条上（断言里靠 kind 字面量认出来）
     describeFsError: (err: unknown) => `模拟错误：${JSON.stringify(err)}`,
-    ENCODING_LABELS: { utf8: 'UTF-8', utf16_le: 'UTF-16 LE', utf16_be: 'UTF-16 BE', gbk: 'GBK' },
-    LINE_ENDING_LABELS: { lf: 'LF', crlf: 'CRLF' },
   },
   dialog: { open: vi.fn(), save: vi.fn() },
   // 关窗守卫（src/ipc/windowClose.ts）要用的两个 Tauri API。jsdom 里没有运行时，
@@ -32,7 +30,15 @@ const { ipc, dialog, tauriEvent, tauriCore } = vi.hoisted(() => ({
   tauriCore: { invoke: vi.fn() },
 }))
 
-vi.mock('./ipc/fs', () => ipc)
+// 只假掉三个函数，**其余用真的**：状态栏要遍历 ENCODING_CHOICES / ENCODING_IDS /
+// LINE_ENDING_IDS 渲染下拉，整体替换成假对象会让它在 render 里就抛（dispose 都不是函数，
+// 38 条用例一起挂）。标签表本来也该是真的——那正是要显示给用户看的东西。
+vi.mock('./ipc/fs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./ipc/fs')>()),
+  openFile: (...args: unknown[]) => ipc.openFile(...args),
+  saveFile: (...args: unknown[]) => ipc.saveFile(...args),
+  describeFsError: (err: unknown) => ipc.describeFsError(err),
+}))
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
 vi.mock('@tauri-apps/api/event', () => tauriEvent)
 vi.mock('@tauri-apps/api/core', () => tauriCore)
@@ -120,8 +126,24 @@ function focusHost(index: number) {
   target.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
 }
 
-function badges(): string[] {
-  return [...container.querySelectorAll('.badge')].map((b) => b.textContent ?? '')
+/**
+ * 状态栏的格子。中间那几格（「选中 N 字符」「N 个选区」）是条件渲染的，下标不稳定，
+ * 所以文档名取第一格、行数·字符数取最后一格，别按固定下标去数。
+ * 顺手把空白归一化：JSX 里跨行写的文本会带缩进换行。
+ */
+function statusCells(): string[] {
+  return [...container.querySelectorAll('.statusbar .status-cell')].map((c) =>
+    (c.textContent ?? '').replace(/\s+/g, ' ').trim(),
+  )
+}
+
+function statusName(): string {
+  return statusCells()[0]!
+}
+
+function statusCounts(): string {
+  const cells = statusCells()
+  return cells[cells.length - 1]!
 }
 
 function notices(): { level: string; text: string }[] {
@@ -202,9 +224,9 @@ function textFile(overrides: Partial<{ text: string; lossy: boolean }> = {}) {
 describe('App 接线', () => {
   it('挂载后编辑器就位，状态栏报出空文档的度量', () => {
     expect(container.querySelector('.editor-container .cm-editor')).not.toBeNull()
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
     // CM6 把空文档算作「一行空行」，所以是 1 行 0 字符，不是 0 行
-    expect(badges()[1]).toBe('1 行 · 0 字符')
+    expect(statusCounts()).toBe('1 行 · 0 字符')
     // 提示条容器常驻但没有内容：它占着 grid 的第二行，行数必须是固定的
     expect(container.querySelector('.notices')).not.toBeNull()
     expect(container.querySelector('.notice')).toBeNull()
@@ -212,7 +234,7 @@ describe('App 接线', () => {
 
   it('输入会经 onUpdate 推到状态栏（CM6 → signal 的回路在真实 App 里通）', () => {
     typeText('第一行\n第二行\n第三行')
-    expect(badges()[1]).toBe('3 行 · 11 字符')
+    expect(statusCounts()).toBe('3 行 · 11 字符')
   })
 
   it('Alt+Z 经命令中心切换换行，按钮标签与编辑器状态同时更新', () => {
@@ -258,14 +280,14 @@ describe('App 接线', () => {
 
   it('「新建」另开一个空标签，状态栏与编辑器都跟着换过去', () => {
     typeText('a\nb\nc\nd')
-    expect(badges()[1]).toBe('4 行 · 7 字符')
+    expect(statusCounts()).toBe('4 行 · 7 字符')
 
     button('新建').click()
 
     expect(tabs()).toHaveLength(2)
     expect(view().state.doc.toString()).toBe('')
-    expect(badges()[0]).toBe('空文档')
-    expect(badges()[1]).toBe('1 行 · 0 字符')
+    expect(statusName()).toBe('空文档')
+    expect(statusCounts()).toBe('1 行 · 0 字符')
   })
 
   /*
@@ -285,7 +307,7 @@ describe('App 接线', () => {
 
     expect(container.querySelector('.cm-editor')).toBe(before)
     expect(view().state.doc.toString()).toBe('第一份')
-    expect(badges()[1]).toBe('1 行 · 3 字符')
+    expect(statusCounts()).toBe('1 行 · 3 字符')
   })
 
   it('卸载后全局快捷键监听被摘掉，不会再驱动已销毁的编辑器', () => {
@@ -307,10 +329,10 @@ describe('文件生命周期接线', () => {
 
     expect(dialog.open).toHaveBeenCalledWith({ multiple: false, directory: false })
     expect(view().state.doc.toString()).toBe('第一行\n第二行\n')
-    // 徽章只显示 basename，全路径挂在 title 上
-    expect(badges()[0]).toBe('win.txt')
-    expect(container.querySelector<HTMLElement>('.badge')?.title).toBe('/Users/x/notes/win.txt')
-    expect(badges()[1]).toBe('3 行 · 8 字符')
+    // 状态栏只显示 basename，全路径挂在 title 上
+    expect(statusName()).toBe('win.txt')
+    expect(container.querySelector<HTMLElement>('.status-path')?.title).toBe('/Users/x/notes/win.txt')
+    expect(statusCounts()).toBe('3 行 · 8 字符')
     expect(notices()).toEqual([])
   })
 
@@ -320,36 +342,36 @@ describe('文件生命周期接线', () => {
     button('打开…').click()
     await flush()
     // 整篇替换正文不算用户改动——这条是 `replacing` 标志存在的全部理由
-    expect(badges()[0]).toBe('a.txt')
+    expect(statusName()).toBe('a.txt')
 
     typeText('改')
-    expect(badges()[0]).toBe('● a.txt')
+    expect(statusName()).toBe('● a.txt')
 
     press('s', modInit())
     await flush()
 
     expect(ipc.saveFile).toHaveBeenCalledWith('/a.txt', '原文改', { encoding: 'utf8', bom: false, eol: 'lf' })
-    expect(badges()[0]).toBe('a.txt')
+    expect(statusName()).toBe('a.txt')
   })
 
   it('光标移动不置脏', () => {
     typeText('abc')
-    const before = badges()[0]
+    const before = statusName()
     view().dispatch({ selection: { anchor: 0 } })
-    expect(badges()[0]).toBe(before)
+    expect(statusName()).toBe(before)
   })
 
   it('无名文档按 Mod+S 会落到另存为，用对话框拿到路径再写', async () => {
     dialog.save.mockResolvedValue('/chosen/new.txt')
     typeText('新内容')
-    expect(badges()[0]).toBe('● 空文档')
+    expect(statusName()).toBe('● 空文档')
 
     press('s', modInit())
     await flush()
 
     expect(dialog.save).toHaveBeenCalled()
     expect(ipc.saveFile).toHaveBeenCalledWith('/chosen/new.txt', '新内容', { encoding: 'utf8', bom: false, eol: 'lf' })
-    expect(badges()[0]).toBe('new.txt')
+    expect(statusName()).toBe('new.txt')
   })
 
   it('另存为用 Mod+Shift+S，不会被 Mod+S 吃掉', async () => {
@@ -360,7 +382,7 @@ describe('文件生命周期接线', () => {
     await flush()
 
     expect(dialog.save).toHaveBeenCalledOnce()
-    expect(badges()[0]).toBe('copy.txt')
+    expect(statusName()).toBe('copy.txt')
   })
 
   it('对话框取消时什么都不动', async () => {
@@ -368,7 +390,7 @@ describe('文件生命周期接线', () => {
     button('打开…').click()
     await flush()
     expect(ipc.openFile).not.toHaveBeenCalled()
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
   })
 
   it('打开失败时报出错误，并且另开一个干净标签来承载——草稿一动不动', async () => {
@@ -385,7 +407,7 @@ describe('文件生命周期接线', () => {
     expect(list[0]!.level).toBe('error')
     expect(list[0]!.text).toContain('too_large')
     expect(view().state.doc.toString()).toBe('')
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
 
     container.querySelector<HTMLButtonElement>('.notice-close')?.click()
     expect(notices()).toEqual([])
@@ -393,7 +415,7 @@ describe('文件生命周期接线', () => {
     // 切回第一个标签，草稿还在，脏标记也还在
     tabs()[0]!.click()
     expect(view().state.doc.toString()).toBe('手稿')
-    expect(badges()[0]).toBe('● 空文档')
+    expect(statusName()).toBe('● 空文档')
     expect(notices()).toEqual([])
   })
 
@@ -431,7 +453,7 @@ describe('文件生命周期接线', () => {
     expect(list).toHaveLength(1)
     expect(list[0]!.level).toBe('warning')
     expect(list[0]!.text).toContain('GBK')
-    expect(badges()[0]).toBe('gbk.txt')
+    expect(statusName()).toBe('gbk.txt')
   })
 
   it('IO 进行中四个文档按钮都是 disabled 的', async () => {
@@ -472,7 +494,7 @@ describe('关闭确认接线', () => {
     closeTabButton(0).click()
     await flush()
     expect(modal()).toBeNull()
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
   })
 
   it('关掉脏标签弹出三选一，标题里带文件名', async () => {
@@ -504,7 +526,7 @@ describe('关闭确认接线', () => {
 
     expect(modal()).toBeNull()
     expect(tabs()).toHaveLength(1)
-    expect(badges()[0]).toBe('● a.txt')
+    expect(statusName()).toBe('● a.txt')
     expect(view().state.doc.toString()).toBe('正文改')
   })
 
@@ -532,7 +554,7 @@ describe('关闭确认接线', () => {
     expect(modal()).toBeNull()
     // 关掉的是唯一的标签，补进来一个空的
     expect(tabs()).toHaveLength(1)
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
   })
 
   it('点「保存」：写盘之后才关', async () => {
@@ -545,7 +567,7 @@ describe('关闭确认接线', () => {
 
     expect(ipc.saveFile).toHaveBeenCalledWith('/a.txt', '正文改', { encoding: 'utf8', bom: false, eol: 'lf' })
     expect(modal()).toBeNull()
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
   })
 
   it('Rust 发来关窗事件：没有未保存改动时直接关，不弹对话框', async () => {
@@ -577,7 +599,7 @@ describe('关闭确认接线', () => {
 
     expect(tauriCore.invoke).not.toHaveBeenCalledWith('close_window')
     expect(modal()).toBeNull()
-    expect(badges()[0]).toBe('● a.txt')
+    expect(statusName()).toBe('● a.txt')
   })
 
   it('多个脏标签时一次列出全部文件名，而不是一个一个弹', async () => {
@@ -615,7 +637,7 @@ describe('分屏接线', () => {
     expect(views()[0]).not.toBe(views()[1])
     expect(focused()).toBe(1)
     expect(tabs()).toHaveLength(2)
-    expect(badges()[0]).toBe('空文档')
+    expect(statusName()).toBe('空文档')
     expect(button('合并').disabled).toBe(false)
     expect(container.querySelector('.body')?.classList.contains('column')).toBe(false)
   })
@@ -645,15 +667,15 @@ describe('分屏接线', () => {
 
     expect(views()[0]!.state.doc.toString()).toBe('AAAA')
     expect(views()[1]!.state.doc.toString()).toBe('BBBBBBB')
-    expect(badges()[1]).toBe('1 行 · 7 字符')
+    expect(statusCounts()).toBe('1 行 · 7 字符')
 
     // 往没聚焦的那块敲字不该动状态栏——度量是「聚焦分屏的标签」的属性
     typeInto(0, 'CC')
-    expect(badges()[1]).toBe('1 行 · 7 字符')
+    expect(statusCounts()).toBe('1 行 · 7 字符')
 
     focusHost(0)
     expect(focused()).toBe(0)
-    expect(badges()[1]).toBe('1 行 · 6 字符')
+    expect(statusCounts()).toBe('1 行 · 6 字符')
   })
 
   it('Mod+\\ 与 Mod+Shift+\\ 与按钮走同一条路', () => {
@@ -681,12 +703,12 @@ describe('分屏接线', () => {
     button('右分屏').click()
     typeInto(1, 'BBBBBBB')
     expect(focused()).toBe(1)
-    expect(badges()[1]).toBe('1 行 · 7 字符')
+    expect(statusCounts()).toBe('1 行 · 7 字符')
 
     focusHost(0)
 
     expect(focused()).toBe(0)
-    expect(badges()[1]).toBe('1 行 · 0 字符')
+    expect(statusCounts()).toBe('1 行 · 0 字符')
   })
 
   it('合并掉带未保存改动的分屏不丢稿子：标签留在条上，点回去正文还在', () => {
@@ -702,7 +724,7 @@ describe('分屏接线', () => {
 
     tabs()[1]!.click()
     expect(views()[0]!.state.doc.toString()).toBe('草稿')
-    expect(badges()[1]).toBe('1 行 · 2 字符')
+    expect(statusCounts()).toBe('1 行 · 2 字符')
   })
 
   it('合并到只剩一块之后「合并」按钮重新 disabled', () => {

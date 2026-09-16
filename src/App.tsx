@@ -5,8 +5,8 @@ import { attachKeybindingDispatch } from './commands/dispatch'
 import { detectPlatform } from './commands/keybinding'
 import { createCommandRegistry, type AppContext } from './commands/registry'
 import { DiscardDialog } from './doc/DiscardDialog'
+import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
-import { UNTITLED_LABEL } from './doc/document'
 import { createWorkspace, MAX_PANES, type DiscardDecision, type Pane } from './doc/workspace'
 import { EditorPane } from './editor/EditorPane'
 import {
@@ -213,7 +213,7 @@ export default function App() {
           </button>
         </div>
 
-        <div class="toolbar-group">
+        <div class="toolbar-group" style="border-right:none">
           <span class="toolbar-label">分屏</span>
           <button
             onClick={() => void registry.execute('editor.splitRight')}
@@ -237,15 +237,6 @@ export default function App() {
             合并
           </button>
         </div>
-
-        <div class="toolbar-group" style="margin-left:auto;border-right:none">
-          <span class="badge" title={activeDoc().path() ?? UNTITLED_LABEL}>
-            {activeDoc().busy() ? '读写中…' : `${activeDoc().dirty() ? '● ' : ''}${activeDoc().name()}`}
-          </span>
-          <span class="badge">
-            {ws.metrics().lines.toLocaleString()} 行 · {ws.metrics().chars.toLocaleString()} 字符
-          </span>
-        </div>
       </div>
 
       <TabStrip workspace={ws} />
@@ -255,7 +246,8 @@ export default function App() {
       <div class="notices">
         <Show when={activeDoc().lossy()}>
           <div class="notice warning">
-            这个文件没能完整解码，正文里的 U+FFFD 是替换字符。<strong>原样保存会永久损坏它</strong>——请另存为一份新文件。
+            这个文件没能完整解码，正文里的 U+FFFD 是替换字符。<strong>原样保存会永久损坏它</strong>
+            ——可以在状态栏的编码菜单里选「以…重新打开」换个编码重读一次，或者另存为一份新文件。
           </div>
         </Show>
         <Show when={activeDoc().notice()}>
@@ -284,6 +276,8 @@ export default function App() {
           )}
         </For>
       </div>
+
+      <StatusBar workspace={ws} />
 
       {/* `.modal-backdrop` 是 position:fixed，脱离 grid 流，所以不会给行数固定的
           `.app` 多加出一行来（绝对定位的子元素不是 grid item） */}

@@ -13,7 +13,19 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
 
-import { describeFsError, openFile, saveFile, type FileFormat, type TextFile, type WriteReport } from './fs'
+import {
+  describeFsError,
+  ENCODING_CHOICES,
+  ENCODING_IDS,
+  encodingChoiceId,
+  LINE_ENDING_IDS,
+  openFile,
+  parseEncodingChoice,
+  saveFile,
+  type FileFormat,
+  type TextFile,
+  type WriteReport,
+} from './fs'
 
 // 与 Rust 侧 text_file_的线上形状 用的是同一个文件（GBK + CRLF + 「第一行\n第二行\n」）
 const GOLDEN_TEXT_FILE =
@@ -58,10 +70,21 @@ describe('Rust → 前端 的字段名', () => {
 })
 
 describe('前端 → Rust 的 command 名与参数名', () => {
-  it('open_file 只收一个 path', async () => {
+  it('open_file 不覆写编码时把 encoding 显式传成 null', async () => {
     invoke.mockResolvedValue(JSON.parse(GOLDEN_TEXT_FILE))
     await openFile('/tmp/a.txt')
-    expect(invoke).toHaveBeenCalledWith('open_file', { path: '/tmp/a.txt' })
+    // ⚠️ 不能省掉这个 key：Tauri 对「参数缺失」与「参数为 null」的处理并不显然一致，
+    // 而 `Option<Encoding>` 反序列化 null 恒为 None，传 null 就不用去赌前一种。
+    // 对应 Rust 侧 wire_contract.rs 的「编码覆写参数用_null_表示走探测」
+    expect(invoke).toHaveBeenCalledWith('open_file', { path: '/tmp/a.txt', encoding: null })
+  })
+
+  it('open_file 覆写编码时把 snake_case 的枚举值原样传下去', async () => {
+    invoke.mockResolvedValue(JSON.parse(GOLDEN_TEXT_FILE))
+    await openFile('/tmp/a.txt', 'utf16_le')
+    // 漏传或拼错的后果是静默的：Rust 那边收到 None，「以某编码重新打开」退化成
+    // 「再探测一次」，用户看到的还是同一屏乱码，没有任何提示说刚才那下没生效
+    expect(invoke).toHaveBeenCalledWith('open_file', { path: '/tmp/a.txt', encoding: 'utf16_le' })
   })
 
   it('save_file 的参数名与 Rust command 的形参一一对应', async () => {
@@ -70,6 +93,39 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     await saveFile('/tmp/a.txt', '正文', format)
     // Tauri 2 默认把 command 形参按 camelCase 暴露给 JS；这三个都是单词，两边同名
     expect(invoke).toHaveBeenCalledWith('save_file', { path: '/tmp/a.txt', text: '正文', format })
+  })
+})
+
+describe('状态栏下拉用的编码组合表', () => {
+  it('七个合法组合，GBK 只有不带 BOM 的那一种', () => {
+    // Rust 侧 `Encoding::supports_bom` 排除了 gbk + bom：写了也没工具认，encode 还会忽略它。
+    // UI 不提供不可能的组合，比提供了再在下游兜住要便宜
+    expect(ENCODING_CHOICES.map((c) => encodingChoiceId(c))).toEqual([
+      'utf8',
+      'utf8-bom',
+      'utf16_le',
+      'utf16_le-bom',
+      'utf16_be',
+      'utf16_be-bom',
+      'gbk',
+    ])
+    expect(ENCODING_CHOICES.find((c) => c.encoding === 'gbk')?.bom).toBe(false)
+  })
+
+  it('压成字符串再解回来，两个字段都不丢', () => {
+    for (const choice of ENCODING_CHOICES) {
+      expect(parseEncodingChoice(encodingChoiceId(choice))).toEqual({
+        encoding: choice.encoding,
+        bom: choice.bom,
+      })
+    }
+    // 展示名带不带 BOM 是用户唯一能看出区别的地方
+    expect(ENCODING_CHOICES.find((c) => c.encoding === 'utf16_be' && c.bom)?.label).toBe('UTF-16 BE BOM')
+  })
+
+  it('「重新打开」那一组只列四个编码：BOM 是从字节里读的，不由用户选', () => {
+    expect(ENCODING_IDS).toEqual(['utf8', 'utf16_le', 'utf16_be', 'gbk'])
+    expect(LINE_ENDING_IDS).toEqual(['lf', 'crlf'])
   })
 })
 

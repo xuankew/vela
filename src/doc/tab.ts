@@ -1,6 +1,7 @@
 import { Compartment, type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import type { EditorSnapshot } from '../editor/controller'
+import type { LanguageChoice } from '../editor/language'
 import { createEditorState, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
 import { createDocumentModel, type DocumentModel } from './document'
 
@@ -21,17 +22,17 @@ import { createDocumentModel, type DocumentModel } from './document'
  * 之前那个再也拨不动。共享一个实例，一次 reconfigure 才能同时作用于「正在显示的那个 view」
  * 与「存着的所有 state」。
  *
- * `markdownMode` 眼下也是全局的：M1-E 做「按扩展名分语言」时它要变成每标签一个，
- * 到那时这个字段从 ViewConfig 挪到 Tab 上。
+ * 语言不在这儿：它由每个标签自己的路径决定，槽位因此是**每标签一个实例**（见 `Tab`）。
+ * 同一个 Compartment 实例被多个 state 共享时，reconfigure 会一次拨动全部——那正是换行
+ * 想要的、也正是语言不想要的。
  */
 export interface ViewConfig {
   lineWrap: boolean
-  markdownMode: boolean
   readonly lineWrapSlot: Compartment
 }
 
-export function createViewConfig(lineWrap = true, markdownMode = true): ViewConfig {
-  return { lineWrap, markdownMode, lineWrapSlot: new Compartment() }
+export function createViewConfig(lineWrap = true): ViewConfig {
+  return { lineWrap, lineWrapSlot: new Compartment() }
 }
 
 export interface Tab {
@@ -46,6 +47,12 @@ export interface Tab {
   snapshot: EditorSnapshot
   /** 重建 state 时要原样带上的回调。存在标签上而不是每次由调用方传，否则换文档会顺手换掉监听器 */
   readonly onUpdate?: (info: EditorUpdateInfo) => void
+  /** 语言槽位，每标签一个实例。理由见 `ViewConfig` 的注释 */
+  readonly languageSlot: Compartment
+  /** 当前装着的语言。`null` = 槽位还是空的（刚重建完 state，还没装） */
+  language: LanguageChoice | null
+  /** 异步子语言加载的代号。加载回来时若已不等于当前值，说明期间又换过语言，结果要丢掉 */
+  languageToken: number
 }
 
 /**
@@ -59,6 +66,8 @@ export interface TabHost {
   getText(tab: Tab): string
   setText(tab: Tab, text: string): void
   focus(tab: Tab): void
+  /** 路径变了（打开文件、另存为）。跟着路径走的东西——眼下只有语言——由宿主重算 */
+  pathChanged(tab: Tab): void
 }
 
 export interface CreateTabInit {
@@ -69,28 +78,45 @@ export interface CreateTabInit {
   onUpdate?: (info: EditorUpdateInfo) => void
 }
 
-export function buildState(text: string, config: ViewConfig, onUpdate?: (info: EditorUpdateInfo) => void): EditorState {
+export function buildState(
+  text: string,
+  config: ViewConfig,
+  languageSlot: Compartment,
+  onUpdate?: (info: EditorUpdateInfo) => void,
+): EditorState {
+  // 刻意不传 language：建出来的槽位是空的，语言一律由 workspace 的 syncLanguage 装。
+  // 留两条安装路径的话，子语言懒加载回来的那一刻就得再判断一次「这个 state 是哪条路建的」
   return createEditorState({
     doc: text,
     lineWrap: config.lineWrap,
-    markdownMode: config.markdownMode,
     lineWrapSlot: config.lineWrapSlot,
+    languageSlot,
     onUpdate,
   })
 }
 
 export function createTab(init: CreateTabInit): Tab {
+  // 每标签一个实例：语言是标签的属性，共享实例会让改一个标签的语言波及全部
+  const languageSlot = new Compartment()
   // `tab` 在自己的初始化表达式里被三个闭包引用。闭包只会在 createTab 返回之后被调用，
   // 所以这不是 TDZ 问题；写成两段赋值只是为了让 host 能拿到标签自己。
   let tab: Tab
   tab = {
     id: init.id,
-    snapshot: { state: buildState(init.text ?? '', init.config, init.onUpdate), scrollTop: 0, scrollLeft: 0 },
+    snapshot: {
+      state: buildState(init.text ?? '', init.config, languageSlot, init.onUpdate),
+      scrollTop: 0,
+      scrollLeft: 0,
+    },
     ...(init.onUpdate ? { onUpdate: init.onUpdate } : {}),
+    languageSlot,
+    language: null,
+    languageToken: 0,
     doc: createDocumentModel({
       getText: () => init.host.getText(tab),
       setText: (text) => init.host.setText(tab, text),
       focus: () => init.host.focus(tab),
+      pathChanged: () => init.host.pathChanged(tab),
     }),
   }
   return tab
@@ -116,7 +142,14 @@ export function tabChars(tab: Tab): number {
  * Cmd+Z 把**上一个文件**的内容拉回来。换文档就该是新文档。滚动位置一并归零。
  */
 export function replaceTabText(tab: Tab, text: string, config: ViewConfig) {
-  tab.snapshot = { state: buildState(text, config, tab.onUpdate), scrollTop: 0, scrollLeft: 0 }
+  tab.snapshot = {
+    state: buildState(text, config, tab.languageSlot, tab.onUpdate),
+    scrollTop: 0,
+    scrollLeft: 0,
+  }
+  // 新 state 的语言槽位是空的。不归零的话 syncLanguage 会认为「语言没变」直接跳过，
+  // 于是打开文件之后既没有语法高亮也没有字体分区，而且静默无报错
+  tab.language = null
 }
 
 /**

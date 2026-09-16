@@ -37,6 +37,16 @@ impl Encoding {
         self != Encoding::Gbk
     }
 
+    /// 这个编码自己的 BOM。GBK 没有 BOM，返回空切片——调用方据此判断「有没有可剥的」。
+    fn bom(self) -> &'static [u8] {
+        match self {
+            Encoding::Utf8 => &BOM_UTF8,
+            Encoding::Utf16Le => &BOM_UTF16_LE,
+            Encoding::Utf16Be => &BOM_UTF16_BE,
+            Encoding::Gbk => &[],
+        }
+    }
+
     fn codec(self) -> &'static encoding_rs::Encoding {
         match self {
             Encoding::Utf8 => encoding_rs::UTF_8,
@@ -83,8 +93,43 @@ pub fn decode(bytes: &[u8]) -> Decoded {
     decode_with(bytes, Encoding::Gbk, false)
 }
 
+/// 用**调用方指定**的编码解码，跳过探测。
+///
+/// 存在的理由是探测会**静默地错**：一份 GBK 文件如果字节恰好是合法 UTF-8，`decode`
+/// 会报 `utf8` 且 `lossy = false`——正文是乱码，但没有任何标记能让 UI 警告用户。
+/// 这条路径就是给那种情况准备的逃生口（状态栏的「以…重新打开」）。
+///
+/// BOM 的处理与探测路径**不一样**：只剥离「属于所选编码」的那一个。
+/// 理由是 `FileFormat` 里不能有 `gbk + bom = true` 这种组合（`supports_bom` 明确排除，
+/// `encode` 也会直接忽略它），而写回去时忽略 BOM 就等于悄悄删掉用户文件头的三个字节。
+/// 于是：以 UTF-8 重开一个 UTF-8 BOM 文件 → 剥掉、`bom = true`，能往返；
+/// 以 GBK 重开同一个文件 → `bom = false`，BOM 那三字节当 GBK 正文解出来是乱码，
+/// 而**乱码正是「你选错了」该有的信号**。
+///
+/// ⚠️ 无 BOM 的 UTF-16 在探测路径上是刻意不猜的（见文件头），但**显式指定时可以读**：
+/// 不猜是因为猜错要写坏文件，而这里的责任在用户身上。
+pub fn decode_as(bytes: &[u8], encoding: Encoding) -> Decoded {
+    let bom = encoding.bom();
+    // GBK 的 bom() 是空切片，而 `strip_prefix(&[])` 恒成功——不先判空就会把整份正文
+    // 当成「剥过 BOM 的」交出去，`bom = true` 于是凭空成立
+    let stripped = if bom.is_empty() { None } else { bytes.strip_prefix(bom) };
+    match stripped {
+        Some(rest) => decode_with(rest, encoding, true),
+        None => decode_with(bytes, encoding, false),
+    }
+}
+
+/// ⚠️ 必须用 `decode_without_bom_handling` 而不是 `decode`。
+///
+/// encoding_rs 的 `decode` **会先做 BOM sniffing**：`GBK.decode()` 遇到开头的
+/// EF BB BF 时会自动改用 UTF-8 解码，并把「实际用的编码」放在返回值的第二项里——
+/// 而那一项我们本来就没读。于是 `decode_as(bytes, Gbk)` 在带 BOM 的文件上会
+/// 静默地不解成 GBK，用户显式指定的编码被无视，正文看起来还完全正常。
+///
+/// 探测路径（`decode`）撞不到这个坑，因为它总是先自己把 BOM 剥掉；`decode_as`
+/// 刻意不剥别人的 BOM，所以就撞上了。BOM 的剥离由调用方负责，这里只管解码。
 fn decode_with(bytes: &[u8], encoding: Encoding, bom: bool) -> Decoded {
-    let (text, _, lossy) = encoding.codec().decode(bytes);
+    let (text, lossy) = encoding.codec().decode_without_bom_handling(bytes);
     Decoded { text: text.into_owned(), encoding, bom, lossy }
 }
 
@@ -115,13 +160,8 @@ pub fn encode(text: &str, encoding: Encoding, bom: bool) -> Encoded {
     };
 
     if bom {
-        let prefix: &[u8] = match encoding {
-            Encoding::Utf8 => &BOM_UTF8,
-            Encoding::Utf16Le => &BOM_UTF16_LE,
-            Encoding::Utf16Be => &BOM_UTF16_BE,
-            // GBK 没有 BOM，见 Encoding::supports_bom
-            Encoding::Gbk => &[],
-        };
+        // GBK 的 bom() 是空切片，所以这里天然就是「GBK 没有 BOM，见 Encoding::supports_bom」
+        let prefix = encoding.bom();
         if !prefix.is_empty() {
             bytes.splice(0..0, prefix.iter().copied());
         }
@@ -264,5 +304,69 @@ mod tests {
         assert_ne!(d.encoding, Encoding::Utf16Le, "无 BOM 却猜成了 UTF-16");
         // 落到 GBK 兜底路径上，正文是乱码——所以 UI 必须把 lossy 显式告诉用户
         assert!(d.lossy || d.text != "中文 mixed");
+    }
+
+    /// `decode_as` 存在的**全部理由**：探测会静默地错，而且错得毫无痕迹。
+    #[test]
+    fn 探测判成_utf8_的字节可以被显式改判为_gbk() {
+        // C4 A3 同时是合法的 UTF-8（"ģ"）与合法的 GBK（"模"）。
+        // 探测按「合法 UTF-8 优先」报 utf8，而 lossy = false —— 正文是错的，
+        // 但 UI 拿不到任何可以警告用户的依据。这就是需要「以…重新打开」的场景。
+        let bytes = [0xC4, 0xA3];
+        let guessed = decode(&bytes);
+        assert_eq!(guessed.encoding, Encoding::Utf8);
+        assert!(!guessed.lossy, "静默错判的前提正是它看起来完全正常");
+        assert_eq!(guessed.text, "ģ");
+
+        let forced = decode_as(&bytes, Encoding::Gbk);
+        assert_eq!(forced.encoding, Encoding::Gbk);
+        assert_eq!(forced.text, "模");
+        assert!(!forced.lossy);
+    }
+
+    #[test]
+    fn 显式指定编码时只剥离属于该编码的_bom() {
+        let mut bytes = BOM_UTF8.to_vec();
+        bytes.extend_from_slice("正文".as_bytes());
+
+        // 以 UTF-8 重开一个 UTF-8 BOM 文件：剥掉、bom 记着，于是能原样写回
+        let same = decode_as(&bytes, Encoding::Utf8);
+        assert!(same.bom);
+        assert_eq!(same.text, "正文");
+        assert!(!same.lossy);
+
+        // 以 GBK 重开同一个文件：GBK 没有 BOM，那三字节被当正文解出来是乱码，
+        // 而乱码正是「你选错了」该有的信号。**bom 不能是 true**——
+        // `gbk + bom = true` 是 FileFormat 里不存在的组合，encode 会忽略它，
+        // 写回去就悄悄少了文件头三个字节
+        let other = decode_as(&bytes, Encoding::Gbk);
+        assert!(!other.bom, "凭空多出 GBK 的 BOM，写回时会静默丢掉文件头");
+        // 这条断言守的是 encoding_rs 的 BOM sniffing：用 `decode` 而不是
+        // `decode_without_bom_handling` 的话，GBK 会看见 UTF-8 的 BOM 就自己改用 UTF-8，
+        // 于是这里解出来还是 "正文"、lossy 还是 false——用户的选择被静默吞掉
+        assert_ne!(other.text, "正文", "指定的 GBK 没有生效，八成是 BOM sniffing 又回来了");
+    }
+
+    /// 探测路径刻意不猜无 BOM 的 UTF-16，但显式指定时必须读得出来：
+    /// 不猜是因为猜错要写坏文件，而这里的责任在用户身上。
+    #[test]
+    fn 无_bom_的_utf16_显式指定时能读() {
+        let bytes = encode("中文", Encoding::Utf16Le, false).bytes;
+        assert_ne!(decode(&bytes).text, "中文", "前提不成立：探测本来就该读不出来");
+
+        let d = decode_as(&bytes, Encoding::Utf16Le);
+        assert_eq!(d.text, "中文");
+        assert_eq!(d.encoding, Encoding::Utf16Le);
+        assert!(!d.bom);
+        assert!(!d.lossy);
+    }
+
+    #[test]
+    fn 显式指定编码不会把有损解码变成无损() {
+        // 「我告诉你是 UTF-8」不等于「它就是 UTF-8」。用户指定了编码就假装无损的话，
+        // U+FFFD 会被当成正常正文写回去——那才是真的损坏文件
+        let d = decode_as(&[0x61, 0xFF, 0xFF, 0x62], Encoding::Utf8);
+        assert!(d.lossy);
+        assert!(d.text.contains('\u{FFFD}'));
     }
 }

@@ -4,6 +4,7 @@ import { Compartment, EditorSelection, type EditorState } from '@codemirror/stat
 import { EditorView } from '@codemirror/view'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EditorController } from './controller'
+import { languageFor } from './language'
 import { createEditorState, type EditorUpdateInfo } from './setup'
 
 let host: HTMLElement
@@ -19,7 +20,14 @@ function makeSlot() {
 }
 
 function stateFor(doc = '', lineWrap = true, slot = makeSlot(), onUpdate?: (info: EditorUpdateInfo) => void) {
-  return createEditorState({ doc, lineWrap, markdownMode: true, lineWrapSlot: slot, onUpdate })
+  return createEditorState({
+    doc,
+    lineWrap,
+    language: languageFor(null),
+    lineWrapSlot: slot,
+    languageSlot: new Compartment(),
+    onUpdate,
+  })
 }
 
 function wrapEnabled(view: EditorView): boolean {

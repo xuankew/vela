@@ -18,7 +18,9 @@
 use std::path::Path;
 
 use tauri::command;
-use vela_core::fs::{read_text, write_text_atomic, FileFormat, ReadError, TextFile, WriteError, WriteReport};
+use vela_core::fs::{
+    read_text, read_text_as, write_text_atomic, Encoding, FileFormat, ReadError, TextFile, WriteError, WriteReport,
+};
 
 /// 读一个文本文件。
 ///
@@ -26,9 +28,16 @@ use vela_core::fs::{read_text, write_text_atomic, FileFormat, ReadError, TextFil
 /// 同步 command 会阻塞 UI。函数体本身是阻塞 IO，没有再套 `spawn_blocking`：
 /// 上限 4MB 的文件读 + 解码在毫秒量级，而运行时上目前只有这一个来源的活。
 /// 等 M1 的搜索与文件监听落地、运行时真有了并发负载，再把这里挪进 blocking 池。
+///
+/// `encoding` 为 `None` 时走探测，`Some` 时**跳过探测**用它解——这是「以某编码重新
+/// 打开」。必须有这条路：探测会静默地错，一份 GBK 文件如果字节恰好是合法 UTF-8，
+/// 会被判成 utf8 且 `lossy = false`，正文是乱码而 UI 没有任何依据去警告用户。
 #[command]
-pub async fn open_file(path: String) -> Result<TextFile, ReadError> {
-    read_text(Path::new(&path))
+pub async fn open_file(path: String, encoding: Option<Encoding>) -> Result<TextFile, ReadError> {
+    match encoding {
+        Some(encoding) => read_text_as(Path::new(&path), encoding),
+        None => read_text(Path::new(&path)),
+    }
 }
 
 /// 原子写入一个文本文件，并把编码/行尾还原成 `format` 记录的原样。

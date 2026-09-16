@@ -33,6 +33,7 @@ import {
   syntaxTreeAvailable,
   HighlightStyle,
   indentUnit,
+  type LanguageSupport,
 } from '@codemirror/language'
 import { search, searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { autocompletion, completionKeymap, closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
@@ -41,6 +42,7 @@ import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
 import { createFindReplacePanel, preserveCase } from './findReplace'
 import { indentGuides } from './indentGuides'
+import type { LanguageChoice } from './language'
 import { mouseGestures } from './multiCursor'
 import { coveredRange, escapesCoverage } from './viewport'
 
@@ -210,11 +212,26 @@ const tokenHighlight = HighlightStyle.define([
   { tag: tags.processingInstruction, color: '#565f89' },
 ])
 
+/**
+ * 缩进单位。导出成常量而不是内联字面量：状态栏要把它报出来，两处各写一份迟早分叉。
+ */
+export const INDENT_UNIT = '  '
+
+/** 缩进设置的展示名。含 Tab 就报「Tab」，否则报空格数 */
+export function indentLabel(unit: string): string {
+  return unit.includes('\t') ? 'Tab' : `${unit.length} 空格`
+}
+
 export interface EditorSetupOptions {
   /** 是否开启自动换行 */
   lineWrap?: boolean
-  /** 是否启用 Markdown + 子语言懒加载。关闭时整篇按代码渲染 */
-  markdownMode?: boolean
+  /**
+   * 这个文档的语言。决定语法树与字体分区，由 `./language` 从路径算出来。
+   *
+   * 可选：`tab.ts` 建 state 时**刻意不传**，让槽位空着、随后由 workspace 的 syncLanguage
+   * 统一装。语言只有一条安装路径，子语言懒加载回来时就不必再判断「这个 state 是哪条路建的」。
+   */
+  language?: LanguageChoice
   /**
    * 自动换行的开关槽位，由调用方（`EditorController`）持有。
    *
@@ -222,6 +239,37 @@ export interface EditorSetupOptions {
    * 而 `lineWrapping` 只是众多扩展里的一个，reconfigure 就够了。
    */
   lineWrapSlot: Compartment
+  /**
+   * 语言的开关槽位，**每标签一个实例**。
+   *
+   * 与 `lineWrapSlot` 正好相反：换行是全局视图设置，共享一个实例才能一次 reconfigure
+   * 拨动所有标签；语言是标签自己的属性（由它的路径决定），共享实例会让改一个标签的
+   * 语言波及全部。Compartment 按实例寻址，所以「每标签一个」就是「每标签独立」。
+   *
+   * 必须是槽位而不是重建 state：`language-data` 的子语言靠动态 import 懒加载，
+   * 建 state 那一刻拿不到 `LanguageSupport`，只能先装上同步部分、等 import 落地再补。
+   */
+  languageSlot: Compartment
+}
+
+/**
+ * 一种语言对应的扩展：语法 + 字体分区。
+ *
+ * `support` 为 null 表示懒加载还没落地，此时只有字体分区生效——字体不能等，
+ * 否则用户会先看到一屏正文字体的代码，再闪一下变成等宽。
+ */
+export function languageExtensions(choice: LanguageChoice, support: LanguageSupport | null): Extension[] {
+  switch (choice.kind) {
+    case 'markdown':
+      // markdown 是静态依赖，不走 language-data 的懒加载。codeLanguages 让围栏里的
+      // ts/rust/json 按需解析；正文用文楷，代码块与表格行由装饰换成等宽字体
+      return [markdown({ base: markdownLanguage, codeLanguages: languages }), fontTheme, codeFontBySyntax]
+    case 'code':
+      return [...(support === null ? [] : [support]), codeDocFontTheme]
+    case 'plain':
+      // 没匹配上的扩展名一律等宽且不挂语言：等宽对日志与表格的列对齐是刚需
+      return [codeDocFontTheme]
+  }
 }
 
 /**
@@ -231,7 +279,7 @@ export interface EditorSetupOptions {
  * 部分（如 lint gutter）。
  */
 export function buildExtensions(options: EditorSetupOptions): Extension[] {
-  const { lineWrap = true, markdownMode = true, lineWrapSlot } = options
+  const { lineWrap = true, language, lineWrapSlot, languageSlot } = options
 
   const exts: Extension[] = [
     lineNumbers(),
@@ -245,7 +293,7 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     // 不报错，只是光标少了一堆，所以 Option+Click / Option+Shift+拖拽 全指着这一条。
     EditorState.allowMultipleSelections.of(true),
     indentOnInput(),
-    indentUnit.of('  '),
+    indentUnit.of(INDENT_UNIT),
     bracketMatching(),
     closeBrackets(),
     autocompletion(),
@@ -284,16 +332,10 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     ]),
   ]
 
-  if (markdownMode) {
-    // languages 提供子语言懒加载：代码块内的 ts/rust/json 按需解析
-    exts.push(markdown({ base: markdownLanguage, codeLanguages: languages }))
-    // 正文用文楷，代码块/表格行由装饰换成等宽字体
-    exts.push(fontTheme, codeFontBySyntax)
-  } else {
-    exts.push(codeDocFontTheme)
-  }
-
-  // 槽位必须始终在扩展集里：关闭换行时塞空数组，否则之后 reconfigure 无处生效
+  // 语言槽位必须始终在扩展集里，与换行槽位同一条理由。缺省时装空数组：
+  // 语言由 workspace 的 syncLanguage 随后 reconfigure 进来，槽位不存在就无处生效
+  exts.push(languageSlot.of(language === undefined ? [] : languageExtensions(language, null)))
+  // 换行槽位同理：关闭换行时塞空数组，否则之后 reconfigure 无处生效
   exts.push(lineWrapSlot.of(lineWrap ? [EditorView.lineWrapping] : []))
 
   return exts
