@@ -5,6 +5,7 @@
 //! （`src-tauri` 把这一整个函数放进后台线程，回调里 `app.emit`）。
 //! 这样本模块的每个分支都能用 `tempfile` 在当前线程上测完。
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use grep_searcher::{sinks, BinaryDetection, Searcher, SearcherBuilder};
 use ignore::WalkBuilder;
 use serde::Serialize;
 
-use super::query::{build_filters, build_matcher, Filters, SearchError, SearchQuery};
+use super::query::{build_filters, build_matcher, build_template, Filters, SearchError, SearchQuery, Template};
 
 /// 一次搜索最多产出多少条命中。撞到就**整个停下来**，`SearchSummary::truncated` 为真。
 ///
@@ -63,7 +64,7 @@ const BATCH_HITS: usize = 256;
 ///
 /// 256 是按「十万个文件最多推 400 次心跳」倒推的：一次心跳的 payload 只有几十字节，
 /// 400 次连 4MB 上限的零头都不到，而前端每 256 个文件能刷一次「已扫 N 个」。
-const HEARTBEAT_FILES: u32 = 256;
+pub(super) const HEARTBEAT_FILES: u32 = 256;
 
 /// 或者距上一次推批次过了这么久，也推一次心跳。
 ///
@@ -73,7 +74,7 @@ const HEARTBEAT_FILES: u32 = 256;
 ///
 /// 这一半没法确定地测（要测就得 sleep，而 sleep 出来的测试测的是调度器）；
 /// 钉住的是文件数那一半，见 `扫过很多个没有命中的文件时会推心跳`。
-const HEARTBEAT_MS: u64 = 250;
+pub(super) const HEARTBEAT_MS: u64 = 250;
 
 /// 一行里的一个命中段。
 ///
@@ -101,7 +102,25 @@ pub struct SearchHit {
     /// 截断之外，或者命中段数撞到 `MAX_RANGES_PER_HIT`。空的意思是「这一行确实命中了，
     /// 只是没能告诉你命中在哪儿」，行号照样能跳
     pub ranges: Vec<MatchRange>,
-    /// 正文被截断了（原文比 `text` 长）
+    /// 这一行**换完之后**长什么样（M2-D）。`None` = 这是一次纯搜索，没有替换。
+    ///
+    /// ⚠️ 三条不显然的规矩：
+    ///
+    /// - **`Some("")` 是合法且常见的**：模板为空、或者模板是 `$1` 而第 1 组这次没参与匹配，
+    ///   都会得到空串。它的含义是「这一行换完就没了那一段」，不是「没有替换」。
+    ///   前端必须判 `!== undefined`，判真假的话这一行会安静地退回成纯搜索的样子。
+    /// - **`skip_serializing_if` 是有意的**：纯搜索时这个字段整个不上线，
+    ///   于是 M2-C 那批黄金 JSON 一字不改。省下的是真金白银——两万条命中每条多
+    ///   `"replaced":null,` 十七个字节就是 340KB，全花在「本来就没有替换」上。
+    /// - **它是整行的替换结果，不是命中那一段的**。UI 显示成「原行 → 新行」，
+    ///   所以两边都得是整行才对得上。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<String>,
+    /// 正文或替换预览**任一个**被 `MAX_PREVIEW_BYTES` 截断了（原文比字段里的长）。
+    ///
+    /// ⚠️ 刻意合成一个标志而不是两个：UI 上它就是一条省略号，而「哪一半被截了」
+    /// 对用户没有可操作的区别。分成两个字段的话前端要写 `a || b`，
+    /// 而那正是两个字段会各自漂掉的地方
     pub truncated: bool,
 }
 
@@ -167,7 +186,7 @@ pub struct SearchSummary {
 /// 在 `root` 下搜一遍，结果分批交给 `on_batch`。
 ///
 /// `cancel` 由调用方持有（生产上是 `Arc<AtomicBool>`，一半注册在 Tauri 的 managed state
-/// 里等 `cancel_search` 来置真）。**遍历途中每个文件之间、以及扫描途中每一行之间**都会
+/// 里等 `cancel_task` 来置真）。**遍历途中每个文件之间、以及扫描途中每一行之间**都会
 /// 读它一次：只在大循环里读的话，一个几十万行的文件能让「点了取消」等上好几秒。
 ///
 /// ⚠️ `root` 必须是**绝对路径**且确实是一个目录，否则返回 `SearchError`。
@@ -176,6 +195,16 @@ pub struct SearchSummary {
 ///
 /// ⚠️ `on_batch` 收到的批次**可能 `files` 为空**——那是一次心跳，不是「搜完了」。
 /// 搜完的唯一信号是本函数返回。理由与阈值见 `mod.rs`「一个都不命中时」那一节。
+///
+/// ## `query.replace` 为 `Some` 时它是**预览**，不是替换（M2-D）
+///
+/// 那条路上每一条命中多带一个 [`SearchHit::replaced`]：整行按模板换完之后的样子。
+/// 除此之外**什么都不变**——遍历、过滤、批次、总账里的每一个数都与纯搜索逐位相同
+/// （钉住这一点的是 `替换预览不改变总账里的任何一个数`）。
+///
+/// ⚠️ 它一个字节都不写盘。真正落盘是另一层的事（M2-D-2），而那边**共用同一个
+/// `Template::expand_line`**：预览与落盘各写一套替换逻辑的话，两边的偏差
+/// 没有任何测试能发现，而用户是拿预览去决定要不要按下「替换全部」的。
 pub fn search<F>(
     root: &Path,
     query: &SearchQuery,
@@ -185,19 +214,27 @@ pub fn search<F>(
 where
     F: FnMut(SearchBatch),
 {
-    let (matcher, filters) = prepare(root, query)?;
+    let prepared = prepare(root, query)?;
 
     let started = Instant::now();
     let mut run = Run {
-        root,
-        matcher,
-        filters,
+        matcher: prepared.matcher,
+        template: prepared.template,
         cancel,
         searcher: searcher(),
         collector: Collector::new(on_batch),
         tally: Tally::default(),
     };
-    run.walk();
+    // ⚠️ `prepared.filters` 刻意**留在局部**、不搬进 `Run`：搬进去的话下面这个闭包
+    // 就没法整体可变借用 `run`（`&self.filters` 与 `&mut self` 打架）。
+    // 而「走哪些文件」这件事必须由 [`walk_files`] 这一个函数说了算——
+    // 预览走过一遍的文件集与落盘走过的不是同一个的话，用户批准的是一份清单、
+    // 改的是另一份。
+    //
+    // ⚠️ 分两句写：`run.tally.absorb(walk_files(..))` 编不过，
+    // 接收者 `run.tally` 与闭包捕获的 `&mut run` 会同时活着
+    let outcome = walk_files(root, &prepared.filters, cancel, |path, rel| run.visit(path, rel));
+    run.tally.absorb(outcome);
     // ⚠️ 结尾必须冲一次：最后一批几乎总是不满的。漏掉它的失败方式是
     // 「搜索结果少了最后几个文件」，而那恰好是最难发现的一种少——
     // 用户不会知道有几个文件本该出现在列表末尾。
@@ -222,8 +259,15 @@ pub fn preflight(root: &Path, query: &SearchQuery) -> Result<(), SearchError> {
     prepare(root, query).map(|_| ())
 }
 
-/// 起飞前检查本体：root 与 query 有没有可能跑起来，跑起来的话用什么匹配机与过滤器。
-fn prepare(root: &Path, query: &SearchQuery) -> Result<(RegexMatcher, Filters), SearchError> {
+/// 起飞前检查本体：root 与 query 有没有可能跑起来，跑起来的话用什么匹配机、
+/// 过滤器与替换模板。
+///
+/// ⚠️ 三样收进 [`Prepared`] 一个结构体，而不是返回一个三元组：`matcher` 与 `template`
+/// **必须成对旅行**。模板里的组号是拿 `matcher.capture_count()` 校验过的（见
+/// `query::build_template`），把它们摊成两个自由变量的话，某天有人把模板交给另一个
+/// matcher，失败方式是 `caps.get(n)` 安静地返回 `None`——两万处各插进一个空串，
+/// 而这一步是直接改写磁盘的。
+pub(crate) fn prepare(root: &Path, query: &SearchQuery) -> Result<Prepared, SearchError> {
     if !root.is_absolute() {
         return Err(SearchError::BadRoot { path: root.display().to_string() });
     }
@@ -233,7 +277,23 @@ fn prepare(root: &Path, query: &SearchQuery) -> Result<(RegexMatcher, Filters), 
         Ok(meta) if meta.is_dir() => {}
         _ => return Err(SearchError::NotFound { path: root.display().to_string() }),
     }
-    Ok((build_matcher(query)?, build_filters(query)?))
+    let matcher = build_matcher(query)?;
+    let filters = build_filters(query)?;
+    // ⚠️ 模板也在这里编，于是 `$2` 配 `(a)` 这种错与「正则编不出来」一样当场 reject，
+    // 而不是等第一批结果推出去之后才发现。`mod.rs` 最后那条性质
+    // （「每一个 `SearchError` 都发生在第一批结果之前」）因此对 M2-D 也成立
+    let template = build_template(query, &matcher)?;
+    Ok(Prepared { matcher, filters, template })
+}
+
+/// 编好的三样东西。字段全是 `pub(crate)`：落盘那一层（M2-D-2）要用同一个
+/// `matcher` 与 `template` 去**改文件**，而「预览用的匹配机」与「落盘用的匹配机」
+/// 是同一个对象这件事，正是「所见即所做」的全部依据
+pub(crate) struct Prepared {
+    pub(crate) matcher: RegexMatcher,
+    pub(crate) filters: Filters,
+    /// `None` = 这是一次纯搜索
+    pub(crate) template: Option<Template>,
 }
 
 /// 造一个扫描器。
@@ -252,13 +312,123 @@ fn searcher() -> Searcher {
     SearcherBuilder::new().binary_detection(BinaryDetection::quit(0)).build()
 }
 
-/// 一次搜索的可变状态。收进一个结构体是为了让 `walk` / `scan_file` 各自短一点：
+/// 遍历自己的那几笔账。
+///
+/// ⚠️ **返回值而不是 `&mut` 参数**，这不是风格问题：[`search`] 里 visit 闭包
+/// 已经整体可变借用了 `Run`，再传一个 `&mut` 计数器进去就得让那个计数器
+/// 长在 `Run` 外面（否则一次调用里两个 `&mut`）。而它长在 `Run` 里面的话，
+/// 闭包就没法整体借用 `Run` 了——绕来绕去的终点还是「遍历逻辑抄两份」
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalkOutcome {
+    /// 遍历途中读不动的目录（权限不够、途中被删）
+    pub(crate) unreadable: u32,
+    /// 因为超过 `MAX_FILE_BYTES` 而没碰的文件
+    pub(crate) skipped_too_large: u32,
+    /// 是被 `cancel` 叫停的，不是走完了
+    pub(crate) cancelled: bool,
+}
+
+/// 配好五个设置的遍历器。
+///
+/// ⚠️ **搜索与替换必须共用这一个函数**，这是「所见即所做」在文件集合那一半的依据：
+/// 用户在预览里看到并批准的是**一份清单**，落盘时走的是另一份的话，
+/// 被改的文件里就有他从没见过的那几个。另一半依据（匹配机与模板成对旅行）
+/// 写在 [`Prepared`] 上。
+///
+/// 这五条设置各自的理由都记在对应那行上，它们不是可以「顺手统一一下」的东西
+pub(crate) fn walker(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        // 点开头的目录要搜：`.github/workflows/ci.yml`、`.vscode/settings.json`
+        // 都是用户真会去搜的东西。代价是 `.git` 不再被「隐藏文件」那条规则顺带挡掉，
+        // 所以下面显式挡一次
+        .hidden(false)
+        // 一个光秃秃的 `.gitignore`（没有 `.git` 目录）也算数。默认值是 true，
+        // 那意味着「不在 git 仓库里就完全不过滤」——而用户打开的文件夹是不是一个
+        // 仓库，与他要不要跳过 `build/` 里的产物没有任何关系
+        .require_git(false)
+        // ⚠️ 与文件树相反：**不跟随符号链接**。树放行链接是因为「展开一层」的成本有限，
+        // 而搜索要读正文——跟着 pnpm 的符号链接农场走会把同一个包读几十遍，
+        // 还可能成环。`follow_links(false)` 之下链接自己的 `file_type` 既不是 file
+        // 也不是 dir，于是下面那条 `is_file()` 把「目录」与「链接」一起挡掉了
+        .follow_links(false)
+        // `.git` 里面是几万条对象文件与 reflog，搜它们从来不是用户的意思
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+        // 顺序确定，同一棵树搜两次长得一样。并行遍历做不到这一点，
+        // 而测试与 UI 都依赖顺序稳定（见 `mod.rs`「为什么是单线程遍历」）。
+        // 参数类型必须写出来：这里传的是 `impl Fn`，编译器没有位置可以反推
+        .sort_by_file_name(|a: &std::ffi::OsStr, b: &std::ffi::OsStr| a.cmp(b));
+    builder
+}
+
+/// 走一遍 root 下所有**该看的**文件，对每一个调 `visit`。
+///
+/// 「该看」= 不是 root 自己、是普通文件（目录与符号链接都不算）、rel 通过了
+/// include/exclude、且不大于 `MAX_FILE_BYTES`。这四条规则只在这里写一次，
+/// 于是搜索侧与替换侧看到的文件集在结构上相同，而不是靠两边测试都过才相同。
+///
+/// `visit` 返回 `Break` 就当场收手（`MAX_HITS` 到了）。取消是**每个条目问一次**，
+/// 粒度是「走到哪儿停到哪儿」——十万个文件的仓库上取消必须在一帧内生效
+pub(crate) fn walk_files<V>(root: &Path, filters: &Filters, cancel: &AtomicBool, mut visit: V) -> WalkOutcome
+where
+    V: FnMut(&Path, &str) -> ControlFlow<()>,
+{
+    let mut out = WalkOutcome::default();
+    for item in walker(root).build() {
+        if cancel.load(Ordering::Relaxed) {
+            out.cancelled = true;
+            break;
+        }
+        let entry = match item {
+            Ok(entry) => entry,
+            // 某个目录读不动（权限不够、遍历途中被删）：记一笔继续。
+            // 整次搜索失败比少搜一个目录糟得多，但**必须记下来**——
+            // 不记的话「没找到」就成了一个看起来很确定的错答案
+            Err(_) => {
+                out.unreadable += 1;
+                continue;
+            }
+        };
+        // depth 0 是 root 自己
+        if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        // `rel_of` 返回 None 只可能是路径没长在 root 下面——`WalkBuilder` 从 root
+        // 出发，正常走不到这一支。真走到了就跳过：一个算不出 rel 的命中
+        // 在 UI 上无处可挂
+        let Some(rel) = rel_of(root, path) else { continue };
+        if !filters.allows(&rel) {
+            continue;
+        }
+        // `metadata()` 读不动就当它不大：宁可扫一个可能很大的文件，
+        // 也不要因为一次 stat 失败就静默地少搜一个文件
+        if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
+            out.skipped_too_large += 1;
+            continue;
+        }
+        if visit(path, &rel).is_break() {
+            break;
+        }
+    }
+    out
+}
+
+/// 一次搜索的可变状态。收进一个结构体是为了让 `visit` / `scan_file` 各自短一点：
 /// 摊平成一个函数的话，遍历、过滤、扫描、分批四件事会挤在同一个作用域里，
 /// 而它们各自都有需要注释的取舍。
+///
+/// ⚠️ **这里没有 `filters` 字段**，那是刻意的：过滤器由 [`walk_files`] 拿着，
+/// 而 `walk_files` 的 visit 闭包要整体可变借用 `Run`。把它搬进结构体的话，
+/// 闭包里的 `&self.filters` 与 `&mut self` 会打架——而绕开这个冲突的唯一办法是
+/// 让闭包只借用 `Run` 的一部分，那正是「遍历逻辑散到两处」的开头。
 struct Run<'a, F> {
-    root: &'a Path,
     matcher: RegexMatcher,
-    filters: Filters,
+    /// 替换模板（M2-D）。`None` = 纯搜索，`make_hit` 就不算 `replaced`。
+    ///
+    /// ⚠️ 它必须与上面那个 `matcher` 是 `prepare` 一起编出来的那一对，
+    /// 理由写在 [`Prepared`] 上
+    template: Option<Template>,
     cancel: &'a AtomicBool,
     searcher: Searcher,
     collector: Collector<F>,
@@ -266,78 +436,34 @@ struct Run<'a, F> {
 }
 
 impl<F: FnMut(SearchBatch)> Run<'_, F> {
+    /// 取消了吗。
+    ///
+    /// ⚠️ 与 [`walk_files`] 里那次检查**不是同一件事**：那边是「下一个文件别碰了」，
+    /// 这边是「这个文件扫到一半被叫停，半份结果不能推出去」（理由在 `scan_file` 那一支上）
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    fn walk(&mut self) {
-        let mut builder = WalkBuilder::new(self.root);
-        builder
-            // 点开头的目录要搜：`.github/workflows/ci.yml`、`.vscode/settings.json`
-            // 都是用户真会去搜的东西。代价是 `.git` 不再被「隐藏文件」那条规则顺带挡掉，
-            // 所以下面显式挡一次
-            .hidden(false)
-            // 一个光秃秃的 `.gitignore`（没有 `.git` 目录）也算数。默认值是 true，
-            // 那意味着「不在 git 仓库里就完全不过滤」——而用户打开的文件夹是不是一个
-            // 仓库，与他要不要跳过 `build/` 里的产物没有任何关系
-            .require_git(false)
-            // ⚠️ 与文件树相反：**不跟随符号链接**。树放行链接是因为「展开一层」的成本有限，
-            // 而搜索要读正文——跟着 pnpm 的符号链接农场走会把同一个包读几十遍，
-            // 还可能成环。`follow_links(false)` 之下链接自己的 `file_type` 既不是 file
-            // 也不是 dir，于是下面那条 `is_file()` 把「目录」与「链接」一起挡掉了
-            .follow_links(false)
-            // `.git` 里面是几万条对象文件与 reflog，搜它们从来不是用户的意思
-            .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
-            // 顺序确定，同一棵树搜两次长得一样。并行遍历做不到这一点，
-            // 而测试与 UI 都依赖顺序稳定（见 `mod.rs`「为什么是单线程遍历」）。
-            // 参数类型必须写出来：这里传的是 `impl Fn`，编译器没有位置可以反推
-            .sort_by_file_name(|a: &std::ffi::OsStr, b: &std::ffi::OsStr| a.cmp(b));
-
-        for item in builder.build() {
-            if self.cancelled() {
-                self.tally.cancelled = true;
-                break;
-            }
-            let entry = match item {
-                Ok(entry) => entry,
-                // 某个目录读不动（权限不够、遍历途中被删）：记一笔继续。
-                // 整次搜索失败比少搜一个目录糟得多，但**必须记下来**——
-                // 不记的话「没找到」就成了一个看起来很确定的错答案
-                Err(_) => {
-                    self.tally.unreadable += 1;
-                    continue;
-                }
-            };
-            // depth 0 是 root 自己
-            if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            // `rel_of` 返回 None 只可能是路径没长在 root 下面——`WalkBuilder` 从 root
-            // 出发，正常走不到这一支。真走到了就跳过：一个算不出 rel 的命中
-            // 在 UI 上无处可挂
-            let Some(rel) = rel_of(self.root, path) else { continue };
-            if !self.filters.allows(&rel) {
-                continue;
-            }
-            // `metadata()` 读不动就当它不大：宁可扫一个可能很大的文件，
-            // 也不要因为一次 stat 失败就静默地少搜一个文件
-            if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
-                self.tally.skipped_too_large += 1;
-                continue;
-            }
-            self.scan_file(path, &rel);
-            if self.tally.hits >= MAX_HITS {
-                self.tally.truncated = true;
-                break;
-            }
+    /// 扫一个文件，然后回答「还要不要继续走」。
+    ///
+    /// 返回 `ControlFlow` 而不是 `()`：`MAX_HITS` 到了就得停，而停下来这件事发生在
+    /// **命中被数出来之后**，也就是在遍历那一层看不见的地方。让 visit 自己说
+    /// `Break`，比让 [`walk_files`] 反过来去读调用方的某个计数器要诚实
+    fn visit(&mut self, path: &Path, rel: &str) -> ControlFlow<()> {
+        self.scan_file(path, rel);
+        if self.tally.hits >= MAX_HITS {
+            self.tally.truncated = true;
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
     }
 
     fn scan_file(&mut self, path: &Path, rel: &str) {
         let mut hits: Vec<SearchHit> = Vec::new();
         let mut truncated = false;
-        if scan(&mut self.searcher, &self.matcher, self.cancel, path, &mut hits, &mut truncated).is_err() {
+        if scan(&mut self.searcher, &self.matcher, self.template.as_ref(), self.cancel, path, &mut hits, &mut truncated)
+            .is_err()
+        {
             // 读不动这个文件（权限、途中被删、或者二进制探测之外的 IO 错误）。
             // 与遍历错误记进同一个数：对用户来说都是「有一个东西我没能看」
             self.tally.unreadable += 1;
@@ -378,6 +504,7 @@ impl<F: FnMut(SearchBatch)> Run<'_, F> {
 fn scan(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
+    template: Option<&Template>,
     cancel: &AtomicBool,
     path: &Path,
     hits: &mut Vec<SearchHit>,
@@ -390,7 +517,7 @@ fn scan(
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            hits.push(make_hit(line_num, line, matcher));
+            hits.push(make_hit(line_num, line, matcher, template));
             if hits.len() as u32 > MAX_HITS_PER_FILE {
                 *truncated = true;
                 return Ok(false);
@@ -409,13 +536,13 @@ fn scan(
 /// Vela 的目标用户会打开 GBK 文件，这不是边角情况（`fs` 那边专门做了 GBK 探测）。
 /// 代价是**中文搜索词搜不到非 UTF-8 文件里的中文**：字节序列不同，
 /// 要支持它得先按探测出的编码解码整个文件，那是另一件事。
-fn make_hit(line_num: u64, line: &str, matcher: &RegexMatcher) -> SearchHit {
+fn make_hit(line_num: u64, line: &str, matcher: &RegexMatcher, template: Option<&Template>) -> SearchHit {
     // ⚠️ 先脱掉行终止符再算任何东西。`sinks::Lossy` 交出来的 `&str` 是**带着** `\n` 的
     // （实测；钉它的是 `命中里的文本不带行尾换行_两种行尾与没有换行的最后一行都一样`）。
     // 带着它的话：预览末尾多一个看不见的字符、`text.len()` 的分母对不上编辑器里那一行、
     // CRLF 文件里还会多留一个 `\r`。
     let line = strip_terminator(line);
-    let (text, truncated) = preview(line);
+    let (text, text_truncated) = preview(line);
     let mut ranges: Vec<MatchRange> = Vec::new();
     // (字节游标, UTF-16 游标)。`find_iter` 给出的区间升序且不重叠，字符边界也升序，
     // 所以两个游标一起单向前走就够，不需要为每行建一张偏移映射表
@@ -434,7 +561,29 @@ fn make_hit(line_num: u64, line: &str, matcher: &RegexMatcher) -> SearchHit {
             ranges.len() < MAX_RANGES_PER_HIT
         })
         .expect("NoError 不可构造");
-    SearchHit { line: line_num as u32, text: text.to_owned(), ranges, truncated }
+
+    // 替换预览（M2-D）。⚠️ 三件事的顺序是硬的：
+    //
+    // 1. **对整行原文换，不是对 `text` 换。**`text` 可能已经被 `MAX_PREVIEW_BYTES`
+    //    截断了，在截断过的串上跑正则，命中可能落在切口上，换出来的东西与真换的结果
+    //    不一样——而用户拿这个预览去决定要不要按下「替换全部」。
+    // 2. **走 `expand_line` 这一个实现**，与落盘那条路（M2-D-2）是同一个函数。
+    //    前端算预览、Rust 算落盘是另一种写法，它的失败方式是「预览说会改成 A、
+    //    实际改成了 B」，而两边各有一套 `$` 语法解析，谁也测不出对方的偏差。
+    //    代价是替换模式下这一行跑了**两遍**正则（`find_iter` 一遍、替换一遍）。
+    //    这个代价买得值：正则只跑在**命中的那些行**上，而遍历的主要成本是把
+    //    10MiB 的文件从盘上读进来（实测 6.9–8.5ms）；换成「预览可能说谎」是不可接受的。
+    // 3. **换完再过一次 `preview`**，于是两边受同一个上限管，一行最多两个 1000 字节。
+    let (replaced, truncated) = match template {
+        None => (None, text_truncated),
+        Some(t) => {
+            let (whole, _) = t.expand_line(matcher, line);
+            let (shown, replaced_truncated) = preview(&whole);
+            (Some(shown.to_owned()), text_truncated || replaced_truncated)
+        }
+    };
+
+    SearchHit { line: line_num as u32, text: text.to_owned(), ranges, replaced, truncated }
 }
 
 /// 脱掉行尾的换行符。CRLF 文件里 `\n` 前面还留着一个 `\r`，一并脱掉。
@@ -474,7 +623,7 @@ fn utf16_at(text: &str, target: usize, cursor: &mut (usize, u32)) -> u32 {
 }
 
 /// `path` 相对 `root` 的那条 rel，规矩与 `DirEntry.rel` 完全一致。
-fn rel_of(root: &Path, path: &Path) -> Option<String> {
+pub(crate) fn rel_of(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     // 逐组件用 `/` 拼，而不是 `replace('\\', "/")`：后者是「假设分隔符是反斜杠」，
     // 前者是「不假设任何平台的分隔符」
@@ -567,6 +716,18 @@ struct Tally {
 }
 
 impl Tally {
+    /// 把遍历那一层的账并进总账。
+    ///
+    /// ⚠️ `unreadable` 是**加**不是赋值：它同时收两种东西——遍历时读不动的目录
+    /// （[`walk_files`] 记的）与扫描时读不动的文件（`scan_file` 记的）。
+    /// 对用户来说都是「有一个东西我没能看」，所以共用一个数；
+    /// 写成赋值的话其中一种会被另一种安静地盖掉，而盖掉的顺序取决于谁先跑完
+    fn absorb(&mut self, out: WalkOutcome) {
+        self.unreadable += out.unreadable;
+        self.skipped_too_large += out.skipped_too_large;
+        self.cancelled |= out.cancelled;
+    }
+
     fn into_summary(self, elapsed_ms: u64) -> SearchSummary {
         SearchSummary {
             files_scanned: self.files_scanned,
@@ -1277,7 +1438,15 @@ mod tests {
     #[test]
     fn 出错时一个批次都没推出去() {
         let dir = fixture();
-        for q in [query(""), query("a\nb"), query("(没关上")] {
+        // 后两条是 M2-D 的替换模板：`mod.rs` 最后那条性质（每一个 `SearchError`
+        // 都发生在第一批结果之前）对模板也成立，靠的是 `prepare` 把模板一起编了
+        for q in [
+            query(""),
+            query("a\nb"),
+            query("(没关上"),
+            SearchQuery { replace: Some("$name".to_owned()), ..query("(a)") },
+            SearchQuery { replace: Some("$2".to_owned()), ..query("(a)") },
+        ] {
             let mut batches = 0;
             let err = search(dir.path(), &q, &AtomicBool::new(false), |_| batches += 1).unwrap_err();
             assert_eq!(batches, 0, "{err}");
@@ -1308,6 +1477,12 @@ mod tests {
             (root, query("(没关上")),
             (root, SearchQuery { include: vec!["[".to_owned()], ..query("needle") }),
             (root, SearchQuery { exclude: vec!["[".to_owned()], ..query("needle") }),
+            // M2-D：模板也是起飞前检查的一部分。⚠️ 这两条要是漏掉，失败方式是
+            // `preflight` 说「可以搜」、taskId 已经返回给前端了、后台线程里才报错——
+            // 前端于是收到一个它按规则不可能收到的 failed event
+            (root, SearchQuery { replace: Some("$name".to_owned()), ..query("(a)") }),
+            (root, SearchQuery { replace: Some("$2".to_owned()), ..query("(a)") }),
+            (root, SearchQuery { replace: Some("ok".to_owned()), ..query("needle") }),
             (Path::new("repo"), query("needle")),
             (&missing, query("needle")),
             (&file, query("needle")),
@@ -1322,6 +1497,154 @@ mod tests {
                 _ => panic!("{case_root:?} {q:?}：preflight 是 {before:?} 而 search 是 {:?}", during.is_ok()),
             }
         }
+    }
+
+    // ── M2-D 替换预览 ───────────────────────────────────────────────────────
+    //
+    // 这一节钉的是 `SearchHit::replaced` 在**真实目录**上的行为。`$` 语法本身在
+    // `query.rs` 那一节，两边刻意不重复：这里只关心「模板与遍历接起来之后，
+    // 前端拿到的那一行是对的还是错的」。
+
+    fn replace_query(pattern: &str, template: &str) -> SearchQuery {
+        SearchQuery { replace: Some(template.to_owned()), ..query(pattern) }
+    }
+
+    #[test]
+    fn 带模板时每条命中都带_replaced_不带时一条都没有() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "let needle = 1;\nno match\nneedle needle\n").unwrap();
+
+        let plain = hits_of(root, &query("needle"));
+        assert_eq!(plain.len(), 2, "本测试的前提：这个文件里有两行命中");
+        assert!(plain.iter().all(|h| h.replaced.is_none()), "纯搜索不该带替换预览");
+
+        let hits = hits_of(root, &replace_query("needle", "haystack"));
+        assert_eq!(hits.len(), 2, "替换预览不该改变命中数");
+        // ⚠️ `text` 是**原行**，`replaced` 是换完的行——UI 显示成「原行 → 新行」，
+        // 两边都得留着。把 `text` 也换成新串的话用户就看不出这一处改了什么
+        assert_eq!(hits[0].text, "let needle = 1;");
+        assert_eq!(hits[0].replaced.as_deref(), Some("let haystack = 1;"));
+        // 一行里的每一处都换
+        assert_eq!(hits[1].text, "needle needle");
+        assert_eq!(hits[1].replaced.as_deref(), Some("haystack haystack"));
+        // `ranges` 是按 `text` 算的，加了替换之后不能跟着漂——
+        // 漂了的失败方式是「高亮画在换完的那一行上」，而那一段已经不是命中了
+        assert_eq!(hits[0].ranges, vec![MatchRange { start: 4, end: 10 }]);
+    }
+
+    #[test]
+    fn 空模板是删除_而它照样出现在_replaced_里() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "x needle y\n").unwrap();
+
+        let hit = &hits_of(root, &replace_query("needle", ""))[0];
+        // ⚠️ 断的是 `Some` 而不是「非空」：前端判真假的话这一行会安静地退回成
+        // 纯搜索的样子，而用户以为自己刚刚预览了一次删除
+        assert_eq!(hit.replaced, Some("x  y".to_owned()));
+        assert_eq!(hit.text, "x needle y");
+    }
+
+    #[test]
+    fn replaced_里不带行终止符_crlf_也一样() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("crlf.txt"), "a needle b\r\nc needle d\r\n").unwrap();
+
+        let hits = hits_of(root, &replace_query("needle", "N"));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].replaced.as_deref(), Some("a N b"));
+        assert_eq!(hits[1].replaced.as_deref(), Some("c N d"));
+        // `\r` 由 `strip_terminator` 在替换**之前**就脱掉了。漏掉的话写回去的文件
+        // 会在每一行多一个 `\r`，而那正是 M1-B 修过的那个 `\r\r\n` 的翻版
+        for h in &hits {
+            let replaced = h.replaced.as_deref().unwrap();
+            assert!(!replaced.ends_with('\r') && !replaced.ends_with('\n'), "{replaced:?}");
+        }
+    }
+
+    /// ⚠️ 这一条是替换预览里最容易错、错了又最安静的一处：**替换必须对整行原文做，
+    /// 不能对已经截断过的 `text` 做**。
+    ///
+    /// 构造一行「命中正好落在预览切口上」的正文：995 个 `x` 加 `needle`，
+    /// 一共 1001 字节，比 `MAX_PREVIEW_BYTES`（1000）恰好多一个。于是 `text`
+    /// 是前 1000 字节，那个 `needle` 被切成了 `needl`——**在截断过的串上压根匹配不到**。
+    /// 要是对 `text` 做替换，`replaced` 会等于 `text`、处数为 0，
+    /// 用户在预览里看到「这一行不会改」，而落盘时它被改了。
+    #[test]
+    fn 替换对整行原文做_不是对截断过的预览做() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let pad = "x".repeat(MAX_PREVIEW_BYTES - 5);
+        let line = format!("{pad}needle");
+        assert_eq!(line.len(), MAX_PREVIEW_BYTES + 1, "本测试的前提：正好比预览上限长一个字节");
+        fs::write(root.join("long.txt"), format!("{line}\n")).unwrap();
+
+        let hit = &hits_of(root, &replace_query("needle", "N"))[0];
+        assert!(hit.truncated, "正文被截断了");
+        assert_eq!(hit.text.len(), MAX_PREVIEW_BYTES);
+        assert!(hit.ranges.is_empty(), "命中跨在切口上，高亮画不出来——但这一行确实命中了");
+        // 换完是 995 个 `x` 加一个 `N`，比预览上限短，所以 `replaced` 自己是完整的。
+        // 要是替换跑在 `text` 上，这里会等于 `text`
+        let expected = format!("{pad}N");
+        assert_eq!(hit.replaced.as_deref(), Some(expected.as_str()));
+    }
+
+    /// 加了替换预览之后，总账里的每个数都必须与纯搜索**完全一致**（`elapsed_ms` 除外）。
+    ///
+    /// 这条钉的是「预览不改变搜索的语义」。M2-D-2 的落盘那条路要靠
+    /// 「预览看到多少处，落盘就改多少处」这个推理，两边总账不一致的话它就断了。
+    #[test]
+    fn 替换预览不改变总账里的任何一个数() {
+        let dir = fixture();
+        let root = dir.path();
+        let plain = run(root, &query("needle")).1;
+        assert!(plain.hits > 0, "本测试的前提：fixture 里真的有命中");
+        let previewed = run(root, &replace_query("needle", "N")).1;
+
+        // 摊成一个元组比七条 assert 好：失败时一眼能看出是哪一个数漂了
+        let strip = |s: SearchSummary| {
+            (s.files_scanned, s.files_with_hits, s.hits, s.skipped_too_large, s.unreadable, s.truncated, s.cancelled)
+        };
+        assert_eq!(strip(plain), strip(previewed));
+    }
+
+    /// `MAX_HITS_PER_FILE` 是**报告**的上限，不是「做」的上限。
+    ///
+    /// ⚠️ 这条对 M2-D-2 很重要：预览里少掉的那些命中，落盘时**照样要换**。
+    /// 写一个只换了一半的文件比两个极端都糟——而这一条钉住的正是
+    /// 「预览会少报」这件事本身，好让落盘那边不去对齐它。
+    #[test]
+    fn 替换预览也受单文件上限管_而且截断标志照样报() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("many.txt"), "needle\n".repeat(MAX_HITS_PER_FILE as usize + 10)).unwrap();
+
+        let file = file_of(root, &replace_query("needle", "N"), "many.txt");
+        assert!(file.truncated, "命中数超过了单文件上限");
+        assert_eq!(file.hits.len(), MAX_HITS_PER_FILE as usize, "多扫的那一行只用来判断「还有没有更多」");
+        assert!(file.hits.iter().all(|h| h.replaced.is_some()), "留下来的每一条都该带预览");
+    }
+
+    #[test]
+    fn 三个开关在替换模式下照样生效() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "Needle needle needleX\n").unwrap();
+        fs::write(root.join("b.txt"), "a.c axc\n").unwrap();
+
+        // 默认不区分大小写、不要求整词：三处都换
+        assert_eq!(hits_of(root, &replace_query("needle", "N"))[0].replaced.as_deref(), Some("N N NX"));
+        // 区分大小写：大写那个不动
+        let q = SearchQuery { case_sensitive: true, ..replace_query("needle", "N") };
+        assert_eq!(hits_of(root, &q)[0].replaced.as_deref(), Some("Needle N NX"));
+        // 整词：`needleX` 里那个不算
+        let q = SearchQuery { whole_word: true, ..replace_query("needle", "N") };
+        assert_eq!(hits_of(root, &q)[0].replaced.as_deref(), Some("N N needleX"));
+        // 字面量：`.` 不再是「任意字符」，于是只有 b.txt 命中
+        let q = SearchQuery { literal: true, ..replace_query("a.c", "Z") };
+        assert_eq!(hits_of(root, &q)[0].replaced.as_deref(), Some("Z axc"));
     }
 
     // ── 线上形状 ────────────────────────────────────────────────────────────

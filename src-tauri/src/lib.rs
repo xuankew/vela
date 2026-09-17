@@ -21,12 +21,34 @@ const SEARCH_DONE: &str = "vela://search-done";
 /// 自己那次检查之间被删掉/被卸载——罕见，但不处理的话前端会永远等不到 done。
 const SEARCH_FAILED: &str = "vela://search-failed";
 
+/// 替换的进度快照。另一半在 `src/ipc/replace.ts`。
+///
+/// ⚠️ 与 `SEARCH_BATCH` 不同，这一个**可能一个都不来**：全部文件都没有命中时
+/// 既没有「改动」触发推送，心跳阈值又远没到（理由见
+/// `crates/vela-core/src/search/replace.rs` 里 `Sink` 的文档）。前端不能把
+/// 「没收到 progress」当成出错——终止信号永远是 done。
+///
+/// ⚠️ 而且它里面的 `filesScanned` **可以小于** done 里那个：落盘那一侧刻意不做
+/// 收尾 flush。最终数字一律以 `REPLACE_DONE` 的 summary 为准。
+const REPLACE_PROGRESS: &str = "vela://replace-progress";
+
+/// 替换结束，载荷里带 `ReplaceSummary`。**这是唯一的终止信号，也是唯一权威的最终数字。**
+///
+/// ⚠️ 这个名字拼错的后果比搜索那边重一档：前端会永远停在「正在替换…」，
+/// 而磁盘上的文件**已经全改完了**。用户面对的是一个改完了却不知道改完了的仓库
+const REPLACE_DONE: &str = "vela://replace-done";
+
+/// 替换在 `start_replace` 的预检**之后**才失败，载荷里带 `SearchError`。
+/// 与 `SEARCH_FAILED` 同一种罕见情形（root 在两步之间被删掉/被卸载）
+const REPLACE_FAILED: &str = "vela://replace-failed";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        // M2-C：`taskId → 取消标志`的注册表。见 `commands::SearchTasks`
-        .manage(commands::SearchTasks::default())
+        // M2-C 起的 `taskId → 取消标志` 注册表，M2-D 的替换与搜索**共用这一份**。
+        // 见 `commands::TaskRegistry`
+        .manage(commands::TaskRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::save_file,
@@ -40,7 +62,8 @@ pub fn run() {
             commands::load_session,
             commands::save_session,
             commands::start_search,
-            commands::cancel_search
+            commands::start_replace,
+            commands::cancel_task
         ])
         // 未保存改动的关闭拦截（PLAN.md M1-D-4）。
         //
@@ -74,7 +97,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     /// 与 `src/ipc/windowClose.ts` 的 `REQUEST_CLOSE_EVENT`、
-    /// `src/ipc/search.ts` 的三个 `SEARCH_*_EVENT` 对照。
+    /// `src/ipc/search.ts` 的三个 `SEARCH_*_EVENT`、`src/ipc/replace.ts` 的三个
+    /// `REPLACE_*_EVENT` 对照。
     ///
     /// 这是个**契约快照**，和 `crates/vela-core/tests/wire_contract.rs` 同一套路数：
     /// 事件名在 Rust 与 TS 各手写一份，没有代码生成。名字对不上的失败方式很安静——
@@ -91,5 +115,15 @@ mod tests {
         assert_eq!(super::SEARCH_BATCH, "vela://search-batch");
         assert_eq!(super::SEARCH_DONE, "vela://search-done");
         assert_eq!(super::SEARCH_FAILED, "vela://search-failed");
+    }
+
+    /// ⚠️ 这一条的分量比上面那条重：`REPLACE_DONE` 拼错的后果不是「界面没反应」，
+    /// 而是「界面永远停在正在替换，而磁盘上的两万个文件已经改完了」。
+    /// 用户手上是一个改完了却不知道改完了的仓库，很可能再按一次替换
+    #[test]
+    fn replace_events_match_frontend() {
+        assert_eq!(super::REPLACE_PROGRESS, "vela://replace-progress");
+        assert_eq!(super::REPLACE_DONE, "vela://replace-done");
+        assert_eq!(super::REPLACE_FAILED, "vela://replace-failed");
     }
 }

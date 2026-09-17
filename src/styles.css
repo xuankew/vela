@@ -703,6 +703,25 @@ select {
   font-size: 13px;
 }
 
+/* 对话框正文那几段：说的是「这一步会发生什么」。比标题小一档、压暗一档，
+   于是眼睛先落到标题上，再往下读细节——顺序反了的话用户会先读到「另有 2 个文件被跳过」
+   而不知道自己在批准什么 */
+.modal-body {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--vela-fg-dim);
+}
+
+/* 「这一步没法撤销」那一句。用警告色而不是错误色：它不是在报错，
+   而是在限定上面那几个数字的效力（与 `.find-warning` 同一条理由） */
+.modal-warn {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--vela-warn);
+}
+
 /* 关窗口时可能一次列出十几个文件，给个上限让它自己滚，别把对话框顶出屏幕 */
 .modal-list {
   margin: 0 0 10px;
@@ -798,7 +817,8 @@ select {
 
 /* `.*` / `Aa` / `ab` 三个开关。等宽的小方块，关着的时候是暗的——
    开着的那几个必须一眼就能数出来有几个，所以用实色而不是只改边框 */
-.find-opt {
+.find-opt,
+.find-mode {
   flex: 0 0 auto;
   min-width: 26px;
   padding: 2px 4px;
@@ -807,7 +827,15 @@ select {
   color: var(--vela-fg-dim);
 }
 
-.find-opt.on {
+/* 「替换」是**模式**开关而不是第四个匹配选项，所以用 UI 字体、也稍宽一点：
+   那三个是符号（`.*` / `Aa` / `ab`），这一个是词。「开着就实色」那套语言两边共用 */
+.find-mode {
+  padding: 2px 6px;
+  font-family: var(--vela-font-ui);
+}
+
+.find-opt.on,
+.find-mode.on {
   color: var(--vela-bg-alt);
   background: var(--vela-accent);
   border-color: var(--vela-accent);
@@ -835,6 +863,16 @@ select {
   align-items: center;
   gap: 2px;
   margin-left: auto;
+}
+
+/* 替换模式才出现的那一排。与 `.find-head` 同一套排法：里面的输入框直接复用
+   `.find-input`（`flex: 1 1 auto`），于是「替换全部」永远贴在最右边、不会被挤出去 */
+.find-replace {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--vela-border);
 }
 
 .find-status {
@@ -969,4 +1007,25 @@ select {
   background: none;
   color: var(--vela-accent);
   font-weight: 600;
+}
+
+/* 替换预览：`原文 → 新内容`。箭头压暗，新内容用 ok 色——一行里已经有一个 accent 色的
+   命中段了，预览也用 accent 的话「哪一段要被换掉」与「换完长什么样」就分不开 */
+.find-arrow {
+  padding: 0 6px;
+  color: var(--vela-fg-dim);
+}
+
+.find-new {
+  color: var(--vela-ok);
+}
+
+/* 这个文件会被落盘那一轮跳过（正开着且有未保存的改动）。整行压暗，
+   而「为什么」写在计数那一格里——只压暗的话它与「命中很少的文件」看起来没区别 */
+.find-row.skipped {
+  color: var(--vela-fg-dim);
+}
+
+.find-row.skipped .find-count {
+  color: var(--vela-warn);
 }

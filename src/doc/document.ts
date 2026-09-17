@@ -99,6 +99,24 @@ export interface DocumentModel {
    * 而 `lossy` 为 false，提示条一个字都不会说（见 `vela-core::fs::encoding::decode_as`）。
    */
   reopenWith: (encoding: EncodingId) => Promise<void>
+  /**
+   * 磁盘上的这个文件可能已经被别人改过了，重新读一遍（M2-D 全局替换之后对账用）。
+   *
+   * 与 `reopenWith` 的差别有三处，每一处都是有理由的：
+   *
+   * - 用**当前**编码，不让后端重新探测。用户可能刚刚「以 GBK 重新打开」过，
+   *   重新探测会把这个决定悄悄扔掉
+   * - **正文一模一样时一个字都不动**。`setText` 会重建 CM6 的 state，撤销栈跟着一起没——
+   *   全局替换压根没碰到的那些标签，凭什么丢掉自己的撤销历史
+   * - **不抢焦点**。对账是后台发生的，抢焦点的话用户正在打的字会跑到别的标签上去
+   *
+   * 脏文档一律不碰：那份未保存的改动是磁盘上没有的唯一副本。而全局替换本来就把它
+   * 列进了 `skip`（见 `ReplaceRequest.skip`），两边必须说法一致——一边跳过一边覆盖
+   * 的话，用户看到的是「明明跳过了，怎么内容还是变了」
+   *
+   * @returns 正文有没有真的换过。未命名、脏、读失败、以及内容没变都是 false
+   */
+  reload: () => Promise<boolean>
 }
 
 function baseName(path: string): string {
@@ -226,6 +244,31 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     }
   }
 
+  async function reload(): Promise<boolean> {
+    const target = path()
+    // 未命名文档在磁盘上没有对应物；脏文档的理由见接口上那段
+    // ⚠️ 两道都排在 `setBusy` 之前：它们是「压根不去读」，不是「读了但没用」
+    if (target === null || dirty()) return false
+    setBusy(true)
+    try {
+      const file = await openFile(target, format().encoding)
+      const changed = file.text !== host.getText()
+      // 正文没变就一个字都不动，理由见接口上那段（撤销栈）
+      if (changed) replaceText(file.text)
+      // 格式与 lossy 一律对齐磁盘：行尾或 BOM 在盘上变过而正文没变是可能的
+      // （外部工具改写了行尾），而状态栏显示一个过时的行尾比显示过时的正文更难察觉
+      setFormat(file.format)
+      setLossy(file.lossy)
+      setNotice(null)
+      return changed
+    } catch (err) {
+      setNotice({ level: 'error', text: `重新读取失败：${describeFsError(err)}` })
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function writeTo(target: string) {
     setBusy(true)
     try {
@@ -284,5 +327,6 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     saveAs,
     changeFormat,
     reopenWith,
+    reload,
   }
 }

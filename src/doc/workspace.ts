@@ -149,6 +149,23 @@ export interface Workspace {
   /** 有没有任何标签还没落盘 */
   anyDirty: () => boolean
   /**
+   * 脏标签的**绝对路径**，原样：不 normalize、不解析符号链接、不管大小写。
+   *
+   * M2-D 全局替换把它递进 `ReplaceRequest.skip`，那里逐组件比 `Path` 相等，
+   * 所以这里递的必须是后端给过的原样字符串（`doc.path()` 就是 `openFile` 收到的那个）。
+   * 自己拼一个的后果是「少保护一个文件」——用户的未保存改动被落盘盖掉
+   */
+  dirtyPaths: () => string[]
+  /**
+   * 全局替换落盘之后的对账：把 `root` 底下那些标签重新读一遍。
+   *
+   * 不做这一步的话，编辑器里显示的仍是**替换之前**的内容，而用户下一次 ⌘S
+   * 会把刚落盘的结果又盖回去——一次替换等于没发生过，还搭进去一个新写入。
+   *
+   * @returns 正文真的换过了的标签数（脏的、内容没变的都不算）
+   */
+  reloadUnder: (root: string) => Promise<number>
+  /**
    * 窗口级关闭的总闸：Rust 侧拦下 CloseRequested / Cmd+Q 之后问这里。
    * 返回 true 表示「可以真的关了」，调用方负责去拆窗口（见 `src/ipc/windowClose.ts`）。
    */
@@ -749,6 +766,26 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     setLineWrap,
     toggleLineWrap: () => setLineWrap(!config.lineWrap),
     anyDirty: () => tabs().some((t) => t.doc.dirty()),
+    dirtyPaths: () =>
+      tabs().flatMap((t) => {
+        const at = t.doc.path()
+        // 未命名的脏标签没有路径可递，而它也不需要保护：磁盘上没有它，落盘碰不到
+        return t.doc.dirty() && at !== null ? [at] : []
+      }),
+    async reloadUnder(root) {
+      // 只碰 root 底下的：替换只可能改到那些文件，而 root 之外的标签重读一遍
+      // 是白花一次 IPC——正文一样时 `reload` 什么都不做，但那一趟读盘已经发生了
+      const prefix = root.endsWith('/') ? root : `${root}/`
+      let changed = 0
+      for (const tab of tabs()) {
+        const at = tab.doc.path()
+        if (at === null || !at.startsWith(prefix)) continue
+        // 脏不脏由 `reload` 自己判：那条规矩只该有一个真相来源，
+        // 在这里再写一遍的话两边哪天分岔，失败方式是「用户的稿子被覆盖」
+        if (await tab.doc.reload()) changed += 1
+      }
+      return changed
+    },
     // 一次问完所有脏标签，而不是一个一个弹：关窗口时弹五次对话框没人受得了
     requestWindowClose: () => settle(tabs().filter((t) => t.doc.dirty())),
     serializeSession,

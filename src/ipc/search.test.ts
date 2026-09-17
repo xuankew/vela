@@ -9,9 +9,14 @@ import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
  * Rust 侧的对照分两处，两边的字面量必须同时改：
  *
  * - `crates/vela-core/tests/wire_contract.rs` 的「M2-C 全文搜索」那一节
- *   （`search_query_的线上形状` / `搜索结果的线上形状` / `search_error_的四个变体在契约上各有其名`）
- * - `src-tauri/src/commands.rs` 的 `三个搜索事件载荷的线上形状`（信封那一层）
+ *   （`search_query_的线上形状` / `搜索结果的线上形状` / `search_error_的五个变体在契约上各有其名`）
+ * - `src-tauri/src/commands.rs` 的 `三个搜索事件载荷的线上形状`（信封那一层，
+ *   里面还顺带钉了替换模式下 `replaced` 上线时的信封形状）
  * - 事件名本身：`src-tauri/src/lib.rs` 的 `search_events_match_frontend`
+ *
+ * ⚠️ 取消不在这个文件里测：M2-D 之后搜索与替换共用同一个 `cancel_task` 命令，
+ * 它的前端封装与快照在 `src/ipc/task.ts` / `task.test.ts`。
+ * 替换那一半（`start_replace` 与三个 `vela://replace-*`）在 `replace.test.ts`
  */
 
 /**
@@ -31,7 +36,6 @@ vi.mock('@tauri-apps/api/core', () => tauriCore)
 
 import {
   attachSearchListeners,
-  cancelSearch,
   describeSearchError,
   startSearch,
   SEARCH_BATCH_EVENT,
@@ -42,6 +46,7 @@ import {
   type SearchDonePayload,
   type SearchError,
   type SearchFailedPayload,
+  type SearchHit,
   type SearchQuery,
   type SearchSummary,
   type MatchRange,
@@ -52,11 +57,31 @@ import {
 
 /** 对照 `search_query_的线上形状` */
 const GOLDEN_QUERY =
-  '{"pattern":"foo","literal":true,"caseSensitive":true,"wholeWord":false,"include":["*.ts"],"exclude":[]}'
+  '{"pattern":"foo","literal":true,"caseSensitive":true,"wholeWord":false,"include":["*.ts"],"exclude":[],"replace":"bar"}'
+/**
+ * 同一个测试里的第二条：Rust 侧**序列化**一个默认 query 时 `replace` 上线的是 `null`，
+ * 不是缺席。⚠️ 前端从来不发这个 key（靠 `#[serde(default)]` 落到 `None`），
+ * 所以这一条对前端只有阅读价值——它把「`null` 与缺 key 在 Rust 侧是同一个意思」
+ * 写在这儿，免得哪天有人在前端补一句 `replace: null` 时以为自己在做一件新的事
+ */
+const GOLDEN_QUERY_DEFAULT =
+  '{"pattern":"foo","literal":false,"caseSensitive":false,"wholeWord":false,"include":[],"exclude":[],"replace":null}'
 
 /** 对照 `搜索结果的线上形状` */
 const GOLDEN_MATCH_RANGE = '{"start":4,"end":10}'
 const GOLDEN_HIT = '{"line":12,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}'
+/**
+ * 替换模式下才上线的那一条：`replaced` 夹在 `ranges` 与 `truncated` 之间，
+ * 跟着 Rust 侧的字段声明顺序走
+ */
+const GOLDEN_HIT_REPLACED =
+  '{"line":12,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"replaced":"let a = haystack;","truncated":false}'
+/**
+ * ⚠️ `replaced` 为空串时**照样上线**：那是「把命中的地方删掉」这个合法操作。
+ * 它要是被跳过去，前端读到 `undefined`，那一行会安静地退回成纯搜索的样子，
+ * 而用户以为自己刚刚预览了一次删除
+ */
+const GOLDEN_HIT_DELETED = '{"line":1,"text":"needle","ranges":[],"replaced":"","truncated":false}'
 const GOLDEN_FILE = '{"rel":"src/main.rs","path":"/repo/src/main.rs","hits":[],"truncated":true}'
 /** ⚠️ `files` 为空的这一个不是「没有结果」，是一次**心跳** */
 const GOLDEN_HEARTBEAT = '{"files":[],"filesScanned":512}'
@@ -157,24 +182,45 @@ describe('跨语言契约：事件名与命令名', () => {
 })
 
 describe('Rust → 前端 的字段名', () => {
-  it('SearchQuery 的六个字段名与顺序与 Rust 侧序列化结果一致', () => {
+  it('SearchQuery 的七个字段名与顺序与 Rust 侧序列化结果一致', () => {
     const parsed = JSON.parse(GOLDEN_QUERY) as Required<SearchQuery>
     // 键顺序就是 JSON.parse 的插入顺序，所以 stringify 相等 == 字段集合与顺序都相等
     expect(JSON.stringify(parsed)).toBe(GOLDEN_QUERY)
-    expect(Object.keys(parsed)).toEqual(['pattern', 'literal', 'caseSensitive', 'wholeWord', 'include', 'exclude'])
+    expect(Object.keys(parsed)).toEqual([
+      'pattern',
+      'literal',
+      'caseSensitive',
+      'wholeWord',
+      'include',
+      'exclude',
+      'replace',
+    ])
     // `caseSensitive` 是最容易写成 `case_sensitive` 的一个。写错的失败方式是**静默的**：
     // Rust 侧 `#[serde(default)]` 会安静地拿到 false，于是「我明明勾了区分大小写」
     // 变成「结果里全是不想要的东西」，控制台一行错都没有
     expect(parsed.caseSensitive).toBe(true)
     expect(parsed.wholeWord).toBe(false)
+    // ⚠️ `replace` 是最末一个，M2-D 加的。它写错的失败方式比上面那个更贵：
+    // Rust 侧落到 `None`，于是「预览」面板照常出结果（纯搜索也是这条路），
+    // 只是每处命中都不带 `replaced`，而点「替换全部」会被 preflight 拒成
+    // `bad_replacement`——用户看到的是「明明搜到了却换不了」
+    expect(parsed.replace).toBe('bar')
   })
 
-  it('命中那一层的三个类型字段都在', () => {
+  it('Rust 侧序列化默认 query 时 replace 是 null 而不是缺席', () => {
+    const parsed = JSON.parse(GOLDEN_QUERY_DEFAULT) as SearchQuery
+    expect(JSON.stringify(parsed)).toBe(GOLDEN_QUERY_DEFAULT)
+    expect(parsed.replace ?? null).toBeNull()
+    // 前端不发这个 key（见下面 `只填搜索词时只发 pattern 这一个 key`），
+    // 所以这一条对前端只是阅读材料：它把「null 与缺 key 在 Rust 侧同义」写在这儿
+  })
+
+  it('命中那一层的四个类型字段都在', () => {
     const range = JSON.parse(GOLDEN_MATCH_RANGE) as MatchRange
     expect(Object.keys(range)).toEqual(['start', 'end'])
     expect(range).toEqual({ start: 4, end: 10 })
 
-    const hit = JSON.parse(GOLDEN_HIT) as { line: number; text: string; ranges: MatchRange[]; truncated: boolean }
+    const hit = JSON.parse(GOLDEN_HIT) as SearchHit
     expect(Object.keys(hit)).toEqual(['line', 'text', 'ranges', 'truncated'])
     expect(hit.line).toBe(12)
     expect(hit.text).toBe('let a = needle;')
@@ -184,11 +230,39 @@ describe('Rust → 前端 的字段名', () => {
     for (const r of hit.ranges) {
       expect(hit.text.slice(r.start, r.end)).toBe('needle')
     }
+    // ⚠️ 纯搜索时 `replaced` **整个 key 都不在**（Rust 侧挂了 `skip_serializing_if`）。
+    // 判它必须用 `'replaced' in hit` 或 `=== undefined`，不能用真值判断——
+    // 下一段那个空串预览在真值判断下与「纯搜索」长得一模一样
+    expect('replaced' in hit).toBe(false)
 
     const file = JSON.parse(GOLDEN_FILE) as { rel: string; path: string; hits: unknown[]; truncated: boolean }
     expect(Object.keys(file)).toEqual(['rel', 'path', 'hits', 'truncated'])
     expect(file.rel).toBe('src/main.rs')
     expect(file.path).toBe('/repo/src/main.rs')
+  })
+
+  it('替换模式下 replaced 夹在 ranges 与 truncated 之间', () => {
+    const hit = JSON.parse(GOLDEN_HIT_REPLACED) as SearchHit
+    expect(JSON.stringify(hit)).toBe(GOLDEN_HIT_REPLACED)
+    expect(Object.keys(hit)).toEqual(['line', 'text', 'ranges', 'replaced', 'truncated'])
+    expect(hit.replaced).toBe('let a = haystack;')
+
+    // ⚠️ `ranges` 数的是 `text` 里的位置，**不是** `replaced` 里的。
+    // 拿它去切 `replaced` 会安静地切错：`haystack` 在 `replaced` 里是 8..16，
+    // 而 ranges 说的是 8..14，于是切出来是半个词。替换之后长度会变，
+    // 这一条错的话高亮会画在错的地方，而且只在「替换串比原串长/短」时才看得出来
+    expect(hit.text.slice(8, 14)).toBe('needle')
+    expect(hit.replaced?.slice(8, 14)).toBe('haysta')
+    expect(hit.replaced?.slice(8, 16)).toBe('haystack')
+  })
+
+  it('⚠️ 替换成空串时 replaced 照样上线，那是「删掉」而不是「没预览」', () => {
+    const hit = JSON.parse(GOLDEN_HIT_DELETED) as SearchHit
+    expect(JSON.stringify(hit)).toBe(GOLDEN_HIT_DELETED)
+    expect(hit.replaced).toBe('')
+    expect('replaced' in hit).toBe(true)
+    // 与上面那条纯搜索的 `'replaced' in hit === false` 合起来才是完整的两句话：
+    // 「这一行没被预览过」与「这一行预览的结果是删光」在契约上是两种东西
   })
 
   it('⚠️ SearchBatch 上那个累计计数叫 filesScanned，不是 files_scanned', () => {
@@ -234,19 +308,27 @@ describe('Rust → 前端 的字段名', () => {
     expect(parsed.unreadable).toBe(2)
   })
 
-  it('四个错误变体在契约上各有其名', () => {
+  it('五个错误变体在契约上各有其名', () => {
     // 穷举就是这条测试的全部内容：Rust 侧加了变体而前端没跟上，这里会少一行。
-    // 顺序与 Rust 侧 `search_error_的四个变体在契约上各有其名` 一一对应
+    // 顺序与 Rust 侧 `search_error_的五个变体在契约上各有其名` 一一对应
     const cases: [SearchError, string][] = [
       [{ kind: 'bad_pattern', message: '搜索词不能为空' }, '{"kind":"bad_pattern","message":"搜索词不能为空"}'],
       [{ kind: 'bad_glob', glob: '[', message: '炸了' }, '{"kind":"bad_glob","glob":"[","message":"炸了"}'],
+      [
+        { kind: 'bad_replacement', message: '认不出 $x 这种写法' },
+        '{"kind":"bad_replacement","message":"认不出 $x 这种写法"}',
+      ],
       [{ kind: 'bad_root', path: 'repo' }, '{"kind":"bad_root","path":"repo"}'],
       [{ kind: 'not_found', path: '/repo' }, '{"kind":"not_found","path":"/repo"}'],
     ]
     for (const [error, golden] of cases) {
       expect(JSON.stringify(error)).toBe(golden)
     }
-    expect(cases.map(([e]) => e.kind)).toEqual(['bad_pattern', 'bad_glob', 'bad_root', 'not_found'])
+    expect(cases.map(([e]) => e.kind)).toEqual(['bad_pattern', 'bad_glob', 'bad_replacement', 'bad_root', 'not_found'])
+    // ⚠️ `bad_replacement` 与 `bad_pattern` 是**两个 kind 而不是一个**（M2-D 加的）：
+    // 前端要把出错的那个输入框标红，而搜索词框与替换框是两个框。
+    // 合成一个的话界面上只能说「你填的东西不对」
+    //
     // ⚠️ 这里**没有 `io`**，与 `TreeError` 的七个变体不同：遍历途中读不动某个文件
     // 不是「搜索失败」，它计入 `SearchSummary.unreadable` 而搜索继续。
     // 于是「这次搜索失败了」与「这次搜索有几个文件没读成」在契约上就是两种东西
@@ -327,7 +409,7 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     expect(JSON.stringify(sentArgs().query)).toBe(GOLDEN_QUERY)
   })
 
-  it('只填搜索词时只发 pattern 这一个 key，其余五个交给 Rust 侧的默认值', async () => {
+  it('只填搜索词时只发 pattern 这一个 key，其余六个交给 Rust 侧的默认值', async () => {
     tauriCore.invoke.mockResolvedValue('search-1')
     await startSearch('/repo', { pattern: 'needle' })
     const sent = sentArgs().query as Record<string, unknown>
@@ -335,18 +417,15 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     // 不主动补 `literal: false` 之类：Rust 侧容器上有 `#[serde(default)]`，
     // 由 `只发_pattern_的搜索条件也能解析` 钉住。前端替它补默认值等于把默认值抄两份，
     // 哪天 Rust 侧改了默认，两边就悄悄分岔了
+    //
+    // ⚠️ M2-D 之后这一条还多担一件事：**不发 `replace` 这个 key == 纯搜索**。
+    // 补成 `replace: ''` 的话那是一次「把每处命中都删掉」的合法请求，
+    // 而两个值在 Rust 侧只差一个 `Option` 的默认实现
+    expect('replace' in sent).toBe(false)
   })
 
-  it('⚠️ cancel_search 的参数叫 taskId：本项目第二个多单词命令参数', async () => {
-    tauriCore.invoke.mockResolvedValue(undefined)
-    await cancelSearch('search-7')
-    // Rust 侧形参是 `task_id`，Tauri 2 在命令边界上把它转成驼峰。写成 `task_id`
-    // 的失败方式是一句「invalid args `taskId` for command `cancel_search`」——
-    // 那句报错说的是**它要的**名字，读的人却往往以为是自己传错了值。
-    // 第一个多单词参数是 `rename_entry` 的 `newName`，见 project.test.ts
-    expect(tauriCore.invoke).toHaveBeenCalledWith('cancel_search', { taskId: 'search-7' })
-    expect(sentArgs()).toEqual({ taskId: 'search-7' })
-  })
+  // 取消不在这个文件里：M2-D 之后搜索与替换共用 `cancel_task` 一个命令，
+  // 它的参数名（`taskId`，本项目第二个多单词命令参数）由 `src/ipc/task.test.ts` 钉住
 
   it('root 是绝对路径，前端不做任何路径拼接', async () => {
     tauriCore.invoke.mockResolvedValue('search-1')
@@ -375,6 +454,13 @@ describe('错误落地成人能读的话', () => {
     const text = describeSearchError({ kind: 'bad_glob', glob: '', message: '炸了' })
     expect(text.startsWith('""')).toBe(true)
     // 直接内插会得到「 不是合法的通配：炸了」——一句没有主语的话，看着像文案坏了
+  })
+
+  it('bad_replacement 也直接用 Rust 侧给的 message', () => {
+    expect(describeSearchError({ kind: 'bad_replacement', message: '认不出 $x 这种写法' })).toBe('认不出 $x 这种写法')
+    // 与 `bad_pattern` 同一条道理：替换模板也是用户打的，Rust 侧那句已经是人话。
+    // ⚠️ 而且这一条**不能**被包成「替换内容不能为空」之类——空串是合法的删除操作，
+    // Rust 侧只拒 `null`（前端不发 key）与编不出来的 `$` 转义
   })
 
   it('not_found 是用户的处境，不说「内部错误」', () => {

@@ -20,7 +20,8 @@ use vela_core::fs::{
 };
 use vela_core::project::{create_entry, list_dir, rename_entry, DirEntry, DirListing, EntryKind, TreeError};
 use vela_core::search::{
-    search, MatchRange, SearchBatch, SearchError, SearchFile, SearchHit, SearchQuery, SearchSummary,
+    apply, preflight_apply, search, MatchRange, ReplaceProgress, ReplaceRequest, ReplaceSummary, SearchBatch,
+    SearchError, SearchFile, SearchHit, SearchQuery, SearchSummary,
 };
 use vela_core::session::{
     load_session, save_session, PaneDirection, Session, SessionError, SessionProject, SessionReport, SessionTab,
@@ -520,31 +521,51 @@ fn search_query_的线上形状() {
         whole_word: false,
         include: vec!["*.ts".to_owned()],
         exclude: vec![],
+        replace: Some("bar".to_owned()),
     })
     .unwrap();
     assert_eq!(
         json,
-        r#"{"pattern":"foo","literal":true,"caseSensitive":true,"wholeWord":false,"include":["*.ts"],"exclude":[]}"#
+        r#"{"pattern":"foo","literal":true,"caseSensitive":true,"wholeWord":false,"include":["*.ts"],"exclude":[],"replace":"bar"}"#
+    );
+    // `replace` 为 None 时上线的是 `null`。⚠️ 但前端**根本不发这个 key**（与 include /
+    // exclude 同一条路数，靠容器上的 `#[serde(default)]` 落到 None），所以两种写法都要钉
+    assert_eq!(
+        serde_json::to_string(&SearchQuery { pattern: "foo".to_owned(), ..SearchQuery::default() }).unwrap(),
+        r#"{"pattern":"foo","literal":false,"caseSensitive":false,"wholeWord":false,"include":[],"exclude":[],"replace":null}"#
     );
 }
 
-/// 前端可以只发 `pattern`：其余五个字段缺 key 时落到默认值。
+/// 前端可以只发 `pattern`：其余六个字段缺 key 时落到默认值。
 ///
 /// 这一条钉的是**宽容**本身。要是哪天有人把容器上的 `#[serde(default)]` 摘掉，
 /// 前端那句 `invoke('start_search', { root, query: { pattern } })` 就会当场变成
 /// 「invalid args」，而那个改动的动机看起来只是「收紧一下类型」。
+///
+/// ⚠️ M2-D 之后这一条还多担一件事：**`replace` 缺 key 必须是 `None`（纯搜索）而不是
+/// `Some("")`（把每处命中删掉）**。这两个值的差别是「什么都不改」与「改坏两万个文件」，
+/// 而它们只差一个 `Option` 的默认实现
 #[test]
 fn 只发_pattern_的搜索条件也能解析() {
     let parsed: SearchQuery = serde_json::from_str(r#"{"pattern":"foo"}"#).unwrap();
     assert_eq!(parsed, SearchQuery { pattern: "foo".to_owned(), ..SearchQuery::default() });
     assert!(!parsed.literal && !parsed.case_sensitive && !parsed.whole_word);
     assert!(parsed.include.is_empty() && parsed.exclude.is_empty());
+    assert_eq!(parsed.replace, None, "缺 key 必须是「不替换」，不能是「替换成空串」");
+    // `Some("")` 是合法的**删除**操作，不能被上面那条顺手拒掉
+    assert_eq!(
+        serde_json::from_str::<SearchQuery>(r#"{"pattern":"foo","replace":""}"#).unwrap().replace,
+        Some(String::new())
+    );
 }
 
 #[test]
-fn search_error_的四个变体在契约上各有其名() {
-    // 只有四个，而且**没有 `io`**：单个文件读不动不是失败，它计入 `SearchSummary::unreadable`。
-    // 于是「这次搜索失败了」与「这次搜索有几个文件没读成」在契约上就是两种不同的东西
+fn search_error_的五个变体在契约上各有其名() {
+    // 只有五个，而且**没有 `io`**：单个文件读不动不是失败，它计入 `SearchSummary::unreadable`。
+    // 于是「这次搜索失败了」与「这次搜索有几个文件没读成」在契约上就是两种不同的东西。
+    //
+    // ⚠️ M2-D 加的 `bad_replacement` 与 `bad_pattern` 是**两个 kind 而不是一个**：
+    // 前端要把出错的那个输入框标红，搜索词框与替换框是两个框
     let cases = [
         (
             SearchError::BadPattern { message: "搜索词不能为空".to_owned() },
@@ -553,6 +574,10 @@ fn search_error_的四个变体在契约上各有其名() {
         (
             SearchError::BadGlob { glob: "[".to_owned(), message: "炸了".to_owned() },
             r#"{"kind":"bad_glob","glob":"[","message":"炸了"}"#,
+        ),
+        (
+            SearchError::BadReplacement { message: "认不出 $x 这种写法".to_owned() },
+            r#"{"kind":"bad_replacement","message":"认不出 $x 这种写法"}"#,
         ),
         (SearchError::BadRoot { path: "repo".to_owned() }, r#"{"kind":"bad_root","path":"repo"}"#),
         (SearchError::NotFound { path: "/repo".to_owned() }, r#"{"kind":"not_found","path":"/repo"}"#),
@@ -568,6 +593,11 @@ fn search_error_的四个变体在契约上各有其名() {
 /// `elapsed_ms` 每次都不同，做成字面量这个测试自己就会漂。
 /// 真实输出与字段**之间的关系**（`rel` 与 `path` 指向同一个文件、偏移量按码元数）
 /// 由 `search/run.rs` 里那些跑真实目录的测试钉住。
+///
+/// ⚠️ `replaced: None` 那两处**没有改变下面任何一条期望字符串**——M2-D 给
+/// `SearchHit` 加字段时挂了 `skip_serializing_if`，所以纯搜索的线上形状与 M2-C 时
+/// 一字不差。这件事值得单独说一句：加一个字段而不动既有契约，靠的是那个 attribute，
+/// 不是靠运气
 #[test]
 fn 搜索结果的线上形状() {
     assert_eq!(serde_json::to_string(&MatchRange { start: 4, end: 10 }).unwrap(), r#"{"start":4,"end":10}"#);
@@ -576,10 +606,39 @@ fn 搜索结果的线上形状() {
             line: 12,
             text: "let a = needle;".to_owned(),
             ranges: vec![MatchRange { start: 8, end: 14 }],
+            replaced: None,
             truncated: false,
         })
         .unwrap(),
         r#"{"line":12,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}"#
+    );
+    // 替换模式下 `replaced` 才上线，位置在 `ranges` 与 `truncated` 之间（跟着字段声明顺序走）
+    assert_eq!(
+        serde_json::to_string(&SearchHit {
+            line: 12,
+            text: "let a = needle;".to_owned(),
+            ranges: vec![MatchRange { start: 8, end: 14 }],
+            replaced: Some("let a = haystack;".to_owned()),
+            truncated: false,
+        })
+        .unwrap(),
+        r#"{"line":12,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"replaced":"let a = haystack;","truncated":false}"#
+    );
+    // ⚠️ `Some("")` 必须**照样序列化出去**，它是「把命中的地方删掉」那个合法操作。
+    // `skip_serializing_if` 只跳 `None`，不跳空串——但这条断言存在的全部意义是：
+    // 哪天有人把条件改成 `Option::is_none` 之外的东西（比如「空就跳」），
+    // 前端读到 `undefined`，那一行会安静地退回成纯搜索的样子，
+    // 而用户以为自己刚刚预览了一次删除
+    assert_eq!(
+        serde_json::to_string(&SearchHit {
+            line: 1,
+            text: "needle".to_owned(),
+            ranges: vec![],
+            replaced: Some(String::new()),
+            truncated: false,
+        })
+        .unwrap(),
+        r#"{"line":1,"text":"needle","ranges":[],"replaced":"","truncated":false}"#
     );
     assert_eq!(
         serde_json::to_string(&SearchFile {
@@ -608,6 +667,7 @@ fn 搜索结果的线上形状() {
                     line: 1,
                     text: "needle".to_owned(),
                     ranges: vec![MatchRange { start: 0, end: 6 }],
+                    replaced: None,
                     truncated: false,
                 }],
                 truncated: false,
@@ -668,6 +728,10 @@ fn 真实搜索的批次与总账互相对得上() {
         for h in &f.hits {
             assert!(h.line >= 1, "行号是 1 起的");
             assert!(!h.text.ends_with('\n') && !h.text.ends_with('\r'), "text 不带行终止符：{:?}", h.text);
+            // 纯搜索（query 里没有 `replace`）时这个字段必须整个不存在。
+            // 上面那条黄金 JSON 钉的是**形状**，这一条钉的是**真实输出也是那个形状**：
+            // 少了它，`skip_serializing_if` 被摘掉的话黄金 JSON 会跟着改，两边一起漂
+            assert!(h.replaced.is_none(), "纯搜索不该带替换预览：{:?}", h.replaced);
             // 偏移量是**码元**，所以校验也要按码元切，不能按字节或字符
             let units: Vec<u16> = h.text.encode_utf16().collect();
             for r in &h.ranges {
@@ -687,4 +751,214 @@ fn 真实搜索的批次与总账互相对得上() {
     let scanned: Vec<u32> = batches.iter().map(|b| b.files_scanned).collect();
     assert!(scanned.windows(2).all(|w| w[0] <= w[1]), "{scanned:?} 应该单调不减");
     assert!(*scanned.last().unwrap() <= summary.files_scanned, "{scanned:?} 越过了总账");
+}
+
+// ────────────────────────────── M2-D 全局替换 ──────────────────────────────
+//
+// 前端那一份在 `src/ipc/replace.ts` + `src/ipc/replace.test.ts`。
+//
+// ⚠️ 这一节的分量比上面那节重：搜索的契约漂了，最坏是界面显示错；替换的契约漂了，
+// 漂的可能是**「哪些文件被拒了」那几个计数器**。前端要靠它们告诉用户
+// 「有 3 个文件没改，因为是二进制」，字段名写错的话它读到 `undefined`，
+// 用户看到的是「全部替换完成」——而磁盘上有三个文件一个字节都没动。
+
+/// `ReplaceProgress` / `ReplaceSummary` 的黄金 JSON。
+///
+/// ⚠️ 十三个字段一个都不能少：`ReplaceSummary` 里那七个 `skipped*` / `*failed`
+/// 是「这一层把每一个不确定都倒向不写」这件事**唯一的对外出口**。
+/// 少序列化一个，那类拒绝就从用户眼前彻底消失了，而 Rust 侧的测试全绿
+#[test]
+fn 替换载荷的线上形状() {
+    assert_eq!(
+        serde_json::to_string(&ReplaceProgress { files_scanned: 12, files_changed: 3, replacements: 7 }).unwrap(),
+        r#"{"filesScanned":12,"filesChanged":3,"replacements":7}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&ReplaceSummary {
+            files_scanned: 120,
+            files_changed: 3,
+            replacements: 7,
+            skipped_binary: 1,
+            skipped_lossy: 2,
+            skipped_unmappable: 0,
+            skipped_too_large: 4,
+            skipped_open: 1,
+            unreadable: 2,
+            write_failed: 0,
+            truncated: false,
+            cancelled: true,
+            elapsed_ms: 45,
+        })
+        .unwrap(),
+        r#"{"filesScanned":120,"filesChanged":3,"replacements":7,"skippedBinary":1,"skippedLossy":2,"skippedUnmappable":0,"skippedTooLarge":4,"skippedOpen":1,"unreadable":2,"writeFailed":0,"truncated":false,"cancelled":true,"elapsedMs":45}"#
+    );
+}
+
+/// `ReplaceRequest` 的解析：`skip` 缺 key 必须是「不跳过任何文件」，
+/// `query.replace` 缺 key 必须是 `None`（那会被 preflight 拒掉）——
+/// 两件事都不能悄悄变成「跳过一切」或「替换成空串」
+#[test]
+fn 替换请求的线上形状() {
+    let parsed: ReplaceRequest = serde_json::from_str(r#"{"query":{"pattern":"a","replace":"b"}}"#).unwrap();
+    assert_eq!(parsed.query.pattern, "a");
+    assert_eq!(parsed.query.replace.as_deref(), Some("b"));
+    assert!(parsed.skip.is_empty(), "缺 key 时 skip 必须是空的");
+
+    let parsed: ReplaceRequest =
+        serde_json::from_str(r#"{"query":{"pattern":"a","replace":""},"skip":["/repo/x.ts"]}"#).unwrap();
+    assert_eq!(parsed.query.replace, Some(String::new()), "空串是「删掉」，不能变成 None");
+    assert_eq!(parsed.skip, vec!["/repo/x.ts".to_owned()]);
+
+    let parsed: ReplaceRequest = serde_json::from_str(r#"{"query":{"pattern":"a"}}"#).unwrap();
+    assert!(parsed.query.replace.is_none(), "缺 key 必须是「不替换」，那会被 preflight 拒掉");
+}
+
+/// 把「手搓的字面量」与「真实替换」连起来的那一条。
+///
+/// 上面两条钉的是形状，这一条钉的是**内容**，而且钉的是 M2-D 全部设计里最要命的那个
+/// 不变量：**用户在预览里批准的那份清单，就是落盘时改的那份**。`replace.rs` 内部
+/// 已经有两条测试从实现侧断言这件事，这里从**线上字段**再断言一次——差别在于
+/// 内部测试可以看到私有计数器，而前端只能看到这几个字段。前端能看到的对不上，
+/// 内部对得再上也没用。
+///
+/// ⚠️ 关键手法是 `SearchHit::ranges`：它本来是给前端画高亮用的（一段命中一个 range），
+/// 于是 `ranges.len()` 恰好就是「这一行有几处命中」。而 `ReplaceSummary::replacements`
+/// 数的也是**处**，不是行。两边因此可以在线上直接对账，不需要任何新增字段
+#[test]
+fn 真实替换与真实预览在线上对得上() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("src")).unwrap();
+    // 一行一处、一行三处、一行没有、一个文件整个没有命中——四种都摆上
+    fs::write(root.join("src/a.ts"), "let needle = 1;\nlet other = 2;\nneedle needle needle\n").unwrap();
+    fs::write(root.join("src/b.md"), "nothing here\n").unwrap();
+    fs::write(root.join("c.txt"), "needle\n").unwrap();
+
+    let query = SearchQuery { pattern: "needle".to_owned(), replace: Some("NEEDLE".to_owned()), ..Default::default() };
+
+    // 先预览。⚠️ 顺序不能反：apply 会把文件改掉，之后再 search 就是另一份结果了
+    let mut previewed: Vec<(String, String)> = Vec::new();
+    let mut ranges_per_line: Vec<usize> = Vec::new();
+    let preview = search(root, &query, &AtomicBool::new(false), |batch| {
+        for f in &batch.files {
+            for h in &f.hits {
+                let replaced = h.replaced.clone().expect("替换模式下每条命中都该带预览");
+                previewed.push((f.rel.clone(), replaced));
+                ranges_per_line.push(h.ranges.len());
+            }
+        }
+    })
+    .unwrap();
+
+    let matches: usize = ranges_per_line.iter().sum();
+    assert!(ranges_per_line.iter().any(|&n| n > 1), "前提：得有「一行多处」，否则下面那条区分是空的");
+
+    preflight_apply(root, &ReplaceRequest { query: query.clone(), skip: Vec::new() }).unwrap();
+    let mut progress: Vec<ReplaceProgress> = Vec::new();
+    let applied =
+        apply(root, &ReplaceRequest { query: query.clone(), skip: Vec::new() }, &AtomicBool::new(false), |p| {
+            progress.push(p)
+        })
+        .unwrap();
+
+    // ① 走过同一批文件
+    assert_eq!(
+        applied.files_scanned, preview.files_scanned,
+        "两边扫过的文件数不一致：{} vs {}",
+        applied.files_scanned, preview.files_scanned
+    );
+    assert_eq!(applied.files_scanned, 3, "没命中的那个也算扫过");
+    // ② 改的就是预览说有命中的那些
+    assert_eq!(applied.files_changed, preview.files_with_hits);
+    assert_eq!(applied.files_changed, 2);
+    // ③ 换掉的处数 = 预览里所有 range 的个数。⚠️ **不等于** `preview.hits`：
+    // 后者数的是命中**行**，一行里可以有多处
+    assert_eq!(applied.replacements as usize, matches);
+    assert_eq!(applied.replacements, 5);
+    assert!(
+        preview.hits < applied.replacements,
+        "前提：行数与处数在这个 fixture 上确实不同（{} vs {}）",
+        preview.hits,
+        applied.replacements
+    );
+    // ④ 一个都没被拒。这条不能省：上面三条在「全部被跳过」时也成立
+    // （files_changed = 0 = files_with_hits），而那是完全相反的情形
+    assert_eq!(
+        (
+            applied.skipped_binary,
+            applied.skipped_lossy,
+            applied.skipped_unmappable,
+            applied.skipped_too_large,
+            applied.skipped_open,
+            applied.unreadable,
+            applied.write_failed
+        ),
+        (0, 0, 0, 0, 0, 0, 0),
+        "有文件被静默跳过了"
+    );
+    assert!(!applied.truncated && !applied.cancelled);
+
+    // ⑤ 磁盘上每一行与预览里那条 `replaced` 逐字相同——这是「所见即所做」的字面意思
+    for (rel, replaced) in &previewed {
+        let on_disk = fs::read_to_string(root.join(rel)).unwrap();
+        assert!(
+            on_disk.lines().any(|l| l == replaced),
+            "预览说 {rel} 里会出现 {replaced:?}，磁盘上没有。实际内容：{on_disk:?}"
+        );
+    }
+    assert_eq!(previewed.len(), preview.hits as usize);
+    assert!(!fs::read_to_string(root.join("src/b.md")).unwrap().contains("NEEDLE"), "没命中的文件被改了");
+
+    // ⑥ 进度快照累计、单调，最后一个与总账对得上。前端拿它画进度条
+    assert!(!progress.is_empty(), "一次进度都没推");
+    for w in progress.windows(2) {
+        assert!(w[1].files_scanned >= w[0].files_scanned, "{progress:?} 扫描数倒退");
+        assert!(w[1].files_changed >= w[0].files_changed, "{progress:?} 改动数倒退");
+        assert!(w[1].replacements >= w[0].replacements, "{progress:?} 处数倒退");
+    }
+    let last = *progress.last().unwrap();
+    // ⚠️ `files_scanned` 是**不超过**，不是相等。落盘那一侧刻意不做搜索侧那种收尾
+    // flush（理由写在 `replace.rs` 里 `Sink` 的文档上），于是最后一个被改动的文件之后
+    // 扫过的那些没命中的文件不进快照。这个 fixture 上正好差一个：`src/b.md` 排在最后且没命中
+    assert_eq!(last.files_changed, applied.files_changed, "改动数与总账不一致");
+    assert_eq!(last.replacements, applied.replacements, "处数与总账不一致");
+    assert!(last.files_scanned <= applied.files_scanned, "{last:?} 越过了总账");
+    assert_eq!(last.files_scanned, applied.files_scanned - 1, "这个 fixture 上差的就是那个没命中的文件");
+}
+
+/// 起飞前检查用的也是同一批线上类型，所以它的拒绝理由也归契约管。
+///
+/// 前端在按下「替换全部」之前先调一次它，为的是**把一个文件都没动**这件事
+/// 摆在写盘之前。这里钉住三种拒法各自的名字：前端要按名字给不同的文案
+/// （搜索词写坏了 → 指到搜索框；模板写坏了 → 指到替换框），
+/// 全部压成一个字符串的话它只能原样弹出来
+#[test]
+fn 起飞前检查在线上给出可分支的拒绝理由() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("a.txt"), "needle\n").unwrap();
+
+    // 缺 replace：形状上是合法的 `SearchQuery`，但替换必须有替换内容
+    let no_replace =
+        ReplaceRequest { query: SearchQuery { pattern: "needle".to_owned(), ..Default::default() }, skip: Vec::new() };
+    match preflight_apply(root, &no_replace) {
+        Err(SearchError::BadReplacement { message }) => assert!(message.contains("replace"), "{message}"),
+        other => panic!("期望 BadReplacement，实际 {other:?}"),
+    }
+    // 搜索词编不出来
+    let bad_pattern = ReplaceRequest {
+        query: SearchQuery { pattern: "(".to_owned(), replace: Some("x".to_owned()), ..Default::default() },
+        skip: Vec::new(),
+    };
+    assert!(matches!(preflight_apply(root, &bad_pattern), Err(SearchError::BadPattern { .. })));
+    // 模板里的 `$` 用法不支持
+    let bad_template = ReplaceRequest {
+        query: SearchQuery { pattern: "needle".to_owned(), replace: Some("$-".to_owned()), ..Default::default() },
+        skip: Vec::new(),
+    };
+    assert!(matches!(preflight_apply(root, &bad_template), Err(SearchError::BadReplacement { .. })));
+
+    // ⚠️ 三种都被拒了，而那个文件必须还是原样。这条断言是「检查发生在写盘之前」
+    // 唯一的证据——没有它，一个「先改完再报错」的实现同样能让上面三条通过
+    assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "needle\n");
 }

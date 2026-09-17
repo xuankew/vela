@@ -6,18 +6,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 /**
  * 底部搜索面板的测试：DOM 与 `createSearchPanel` 之间的接线。
  *
- * 状态机那一半（什么时候去搜、批次放哪、taskId 怎么认领作废）在 `./store.test.ts` 里钉过了，
- * 行扁平化、键盘落点、总账文案与命中段切分在 `./rows.test.ts` 里钉过了。这里测四件事：
+ * 状态机那一半（什么时候去搜、批次放哪、taskId 怎么认领作废、`stale` 与 `canApply` 怎么算）
+ * 在 `./store.test.ts` 里钉过了，行扁平化、键盘落点、总账文案与命中段切分在 `./rows.test.ts`
+ * 里钉过了，确认对话框自己在 `./ReplaceConfirm.test.tsx` 里。这里测五件事：
  * **渲染出来的东西对不对**、**点对了地方会不会调到对的方法**、
  * **虚拟滚动是不是真的只渲染看得见的那几十行、并且滚动时复用 DOM**、
- * 以及**那五个键与 Esc 落在输入框和落在列表上分别做什么**。
+ * **那五个键与 Esc 落在输入框和落在列表上分别做什么**，
+ * 以及——M2-D 之后——**替换模式下多出来的那一排、命中行上的 `原文 → 预览`、
+ * 会被跳过的文件标记**。
  *
  * 虚拟滚动那条是整段设计的承重墙——结果上限是两万条命中，全部渲染出来是四万个 DOM 节点。
  * 它坏掉的方式不报错：滚动时整棵子树被重建，帧率掉到个位数，而所有功能测试照样全绿。
  *
+ * ⚠️ 替换那一半有一条边界必须在这里钉：「替换全部」**只摊一张确认单**，
+ * 一个字节都不写，而且对话框不由面板渲染（两个遮罩叠着的话两个都能点「替换」）。
+ * 落盘那一下的批准在 App 那一层，所以这条只有面板自己的测试说得住。
+ *
  * ⚠️ 有些东西这里钉不住，都得在真实窗口里看：面板占掉多少编辑区高度、240px 合不合适、
- * 结果行的省略号断在哪儿、`.find-mark` 与 `.find-opt.on` 的对比度（jsdom 里没有布局，
- * `getBoundingClientRect()` 全是 0）。
+ * 多出来那一排（26px）值不值、结果行的省略号断在哪儿、`.find-mark` 与 `.find-opt.on`
+ * 的对比度、`.find-new` 那个绿与 `.find-mark` 那个蓝分不分得开、`.find-row.skipped`
+ * 压暗到什么程度才看得出又不刺眼（jsdom 里没有布局，`getBoundingClientRect()` 全是 0）。
  */
 
 /**
@@ -26,15 +34,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  * 签名里直接用 `SearchQuery` 是安全的——类型在编译时被擦掉，`vi.hoisted` 的工厂搬到
  * import 之前也不会引用到任何运行时值。
  */
-const { ipc } = vi.hoisted(() => ({
+const { ipc, task, rep } = vi.hoisted(() => ({
   ipc: {
     startSearch: vi.fn<(root: string, query: SearchQuery) => Promise<string>>(),
-    cancelSearch: vi.fn<(taskId: string) => Promise<void>>(),
     describeSearchError: (err: unknown) => `模拟错误：${JSON.stringify(err)}`,
+  },
+  task: {
+    cancelTask: vi.fn<(taskId: string) => Promise<void>>(),
+  },
+  rep: {
+    startReplace: vi.fn<(root: string, query: SearchQuery, skip: string[]) => Promise<string>>(),
   },
 }))
 
 vi.mock('../ipc/search', () => ipc)
+vi.mock('../ipc/task', () => task)
+vi.mock('../ipc/replace', () => rep)
 
 import type { MatchRange, SearchFile, SearchHit, SearchQuery, SearchSummary } from '../ipc/search'
 import { OVERSCAN } from '../project/tree'
@@ -63,6 +78,16 @@ function file(rel: string, texts: string[], truncated = false): SearchFile {
 }
 
 const TWO_FILES = [file('src/a.ts', ['let a = needle;', 'let b = needle;']), file('README.md', ['a needle here'])]
+
+/** 替换模式下的一批结果：`pairs` 的每一项是「原文 / 换完长什么样」 */
+function previewFile(rel: string, pairs: [string, string][], truncated = false): SearchFile {
+  return {
+    rel,
+    path: `/repo/${rel}`,
+    truncated,
+    hits: pairs.map(([text, replaced], i) => ({ ...hit(i + 1, text), replaced })),
+  }
+}
 
 function sum(overrides: Partial<SearchSummary> = {}): SearchSummary {
   const base: SearchSummary = {
@@ -94,6 +119,8 @@ const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 let container: HTMLDivElement
 let panel: SearchPanel
 let opened: HitRow[]
+/** 正开着且有未保存改动的那些路径。`mount` 把它接成 `skipPaths`，用例按需填 */
+let dirty: string[]
 /**
  * 当前这一轮的 taskId。⚠️ **每轮自增，不能写死 't1'**：store 会把结束过与作废过的 id
  * 放进 `retired`，第二轮再用同一个 id 的话它的批次会被当成「已作废任务的迟到批次」丢掉，
@@ -107,7 +134,13 @@ let disposeRender: (() => void) | undefined
 function mount(): SearchPanel {
   opened = []
   disposePanel = createRoot((teardown) => {
-    panel = createSearchPanel({ root: () => '/repo', openHit: async (h) => void opened.push(h) })
+    panel = createSearchPanel({
+      // root 是常量而不是 signal：这一组的用例里没有一条要改项目根，
+      // 而「root 变了 canApply 得跟着变」那条在 store.test.ts 里用真 signal 钉过了
+      root: () => '/repo',
+      openHit: async (h) => void opened.push(h),
+      skipPaths: () => dirty,
+    })
     return teardown
   })
   disposeRender = render(() => <FindInFiles panel={panel} />, container)
@@ -129,6 +162,27 @@ async function deliver(files: SearchFile[] = TWO_FILES, filesScanned = 12): Prom
 
 async function done(overrides: Partial<SearchSummary> = {}): Promise<void> {
   panel.handlers.onDone(taskId, sum(overrides))
+  await flush()
+}
+
+/**
+ * 打开替换模式、填好替换内容、搜一遍，并把带 `replaced` 的那一批结果推完。
+ *
+ * 走完这一步 `canApply()` 才是真的：它要求「替换模式开着 + 不在跑 + 没过期 + 有命中」，
+ * 少一样「替换全部」就是灰的，于是那些用例点的其实是一个按不动的按钮
+ */
+async function previewOnce(files: SearchFile[], replacement = 'NEEDLE'): Promise<void> {
+  modeButton().click()
+  await flush()
+  type('needle')
+  typeReplace(replacement)
+  await flush()
+
+  await panel.search()
+  await flush()
+  const hits = files.reduce((n, f) => n + f.hits.length, 0)
+  panel.handlers.onBatch(taskId, { files, filesScanned: files.length })
+  panel.handlers.onDone(taskId, sum({ filesWithHits: files.length, hits }))
   await flush()
 }
 
@@ -208,6 +262,44 @@ function marks(): string[] {
   return [...container.querySelectorAll<HTMLElement>('.find-mark')].map((el) => el.textContent ?? '')
 }
 
+/* ---------- 替换那一排的读取口 ---------- */
+
+/** 模式开关。刻意不用 `.find-opt`：那三个是匹配选项，这一个是模式，class 就该分开 */
+function modeButton(): HTMLButtonElement {
+  const el = container.querySelector<HTMLButtonElement>('.find-mode')
+  if (!el) throw new Error('找不到「替换」模式开关')
+  return el
+}
+
+function replaceRow(): HTMLElement | null {
+  return container.querySelector<HTMLElement>('.find-replace')
+}
+
+/**
+ * 「替换为」那一格。⚠️ 必须限定在 `.find-replace` 里面找：它也挂着 `.find-input`，
+ * 而 `input()` 用的是 `querySelector`（取第一个），少了这个限定就会两个都指到搜索词上
+ */
+function replaceInput(): HTMLInputElement {
+  const el = container.querySelector<HTMLInputElement>('.find-replace .find-input')
+  if (!el) throw new Error('找不到「替换为」输入框')
+  return el
+}
+
+function applyButton(): HTMLButtonElement {
+  const el = container.querySelector<HTMLButtonElement>('.find-replace button')
+  if (!el) throw new Error('找不到「替换全部」')
+  return el
+}
+
+/** 命中行上的预览那一段（`→` 之后的）。没预览过时一个都不存在 */
+function previews(): string[] {
+  return [...container.querySelectorAll<HTMLElement>('.find-new')].map((el) => el.textContent ?? '')
+}
+
+function arrows(): number {
+  return container.querySelectorAll('.find-arrow').length
+}
+
 /* ---------- 事件派发 ---------- */
 
 /**
@@ -224,6 +316,13 @@ function key(el: HTMLElement, which: string): KeyboardEvent {
 /** 往输入框里打字。必须派发 `input`：Solid 的 `onInput` 读的是事件，不是赋值这个动作 */
 function type(text: string): void {
   const el = input()
+  el.value = text
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+/** 与 `type` 同一条规矩，只是落在「替换为」那一格上 */
+function typeReplace(text: string): void {
+  const el = replaceInput()
   el.value = text
   el.dispatchEvent(new Event('input', { bubbles: true }))
 }
@@ -262,14 +361,21 @@ let seq = 0
 
 beforeEach(() => {
   ipc.startSearch.mockReset()
-  ipc.cancelSearch.mockReset()
+  task.cancelTask.mockReset()
+  rep.startReplace.mockReset()
   seq = 0
   taskId = 't0'
   ipc.startSearch.mockImplementation(async (): Promise<string> => {
     taskId = `t${String(++seq)}`
     return taskId
   })
-  ipc.cancelSearch.mockResolvedValue(undefined)
+  task.cancelTask.mockResolvedValue(undefined)
+  // 落盘那一轮的 id 刻意与搜索那一轮不同号：两个 TaskSlot 各有各的 `retired`，
+  // 同号也不会互相作废，而写成不同的值能让「认错了 slot」这类失败在断言里现形
+  rep.startReplace.mockResolvedValue('r1')
+  // 默认没有任何脏标签。⚠️ 不重置的话 `skipPaths()` 交出去的是 undefined，
+  // store 那边 `?? []` 会把它咽掉，于是「跳过的文件要标出来」那条用例永远造不出 skipped
+  dirty = []
   container = document.createElement('div')
   document.body.appendChild(container)
 })
@@ -355,14 +461,14 @@ describe('面板头部', () => {
     expect(p.running()).toBe(true)
   })
 
-  it('正在搜的时候才出现「取消」，点它走 cancelSearch', async () => {
+  it('正在搜的时候才出现「取消」，点它走 cancelTask', async () => {
     const p = mount()
     await searchOnce()
 
     mustButton('取消').click()
     await flush()
 
-    expect(ipc.cancelSearch).toHaveBeenCalledWith('t1')
+    expect(task.cancelTask).toHaveBeenCalledWith('t1')
     // 状态一律不动：已经推出去的批次仍然有效，收尾由随后的 done 事件做
     expect(p.running()).toBe(true)
 
@@ -399,7 +505,7 @@ describe('面板头部', () => {
     expect(p.rows().length).toBeGreaterThan(0)
     expect(p.pattern()).toBe('needle')
     // 收起不等于取消：重新展开该看到上次那份结果
-    expect(ipc.cancelSearch).not.toHaveBeenCalled()
+    expect(task.cancelTask).not.toHaveBeenCalled()
   })
 
   it('行高只有一个真相：常量被注入成 CSS 变量', () => {
@@ -893,5 +999,407 @@ describe('焦点', () => {
     await flush()
 
     expect(document.activeElement).toBe(input())
+  })
+})
+
+/* ───────────────────────── 替换那一半（M2-D） ───────────────────────── */
+
+describe('替换那一排', () => {
+  it('一开始没有那一排，「搜索」就叫搜索；点「替换」之后才出现，按钮改叫「预览」', async () => {
+    const p = mount()
+
+    expect(replaceRow()).toBeNull()
+    expect(headButton('搜索')).toBeTruthy()
+    expect(modeButton().classList.contains('on')).toBe(false)
+    expect(modeButton().getAttribute('aria-pressed')).toBe('false')
+
+    modeButton().click()
+    await flush()
+
+    expect(p.replaceMode()).toBe(true)
+    expect(replaceRow()).toBeTruthy()
+    expect(replaceInput()).toBeTruthy()
+    expect(applyButton()).toBeTruthy()
+    expect(modeButton().classList.contains('on')).toBe(true)
+    expect(modeButton().getAttribute('aria-pressed')).toBe('true')
+    // 同一个按钮换了名字，不是多出来一个：多一个的话「搜索」在替换模式下仍然可点，
+    // 而它按下之后发出去的 query 是带 `replace` 的那一份——两个按钮做同一件事
+    expect(headButton('预览')).toBeTruthy()
+    expect(headButton('搜索')).toBeUndefined()
+
+    modeButton().click()
+    await flush()
+    expect(replaceRow()).toBeNull()
+    expect(headButton('搜索')).toBeTruthy()
+  })
+
+  it('「替换」是模式，不是第四个匹配开关：那三个自己一个都不翻', async () => {
+    const p = mount()
+
+    modeButton().click()
+    await flush()
+
+    expect(opts().map((b) => b.textContent)).toEqual(['.*', 'Aa', 'ab'])
+    expect(opts().some((b) => b.classList.contains('on'))).toBe(false)
+    expect(p.literal()).toBe(false)
+    expect(p.caseSensitive()).toBe(false)
+    expect(p.wholeWord()).toBe(false)
+  })
+
+  it('打字改的是 panel.replacement()，反过来 setReplacement 也写回那一格', async () => {
+    const p = mount()
+    modeButton().click()
+    await flush()
+
+    // ⚠️ 不 trim，与搜索词同一条理由：`"  "` 是「把命中换成两个空格」，
+    // 前端替用户去掉就等于把一次替换悄悄改成了删除
+    typeReplace('  新内容  ')
+    await flush()
+    expect(p.replacement()).toBe('  新内容  ')
+
+    p.setReplacement('换一个')
+    await flush()
+    expect(replaceInput().value).toBe('换一个')
+  })
+
+  it('⚠️ 预览那一次发出去的 query 多一个 replace 字段，纯搜索时没有', async () => {
+    const p = mount()
+    type('needle')
+    await flush()
+    await p.search()
+    await flush()
+
+    expect(ipc.startSearch.mock.calls[0]![1]).toEqual({
+      pattern: 'needle',
+      literal: false,
+      caseSensitive: false,
+      wholeWord: false,
+    })
+
+    modeButton().click()
+    typeReplace('NEEDLE')
+    await flush()
+    await p.search()
+    await flush()
+
+    // 同一条 `start_search`，多一个字段：预览不另起一条 IPC，
+    // 于是「所见即所做」是结构上成立的，而不是靠两边各写一份模板展开去对齐
+    expect(ipc.startSearch.mock.calls[1]![1]).toEqual({
+      pattern: 'needle',
+      literal: false,
+      caseSensitive: false,
+      wholeWord: false,
+      replace: 'NEEDLE',
+    })
+  })
+
+  it('「替换为」那一格里按 Enter 也起一次预览，按 Escape 也收起面板', async () => {
+    const p = mount()
+    modeButton().click()
+    await flush()
+    type('needle')
+    typeReplace('NEEDLE')
+    await flush()
+
+    const enter = key(replaceInput(), 'Enter')
+    await flush()
+    expect(enter.defaultPrevented).toBe(true)
+    expect(ipc.startSearch).toHaveBeenCalledTimes(1)
+    expect(p.running()).toBe(true)
+
+    const esc = key(replaceInput(), 'Escape')
+    await flush()
+    expect(esc.defaultPrevented).toBe(true)
+    expect(p.visible()).toBe(false)
+  })
+
+  it('⚠️ 「替换全部」灰掉的每一种理由都写在 title 上', async () => {
+    const p = mount()
+    modeButton().click()
+    await flush()
+    // 一次都没搜过
+    expect(applyButton().disabled).toBe(true)
+    expect(applyButton().title).toBe('先搜一遍，看看会改到哪些地方')
+
+    // 搜了，一处都没命中
+    type('needle')
+    await flush()
+    await p.search()
+    await flush()
+    await done({ hits: 0, filesWithHits: 0 })
+    expect(applyButton().title).toBe('这一轮一处都没命中')
+
+    // 还在搜
+    await p.search()
+    await flush()
+    expect(applyButton().disabled).toBe(true)
+    expect(applyButton().title).toBe('等这一轮搜完')
+
+    // 搜完、有命中：可以按了
+    await deliver([previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+    await done({ hits: 1, filesWithHits: 1 })
+    expect(p.canApply()).toBe(true)
+    expect(applyButton().disabled).toBe(false)
+    expect(applyButton().title).toBe('把命中的地方全换成上面填的内容（会先摊一张确认单）')
+
+    // 条件改过了：预览对不上了。这一条是唯一在面板上别处也说了的（警告行），
+    // 两处都得有——按钮离手最近，警告行才是说清「为什么」的那一句
+    typeReplace('别的')
+    await flush()
+    expect(p.stale()).toBe(true)
+    expect(applyButton().disabled).toBe(true)
+    expect(applyButton().title).toBe('条件改过了：重新搜一遍，让预览对上你批准的那份')
+    expect(warningText()).toContain('预览已过期')
+  })
+
+  it('正在写盘的时候「替换全部」与「预览」都灰掉，「取消」出现并且停的是落盘那一个', async () => {
+    const p = mount()
+    await previewOnce([previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+
+    void p.confirmApply()
+    await flush()
+
+    expect(p.replacing()).toBe(true)
+    expect(applyButton().disabled).toBe(true)
+    expect(applyButton().title).toBe('正在写盘，等它结束')
+    // 「预览」灰掉：那一轮正在改磁盘，而搜完的结果会把它自己的进度挤掉
+    expect(mustButton('预览').disabled).toBe(true)
+    expect(mustButton('取消')).toBeTruthy()
+
+    mustButton('取消').click()
+    await flush()
+    // 认的是 applySlot 那个 id，不是刚才搜过的那一个
+    expect(task.cancelTask).toHaveBeenCalledWith('r1')
+  })
+
+  it('⚠️ 点「替换全部」只摊一张确认单，一个字节都不写；对话框由 App 渲染，不在面板里', async () => {
+    const p = mount()
+    await previewOnce([
+      previewFile('src/a.ts', [
+        ['let a = needle;', 'let a = NEEDLE;'],
+        ['let b = needle;', 'let b = NEEDLE;'],
+      ]),
+      previewFile('README.md', [['a needle here', 'a NEEDLE here']]),
+    ])
+    expect(p.canApply()).toBe(true)
+
+    applyButton().click()
+    await flush()
+
+    expect(p.confirm()).toEqual({ files: 2, lines: 3, skipped: 0, deleting: false, truncated: false })
+    expect(rep.startReplace).not.toHaveBeenCalled()
+    // 面板自己不弹对话框：那张单子是 `ReplaceConfirm`，由 App 渲染在 `.app` 那一层。
+    // 在这里也渲染一份的话会有两个遮罩叠着，而两个都能点「替换」
+    expect(container.querySelector('.modal-backdrop')).toBeNull()
+
+    p.dismissConfirm()
+    await flush()
+    expect(p.confirm()).toBeNull()
+    expect(rep.startReplace).not.toHaveBeenCalled()
+  })
+
+  it('替换内容留空时确认单上 deleting 为真——那是「把命中的那一段删掉」', async () => {
+    const p = mount()
+    await previewOnce([previewFile('src/a.ts', [['x needle y', 'x  y']])], '')
+
+    applyButton().click()
+    await flush()
+
+    expect(p.confirm()).toEqual({ files: 1, lines: 1, skipped: 0, deleting: true, truncated: false })
+    expect(rep.startReplace).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 单个文件撞到自己的上限：总账没截断，确认单上也得说「这份清单不完整」', async () => {
+    const p = mount()
+    await previewOnce([previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']], true)])
+
+    expect(p.summary()?.truncated).toBe(false)
+    expect(rowEls()[0]!.querySelector('.find-count')?.textContent).toBe('1 处（这个文件没搜完）')
+
+    applyButton().click()
+    await flush()
+    // 落盘那一侧对单文件**没有** 500 条上限，实际会换掉的比预览里显示的多
+    expect(p.confirm()).toEqual({ files: 1, lines: 1, skipped: 0, deleting: false, truncated: true })
+  })
+
+  it('总条数撞到上限时确认单上 truncated 也为真', async () => {
+    const p = mount()
+    modeButton().click()
+    await flush()
+    type('needle')
+    typeReplace('NEEDLE')
+    await flush()
+    await p.search()
+    await flush()
+    await deliver([previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+    await done({ hits: 1, filesWithHits: 1, truncated: true })
+
+    applyButton().click()
+    await flush()
+    expect(p.confirm()).toEqual({ files: 1, lines: 1, skipped: 0, deleting: false, truncated: true })
+  })
+})
+
+describe('替换预览行', () => {
+  it('⚠️ 命中行渲染成「原文 → 预览」，原文那一段照旧打 mark', async () => {
+    mount()
+    await previewOnce([previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+
+    expect(marks()).toEqual(['needle'])
+    expect(arrows()).toBe(1)
+    expect(previews()).toEqual(['let a = NEEDLE;'])
+    // 箭头与预览都在 `.find-text` 里面：整行只有一个省略号，落在预览的尾巴上
+    const text = rowEls()[1]!.querySelector('.find-text')!
+    expect(text.textContent).toBe('let a = needle;→let a = NEEDLE;')
+    expect(text.querySelector('.find-new')).not.toBeNull()
+  })
+
+  it('⚠️ replaced 是空串时照样画箭头——真值判断会让它退回纯搜索的样子', async () => {
+    mount()
+    await previewOnce([previewFile('src/a.ts', [['x needle y', '']])], '')
+
+    expect(arrows()).toBe(1)
+    expect(previews()).toEqual([''])
+    expect(container.querySelectorAll('.find-new')).toHaveLength(1)
+  })
+
+  it('纯搜索的结果一个箭头都没有', async () => {
+    mount()
+    await searchOnce()
+    await deliver()
+    await done()
+
+    expect(rowEls().length).toBeGreaterThan(0)
+    expect(arrows()).toBe(0)
+    expect(previews()).toEqual([])
+  })
+
+  it('预览里的换行显示成 ↵：行是定高的，撑开一行窗口算术就废了', async () => {
+    mount()
+    await previewOnce([previewFile('src/a.ts', [['call(needle)', 'call(\nNEEDLE\n)']])])
+
+    expect(previews()).toEqual(['call(↵NEEDLE↵)'])
+  })
+
+  it('预览只挂在命中行上，文件行照旧是「rel + 几处」', async () => {
+    mount()
+    await previewOnce([
+      previewFile('src/a.ts', [
+        ['one needle', 'one NEEDLE'],
+        ['two needle', 'two NEEDLE'],
+      ]),
+    ])
+
+    expect(rowEls()[0]!.classList.contains('file')).toBe(true)
+    expect(rowEls()[0]!.querySelector('.find-new')).toBeNull()
+    expect(rowEls()[0]!.querySelector('.find-count')?.textContent).toBe('2 处')
+    expect(arrows()).toBe(2)
+    expect(previews()).toEqual(['one NEEDLE', 'two NEEDLE'])
+  })
+})
+
+describe('会被跳过的文件', () => {
+  it('⚠️ 正开着且有未保存改动的那个：整行标 .skipped，计数里带上原因，确认单里也算进 skipped', async () => {
+    const p = mount()
+    dirty = ['/repo/src/a.ts']
+    await previewOnce([
+      previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']]),
+      previewFile('README.md', [['a needle here', 'a NEEDLE here']]),
+    ])
+
+    const rows = rowEls()
+    expect(rows[0]!.classList.contains('skipped')).toBe(true)
+    expect(rows[2]!.classList.contains('skipped')).toBe(false)
+    // 只压暗是不够的：它与「命中很少的文件」看起来没区别，为什么必须是文字
+    expect(rows[0]!.querySelector('.find-count')?.textContent).toBe('1 处（正开着且有未保存的改动，跳过）')
+    expect(rows[2]!.querySelector('.find-count')?.textContent).toBe('1 处')
+
+    applyButton().click()
+    await flush()
+    // 被跳过的那个既不算进 files，它下面那行也不算进 lines：
+    // 这两个数字是用户批准落盘的唯一依据，把做不到的那部分算进去就是骗他
+    expect(p.confirm()).toEqual({ files: 1, lines: 1, skipped: 1, deleting: false, truncated: false })
+  })
+
+  it('没有脏标签时一个 .skipped 都没有', async () => {
+    mount()
+    await previewOnce([previewFile('src/a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+
+    expect(container.querySelectorAll('.find-row.skipped')).toHaveLength(0)
+    expect(rowEls()[0]!.querySelector('.find-count')?.textContent).toBe('1 处')
+  })
+})
+
+describe('焦点（替换模式）', () => {
+  it('⚠️ 搜索词已经填了才把焦点挪到「替换为」——空着的时候用户要打的第一个东西是搜索词', async () => {
+    mount()
+    type('needle')
+    await flush()
+
+    modeButton().click()
+    await flush()
+    expect(document.activeElement).toBe(replaceInput())
+  })
+
+  it('⚠️ 键盘那条路（showReplace）也得落在「替换为」——它不在 Solid 的事件批里', async () => {
+    const p = mount()
+    type('needle')
+    await flush()
+
+    // 直接调 store 方法，而不是点面板上那个按钮：命令分派挂在 window 的捕获阶段上，
+    // 不在 Solid 委托的事件批里，于是 `replaceMode` 与 `focusRequest` 两次写各自跑完
+    // 一轮更新，组件里那两个 effect 谁后跑完全由写入顺序决定。
+    // 曾经就是靠「后跑的赢」，结果焦点落在搜索词上——一个只在真实按键下才复现的错位
+    p.showReplace()
+    await flush()
+    expect(document.activeElement).toBe(replaceInput())
+
+    // 连按第二次（模式已经开着、`focusRequest` 只加一）也不许把焦点甩回上面那一格
+    p.showReplace()
+    await flush()
+    expect(document.activeElement).toBe(replaceInput())
+  })
+
+  it('替换模式里再按 Mod+Shift+F：焦点回搜索词那一格，模式本身留着', async () => {
+    const p = mount()
+    type('needle')
+    await flush()
+    p.showReplace()
+    await flush()
+    expect(document.activeElement).toBe(replaceInput())
+
+    p.show()
+    await flush()
+    // 那一下表达的是「我要改搜什么」，不是「退出替换模式」——
+    // 顺手把模式关掉的话，用户刚填的替换内容与那份预览会一起没了
+    expect(document.activeElement).toBe(input())
+    expect(p.replaceMode()).toBe(true)
+  })
+
+  it('搜索词是空的时候不挪', async () => {
+    mount()
+    modeButton().click()
+    await flush()
+
+    expect(replaceRow()).toBeTruthy()
+    expect(document.activeElement).not.toBe(replaceInput())
+  })
+
+  it('⚠️ 在替换模式下往搜索词里打字，焦点不许被抢走', async () => {
+    mount()
+    type('needle')
+    await flush()
+    modeButton().click()
+    await flush()
+    expect(document.activeElement).toBe(replaceInput())
+
+    input().focus()
+    type('needle2')
+    await flush()
+
+    // 写成裸 createEffect 的话它会把 `pattern()` 也当成依赖，于是每打一个字焦点就跳一次——
+    // 那种 bug 在 jsdom 里看得见，在真实窗口里的表现是「输入框打着打着就不听话了」
+    expect(document.activeElement).toBe(input())
+    expect(replaceInput().value).toBe('')
   })
 })

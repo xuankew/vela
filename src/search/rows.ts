@@ -26,6 +26,7 @@
  */
 
 import type { MatchRange, SearchFile, SearchSummary } from '../ipc/search'
+import type { ReplaceProgress, ReplaceSummary } from '../ipc/replace'
 import { OVERSCAN, visibleWindow, type VirtualWindow } from '../project/tree'
 
 /** 结果列表里的一行。文件行是分组标题，命中行是真正能点着跳过去的那一条 */
@@ -40,6 +41,15 @@ export interface FileRow {
   hits: number
   /** 撞到单文件上限（Rust 侧 500），UI 要说「还有更多」 */
   truncated: boolean
+  /**
+   * 替换时这个文件会被**跳过**：它正开着一个标签、且有未保存的改动。
+   *
+   * ⚠️ 必须在预览里就说出来，不能等 `ReplaceSummary.skippedOpen` 事后补：
+   * 预览走的是 `start_search`，它不知道 `skip` 清单的存在，于是那些行会照常
+   * 显示成「将会被替换」。不标的话用户批准的是一份**做不到**的清单，
+   * 而事后那句「跳过了 2 个」看起来像是我们偷偷少改了
+   */
+  skipped: boolean
 }
 
 export interface HitRow {
@@ -54,9 +64,22 @@ export interface HitRow {
   /**
    * 要高亮的段，偏移量是 **UTF-16 码元**，与 `String.prototype.slice`、
    * 与 CM6 的文档位置同一口径。⚠️ 可能是空的（见 `SearchHit` 的文档）：
-   * 空不等于「这行没命中」，只是画不出高亮，行号照样能跳
+   * 空不等于「这行没命中」，只是画不出高亮，行号照样能跳。
+   *
+   * ⚠️ 而且它数的是 `text` 里的位置，**不是** `replaced` 里的——替换串长度一变，
+   * 拿它去切 `replaced` 会安静地切错半个词
    */
   ranges: MatchRange[]
+  /**
+   * 替换模式下这一行换完之后长什么样。
+   *
+   * ⚠️ 判它只能用 `=== undefined`，**不能用真值判断**：`''` 是「把命中的地方删光」
+   * 那个合法操作的预览，而真值判断下它与「纯搜索、没预览过」长得一模一样。
+   * 搞混的后果是那一行退回成纯搜索的样子，用户以为自己刚刚预览了一次删除
+   *
+   * ⚠️ 可能含 `\n`（模板里打换行是合法的），所以渲染前要过 [`oneLine`]
+   */
+  replaced?: string
   truncated: boolean
 }
 
@@ -96,11 +119,28 @@ export function resultWindow(scrollTop: number, viewportHeight: number, total: n
  * 每个文件产出「一行标题 + 它的每条命中一行」。命中为零的文件也照样产出标题行——
  * Rust 侧不会推这种文件（`run.rs` 只在 `hits` 非空时才 push），但契约上没禁止，
  * 而漏掉它的话那个文件就在结果里彻底消失了，连「搜到了但没命中」都说不出来。
+ *
+ * @param isSkipped 这个绝对路径在替换时会不会被跳过（见 `FileRow.skipped`）。
+ *   ⚠️ 它是**摊的那一刻**求值的，所以用户在这批到达之后才把某个文件改脏，
+ *   已经摊出来的那一行不会跟着变。这是接受的代价：换成「每次渲染都查一遍」的话
+ *   `rows()` 就得依赖一个每次编辑都变的信号，而 `<For>` 靠引用相等复用 DOM 那条
+ *   性质会当场失效——两万个节点重建一遍。真正的对账在落盘之后，
+ *   由 `ReplaceSummary.skippedOpen` 如实报出
  */
-export function flattenFiles(files: readonly SearchFile[]): ResultRow[] {
+export function flattenFiles(
+  files: readonly SearchFile[],
+  isSkipped: (path: string) => boolean = () => false,
+): ResultRow[] {
   const rows: ResultRow[] = []
   for (const file of files) {
-    rows.push({ kind: 'file', rel: file.rel, path: file.path, hits: file.hits.length, truncated: file.truncated })
+    rows.push({
+      kind: 'file',
+      rel: file.rel,
+      path: file.path,
+      hits: file.hits.length,
+      truncated: file.truncated,
+      skipped: isSkipped(file.path),
+    })
     for (const hit of file.hits) {
       rows.push({
         kind: 'hit',
@@ -109,6 +149,9 @@ export function flattenFiles(files: readonly SearchFile[]): ResultRow[] {
         line: hit.line,
         text: hit.text,
         ranges: hit.ranges,
+        // 直接搬 `hit.replaced`：纯搜索时它是 `undefined`，与「预览结果是删光」那个
+        // 空串在类型上就是两个值，中间不需要任何转换
+        replaced: hit.replaced,
         truncated: hit.truncated,
       })
     }
@@ -253,4 +296,90 @@ export function describeSummary(summary: SearchSummary): string {
 export function unreadableWarning(summary: SearchSummary): string | null {
   if (summary.unreadable <= 0) return null
   return `有 ${summary.unreadable} 个条目读不出来（权限不够、被删或 IO 错误），所以「没有找到」不一定成立`
+}
+
+// ───────────────────────── 替换那一半（M2-D） ─────────────────────────
+
+/**
+ * 把预览串压成一行。
+ *
+ * 模板里打 `\n` 是**合法的**（「把这个调用换成两行」），于是 `replaced` 可以含换行。
+ * 而结果行是定高的：让它撑开的话 `visibleWindow` 那套 O(1) 窗口算术当场失效
+ * （它的全部前提是「每行一样高」），让它溢出的话用户看到半行，
+ * 会以为替换只换了一半。显示成 `↵` 是唯一既保住定高、又如实说出「这里有个换行」的办法。
+ *
+ * ⚠️ 只管 `\n`：`text` 与 `replaced` 都是 Rust 侧 `normalize_to_lf` 之后的产物，
+ * 里面不会有孤立的 `\r`
+ */
+export function oneLine(text: string): string {
+  return text.replaceAll('\n', '↵')
+}
+
+/** 替换进行中那一句进度。⚠️ 快照里的 `filesScanned` 会**落后**于最终总账，见 `replace.rs` 的 `Sink` */
+export function describeReplaceProgress(progress: ReplaceProgress): string {
+  return `正在替换… 已改 ${progress.filesChanged} 个文件、${progress.replacements} 处（扫过 ${progress.filesScanned} 个）`
+}
+
+/**
+ * 一次替换结束时的总账。
+ *
+ * 与 [`describeSummary`] 同一条分层：**这一行只放中性事实**，凡是会限定这些数字效力的
+ * 一律交给 [`replaceWarnings`] 单独成行。理由也一样——「换了 0 处」后面跟一串小字，
+ * 用户扫一眼就走了，而那串小字里恰恰藏着「这个 0 可能是假的」。
+ *
+ * ⚠️ `replacements` 说的是**处**，不是行也不只是文件：一行里可以有多处命中。
+ * 报成「换了 3 个文件」的话，用户不知道到底动了多少地方，
+ * 而「动了多少地方」正是他决定要不要 `git checkout` 的唯一依据
+ */
+export function describeReplaceSummary(summary: ReplaceSummary): string {
+  const parts: string[] = []
+  // 「已取消」放最前面：它限定后面每一个数字，而且必须与 `filesChanged` 一起读。
+  // 只说「已取消」的话用户会以为什么都没发生，而实际上已经改完的文件留在磁盘上
+  if (summary.cancelled) parts.push('已取消（改动不会回滚）')
+  parts.push(
+    summary.replacements === 0 ? '一处都没换' : `换了 ${summary.replacements} 处，写进 ${summary.filesChanged} 个文件`,
+  )
+  parts.push(`扫过 ${summary.filesScanned} 个文件`)
+  parts.push(formatDuration(summary.elapsedMs))
+  // 这两个是**我们主动决定不改**，属于中性事实，不上警告色：
+  // 二进制文件本来就不该被当文本重写，每个带图片的仓库都会跳过一堆
+  if (summary.skippedBinary > 0) parts.push(`跳过 ${summary.skippedBinary} 个二进制文件`)
+  if (summary.skippedTooLarge > 0) parts.push(`跳过 ${summary.skippedTooLarge} 个过大的文件`)
+  if (summary.truncated) {
+    // ⚠️ 这一条比搜索那边严重得多：搜索截断的后果是「少看了一些结果」，
+    // 替换截断的后果是**仓库现在处于「换了一半」的状态**，而那半个状态没法撤销
+    parts.push('撞到上限就停了，仓库现在是「换了一半」的状态——把搜索词写窄一点，剩下的再换一遍')
+  }
+  return parts.join(' · ')
+}
+
+/**
+ * 「这份总账得打个折扣」的那些话，每条单独一行。空数组 = 没有任何保留。
+ *
+ * ⚠️ 顺序是按**严重性**排的，不是按字段声明顺序：前两条说的是「结果可能不完整」，
+ * 后面三条说的是「这些文件我们没碰，而且是有理由的」。混在一起排的话
+ * 用户读到第三条就已经开始跳读了，而前两条才是他必须看见的
+ */
+export function replaceWarnings(summary: ReplaceSummary): string[] {
+  const out: string[] = []
+  // 与其它六个 `skipped*` 不是一类：那些是「我们决定不写」，这一个是「想写而写不成」。
+  // 磁盘满、文件只读、权限不够都落在这里，而它们的共同点是**用户以为换成功了**
+  if (summary.writeFailed > 0) {
+    out.push(`有 ${summary.writeFailed} 个文件没写成（磁盘满、只读或权限不够），它们还是旧内容`)
+  }
+  // 与 `unreadableWarning` 同一条理由，但更要紧：这里「一处都没换」可能是假的
+  if (summary.unreadable > 0) {
+    out.push(`有 ${summary.unreadable} 个文件读不出来（权限不够、被删或 IO 错误），所以这份总账不完整`)
+  }
+  // 这一条用户自己能解决，所以要给出下一步：保存之后再来一遍
+  if (summary.skippedOpen > 0) {
+    out.push(`有 ${summary.skippedOpen} 个文件正开着且有未保存的改动，被跳过了——保存它们之后再换一遍`)
+  }
+  if (summary.skippedUnmappable > 0) {
+    out.push(`有 ${summary.skippedUnmappable} 个文件的替换结果编不回它自己的编码（例如往 GBK 里换进 emoji），整个跳过`)
+  }
+  if (summary.skippedLossy > 0) {
+    out.push(`有 ${summary.skippedLossy} 个文件解码时就已经有损，跳过——写回去会把替换字符永久焊进文件`)
+  }
+  return out
 }

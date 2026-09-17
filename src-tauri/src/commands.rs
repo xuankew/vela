@@ -9,7 +9,7 @@
 //! 放进 vela-core 就意味着 `cargo test` 会把临时文件真的塞进开发机的废纸篓，
 //! 而 CI 的 ubuntu runner 上压根没有废纸篓可用。
 //!
-//! ## 接受路径的命令，按能力分组（M2-C 之后共九个）
+//! ## 接受路径的命令，按能力分组（M2-D 之后共十个）
 //!
 //! | 能力 | 命令 | 参数形状 |
 //! |---|---|---|
@@ -21,6 +21,7 @@
 //! | **删除**（移废纸篓） | `trash_entry` | `(root, rel)` |
 //! | 交给系统工具 | `reveal_entry` / `copy_entry_path` | `(root, rel)` |
 //! | **全文搜索**（读正文） | `start_search` | 任意绝对路径 `root` + 两个 glob 列表 |
+//! | **全局替换**（写正文） | `start_replace` | 同上，外加一份要跳过的绝对路径清单 |
 //!
 //! 另存为没有自己的命令：它是前端先用 dialog 插件拿到新路径，再调同一个 `save_file`。
 //!
@@ -44,21 +45,45 @@
 //! ③ 遍历 `follow_links(false)`，指向 root 外面的符号链接压根不进去——
 //! 这一条同时挡住了 pnpm 的链接农场与「用链接把搜索引出授权范围」。
 //!
+//! ### ⚠️ `start_replace` 是**第十个，也是第一个会在 `root` 底下写盘的**
+//!
+//! 前九个里能写文件的只有 `save_file`，而它写的是**用户此刻正看着的那一个**路径，
+//! 一次一个、由 ⌘S 触发、编辑器里还有撤销栈。`start_replace` 不一样：
+//! 一次调用最多改两万个文件，Vela 没有跨文件撤销，改坏了只能靠 `git checkout`——
+//! 而用户搜的很可能正是一个不在 git 里的目录。所以它的 containment 要比上面那三条更硬：
+//!
+//! 1. **写哪些文件由 `root` 与 `include` / `exclude` 决定，与 `skip` 无关。**
+//!    `skip` 只能**减少**集合（`ReplaceRequest` 的文档里写着比对是逐组件的 `Path` 相等），
+//!    一个不在遍历集合里的 `skip` 条目不会让任何文件被写。于是「逃出 root」在这条路上
+//!    与搜索完全同构，共用 `search::run::walk_files` **同一个函数**——不是两份长得像的代码；
+//! 2. **前端拿不到「写任意路径」这个原语。** 命令签名里没有目标路径，只有 `root` +
+//!    一个 `SearchQuery`。写哪个文件是遍历的结果，不是入参；
+//! 3. **落盘那一层把每个不确定都倒向不写**：二进制（原始字节含 NUL）、有损解码、
+//!    编不回原编码，三种各自一个计数器并且**一个字节都不写**。理由与代价写在
+//!    `vela-core/src/search/replace.rs` 的模块文档里。写盘一律走 `write_bytes_atomic`
+//!    （临时文件 + rename + fsync），所以失败方式是「这个文件没改成」而不是「改了一半」。
+//!
+//! 唯一一份「前端递进来的绝对路径」是 `skip`，而它的用途恰恰是**保护**用户正在编辑的
+//! 那几个脏标签不被落盘盖掉。递错了的后果是「少改一个文件，`skippedOpen` 加一」，
+//! 方向是安全的。
+//!
 //! 符号链接是**有意放行**的（pnpm 的 `node_modules` 就是符号链接搭的），
 //! 理由见 `vela-core/src/project/tree.rs` 的模块文档。⚠️ 注意这句话只适用于**文件树**：
-//! 搜索恰恰相反，见 `vela-core/src/search/mod.rs` 开头那两节。
+//! 搜索与替换恰恰相反（`follow_links(false)`），见 `vela-core/src/search/mod.rs` 开头那两节。
 //!
 //! 会话存档那两个命令也写文件，但**路径由 Rust 侧算出来**（`app_data_dir()/session.json`），
 //! 前端连传路径的入口都没有。所以它们没有把上面那条信任面扩大一分。
 //!
-//! ⚠️ 信任边界：这九个命令合起来等于给了 webview 一个「读、写、枚举、创建、改名、
-//! 删除本地文件」的原语。这在 Vela 里是可接受的，前提是 webview 只加载第一方打包产物：
-//! 没有远程内容、没有 `withGlobalTauri`、没有开 remote 域名白名单。注意
-//! `tauri.conf.json` 目前的 `csp` 仍是 `null`，也就是说这条前提只靠「我们不加载远程内容」
-//! 这个约定撑着，没有第二道防线。**如果将来引入任何远程内容或第三方插件 UI（M5），
-//! 这九个命令必须改成只接受「用户显式授权过的路径」**——具体做法是把 dialog 打开过的
-//! root 记在 Tauri managed state 里，命令只收 `rootId` 而不收路径字符串。
-//! （M2-C 已经有了第一份 managed state，见 [`SearchTasks`]，但那不是授权表。）
+//! ⚠️ 信任边界：这十个命令合起来等于给了 webview 一个「读、写、枚举、创建、改名、
+//! 删除、以及**批量改写**本地文件」的原语。这在 Vela 里是可接受的，前提是 webview
+//! 只加载第一方打包产物：没有远程内容、没有 `withGlobalTauri`、没有开 remote 域名白名单。
+//! 注意 `tauri.conf.json` 目前的 `csp` 仍是 `null`，也就是说这条前提只靠
+//! 「我们不加载远程内容」这个约定撑着，没有第二道防线。**如果将来引入任何远程内容或
+//! 第三方插件 UI（M5），这十个命令必须改成只接受「用户显式授权过的路径」**——
+//! 具体做法是把 dialog 打开过的 root 记在 Tauri managed state 里，命令只收 `rootId`
+//! 而不收路径字符串。⚠️ 而 `start_replace` 是这件事变得**紧迫**的那一个：
+//! 在它之前，一次 XSS 最坏能改掉用户正在看的文件；在它之后，最坏能改掉整个文件夹。
+//! （M2-C 已经有了第一份 managed state，见 [`TaskRegistry`]，但那不是授权表。）
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,7 +96,10 @@ use vela_core::fs::{
     read_text, read_text_as, write_text_atomic, Encoding, FileFormat, ReadError, TextFile, WriteError, WriteReport,
 };
 use vela_core::project::{self, DirEntry, DirListing, EntryKind, TreeError};
-use vela_core::search::{preflight, search, SearchBatch, SearchError, SearchQuery, SearchSummary};
+use vela_core::search::{
+    apply, preflight, preflight_apply, search, ReplaceProgress, ReplaceRequest, ReplaceSummary, SearchBatch,
+    SearchError, SearchQuery, SearchSummary,
+};
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
 
 /// 读一个文本文件。
@@ -292,15 +320,19 @@ pub async fn save_session(app: AppHandle, session: Session) -> Result<SessionRep
     session_store::save_session(&path, session)
 }
 
-// ─── M2-C 全文搜索：本项目第一个 event 流，也是第一份 managed state ───────────
+// ─── M2-C 全文搜索 / M2-D 全局替换：event 流 + 唯一一份 managed state ────────
 //
 // PLAN §2.6 约束 3：长任务一律返回 `taskId`，通过 event 推进度，支持前端取消。
 // 搜索是第一个真的撞上这条的：实测十万个文件要 6.9s（有命中）到 7.4s（无命中），
 // 而一次性回传上万条命中还会撞约束 1 的 4MB payload 上限。
 //
-// ⚠️ 所以 `start_search` **不能**声明成「async 然后 await 到搜完再返回 summary」：
-// 那样前端要等搜索结束才拿到 taskId，而拿到 taskId 才能取消——等于取消了个寂寞。
-// 于是形状只能是：invoke 立刻返回 taskId，批次与终止信号全走 event。
+// ⚠️ 所以 `start_search` / `start_replace` **都不能**声明成「async 然后 await 到跑完
+// 再返回 summary」：那样前端要等结束才拿到 taskId，而拿到 taskId 才能取消——
+// 等于取消了个寂寞。替换那一侧这件事更要命：取消是用户在「已经改了几个文件」
+// 之后唯一的刹车。于是形状只能是：invoke 立刻返回 taskId，进度与终止信号全走 event。
+//
+// ⚠️ 两者共用**同一份** [`TaskRegistry`]，也共用同一个 `cancel_task` 命令。
+// 不给替换另开一份注册表的理由写在 `TaskRegistry` 的文档上。
 
 /// `vela://search-batch` 的载荷。
 #[derive(Clone, Serialize)]
@@ -337,26 +369,40 @@ struct FailedPayload {
 /// 为什么是 `Arc<AtomicBool>` 而不是一个「已取消的 id 集合」：标志由后台线程在
 /// **每两个文件之间、以及每两行之间**读一次（见 `vela_core::search::search`），
 /// 一次原子读比每行去锁一次 HashMap 便宜几个数量级。
+///
+/// ## ⚠️ 搜索与替换共用**这一份**，不各开一份
+///
+/// 注册表里存的东西只有一种：一个「该不该停」的原子标志。两种任务的停止语义完全相同
+/// （置真 → 后台线程在下一次检查时收手 → 已经做完的部分留着）。分成两份的话，
+/// `cancel_task` 就得先猜这个 id 属于哪一份，或者前端得记住该调哪个取消命令——
+/// 而猜错的失败方式是「点了取消，什么也没发生」，安静得查不出来。
+///
+/// 计数器也因此是**全局单调**的，不按前缀各数各的：`search-0`、`replace-1`、`search-2`。
+/// 按前缀分别计数的话两种任务会发出相同的数字，而「id 永不复用」这条性质就得升级成
+/// 「(前缀, 数字) 这个二元组永不复用」——多一个概念，换不来任何东西。
 #[derive(Default)]
-pub struct SearchTasks {
+pub struct TaskRegistry {
     next_id: AtomicU64,
     running: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
-impl SearchTasks {
-    /// 登记一次搜索，返回它的 id 与取消标志。
+impl TaskRegistry {
+    /// 登记一个任务，返回它的 id 与取消标志。
+    ///
+    /// `prefix` 只用来让 id **可读**（`replace-3` 比 `task-3` 好查日志），
+    /// 不参与任何路由判断——路由靠的是 id 整体相等。
     ///
     /// ⚠️ **id 永不复用**，这是用单调计数器而不是「找个空位」的全部理由：
-    /// 复用的话一次迟到的 `cancel_search("search-3")` 会取消掉**另一个**搜索，
+    /// 复用的话一次迟到的 `cancel_task("search-3")` 会取消掉**另一个**任务，
     /// 失败方式是「我明明没点取消，结果只出来一半」，而且只在特定时序下出现。
-    fn register(&self) -> (String, Arc<AtomicBool>) {
-        let task_id = format!("search-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+    fn register(&self, prefix: &str) -> (String, Arc<AtomicBool>) {
+        let task_id = format!("{prefix}-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let cancel = Arc::new(AtomicBool::new(false));
         self.lock().insert(task_id.clone(), Arc::clone(&cancel));
         (task_id, cancel)
     }
 
-    /// 搜索结束了，把条目摘掉。**由后台线程调**，不依赖前端来收尾——
+    /// 任务结束了，把条目摘掉。**由后台线程调**，不依赖前端来收尾——
     /// 前端要是在收到 done 之前就崩了或者被刷新了，条目照样会被清掉。
     fn forget(&self, task_id: &str) {
         self.lock().remove(task_id);
@@ -380,7 +426,7 @@ impl SearchTasks {
 /// 起一次全文搜索，**立刻**返回 `taskId`。
 ///
 /// 结果通过 `vela://search-batch` 一批一批推过来，终止信号是 `vela://search-done`
-/// （或极端情况下的 `vela://search-failed`）。取消用 [`cancel_search`]。
+/// （或极端情况下的 `vela://search-failed`）。取消用 [`cancel_task`]。
 ///
 /// ⚠️ 起飞前检查在**这个**线程上做，不在后台线程里做。于是「搜索词编不出来」当场
 /// reject 掉 invoke，前端不需要先拿到 taskId、再等一个 failed event 绕回来，
@@ -391,13 +437,13 @@ impl SearchTasks {
 #[command]
 pub async fn start_search(
     app: AppHandle,
-    tasks: State<'_, SearchTasks>,
+    tasks: State<'_, TaskRegistry>,
     root: String,
     query: SearchQuery,
 ) -> Result<String, SearchError> {
     preflight(Path::new(&root), &query)?;
 
-    let (task_id, cancel) = tasks.register();
+    let (task_id, cancel) = tasks.register("search");
     let root = PathBuf::from(root);
     // 三样东西都要在批次回调里用、也要在收尾时用，各克隆一份进闭包
     let emitter = app.clone();
@@ -413,7 +459,7 @@ pub async fn start_search(
 
         // ⚠️ 先摘注册表再发终止事件。反过来的话：前端收到 done 立刻发起下一次搜索，
         // 而上一次的条目还挂在表里——那是一份等着被误取消的状态
-        app.state::<SearchTasks>().forget(&final_task_id);
+        app.state::<TaskRegistry>().forget(&final_task_id);
 
         let sent = match outcome {
             Ok(summary) => app.emit(crate::SEARCH_DONE, DonePayload { task_id: final_task_id, summary }),
@@ -429,11 +475,102 @@ pub async fn start_search(
     Ok(task_id)
 }
 
-/// 取消一次搜索。已经推出去的批次仍然有效（`SearchSummary::cancelled` 会为真）。
+/// `vela://replace-progress` 的载荷。
+///
+/// 与搜索的 `BatchPayload` 同样**内嵌而不是摊平**，理由也一样：`ReplaceProgress`
+/// 自己有 `filesScanned`，摊到同一层的话前端分不清哪个 `filesScanned` 是路由用的
+/// 信封字段、哪个是内容。
+///
+/// ⚠️ 这个事件**可能一个都不来**：全部文件都没有命中时既没有「改动」触发推送，
+/// 心跳阈值又远没到。前端不能把「没收到 progress」当成出错了——终止信号永远是 done
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceProgressPayload {
+    task_id: String,
+    progress: ReplaceProgress,
+}
+
+/// `vela://replace-done` 的载荷。**这是唯一的终止信号**，也是唯一权威的最终数字：
+/// progress 里的 `filesScanned` 可以落后于它（`replace.rs` 里 `Sink` 的文档解释了
+/// 为什么那边刻意不做收尾 flush）
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceDonePayload {
+    task_id: String,
+    summary: ReplaceSummary,
+}
+
+/// `vela://replace-failed` 的载荷。与 done 分成两个事件的理由见 [`FailedPayload`]：
+/// 塞进一个 `Option` 会引入一条「两个字段恰好一个非空」的不变式，而没有类型替我守着
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceFailedPayload {
+    task_id: String,
+    error: SearchError,
+}
+
+/// 起一次全局替换，**立刻**返回 `taskId`。
+///
+/// ⚠️ **这是 Vela 里唯一一处会批量改写用户磁盘上的文件的命令**，信任面与
+/// containment 的完整论证写在本文件头部那节「`start_replace` 是第十个」里。
+/// 落盘那一层的取舍（哪些情况一个字节都不写、为什么不用 `fs::read_text`）
+/// 写在 `vela-core/src/search/replace.rs` 的模块文档里。
+///
+/// 进度走 `vela://replace-progress`，终止信号是 `vela://replace-done`
+/// （或极端情况下的 `vela://replace-failed`）。取消同样用 [`cancel_task`]。
+///
+/// ⚠️ **取消不是撤销。** 按下去的那一刻已经改完的文件**留在磁盘上**，
+/// 而 `ReplaceSummary::cancelled` 为真、`files_changed` 如实报出改了几个。
+/// 前端必须把这两个数字说出来：「已取消，改动了 37 个文件」与「已取消」是两句话，
+/// 少说后半句的话用户会以为什么都没发生，然后去按 ⌘S 保存一个已经被改过的文件。
+///
+/// 与 `start_search` 同一条规则：`preflight_apply` 在**这个**线程上做，
+/// reject = 一个文件都没动。这条对替换比对搜索重要得多——搜索 reject 了顶多没结果，
+/// 替换 reject 了要是已经改了一半，用户手上就是一个谁也不认识的仓库。
+#[command]
+pub async fn start_replace(
+    app: AppHandle,
+    tasks: State<'_, TaskRegistry>,
+    root: String,
+    request: ReplaceRequest,
+) -> Result<String, SearchError> {
+    preflight_apply(Path::new(&root), &request)?;
+
+    let (task_id, cancel) = tasks.register("replace");
+    let root = PathBuf::from(root);
+    let emitter = app.clone();
+    let progress_task_id = task_id.clone();
+    let final_task_id = task_id.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let outcome = apply(&root, &request, &cancel, |progress| {
+            let _ = emitter
+                .emit(crate::REPLACE_PROGRESS, ReplaceProgressPayload { task_id: progress_task_id.clone(), progress });
+        });
+
+        // 与搜索同一顺序：先摘注册表再发终止事件
+        app.state::<TaskRegistry>().forget(&final_task_id);
+
+        let sent = match outcome {
+            Ok(summary) => app.emit(crate::REPLACE_DONE, ReplaceDonePayload { task_id: final_task_id, summary }),
+            Err(error) => app.emit(crate::REPLACE_FAILED, ReplaceFailedPayload { task_id: final_task_id, error }),
+        };
+        if let Err(e) = sent {
+            eprintln!("[vela] 替换的终止事件没能发出去：{e}");
+        }
+    });
+
+    Ok(task_id)
+}
+
+/// 取消一个正在跑的任务（搜索或替换）。已经推出去的结果仍然有效
+/// （`SearchSummary::cancelled` / `ReplaceSummary::cancelled` 会为真）。
 ///
 /// **幂等**：taskId 不认识就什么也不做，照样返回成功。
-/// 「取消一个已经搜完的搜索」是正常时序而不是错误——前端点取消的那一刻，
+/// 「取消一个已经跑完的任务」是正常时序而不是错误——前端点取消的那一刻，
 /// 后台线程可能刚好发完 done。报成错误的话前端要多处理一种它无从判断的状态。
+///
+/// ⚠️ 对替换而言，取消**不是撤销**：见 [`start_replace`] 的文档。
 ///
 /// ⚠️ 这是**同步** command，与本文件其余的都不一样。两个理由：
 /// ① Tauri 规定「带引用入参的 async command 必须返回 `Result`」（`State<'_, T>`
@@ -443,7 +580,7 @@ pub async fn start_search(
 /// 后台线程持那把锁的时间也是纳秒级（只在 `register` / `forget` 里），
 /// 所以主线程等不到它。`close_window` 是同步的同一个道理。
 #[command]
-pub fn cancel_search(tasks: State<'_, SearchTasks>, task_id: String) {
+pub fn cancel_task(tasks: State<'_, TaskRegistry>, task_id: String) {
     tasks.cancel(&task_id);
 }
 
@@ -472,6 +609,7 @@ mod tests {
                     line: 3,
                     text: "let a = needle;".to_owned(),
                     ranges: vec![MatchRange { start: 8, end: 14 }],
+                    replaced: None,
                     truncated: false,
                 }],
                 truncated: false,
@@ -481,6 +619,31 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&BatchPayload { task_id: "search-7".to_owned(), batch }).unwrap(),
             r#"{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}}"#
+        );
+
+        // M2-D 替换模式下多出来的那一个字段。⚠️ 上面那条期望字符串**一个字都没改**——
+        // `SearchHit::replaced` 挂着 `skip_serializing_if`，所以纯搜索的信封与 M2-C 时相同。
+        // 这一条单独钉，是因为前端在替换模式里收到的正是这个形状，
+        // 而 `replaced` 写成 `replacement` 的失败方式与 `taskId` 写错一样安静：
+        // 每一行都读到 `undefined`，界面退回成纯搜索的样子，控制台一行错都没有
+        let preview = SearchBatch {
+            files: vec![SearchFile {
+                rel: "src/a.ts".to_owned(),
+                path: "/repo/src/a.ts".to_owned(),
+                hits: vec![SearchHit {
+                    line: 3,
+                    text: "let a = needle;".to_owned(),
+                    ranges: vec![MatchRange { start: 8, end: 14 }],
+                    replaced: Some("let a = N;".to_owned()),
+                    truncated: false,
+                }],
+                truncated: false,
+            }],
+            files_scanned: 3,
+        };
+        assert_eq!(
+            serde_json::to_string(&BatchPayload { task_id: "search-7".to_owned(), batch: preview }).unwrap(),
+            r#"{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"replaced":"let a = N;","truncated":false}],"truncated":false}],"filesScanned":3}}"#
         );
 
         // 心跳：`files` 为空，只有累计的扫描数
@@ -518,23 +681,109 @@ mod tests {
         );
     }
 
+    /// 三个替换事件载荷的黄金 JSON。另一半在 `src/ipc/replace.test.ts`。
+    ///
+    /// 与上面那条分工相同：`ReplaceProgress` / `ReplaceSummary` / `SearchError` **自己的**
+    /// 形状由 `vela-core/tests/wire_contract.rs` 钉，这里钉的是**外面那层信封**。
+    ///
+    /// ⚠️ 替换的信封写错比搜索的更要命一档：`replace-done` 拼错或者 `taskId` 名字不对，
+    /// 前端会永远停在「正在替换…」转圈，而**磁盘上的文件已经全改完了**。
+    /// 搜索那边同样的错误只是「界面一片空白」，用户重试一次就好；
+    /// 这边用户面对的是一个改完了却不知道改完了的仓库，很可能再按一次替换
+    #[test]
+    fn 三个替换事件载荷的线上形状() {
+        assert_eq!(
+            serde_json::to_string(&ReplaceProgressPayload {
+                task_id: "replace-7".to_owned(),
+                progress: ReplaceProgress { files_scanned: 12, files_changed: 3, replacements: 7 }
+            })
+            .unwrap(),
+            r#"{"taskId":"replace-7","progress":{"filesScanned":12,"filesChanged":3,"replacements":7}}"#
+        );
+
+        assert_eq!(
+            serde_json::to_string(&ReplaceDonePayload {
+                task_id: "replace-7".to_owned(),
+                summary: ReplaceSummary {
+                    files_scanned: 120,
+                    files_changed: 3,
+                    replacements: 7,
+                    skipped_binary: 1,
+                    skipped_lossy: 2,
+                    skipped_unmappable: 0,
+                    skipped_too_large: 4,
+                    skipped_open: 1,
+                    unreadable: 2,
+                    write_failed: 0,
+                    truncated: false,
+                    cancelled: true,
+                    elapsed_ms: 45,
+                }
+            })
+            .unwrap(),
+            r#"{"taskId":"replace-7","summary":{"filesScanned":120,"filesChanged":3,"replacements":7,"skippedBinary":1,"skippedLossy":2,"skippedUnmappable":0,"skippedTooLarge":4,"skippedOpen":1,"unreadable":2,"writeFailed":0,"truncated":false,"cancelled":true,"elapsedMs":45}}"#
+        );
+
+        // 错误变体复用搜索那一个 `SearchError`——两边共享 `prepare`，所以坏正则、
+        // 坏 glob、坏 root 三种拒法在两个命令上是同一套。多出来的只有 `bad_replacement`
+        assert_eq!(
+            serde_json::to_string(&ReplaceFailedPayload {
+                task_id: "replace-7".to_owned(),
+                error: SearchError::BadReplacement {
+                    message: "缺少替换内容：replace 不能为 null".to_owned()
+                }
+            })
+            .unwrap(),
+            r#"{"taskId":"replace-7","error":{"kind":"bad_replacement","message":"缺少替换内容：replace 不能为 null"}}"#
+        );
+    }
+
+    /// `start_replace` 的入参在命令边界上长什么样。
+    ///
+    /// ⚠️ 这一条钉的是**反序列化**方向：前端 `invoke('start_replace', { root, request })`
+    /// 递过来的 JSON 必须能落到 `ReplaceRequest` 上。`skip` 缺 key 是最容易出事的——
+    /// 它落到「不跳过任何文件」是对的，落到「跳过一切」的话用户点了替换而一个文件没改，
+    /// 而 summary 里 `skippedOpen` 会等于文件总数，看起来像是有别的 bug
+    #[test]
+    fn 替换请求从命令边界上解析进来() {
+        // 前端在没有任何脏标签时**不发** `skip` 这个 key
+        let parsed: ReplaceRequest =
+            serde_json::from_str(r#"{"query":{"pattern":"a","replace":"b","caseSensitive":true}}"#).unwrap();
+        assert_eq!(parsed.query.pattern, "a");
+        assert_eq!(parsed.query.replace.as_deref(), Some("b"));
+        assert!(parsed.query.case_sensitive);
+        assert!(parsed.skip.is_empty(), "缺 key 必须是「一个都不跳过」");
+
+        // 有脏标签时发一份绝对路径清单
+        let parsed: ReplaceRequest =
+            serde_json::from_str(r#"{"query":{"pattern":"a","replace":""},"skip":["/repo/src/x.ts"]}"#).unwrap();
+        assert_eq!(parsed.query.replace, Some(String::new()), "空模板是「删掉」，不能变成 None");
+        assert_eq!(parsed.skip, vec!["/repo/src/x.ts".to_owned()]);
+    }
+
     #[test]
     fn 注册表发出去的_id_不重复() {
-        let tasks = SearchTasks::default();
-        let (a, _) = tasks.register();
-        let (b, _) = tasks.register();
+        let tasks = TaskRegistry::default();
+        let (a, _) = tasks.register("search");
+        let (b, _) = tasks.register("replace");
+        let (c, _) = tasks.register("search");
         assert_ne!(a, b);
-        assert_eq!(tasks.lock().len(), 2, "两个都还挂着");
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+        assert_eq!(a, "search-0", "前缀要出现在 id 里，那是查日志时唯一能分辨任务种类的线索");
+        assert_eq!(b, "replace-1");
+        assert_eq!(tasks.lock().len(), 3, "三个都还挂着");
     }
 
     /// ⚠️ 这一条钉的是「id 永不复用」那个决定的可观察后果。
     ///
-    /// 复用 id 的失败方式是：一次迟到的 `cancel_search` 取消掉一个**无辜的**搜索，
+    /// 复用 id 的失败方式是：一次迟到的 `cancel_task` 取消掉一个**无辜的**任务，
     /// 用户看到的是「我明明没点取消，结果只出来一半」，而且只在特定时序下出现。
+    /// 替换那一侧后果更重：被误取消的替换会留下一个改了一半的仓库
     #[test]
     fn 结束一个任务之后新任务拿到的是另一个_id() {
-        let tasks = SearchTasks::default();
-        let (first, first_cancel) = tasks.register();
+        let tasks = TaskRegistry::default();
+        let (first, first_cancel) = tasks.register("search");
         tasks.forget(&first);
         assert!(tasks.lock().is_empty(), "摘掉了");
 
@@ -542,14 +791,14 @@ mod tests {
         tasks.cancel(&first);
         assert!(!first_cancel.load(Ordering::Relaxed), "摘掉之后那次取消找不到它");
 
-        let (second, _) = tasks.register();
+        let (second, _) = tasks.register("replace");
         assert_ne!(first, second, "id 一旦发出去就不能再发第二次");
     }
 
     #[test]
     fn 取消把标志置真() {
-        let tasks = SearchTasks::default();
-        let (id, cancel) = tasks.register();
+        let tasks = TaskRegistry::default();
+        let (id, cancel) = tasks.register("replace");
         assert!(!cancel.load(Ordering::Relaxed), "刚起的时候没有取消");
         tasks.cancel(&id);
         assert!(cancel.load(Ordering::Relaxed));
@@ -561,8 +810,9 @@ mod tests {
     /// 那是正常时序，不是错误。
     #[test]
     fn 取消一个不认识的_id_什么也不做() {
-        let tasks = SearchTasks::default();
+        let tasks = TaskRegistry::default();
         tasks.cancel("search-9999");
+        tasks.cancel("replace-9999");
         tasks.forget("search-9999");
         assert!(tasks.lock().is_empty());
     }

@@ -17,7 +17,7 @@ import type { TextFile } from './ipc/fs'
  * 或者等 M1-H 的 CI 里加一个 Tauri driver。
  */
 
-const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd } = vi.hoisted(() => {
+const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd, replaceCmd } = vi.hoisted(() => {
   /**
    * 会话存档这一头（M1-F）。App 一挂载就会 `load_session`，关窗放行后会 `save_session`，
    * 所以这两个 command 的返回值必须有明确的形状：`load_session` 答 `undefined` 会被当成
@@ -39,16 +39,31 @@ const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd } 
    */
   const projectCmd: { fs: Record<string, unknown[]>; calls: string[] } = { fs: {}, calls: [] }
   /**
-   * 全局搜索这一头（M2-C）。`start_search` 与 `cancel_search` 也走 `tauriCore.invoke`。
+   * 全局搜索这一头（M2-C）。`start_search` 与 `cancel_task` 也走 `tauriCore.invoke`。
    *
    * ⚠️ `taskId` 是可写的，因为 store 认任务靠 `adopted`/`starting`/`retired` 三个变量
    * （见 src/search/store.ts 的模块文档）：一个用例里搜两轮时必须让第二轮拿到**不同的** id，
    * 否则它会被当成「已作废任务的迟到批次」整个丢掉，而那种绿是毫无意义的。
+   *
+   * ⚠️ `cancel_task` 自 M2-D 起是搜索与替换**共用**的一个命令，`cancelled` 因此记的是
+   * 「被请求取消过的 taskId」而不是「被取消过的搜索」。区分它们靠 id 本身，
+   * 而前端刻意不解析 id 的前缀（见 src/ipc/task.ts）
    */
   const searchCmd: { calls: { root: string; query: unknown }[]; cancelled: string[]; taskId: string } = {
     calls: [],
     cancelled: [],
     taskId: 'task-1',
+  }
+  /**
+   * 全局替换这一头（M2-D）。`start_replace` 也走 `tauriCore.invoke`。
+   *
+   * ⚠️ `taskId` 刻意与搜索那个**不同号**：Rust 侧是同一个计数器发号、永不重复，
+   * 而前端有两个 TaskSlot（见 src/search/store.ts）。写成同一个字符串的话，
+   * 「落盘的事件被搜索那个 slot 认下来了」这类接线错误在测试里根本看不出来
+   */
+  const replaceCmd: { calls: { root: string; request: unknown }[]; taskId: string } = {
+    calls: [],
+    taskId: 'task-r1',
   }
   return {
     ipc: {
@@ -65,6 +80,7 @@ const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd } 
     sessionCmd,
     projectCmd,
     searchCmd,
+    replaceCmd,
   }
 })
 
@@ -83,6 +99,7 @@ vi.mock('@tauri-apps/api/core', () => tauriCore)
 
 import App from './App'
 import { MAX_PANES } from './doc/workspace'
+import { REPLACE_DONE_EVENT, REPLACE_FAILED_EVENT, REPLACE_PROGRESS_EVENT, type ReplaceSummary } from './ipc/replace'
 import { SEARCH_BATCH_EVENT, SEARCH_DONE_EVENT, SEARCH_FAILED_EVENT } from './ipc/search'
 import { REQUEST_CLOSE_EVENT } from './ipc/windowClose'
 
@@ -97,6 +114,14 @@ let dispose: () => void
 
 /** `listen` 收到的回调，按事件名收着。测试里手动触发，等于模拟 Rust 侧发事件 */
 const listeners = new Map<string, (payload: unknown) => void>()
+
+/**
+ * 「磁盘上现在是什么」，按绝对路径。
+ *
+ * 全局替换的用例要在**一次跑动中间**改掉它：预览读的是替换之前那一份，
+ * 落盘之后的对账重读的必须是替换之后那一份。写成常量就演不出这个先后
+ */
+let disk: Record<string, string> = {}
 
 beforeEach(async () => {
   ipc.openFile.mockReset()
@@ -115,6 +140,9 @@ beforeEach(async () => {
   searchCmd.calls = []
   searchCmd.cancelled = []
   searchCmd.taskId = 'task-1'
+  replaceCmd.calls = []
+  replaceCmd.taskId = 'task-r1'
+  disk = {}
   projectCmd.fs = {
     '': [dirEntry('src', 'src', true), dirEntry('README.md', 'README.md', false), dirEntry('docs', 'docs', true)],
     src: [dirEntry('a.ts', 'src/a.ts', false), dirEntry('b.ts', 'src/b.ts', false)],
@@ -155,7 +183,13 @@ beforeEach(async () => {
       // 而后台其实早就搜完了，没有任何报错可查
       return searchCmd.taskId
     }
-    if (cmd === 'cancel_search') {
+    if (cmd === 'start_replace') {
+      // 记**整个 request**而不是只记 query：`skip` 那一半（正开着且有未保存改动的路径）
+      // 是这条命令唯一由前端递进去的保护，漏递的失败方式是「用户的稿子被落盘盖掉」
+      replaceCmd.calls.push({ root: typeof args?.root === 'string' ? args.root : '', request: args?.request })
+      return replaceCmd.taskId
+    }
+    if (cmd === 'cancel_task') {
       searchCmd.cancelled.push(typeof args?.taskId === 'string' ? args.taskId : '')
       return undefined
     }
@@ -342,16 +376,16 @@ async function rustRequestsClose() {
 }
 
 /**
- * 模拟 Rust 侧推来的一个搜索事件。
+ * 模拟 Rust 侧推来的一个事件（搜索那三个与替换那三个共用一个 `listen` 桩）。
  *
  * ⚠️ handler 收的是 `{ payload }` 那个**信封**而不是 payload 本身：`attachSearchListeners`
- * 里写的是 `(e) => handlers.onBatch(e.payload.taskId, e.payload.batch)`（src/ipc/search.ts）。
- * 直接把 payload 递进去的话三处 `.payload` 全是 undefined，事件被静默吃掉，用例却照样绿——
- * 因为「没结果」与「面板刚展开还没搜」在 DOM 上长得一模一样
+ * 里写的是 `(e) => handlers.onBatch(e.payload.taskId, e.payload.batch)`（src/ipc/search.ts），
+ * `attachReplaceListeners` 同形。直接把 payload 递进去的话 `.payload` 全是 undefined，
+ * 事件被静默吃掉，用例却照样绿——因为「没结果」与「面板刚展开还没搜」在 DOM 上长得一模一样
  */
-async function fireSearch(name: string, payload: unknown): Promise<void> {
+async function fireEvent(name: string, payload: unknown): Promise<void> {
   const handler = listeners.get(name)
-  if (!handler) throw new Error(`搜索监听没挂上：${name}`)
+  if (!handler) throw new Error(`监听没挂上：${name}`)
   handler({ payload })
   await flush()
 }
@@ -401,6 +435,58 @@ function findStatus(): string {
 function findButton(label: string): HTMLButtonElement | null {
   const all = [...(findPanel()?.querySelectorAll<HTMLButtonElement>('button') ?? [])]
   return all.find((b) => b.textContent === label) ?? null
+}
+
+/**
+ * 面板头部那一排的按钮文字，按屏幕顺序。「取消」只在有任务在飞时才渲染，
+ * 所以这个数组的长度本身也是一条断言
+ */
+function headButtonTitles(): string[] {
+  const all = [...(findPanel()?.querySelectorAll<HTMLButtonElement>('.find-head button') ?? [])]
+  return all.map((b) => b.textContent ?? '')
+}
+
+/** 面板最左边那个模式开关。它不是第四个匹配选项，所以 class 也与那三个分开 */
+function findMode(): HTMLButtonElement {
+  const el = findPanel()?.querySelector<HTMLButtonElement>('.find-mode')
+  if (!el) throw new Error('面板里没有「替换」模式开关')
+  return el
+}
+
+/**
+ * 「替换为」那一格。⚠️ 必须限定在 `.find-replace` 里面找：它也挂着 `.find-input`，
+ * 而 `findInput()` 用的是 `querySelector`（取第一个），少了这个限定两个都指到搜索词上
+ */
+function replaceInput(): HTMLInputElement {
+  const el = findPanel()?.querySelector<HTMLInputElement>('.find-replace .find-input')
+  if (!el) throw new Error('面板里没有「替换为」输入框')
+  return el
+}
+
+function typeReplace(text: string): void {
+  const el = replaceInput()
+  el.value = text
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+/** 一份落盘总账。字段太多，让用例只写它关心的那几个 */
+function replaceSummary(overrides: Partial<ReplaceSummary> = {}): ReplaceSummary {
+  return {
+    filesScanned: 2,
+    filesChanged: 1,
+    replacements: 1,
+    skippedBinary: 0,
+    skippedLossy: 0,
+    skippedUnmappable: 0,
+    skippedTooLarge: 0,
+    skippedOpen: 0,
+    unreadable: 0,
+    writeFailed: 0,
+    truncated: false,
+    cancelled: false,
+    elapsedMs: 40,
+    ...overrides,
+  }
 }
 
 function fontSizeSelect(): HTMLSelectElement {
@@ -1391,6 +1477,42 @@ describe('全局搜索接线（M2-C）', () => {
     expect(document.activeElement).toBe(findInput())
   })
 
+  it('Mod+Shift+H 一步落到替换模式，而连按第二次不许把那一排收掉', async () => {
+    press('H', { ...modInit(), shiftKey: true })
+    await flush()
+    expect(findPanel()).not.toBeNull()
+    expect(findMode().classList.contains('on')).toBe(true)
+    expect(container.querySelector('.find-replace')).not.toBeNull()
+    // 搜索词还是空的：要打的第一个东西是搜索词，所以焦点留在上面那一格
+    expect(document.activeElement).toBe(findInput())
+
+    press('H', { ...modInit(), shiftKey: true })
+    await flush()
+    // 快捷键的语义是「我要替换」，不是「翻一下开关」——翻开关是面板上那个按钮的事。
+    // store 里为此单开了一个 `showReplace`，见 src/search/store.ts
+    expect(findMode().classList.contains('on')).toBe(true)
+    expect(container.querySelector('.find-replace')).not.toBeNull()
+  })
+
+  it('先 Mod+Shift+F 搜着再按 Mod+Shift+H，焦点直接落到「替换为」那一格', async () => {
+    press('F', { ...modInit(), shiftKey: true })
+    await flush()
+    // ⚠️ 不能用 `replaceInput()`：那个 helper 在找不到时是**抛错**的，
+    // 而这里要断言的恰恰是「还没有那一排」
+    expect(container.querySelector('.find-replace')).toBeNull()
+
+    typeSearch('needle')
+    press('H', { ...modInit(), shiftKey: true })
+    await flush()
+    // 搜索词已经有了，下一个要打的正好是替换内容，所以焦点该往下挪一格
+    expect(document.activeElement).toBe(replaceInput())
+    // 面板还是只有一个：替换那一排是它**内部**的一行，不是 `.main` 的第三个孩子
+    expect([...container.querySelector('.main')!.children].map((el) => el.className)).toEqual([
+      'body-row',
+      'find-panel',
+    ])
+  })
+
   it('还没打开文件夹时按 Enter 说「还没打开文件夹」，一次 IPC 都不发', async () => {
     press('F', { ...modInit(), shiftKey: true })
     await flush()
@@ -1419,7 +1541,7 @@ describe('全局搜索接线（M2-C）', () => {
     ])
     expect(findStatus()).toBe('正在搜索… 已扫过 0 个文件')
 
-    await fireSearch(SEARCH_BATCH_EVENT, {
+    await fireEvent(SEARCH_BATCH_EVENT, {
       taskId: searchCmd.taskId,
       batch: {
         files: [
@@ -1470,7 +1592,7 @@ describe('全局搜索接线（M2-C）', () => {
     await flush()
     expect(findButton('取消')).not.toBeNull()
 
-    await fireSearch(SEARCH_BATCH_EVENT, {
+    await fireEvent(SEARCH_BATCH_EVENT, {
       taskId: searchCmd.taskId,
       batch: {
         files: [{ rel: 'README.md', path: '/repo/README.md', hits: [], truncated: false }],
@@ -1496,7 +1618,7 @@ describe('全局搜索接线（M2-C）', () => {
     pressInFind('Enter')
     await flush()
 
-    await fireSearch(SEARCH_DONE_EVENT, {
+    await fireEvent(SEARCH_DONE_EVENT, {
       taskId: searchCmd.taskId,
       summary: {
         filesScanned: 12,
@@ -1515,6 +1637,268 @@ describe('全局搜索接线（M2-C）', () => {
     expect(container.querySelector('.find-warning')?.textContent).toBe(
       '有 2 个条目读不出来（权限不够、被删或 IO 错误），所以「没有找到」不一定成立',
     )
+    expect(findButton('取消')).toBeNull()
+  })
+})
+
+describe('全局替换接线（M2-D）', () => {
+  /**
+   * 走一遍完整的用户路径：打开项目 → 一个干净标签 + 一个改脏的标签 → 打开替换模式、
+   * 填好替换内容、搜出预览 → 摊开确认单。返回时 `start_replace` **还没**发出去。
+   *
+   * ⚠️ 这一串必须是一个用例里的连续动作，不能拆成几段分别摆弄：确认单上的数字来自
+   * 「预览那一刻的 `rows()`」，`skip` 清单来自「批准那一刻的 `dirtyPaths()`」，
+   * 两头都在动。分开造的话每一半都能单独造假，绿了也说明不了接线是对的
+   */
+  async function previewTwo(): Promise<void> {
+    await openProject()
+    disk = { '/repo/README.md': 'a needle here', '/repo/src/a.ts': 'let a = needle;\n' }
+    ipc.openFile.mockImplementation(async (path: string) => textFile({ text: disk[path] ?? '正文' }))
+
+    // 第一次「打开…」落在启动那个干净的空白标签上（复用它，不新建），
+    // 第二次因为活动标签已经有路径了，才另开一个。于是 tabs() = [README.md, a.ts]
+    dialog.open.mockResolvedValue('/repo/README.md')
+    button('打开…').click()
+    await flush()
+    dialog.open.mockResolvedValue('/repo/src/a.ts')
+    button('打开…').click()
+    await flush()
+    // ⚠️ 必须真的敲字把它改脏：`skip` 清单来自 `dirtyPaths()`，
+    // 一个干净标签压根不在里面，那条「保护未保存的稿子」的断言就会绿得毫无意义
+    typeText('改一下')
+    await flush()
+    expect(statusName()).toBe('● a.ts')
+
+    press('F', { ...modInit(), shiftKey: true })
+    await flush()
+    typeSearch('needle')
+    findMode().click()
+    await flush()
+    typeReplace('NEEDLE')
+    pressInFind('Enter')
+    await flush()
+
+    await fireEvent(SEARCH_BATCH_EVENT, {
+      taskId: searchCmd.taskId,
+      batch: {
+        files: [
+          {
+            rel: 'README.md',
+            path: '/repo/README.md',
+            hits: [
+              {
+                line: 1,
+                text: 'a needle here',
+                ranges: [{ start: 2, end: 8 }],
+                replaced: 'a NEEDLE here',
+                truncated: false,
+              },
+            ],
+            truncated: false,
+          },
+          {
+            rel: 'src/a.ts',
+            path: '/repo/src/a.ts',
+            hits: [
+              {
+                line: 1,
+                text: 'let a = needle;',
+                ranges: [{ start: 8, end: 14 }],
+                replaced: 'let a = NEEDLE;',
+                truncated: false,
+              },
+            ],
+            truncated: false,
+          },
+        ],
+        filesScanned: 2,
+      },
+    })
+    await fireEvent(SEARCH_DONE_EVENT, {
+      taskId: searchCmd.taskId,
+      summary: {
+        filesScanned: 2,
+        filesWithHits: 2,
+        hits: 2,
+        skippedTooLarge: 0,
+        unreadable: 0,
+        truncated: false,
+        cancelled: false,
+        elapsedMs: 15,
+      },
+    })
+
+    findButton('替换全部')!.click()
+    await flush()
+  }
+
+  it('⚠️ 替换那三个事件与搜索那三个**同时**挂着，不是等到第一次替换才挂', () => {
+    // `listen` 是异步的，注册之前到达的事件永久丢失。而 `replace-done` 是唯一能让 UI
+    // 停止转圈的东西，它到达时磁盘已经改完了——漏掉它用户面对的是一个
+    // 「改完了却显示还在改」的仓库，很可能再按一次替换，而第二次的预览是第一次的结果
+    expect(listeners.has(REPLACE_PROGRESS_EVENT)).toBe(true)
+    expect(listeners.has(REPLACE_DONE_EVENT)).toBe(true)
+    expect(listeners.has(REPLACE_FAILED_EVENT)).toBe(true)
+    // 搜索那三个与关窗守卫那一个都还在：六个监听共用同一个 `listen` 桩，
+    // 谁把谁顶掉了这里会一起红
+    expect(listeners.has(SEARCH_BATCH_EVENT)).toBe(true)
+    expect(listeners.has(SEARCH_DONE_EVENT)).toBe(true)
+    expect(listeners.has(REQUEST_CLOSE_EVENT)).toBe(true)
+  })
+
+  it('卸载时替换那三个监听也一起摘掉', () => {
+    dispose()
+    // 重新挂一个空的，避免 afterEach 再 dispose 一次已卸载的树
+    dispose = () => {}
+
+    expect(listeners.has(REPLACE_PROGRESS_EVENT)).toBe(false)
+    expect(listeners.has(REPLACE_DONE_EVENT)).toBe(false)
+    expect(listeners.has(REPLACE_FAILED_EVENT)).toBe(false)
+    expect(listeners.has(SEARCH_DONE_EVENT)).toBe(false)
+  })
+
+  it('「替换」点开之后才多出下面那一排，而它是面板**内部**的一行', async () => {
+    await openProject()
+    press('F', { ...modInit(), shiftKey: true })
+    await flush()
+
+    expect(container.querySelector('.find-replace')).toBeNull()
+    expect(headButtonTitles()).toEqual(['替换', '.*', 'Aa', 'ab', '搜索', '⌫', '×'])
+    findMode().click()
+    await flush()
+
+    expect(container.querySelector('.find-replace')).not.toBeNull()
+    expect(headButtonTitles()).toEqual(['替换', '.*', 'Aa', 'ab', '预览', '⌫', '×'])
+    // `.main` 的孩子没变：多出来的那一排住在面板里面，不是 grid 的新行。
+    // 面板高度是硬约束（styles.css 的 `.find-panel`），所以这一排只能从 240px 里扣
+    expect([...container.querySelector('.main')!.children].map((el) => el.className)).toEqual([
+      'body-row',
+      'find-panel',
+    ])
+  })
+
+  it('⚠️ 端到端：预览 → 确认单 → 批准 → 落盘 → 开着的干净标签被重读，脏的一个字节都不碰', async () => {
+    await previewTwo()
+
+    // 脏的那个文件在**预览**里就标出来了：`start_search` 不知道 `skip` 的存在，
+    // 不标的话用户批准的是一份做不到的清单
+    expect(findRows()[0]!.classList.contains('skipped')).toBe(false)
+    expect(findRows()[2]!.classList.contains('skipped')).toBe(true)
+    expect(findRowTexts()[2]).toContain('正开着且有未保存的改动，跳过')
+    // 命中行上是「原文 → 预览」，`.find-new` 那一段说的才是换完的样子
+    expect(container.querySelector('.find-new')?.textContent).toBe('a NEEDLE here')
+
+    // 确认单渲染在 `.app` 那一层，不在面板里面：`.modal-backdrop` 是 fixed，
+    // 挂在 240px 的面板里就只罩得住面板自己，而「批准落盘」这件事该盖住整个窗口
+    expect(modal()).not.toBeNull()
+    expect(findPanel()!.querySelector('.modal-backdrop')).toBeNull()
+    // 数字说的是「行」不是「处」，而且**不含**被跳过的那个文件
+    expect(modal()!.getAttribute('aria-label')).toBe('替换 1 个文件里的 1 行？')
+    expect(modal()!.textContent).toContain('Vela 没有跨文件撤销')
+    expect(replaceCmd.calls).toEqual([])
+
+    modalButton('替换').click()
+    await flush()
+
+    // ⚠️ `skip` 里必须带着那个脏标签的绝对路径，原样递：后端逐组件比 Path 相等，
+    // 前端自己 normalize 一遍就会「少保护一个文件」，而那意味着用户的稿子被落盘盖掉
+    expect(replaceCmd.calls).toEqual([
+      {
+        root: '/repo',
+        request: {
+          query: { pattern: 'needle', literal: false, caseSensitive: false, wholeWord: false, replace: 'NEEDLE' },
+          skip: ['/repo/src/a.ts'],
+        },
+      },
+    ])
+    expect(modal()).toBeNull()
+    // 一个快照都没来过是**正常的**（全部文件都没命中时既没有改动触发推送、心跳又远没到），
+    // 所以这时说的是不带数字的一句，而不是「已改 0 个文件」假装收到了
+    expect(findStatus()).toBe('正在替换…')
+
+    await fireEvent(REPLACE_PROGRESS_EVENT, {
+      taskId: replaceCmd.taskId,
+      progress: { filesScanned: 1, filesChanged: 1, replacements: 1 },
+    })
+    expect(findStatus()).toBe('正在替换… 已改 1 个文件、1 处（扫过 1 个）')
+
+    // 磁盘上已经换过了：随后的对账重读到的必须是这一份
+    disk['/repo/README.md'] = 'a NEEDLE here'
+    ipc.openFile.mockClear()
+    await fireEvent(REPLACE_DONE_EVENT, { taskId: replaceCmd.taskId, summary: replaceSummary({ skippedOpen: 1 }) })
+    await flush()
+
+    expect(findStatus()).toBe('换了 1 处，写进 1 个文件 · 扫过 2 个文件 · 40ms')
+    expect(container.querySelector('.find-warning')?.textContent).toBe(
+      '有 1 个文件正开着且有未保存的改动，被跳过了——保存它们之后再换一遍',
+    )
+    // 不变量 4：预览整个扔掉。留着的话「替换全部」仍然可点，而它显示的仍是写盘之前的样子——
+    // 把 `foo` 换成 `foobar` 的人再按一次，第二轮会接着长
+    expect(findRows()).toHaveLength(0)
+    expect(findButton('替换全部')!.disabled).toBe(true)
+
+    // 对账只碰了那个干净标签：脏的那个连读都没读（读了也是白读，`reload` 会拒绝）
+    expect(ipc.openFile.mock.calls.map((c) => c[0])).toEqual(['/repo/README.md'])
+    // 而这件事要说一句：编辑器里的正文自己动了、撤销栈也重建了，
+    // 不解释的话用户看到的是「我刚在改的文件自己变了」
+    expect(
+      notices()
+        .map((n) => n.text)
+        .join(''),
+    ).toContain('已把 1 个开着的标签从磁盘重读了一遍')
+
+    // 切回那个干净标签：显示的必须是落盘之后的内容，否则他下一次 ⌘S 又把结果盖回去
+    tabs()[0]!.click()
+    await flush()
+    expect(statusName()).toBe('README.md')
+    expect(view().state.doc.toString()).toBe('a NEEDLE here')
+
+    // 脏标签的稿子原样留着：跳过它的**全部理由**就是保住这一份
+    tabs()[1]!.click()
+    await flush()
+    expect(statusName()).toBe('● a.ts')
+    expect(view().state.doc.toString()).toBe('let a = needle;\n改一下')
+  })
+
+  it('确认单上点「取消」：一个字节都不写，预览原样留着', async () => {
+    await previewTwo()
+    expect(modal()).not.toBeNull()
+
+    modalButton('取消').click()
+    await flush()
+
+    expect(modal()).toBeNull()
+    expect(replaceCmd.calls).toEqual([])
+    // 预览不清：用户只是还没下决心，不是要重来一遍。清掉的话他得重新搜一次才能再问一遍
+    expect(findRows()).toHaveLength(4)
+    expect(findButton('替换全部')!.disabled).toBe(false)
+
+    // 再点一次还能再摊开：确认单是可反复的，不是一次性的
+    findButton('替换全部')!.click()
+    await flush()
+    expect(modal()).not.toBeNull()
+  })
+
+  it('写盘期间「取消」走 cancel_task，认的是替换那个 taskId', async () => {
+    await previewTwo()
+    modalButton('替换').click()
+    await flush()
+    expect(findButton('取消')).not.toBeNull()
+
+    findButton('取消')!.click()
+    await flush()
+
+    // ⚠️ 不是搜索那个 id：两个 TaskSlot 各有各的 `retired`，认错的话被取消的是
+    // 一个早就结束了的搜索，而真正在改磁盘的那一轮继续跑到底
+    expect(searchCmd.cancelled).toEqual([replaceCmd.taskId])
+    expect(searchCmd.cancelled).not.toContain(searchCmd.taskId)
+
+    // 取消**不是撤销**：已经写完的文件留在磁盘上，由随后的 done 如实报出
+    await fireEvent(REPLACE_DONE_EVENT, {
+      taskId: replaceCmd.taskId,
+      summary: replaceSummary({ cancelled: true, filesChanged: 1, replacements: 1 }),
+    })
+    expect(findStatus()).toContain('已取消（改动不会回滚）')
     expect(findButton('取消')).toBeNull()
   })
 })

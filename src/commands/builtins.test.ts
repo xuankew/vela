@@ -37,6 +37,7 @@ function makeHooks(): BuiltinHooks {
     closeFolder: vi.fn(),
     toggleSidebar: vi.fn(),
     findInFiles: vi.fn(),
+    replaceInFiles: vi.fn(),
   }
 }
 
@@ -123,12 +124,14 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('三十八条命令全部注册成功，且互不抢占快捷键', () => {
+  it('三十九条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
-    // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按前缀分组的：
-    // 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」 < 「视图」 < 「项目」
+    // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按 id 前缀分组的：
+    // 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」 < 「视图」 < 「项目」。
+    // 两条 search.* 排在最前面正是这个缘故——它们的 id 以 s 开头，本该在 file.* 之后
     expect(registry.list().map((c) => c.id)).toEqual([
       'search.findInFiles',
+      'search.replaceInFiles',
       'file.new',
       'file.open',
       'file.save',
@@ -515,6 +518,46 @@ describe('M2-C：全局搜索命令的接线', () => {
     // 「还没打开文件夹」那句话，而不是快捷键按了没反应
     expect(await registry.execute('search.findInFiles')).toBe(true)
     expect(hooks.findInFiles).toHaveBeenCalledOnce()
+  })
+})
+
+describe('M2-D：全局替换命令的接线', () => {
+  it('search.replaceInFiles 分派到自己的 hook，不蹭 findInFiles 那条', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('search.replaceInFiles')).toBe(true)
+    expect(hooks.replaceInFiles).toHaveBeenCalledOnce()
+    // ⚠️ 两个 hook 是**两个入口、两种落点**（一个展开面板、一个展开面板并直接进替换模式）。
+    // 谁把 `replaceInFiles` 接到 `findInFiles` 上，用户按下 Mod+Shift+H 看到的就只是搜索面板，
+    // 而这一条正是唯一能发现它的断言
+    expect(hooks.findInFiles).not.toHaveBeenCalled()
+  })
+
+  it('Mod+Shift+H 命中它，而 Mod+H 与 Mod+Shift+F 都还是原来的样子', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.findForKey(event('H', { metaKey: true, shiftKey: true }))?.id).toBe('search.replaceInFiles')
+    // Mod+H 此前在本项目里就是空的（CM6 的 keymap 里也没有 Mod-h），新命令不该顺手把它占了：
+    // 占用一个用户可能留给输入法或系统手势的组合键，代价比省一条命令大
+    expect(registry.findForKey(event('h', { metaKey: true }))).toBeNull()
+    // 与 Mod+Shift+F 是同一个面板的两个入口，各自命中自己那条
+    expect(registry.findForKey(event('F', { metaKey: true, shiftKey: true }))?.id).toBe('search.findInFiles')
+    // 文档内替换仍然是 Mod+Shift+Enter，与项目内替换隔着一个字母，不互抢
+    expect(registry.findForKey(event('Enter', { metaKey: true, shiftKey: true }))?.id).toBe('editor.replaceNext')
+    // 少一个 Cmd 就是普通字符输入
+    expect(registry.findForKey(event('H', { shiftKey: true }))).toBeNull()
+  })
+
+  it('标题与分类：命令面板里要看得出这条改的是整个项目', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.get('search.replaceInFiles')?.title).toBe('在项目里替换…')
+    expect(registry.get('search.replaceInFiles')?.category).toBe('搜索')
+    // 与 Mod+Shift+F 同一条规矩：mods 顺序由 MOD_ORDER 定，shift 在 meta 前
+    expect(registry.list().find((c) => c.id === 'search.replaceInFiles')?.keybindings).toEqual(['⇧⌘H'])
+  })
+
+  it('没有编辑器时照样执行成功——理由与 Mod+Shift+F 一模一样', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    expect(await registry.execute('search.replaceInFiles')).toBe(true)
+    expect(hooks.replaceInFiles).toHaveBeenCalledOnce()
   })
 })
 

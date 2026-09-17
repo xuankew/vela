@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createRoot } from 'solid-js'
+import { createRoot, createSignal } from 'solid-js'
 
 /**
  * 搜索面板 store 的单测：异步与可变状态这一半。
@@ -12,33 +12,47 @@ import { createRoot } from 'solid-js'
  * 在那种时序下会把整次搜索的结果全丢掉，面板永远停在「正在搜索…」，而且没有任何报错可查。
  * 那几条用例就是用 deferred 把时序掰开来复现的。
  *
- * 假的是 `startSearch`、`cancelSearch` 与 `describeSearchError`——jsdom 里没有 Tauri 运行时。
- * ⚠️ 三个一个都不能少：`store.ts` 是按名字从这个模块导入它们的，少一个就在被调用那一刻变成
+ * 假的是 `startSearch`、`describeSearchError`（都在 `../ipc/search`）、`cancelTask`
+ * （在 `../ipc/task`，M2-D 之后搜索与替换共用一个取消命令）与 `startReplace`
+ * （在 `../ipc/replace`）——jsdom 里没有 Tauri 运行时。
+ * ⚠️ 一个都不能少：`store.ts` 是按名字从这三个模块导入它们的，少一个就在被调用那一刻变成
  * `undefined is not a function`，而 vitest 对「导入了但没调用」是不报错的。
  * `describeSearchError` 也一并假掉：它自己在 `src/ipc/search.test.ts` 里测过，
  * 这里只关心「错误有没有落到 `error` 上」。
+ *
+ * ⚠️ 两组事件监听器本身（`attachSearchListeners` / `attachReplaceListeners`）不在这里：
+ * store 只交出 `handlers` / `replaceHandlers` 两组回调，测试直接调它们，
+ * 于是「事件到达的顺序」变成一个可以随手编排的普通函数调用。
  */
 
 /**
- * ⚠️ 两个桩都写了完整的函数签名，不是裸 `vi.fn()`。
+ * ⚠️ 桩都写了完整的函数签名，不是裸 `vi.fn()`。
  * 裸的话 `.mock.calls` 的元素是 `any`，于是每一处 `calls[0][1].pattern` 都是一次
  * unsafe member access——`pnpm lint` 是门禁的一部分，这里过不了就提交不了。
  *
  * 签名里直接用 `SearchQuery` 是安全的：类型在编译时被擦掉，`vi.hoisted` 的工厂搬到
  * import 之前也不会引用到任何运行时值。
  */
-const { ipc } = vi.hoisted(() => ({
+const { ipc, task, rep } = vi.hoisted(() => ({
   ipc: {
     startSearch: vi.fn<(root: string, query: SearchQuery) => Promise<string>>(),
-    cancelSearch: vi.fn<(taskId: string) => Promise<void>>(),
     describeSearchError: (err: unknown) => `模拟错误：${JSON.stringify(err)}`,
+  },
+  task: {
+    cancelTask: vi.fn<(taskId: string) => Promise<void>>(),
+  },
+  rep: {
+    startReplace: vi.fn<(root: string, query: SearchQuery, skip: string[]) => Promise<string>>(),
   },
 }))
 
 vi.mock('../ipc/search', () => ipc)
+vi.mock('../ipc/task', () => task)
+vi.mock('../ipc/replace', () => rep)
 
 import type { MatchRange, SearchFile, SearchHit, SearchQuery, SearchSummary } from '../ipc/search'
-import { createSearchPanel, type SearchPanel } from './store'
+import type { ReplaceSummary } from '../ipc/replace'
+import { createSearchPanel, type SearchPanel, type SearchPanelOptions } from './store'
 import type { HitRow } from './rows'
 
 /**
@@ -103,26 +117,95 @@ function sum(overrides: Partial<SearchSummary> = {}): SearchSummary {
   }
 }
 
+/** 替换模式下的一条命中：比纯搜索多一个 `replaced` 预览 */
+function previewOf(line: number, text: string, replaced: string): SearchHit {
+  return { ...hitOf(line, text), replaced }
+}
+
+/** 一个文件的全部预览命中。`pairs` 的每一项是 `[原文, 换完之后]` */
+function previewFile(rel: string, pairs: [string, string][], truncated = false): SearchFile {
+  return {
+    rel,
+    path: `/repo/${rel}`,
+    truncated,
+    hits: pairs.map(([text, replaced], i) => previewOf(i + 1, text, replaced)),
+  }
+}
+
+/**
+ * 一份**干净**的替换总账：换了 3 个文件 7 处，一处保留都没有。
+ *
+ * ⚠️ 不叫 `rep`——那是 `startReplace` 的 mock 对象。字段与 `rows.test.ts` 的 `CLEAN` 一致，
+ * 两边措辞用例才能对着读
+ */
+function rsum(overrides: Partial<ReplaceSummary> = {}): ReplaceSummary {
+  return {
+    filesScanned: 120,
+    filesChanged: 3,
+    replacements: 7,
+    skippedBinary: 0,
+    skippedLossy: 0,
+    skippedUnmappable: 0,
+    skippedTooLarge: 0,
+    skippedOpen: 0,
+    unreadable: 0,
+    writeFailed: 0,
+    truncated: false,
+    cancelled: false,
+    elapsedMs: 45,
+    ...overrides,
+  }
+}
+
 let root: string | null
+/** 项目根那个 signal 的写入端，由 `mount` 赋值。用例一律走 `setRootAt`，不直接碰它 */
+let setRoot: (value: string | null) => void
 let opened: HitRow[]
 let panel: SearchPanel
-/** `createSearchPanel` 里有两个 `createMemo`；不在 root 里建，它们永远不会被释放 */
+/** `skipPaths` 的返回值：正开着且有未保存改动的那些绝对路径。默认一个都没有 */
+let dirty: string[]
+/** `onApplied` 收到的总账，按顺序。空 = 落盘那一轮一个文件都没改（或压根没落盘） */
+let applied: ReplaceSummary[]
+/** `createSearchPanel` 里有四个 `createMemo`；不在 root 里建，它们永远不会被释放 */
 let dispose: (() => void) | undefined
 
-function mount() {
+function mount(extra: Partial<SearchPanelOptions> = {}) {
   opened = []
+  applied = []
   dispose = createRoot((teardown) => {
-    panel = createSearchPanel({ root: () => root, openHit: async (hit) => void opened.push(hit) })
+    // ⚠️ 项目根走 signal 而不是直接读那个模块变量：`canApply` 是 `createMemo`，
+    // 而 memo 只在**响应式**依赖变化时重算。真实宿主注入的是 `tree.root`（signal），
+    // 脚手架里用普通变量的话「文件夹被关掉」这件事就测不出来
+    const [rootSignal, setRootSignal] = createSignal<string | null>(root)
+    setRoot = setRootSignal
+    panel = createSearchPanel({
+      root: rootSignal,
+      openHit: async (hit) => void opened.push(hit),
+      skipPaths: () => dirty,
+      onApplied: async (s) => void applied.push(s),
+      ...extra,
+    })
     return teardown
   })
 }
 
+/** 换项目根。⚠️ 一律走这个函数，别直接给 `root` 赋值——见 `mount` 里那条注释 */
+function setRootAt(value: string | null) {
+  root = value
+  setRoot(value)
+}
+
 beforeEach(() => {
   ipc.startSearch.mockReset()
-  ipc.cancelSearch.mockReset()
+  task.cancelTask.mockReset()
+  rep.startReplace.mockReset()
   ipc.startSearch.mockResolvedValue('t1')
-  ipc.cancelSearch.mockResolvedValue(undefined)
+  task.cancelTask.mockResolvedValue(undefined)
+  // 替换的 taskId 与搜索的刻意不同：Rust 侧是同一个计数器发号，两边永不重复，
+  // 桩要是都用 't1' 就测不出「两个 slot 各认各的」这件事
+  rep.startReplace.mockResolvedValue('r1')
   root = '/repo'
+  dirty = []
   mount()
 })
 
@@ -143,15 +226,45 @@ function sentQuery(call = 0): SearchQuery {
   return args
 }
 
-/** 被请求取消过的 taskId，按顺序 */
+/**
+ * 被请求取消过的 taskId，按顺序。
+ *
+ * ⚠️ `cancel_task` 是搜索与替换**共用**的一个命令，而这里挂的是同一个 store，
+ * 所以这个列表可能混着两种 id。分辨靠 id 本身：桩给搜索发的是 `t*`，给替换发的是 `r*`
+ * （与 Rust 侧一致——同一个计数器发号，两类任务永不重号）
+ */
 function cancelled(): string[] {
-  return ipc.cancelSearch.mock.calls.map((c) => c[0])
+  return task.cancelTask.mock.calls.map((c) => c[0])
+}
+
+/** 第 n 次 `startReplace` 收到的三样东西。没发过就抛，不用非空断言 */
+function sentReplace(call = 0): { root: string; query: SearchQuery; skip: string[] } {
+  const args = rep.startReplace.mock.calls[call]
+  if (!args) throw new Error(`第 ${call} 次 startReplace 没有发出去`)
+  return { root: args[0], query: args[1], skip: args[2] }
 }
 
 /** 搜一次并把 taskId 认下来，好让后面的事件有得可发 */
 async function searchOnce(pattern = 'needle'): Promise<void> {
   panel.setPattern(pattern)
   await panel.search()
+}
+
+/**
+ * 起一次**替换预览**并把它跑完：开替换模式 → 搜 → 摊好行 → 填上搜索总账。
+ * 之后 `canApply()` 为真，可以直接 `askApply()` / `confirmApply()`。
+ *
+ * `hits` 从 `files` 上数出来，不写死：`canApply` 看的就是它，
+ * 而对不上的话「搜到 0 处不能落盘」那类用例会莫名其妙地过或莫名其妙地挂
+ */
+async function previewOnce(files: SearchFile[], summaryOverrides: Partial<SearchSummary> = {}): Promise<void> {
+  panel.toggleReplaceMode()
+  panel.setPattern('needle')
+  panel.setReplacement('NEEDLE')
+  await panel.search()
+  const hits = files.reduce((n, f) => n + f.hits.length, 0)
+  panel.handlers.onBatch('t1', { files, filesScanned: files.length })
+  panel.handlers.onDone('t1', sum({ filesWithHits: files.length, hits, ...summaryOverrides }))
 }
 
 describe('初始状态与三个开关', () => {
@@ -169,12 +282,22 @@ describe('初始状态与三个开关', () => {
     expect(panel.selected()).toBeNull()
     expect(panel.focusRequest()).toBe(0)
     expect(ipc.startSearch).not.toHaveBeenCalled()
+    // 替换那一半也一律是「关着、没跑过、没得可批」
+    expect(panel.replaceMode()).toBe(false)
+    expect(panel.replacement()).toBe('')
+    expect(panel.replacing()).toBe(false)
+    expect(panel.replaceSummary()).toBeNull()
+    expect(panel.replaceProgress()).toBeNull()
+    expect(panel.confirm()).toBeNull()
+    expect(panel.stale()).toBe(false)
+    expect(panel.canApply()).toBe(false)
+    expect(rep.startReplace).not.toHaveBeenCalled()
   })
 
   it('空状态的提示是一句「怎么做」，不是一句「没有结果」', () => {
     // 「没有找到」在还没搜过时是假话，而且会让人以为搜索坏了
     expect(panel.statusLine()).toBe('在项目里搜一遍：输入搜索词，按 Enter')
-    expect(panel.warning()).toBeNull()
+    expect(panel.warnings()).toEqual([])
   })
 
   it('三个开关各管各的', () => {
@@ -192,7 +315,7 @@ describe('初始状态与三个开关', () => {
 
 describe('起飞前的两道拦截', () => {
   it('没打开文件夹时连搜索词都不看', async () => {
-    root = null
+    setRootAt(null)
     panel.setPattern('needle')
     await panel.search()
     // 顺序有意义：先判文件夹再说搜索词为空，否则用户会先去填一个填了也没用的框
@@ -236,11 +359,11 @@ describe('发出去的查询条件', () => {
   })
 
   it('一发出去就展开面板、置 running，并把上一轮的 error 清掉', async () => {
-    root = null
+    setRootAt(null)
     await panel.search()
     expect(panel.error()).toBe('还没打开文件夹')
 
-    root = '/repo'
+    setRootAt('/repo')
     await searchOnce()
     expect(panel.error()).toBeNull()
     expect(panel.visible()).toBe(true)
@@ -335,13 +458,13 @@ describe('终止事件', () => {
     expect(panel.statusLine()).toContain('没有找到')
     // ⚠️ 这一句不并进 statusLine：它会跟在一串数字后面，用户只会读到「共 0 处」。
     // 而 unreadable 非零意味着「没找到」可能是假的，必须用警告色单独说
-    expect(panel.warning()).toBe('有 2 个条目读不出来（权限不够、被删或 IO 错误），所以「没有找到」不一定成立')
+    expect(panel.warnings()).toEqual(['有 2 个条目读不出来（权限不够、被删或 IO 错误），所以「没有找到」不一定成立'])
   })
 
   it('一个都没读不出来时不给警告', async () => {
     await searchOnce()
     panel.handlers.onDone('t1', sum())
-    expect(panel.warning()).toBeNull()
+    expect(panel.warnings()).toEqual([])
   })
 
   it('done 之后同一个 taskId 再来的批次被丢掉', async () => {
@@ -368,7 +491,7 @@ describe('终止事件', () => {
     // 那三行是真的搜到的，只是搜索半路断了
     expect(kinds()).toEqual(['F:a.ts', 'H:a.ts:1', 'H:a.ts:2'])
     expect(panel.statusLine()).toBe('共 3 行')
-    expect(panel.warning()).toBeNull()
+    expect(panel.warnings()).toEqual([])
   })
 })
 
@@ -528,7 +651,7 @@ describe('换一轮、取消与清空', () => {
     panel.clear()
     expect(kinds()).toEqual([])
     expect(panel.summary()).toBeNull()
-    expect(panel.warning()).toBeNull()
+    expect(panel.warnings()).toEqual([])
     expect(panel.filesScanned()).toBe(0)
     expect(panel.selected()).toBeNull()
     expect(panel.running()).toBe(false)
@@ -668,6 +791,51 @@ describe('展开与收起', () => {
     expect(panel.focusRequest()).toBe(2)
   })
 
+  it('showReplace 一次到位：面板展开、替换模式已经开着、焦点也要求过一次', () => {
+    panel.showReplace()
+    expect(panel.visible()).toBe(true)
+    expect(panel.replaceMode()).toBe(true)
+    expect(panel.focusRequest()).toBe(1)
+    expect(panel.focusTarget()).toBe('replacement')
+  })
+
+  it('⚠️ 两个入口对「焦点该去哪一格」各执一词，而且是**说出来的**，不是靠 effect 谁后跑', () => {
+    panel.show()
+    expect(panel.focusTarget()).toBe('pattern')
+    panel.showReplace()
+    expect(panel.focusTarget()).toBe('replacement')
+    // 已经在替换模式里了，再按 Mod+Shift+F 仍然要回到搜索词那一格：
+    // 那一下表达的是「我要改搜什么」，模式不该被它顺手改掉，焦点也不该赖在下面
+    panel.show()
+    expect(panel.replaceMode()).toBe(true)
+    expect(panel.focusTarget()).toBe('pattern')
+  })
+
+  it('⚠️ 已经在替换模式时再按一次，模式不许被翻回去', () => {
+    panel.showReplace()
+    panel.showReplace()
+    // 这就是它不复用 `toggleReplaceMode` 的全部理由：那个在已经开着的时候会**关掉**。
+    // 于是连按两次 Mod+Shift+H 的用户会看到「面板还在、下面那一排没了」——
+    // 快捷键的语义是「我要替换」，不是「翻一下开关」
+    expect(panel.replaceMode()).toBe(true)
+    // 但焦点照旧要抢回来：与 `show` 同一条道理，面板本来就展开着时也得能把光标放回输入框
+    expect(panel.focusRequest()).toBe(2)
+  })
+
+  it('⚠️ 确认单摊着的时候按它，单子不会被收掉', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    expect(panel.confirm()).not.toBeNull()
+
+    panel.showReplace()
+    // 键位分派挂在 window 的**捕获阶段**，模态框拦不住它，所以这条路是真的能走到的。
+    // 能走到的前提下，正确的行为是什么都不动：`canApply` 要求 replaceMode，
+    // 于是「单子摊着」⇒「模式开着」⇒ showReplace 走的是不碰任何模式信号的那一支。
+    // 收掉的话用户按下批准键之前先丢了刚批准过的那份清单
+    expect(panel.confirm()).not.toBeNull()
+    expect(panel.replaceMode()).toBe(true)
+  })
+
   it('hide 不取消在飞的搜索，状态全留着', async () => {
     await searchOnce()
     panel.handlers.onBatch('t1', { files: [fileOf('a.ts', ['x'])], filesScanned: 4 })
@@ -691,8 +859,551 @@ describe('展开与收起', () => {
   })
 
   it('报错也会把面板展开——藏起来的错误等于没有错误', async () => {
-    root = null
+    setRootAt(null)
     await panel.search()
     expect(panel.visible()).toBe(true)
+  })
+})
+
+// ───────────────────────── 替换那一半（M2-D） ─────────────────────────
+
+describe('替换模式：query 上多一个 replace', () => {
+  it('纯搜索时连这个 key 都没有', async () => {
+    await searchOnce('foo')
+    expect('replace' in sentQuery()).toBe(false)
+  })
+
+  it('开了替换模式之后 replace 就是输入框里那串', async () => {
+    panel.toggleReplaceMode()
+    panel.setPattern('foo')
+    panel.setReplacement('bar')
+    await panel.search()
+    expect(sentQuery()).toEqual({
+      pattern: 'foo',
+      literal: false,
+      caseSensitive: false,
+      wholeWord: false,
+      replace: 'bar',
+    })
+    expect(Object.keys(sentQuery()).sort()).toEqual(['caseSensitive', 'literal', 'pattern', 'replace', 'wholeWord'])
+  })
+
+  it('⚠️ 替换内容是空串时照样带 replace——那是「把每一处命中删掉」', async () => {
+    panel.toggleReplaceMode()
+    panel.setPattern('foo')
+    await panel.search()
+    expect(sentQuery().replace).toBe('')
+    // 挂在「非空」上的话这里会变成 undefined，Rust 侧回 bad_replacement：
+    // 一个用户真想做的操作报了一个错，而面板看起来一切正常
+  })
+
+  it('关掉替换模式之后 replace 又不见了，行还留着', async () => {
+    await previewOnce([previewFile('a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+    panel.toggleReplaceMode()
+    expect(panel.replaceMode()).toBe(false)
+    // 刻意不清结果：上一轮的预览行照样能看，而 `stale` 会如实说出「条件变了」。
+    // 清掉的话「切一下模式就丢结果」很难联想到原因
+    expect(kinds()).toEqual(['F:a.ts', 'H:a.ts:1'])
+
+    ipc.startSearch.mockResolvedValue('t2')
+    await panel.search()
+    expect('replace' in sentQuery(1)).toBe(false)
+  })
+
+  it('预览行带着 replaced，摊到行上原样不动', async () => {
+    await previewOnce([previewFile('a.ts', [['let a = needle;', 'let a = NEEDLE;']])])
+    const row = panel.rows()[1]
+    expect(row?.kind === 'hit' ? row.replaced : 'not-a-hit-row').toBe('let a = NEEDLE;')
+  })
+})
+
+describe('stale：预览与当前条件是否还一致', () => {
+  it('刚搜完不算过期', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    expect(panel.stale()).toBe(false)
+    expect(panel.warnings()).toEqual([])
+    expect(panel.canApply()).toBe(true)
+  })
+
+  it('搜完之后动了搜索词就过期', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.setPattern('other')
+    expect(panel.stale()).toBe(true)
+    expect(panel.canApply()).toBe(false)
+    expect(panel.warnings()).toEqual(['预览已过期：条件改过了，重新搜一遍再替换'])
+  })
+
+  it('动了替换内容也过期——批准的与发生的必须是同一份条件', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.setReplacement('OTHER')
+    expect(panel.stale()).toBe(true)
+    expect(panel.canApply()).toBe(false)
+  })
+
+  it('动了三个开关里任何一个都过期', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.toggle('wholeWord')
+    expect(panel.stale()).toBe(true)
+  })
+
+  it('切一下替换模式也算改了条件', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.toggleReplaceMode()
+    expect(panel.stale()).toBe(true)
+  })
+
+  it('⚠️ 过期只是把「替换全部」灰掉，行一行都不清', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.setPattern('other')
+    expect(kinds()).toEqual(['F:a.ts', 'H:a.ts:1'])
+    expect(panel.summary()).not.toBeNull()
+    // 清掉的话用户看到的是「刚搜出来的结果凭空没了」，而那不是他做的任何一件事
+  })
+
+  it('重新搜一遍就不算过期了', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.setPattern('other')
+    expect(panel.stale()).toBe(true)
+
+    ipc.startSearch.mockResolvedValue('t2')
+    await panel.search()
+    expect(panel.stale()).toBe(false)
+    // 新一轮还没有总账，所以还是不能落盘——不是靠 stale 挡的
+    expect(panel.canApply()).toBe(false)
+    panel.handlers.onDone('t2', sum({ hits: 3, filesWithHits: 1 }))
+    expect(panel.canApply()).toBe(true)
+  })
+
+  it('没搜过时改了搜索词不叫过期', () => {
+    panel.toggleReplaceMode()
+    panel.setPattern('anything')
+    expect(panel.stale()).toBe(false)
+    expect(panel.warnings()).toEqual([])
+  })
+
+  it('纯搜索模式下不说这句话——它只对「替换全部」有意义', async () => {
+    await searchOnce('needle')
+    panel.handlers.onDone('t1', sum())
+    panel.setPattern('other')
+    expect(panel.stale()).toBe(true)
+    expect(panel.warnings()).toEqual([])
+  })
+
+  it('过期与「读不出来」可以同时说，各占一行', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])], { unreadable: 1 })
+    expect(panel.warnings()).toHaveLength(1)
+    panel.setReplacement('X')
+    expect(panel.warnings()).toHaveLength(2)
+    expect(panel.warnings()[0]).toContain('预览已过期')
+    expect(panel.warnings()[1]).toContain('读不出来')
+  })
+
+  it('clear 之后手上没有预览，也就不存在过期', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.setPattern('other')
+    expect(panel.stale()).toBe(true)
+    panel.clear()
+    expect(panel.stale()).toBe(false)
+    expect(panel.warnings()).toEqual([])
+  })
+})
+
+describe('canApply：「替换全部」此刻能不能按', () => {
+  it('纯搜索模式下不能', async () => {
+    await searchOnce('needle')
+    panel.handlers.onDone('t1', sum({ hits: 3, filesWithHits: 1 }))
+    expect(panel.canApply()).toBe(false)
+  })
+
+  it('没搜过不能', () => {
+    panel.toggleReplaceMode()
+    panel.setReplacement('X')
+    expect(panel.canApply()).toBe(false)
+  })
+
+  it('搜到 0 处不能——没有东西可换，落盘一趟只是白跑一遍仓库', async () => {
+    await previewOnce([])
+    expect(panel.summary()?.hits).toBe(0)
+    expect(panel.canApply()).toBe(false)
+  })
+
+  it('搜索还在飞时不能：手上那份结果是部分的', async () => {
+    panel.toggleReplaceMode()
+    panel.setPattern('needle')
+    panel.setReplacement('NEEDLE')
+    await panel.search()
+    panel.handlers.onBatch('t1', {
+      files: [previewFile('a.ts', [['needle', 'NEEDLE']])],
+      filesScanned: 1,
+    })
+    expect(kinds()).not.toEqual([])
+    expect(panel.canApply()).toBe(false)
+
+    panel.handlers.onDone('t1', sum({ hits: 1, filesWithHits: 1 }))
+    expect(panel.canApply()).toBe(true)
+  })
+
+  it('没打开文件夹时不能', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    setRootAt(null)
+    expect(panel.canApply()).toBe(false)
+  })
+
+  it('过期时不能', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.toggle('caseSensitive')
+    expect(panel.canApply()).toBe(false)
+  })
+})
+
+describe('确认单', () => {
+  it('askApply 摊出文件数与命中行数', async () => {
+    await previewOnce([
+      previewFile('a.ts', [
+        ['needle one', 'NEEDLE one'],
+        ['needle two', 'NEEDLE two'],
+      ]),
+      previewFile('b.md', [['needle', 'NEEDLE']]),
+    ])
+    panel.askApply()
+    expect(panel.confirm()).toEqual({ files: 2, lines: 3, skipped: 0, deleting: false, truncated: false })
+  })
+
+  it('⚠️ 数的是行不是处——处在预览这一层根本数不出来', async () => {
+    // `ranges` 有 32 段的上限，而且可能是空数组，所以拿它去数「一共多少处」会得到
+    // 一个偏小的数，而那个数字是用户批准落盘的唯一依据
+    await previewOnce([previewFile('a.ts', [['needle needle needle', 'x']])])
+    panel.askApply()
+    expect(panel.confirm()?.lines).toBe(1)
+  })
+
+  it('⚠️ 正开着且有未保存改动的文件不计入「会被改」，单独一个数', async () => {
+    dirty = ['/repo/a.ts']
+    await previewOnce([
+      previewFile('a.ts', [['needle', 'NEEDLE']]),
+      previewFile('b.md', [
+        ['needle', 'NEEDLE'],
+        ['needle 2', 'NEEDLE 2'],
+      ]),
+    ])
+    panel.askApply()
+    expect(panel.confirm()).toEqual({ files: 1, lines: 2, skipped: 1, deleting: false, truncated: false })
+    // 行上也标着：预览走的是 start_search，它不知道 skip 的存在，
+    // 不标的话用户批准的是一份**做不到**的清单
+    const head = panel.rows()[0]
+    expect(head?.kind === 'file' && head.skipped).toBe(true)
+    const second = panel.rows()[2]
+    expect(second?.kind === 'file' && second.skipped).toBe(false)
+  })
+
+  it('替换内容为空串时确认单说这是「删掉」', async () => {
+    panel.toggleReplaceMode()
+    panel.setPattern('needle')
+    await panel.search()
+    panel.handlers.onBatch('t1', { files: [previewFile('a.ts', [['needle', '']])], filesScanned: 1 })
+    panel.handlers.onDone('t1', sum({ hits: 1, filesWithHits: 1 }))
+    panel.askApply()
+    expect(panel.confirm()?.deleting).toBe(true)
+  })
+
+  it('某个文件撞到单文件上限 = 这份清单不完整', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']], true)])
+    panel.askApply()
+    expect(panel.confirm()?.truncated).toBe(true)
+  })
+
+  it('整轮撞到总条数上限也算不完整', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])], { truncated: true })
+    panel.askApply()
+    expect(panel.confirm()?.truncated).toBe(true)
+  })
+
+  it('条件不满足时 askApply 什么都不做（按钮本来就是灰的，这只是第二道）', async () => {
+    await searchOnce('needle')
+    panel.handlers.onDone('t1', sum({ hits: 3, filesWithHits: 1 }))
+    panel.askApply()
+    expect(panel.confirm()).toBeNull()
+    expect(rep.startReplace).not.toHaveBeenCalled()
+  })
+
+  it('dismissConfirm 收起，落盘一步都没走，预览还在', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    expect(panel.confirm()).not.toBeNull()
+    panel.dismissConfirm()
+    expect(panel.confirm()).toBeNull()
+    expect(rep.startReplace).not.toHaveBeenCalled()
+    expect(panel.canApply()).toBe(true)
+  })
+
+  it('切替换模式会把摊开的确认单收起来', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    panel.toggleReplaceMode()
+    expect(panel.confirm()).toBeNull()
+  })
+})
+
+describe('落盘', () => {
+  it('confirmApply 递的是与预览同一份条件、同一个根、一份空 skip', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    await panel.confirmApply()
+    expect(sentReplace()).toEqual({
+      root: '/repo',
+      query: { pattern: 'needle', literal: false, caseSensitive: false, wholeWord: false, replace: 'NEEDLE' },
+      skip: [],
+    })
+    // 确认单收起来了，否则它会在落盘期间一直摊在屏幕上
+    expect(panel.confirm()).toBeNull()
+  })
+
+  it('⚠️ skip 是落盘那一刻求值的，不是预览那一刻', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    // 用户看完预览之后才去改了 b.md，没保存
+    dirty = ['/repo/b.md']
+    await panel.confirmApply()
+    expect(sentReplace().skip).toEqual(['/repo/b.md'])
+    // 缓存下来的话这个文件会被落盘盖掉，编辑器里那份未保存的改动就成了孤儿，
+    // 而他下一次 ⌘S 又把刚落盘的结果盖回去
+  })
+
+  it('飞行途中说进度；一个快照都没来时说「正在替换…」而不是编数字', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    const pending = panel.confirmApply()
+
+    expect(panel.replacing()).toBe(true)
+    expect(panel.canApply()).toBe(false)
+    // 一个快照都没来是**正常的**（全部文件都没命中时既没有改动触发推送，心跳又远没到），
+    // 所以这里给一句不带数字的，而不是显示「已改 0 个文件」假装收到了
+    expect(panel.replaceProgress()).toBeNull()
+    expect(panel.statusLine()).toBe('正在替换…')
+
+    panel.replaceHandlers.onProgress('r1', { filesScanned: 10, filesChanged: 2, replacements: 5 })
+    expect(panel.statusLine()).toBe('正在替换… 已改 2 个文件、5 处（扫过 10 个）')
+
+    gate.resolve('r1')
+    await pending
+  })
+
+  it('progress 是累计值，直接赋值不是累加', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+    panel.replaceHandlers.onProgress('r1', { filesScanned: 10, filesChanged: 1, replacements: 2 })
+    panel.replaceHandlers.onProgress('r1', { filesScanned: 40, filesChanged: 3, replacements: 9 })
+    expect(panel.replaceProgress()).toEqual({ filesScanned: 40, filesChanged: 3, replacements: 9 })
+    panel.replaceHandlers.onDone('r1', rsum())
+    await pending
+  })
+
+  it('⚠️ done 把预览整个扔掉：留着的话「替换全部」还能再按一次', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE needle']])])
+    panel.askApply()
+    await panel.confirmApply()
+    panel.replaceHandlers.onDone('r1', rsum({ filesScanned: 1, filesChanged: 1, replacements: 2 }))
+
+    expect(panel.replacing()).toBe(false)
+    expect(kinds()).toEqual([])
+    expect(panel.summary()).toBeNull()
+    expect(panel.canApply()).toBe(false)
+    expect(panel.statusLine()).toBe('换了 2 处，写进 1 个文件 · 扫过 1 个文件 · 45ms')
+    // 行上的 replaced 说的是**写盘之前**的样子，而条件没变、stale 为假，
+    // 所以留着的话「替换全部」此刻仍然可点：把 foo 换成 foobar 的人再按一次，
+    // 第二轮会接着长——而他看到的预览还是第一轮那份
+  })
+
+  it('真的改了东西才通知宿主去对账', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    await panel.confirmApply()
+    panel.replaceHandlers.onDone('r1', rsum({ filesChanged: 2 }))
+    expect(applied).toHaveLength(1)
+    expect(applied[0]?.filesChanged).toBe(2)
+  })
+
+  it('一个文件都没改时不打扰宿主', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    await panel.confirmApply()
+    panel.replaceHandlers.onDone('r1', rsum({ filesChanged: 0, replacements: 0 }))
+    expect(applied).toEqual([])
+    expect(panel.statusLine()).toContain('一处都没换')
+  })
+
+  it('保留意见换成落盘那一份，每条一行', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])], { unreadable: 1 })
+    expect(panel.warnings()).toHaveLength(1)
+    await panel.confirmApply()
+    panel.replaceHandlers.onDone('r1', rsum({ writeFailed: 2, skippedOpen: 1 }))
+    expect(panel.warnings()).toHaveLength(2)
+    expect(panel.warnings()[0]).toContain('没写成')
+    expect(panel.warnings()[1]).toContain('未保存')
+    // 搜索那一份「读不出来」被顶掉了：resetResults 已经清掉搜索总账，
+    // 而落盘的 `unreadable` 说的是同一件事，两句一起出现只会让人以为是两个问题
+  })
+
+  it('failed 当终止处理，但预览留着（磁盘上一个字节都没动）', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    await panel.confirmApply()
+    panel.replaceHandlers.onFailed('r1', { kind: 'not_found', path: '/repo' })
+    expect(panel.replacing()).toBe(false)
+    expect(panel.error()).toBe('模拟错误：{"kind":"not_found","path":"/repo"}')
+    expect(kinds()).toEqual(['F:a.ts', 'H:a.ts:1'])
+    expect(applied).toEqual([])
+    expect(panel.canApply()).toBe(true)
+  })
+
+  it('startReplace reject = 压根没起飞，磁盘没动，预览留着', async () => {
+    rep.startReplace.mockImplementation(() =>
+      rejected<string>({ kind: 'bad_replacement', message: '替换模板里的 $ 用法不支持' }),
+    )
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    await panel.confirmApply()
+    expect(panel.replacing()).toBe(false)
+    expect(panel.error()).toBe('模拟错误：{"kind":"bad_replacement","message":"替换模板里的 $ 用法不支持"}')
+    expect(kinds()).toEqual(['F:a.ts', 'H:a.ts:1'])
+
+    // reject 之后不会有事件来，所以此时来的任何事件都是陌生的
+    panel.replaceHandlers.onDone('ghost', rsum())
+    expect(panel.replaceSummary()).toBeNull()
+    await panel.cancel()
+    expect(cancelled()).toEqual([])
+  })
+
+  it('取消是取消，不是撤销：done 里的 cancelled 与 filesChanged 一起说出来', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+    gate.resolve('r1')
+    await pending
+
+    await panel.cancel()
+    expect(cancelled()).toEqual(['r1'])
+    // 状态一律不动：已经推出去的进度仍然有效，由 done 来收尾
+    expect(panel.replacing()).toBe(true)
+
+    panel.replaceHandlers.onDone('r1', rsum({ cancelled: true, filesChanged: 2, replacements: 4 }))
+    expect(panel.replacing()).toBe(false)
+    expect(panel.statusLine()).toContain('已取消（改动不会回滚）')
+    expect(panel.statusLine()).toContain('换了 4 处，写进 2 个文件')
+    expect(applied).toHaveLength(1)
+  })
+})
+
+describe('替换在飞时的互斥', () => {
+  it('不接新的搜索：那一轮正在改磁盘', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    const pending = panel.confirmApply()
+    expect(panel.replacing()).toBe(true)
+
+    await panel.search()
+    expect(ipc.startSearch).toHaveBeenCalledTimes(1)
+    // 两个「在跑」的信号同时为真时状态栏只能说一句，而那句该说的是正在改磁盘
+    expect(panel.statusLine()).toBe('正在替换…')
+    expect(kinds()).toEqual(['F:a.ts', 'H:a.ts:1'])
+
+    gate.resolve('r1')
+    await pending
+  })
+
+  it('cancel 取消在飞的替换', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+    // ⚠️ 必须先让 taskId 到手：`cancel_task` 是按 id 取消的，而 `starting` 窗口里
+    // 前端手上还没有 id，那一刻「取消」在物理上无从下手（搜索那一边同理）
+    gate.resolve('r1')
+    await pending
+
+    await panel.cancel()
+    expect(cancelled()).toEqual(['r1'])
+    // 状态一律不动，由随后的 done 收尾
+    expect(panel.replacing()).toBe(true)
+  })
+
+  it('clear 会取消在飞的替换，迟到的 done 进不来', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+    gate.resolve('r1')
+    await pending
+
+    panel.clear()
+    expect(cancelled()).toEqual(['r1'])
+    expect(panel.replacing()).toBe(false)
+    expect(kinds()).toEqual([])
+
+    panel.replaceHandlers.onDone('r1', rsum())
+    expect(panel.replaceSummary()).toBeNull()
+  })
+
+  it('hide 不打断落盘——它改的是磁盘，收不收起面板都得跑完', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+    panel.hide()
+    expect(panel.visible()).toBe(false)
+    expect(cancelled()).toEqual([])
+    expect(panel.replacing()).toBe(true)
+    gate.resolve('r1')
+    await pending
+  })
+})
+
+describe('两个 slot 各认各的 taskId', () => {
+  it('搜索的 id 拿去发替换事件没有用，反之也一样', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.replaceHandlers.onDone('t1', rsum())
+    expect(panel.replaceSummary()).toBeNull()
+    expect(panel.replacing()).toBe(false)
+
+    panel.handlers.onDone('r1', sum())
+    expect(panel.summary()?.hits).toBe(1)
+    expect(panel.running()).toBe(false)
+  })
+
+  it('⚠️ 替换的 done 比 startReplace 的返回值先到也认得', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+
+    panel.replaceHandlers.onProgress('early', { filesScanned: 3, filesChanged: 1, replacements: 1 })
+    panel.replaceHandlers.onDone('early', rsum({ filesScanned: 3, filesChanged: 1, replacements: 1 }))
+
+    gate.resolve('early')
+    await pending
+
+    expect(panel.replacing()).toBe(false)
+    expect(panel.replaceSummary()?.filesChanged).toBe(1)
+    expect(applied).toHaveLength(1)
+    // 朴素的「等 invoke 回来再认 id」在这里会让面板永远停在「正在替换…」，
+    // 而磁盘其实早改完了——用户很可能再按一次
+    await panel.cancel()
+    expect(cancelled()).toEqual([])
+  })
+
+  it('作废过的替换任务，迟到的进度进不来', async () => {
+    const gate = deferred<string>()
+    rep.startReplace.mockReturnValue(gate.promise)
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    const pending = panel.confirmApply()
+    gate.resolve('r1')
+    await pending
+
+    panel.clear()
+    panel.replaceHandlers.onProgress('r1', { filesScanned: 99, filesChanged: 9, replacements: 99 })
+    panel.replaceHandlers.onDone('r1', rsum({ filesChanged: 9 }))
+    expect(panel.replaceProgress()).toBeNull()
+    expect(panel.replaceSummary()).toBeNull()
+    expect(applied).toEqual([])
   })
 })

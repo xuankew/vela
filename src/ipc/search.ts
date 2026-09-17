@@ -1,6 +1,10 @@
 /**
- * `vela-core::search` 的前端镜像 + `start_search` / `cancel_search` 封装
- * （PLAN.md §2.6 约束 3、§3.4 M2-C）。
+ * `vela-core::search` 的前端镜像 + `start_search` 封装（PLAN.md §2.6 约束 3、§3.4 M2-C/M2-D）。
+ *
+ * ⚠️ **M2-D 的「预览」也走这个文件**：全局替换的预览不是另一个命令，而是
+ * `start_search` 带上 `query.replace`——Rust 侧于是多算一份「换完之后长什么样」，
+ * 每条命中多一个 `replaced` 字段。真正落盘的那一半在 `src/ipc/replace.ts`，
+ * 取消（两种任务共用）在 `src/ipc/task.ts`。
  *
  * ⚠️ **与 `src/ipc/fs.ts`、`src/ipc/project.ts` 同样的处境：类型是手写的，两边没有
  * 代码生成。** 漂移的失败方式是 `undefined` 而不是异常——`caseSensitive` 写成
@@ -8,9 +12,10 @@
  * 「我明明勾了区分大小写」变成「结果里全是不想要的东西」，控制台一行错都没有。
  * 两侧各有一份对照的黄金 JSON：
  *
- * - Rust：`crates/vela-core/tests/wire_contract.rs` 的「M2-C 全文搜索」那一节，
- *   加上 `src-tauri/src/commands.rs` 的 `三个搜索事件载荷的线上形状`
- * - 前端：`src/ipc/search.test.ts`
+ * - Rust：`crates/vela-core/tests/wire_contract.rs` 的「M2-C 全文搜索」与
+ *   「M2-D 全局替换」两节，加上 `src-tauri/src/commands.rs` 的
+ *   `三个搜索事件载荷的线上形状` / `三个替换事件载荷的线上形状`
+ * - 前端：`src/ipc/search.test.ts`、`src/ipc/replace.test.ts`
  *
  * ## 这是本项目第一个 event 流，形状与前面那些命令都不一样
  *
@@ -50,6 +55,22 @@ export interface SearchQuery {
   include?: string[]
   /** 排除匹配这些通配的路径。⚠️ 优先级**高于** `include` */
   exclude?: string[]
+  /**
+   * 替换模板（M2-D）。**缺省 = 纯搜索**，每条命中不带 `replaced`；给了就是预览模式。
+   *
+   * ⚠️ **空字符串是合法的**，它的意思是「把命中的地方删掉」。所以判断「要不要预览」
+   * 只能用 `replace === undefined`，不能用真值判断——`if (query.replace)` 会把
+   * 一次删除预览悄悄退回成纯搜索，而用户看到的是「我填了空、按了替换、什么都没发生」
+   *
+   * 支持 `$1`..`$9`、`${name}`、`$&`（整个命中）、`$$`（字面的 `$`），与 JS 的
+   * `String.replace` 同一套。写错了 Rust 侧回 `bad_replacement`，**不会**静默当成字面量。
+   *
+   * ⚠️ 模板里的 `\r\n` / `\r` 会在 Rust 侧**编译模板时**就归一化成 `\n`，
+   * 于是预览里看到的与落盘写进去的是同一个东西。而 `\n` 本身是**放行**的
+   * （「把一处命中换成两行」是个真会想要的操作）——所以 `replaced` 可能含换行，
+   * UI 渲染时要考虑它占不止一行
+   */
+  replace?: string
 }
 
 /**
@@ -83,6 +104,22 @@ export interface SearchHit {
    * 行号照样能跳，只是高亮画不出来
    */
   ranges: MatchRange[]
+  /**
+   * 这一行**换完之后**的样子（M2-D）。⚠️ **只有 `query.replace` 非 `undefined` 时才有**
+   * ——纯搜索时 Rust 侧靠 `skip_serializing_if` 把这个 key 整个省掉，所以前端读到的是
+   * `undefined` 而不是 `null`。判断要用 `hit.replaced !== undefined`。
+   *
+   * 与 `text` 同一套规矩：不含行终止符、没有 trim。**空字符串是合法的**，
+   * 意思是「这一行整行被删空」（比如把 `needle` 全删掉而那一行本来只有它）。
+   * 所以 `if (hit.replaced)` 会把「删空」与「没有预览」混成一件事。
+   *
+   * ⚠️ **可能含 `\n`**：模板里允许换行（「把一处命中换成两行」），
+   * 于是这一条在 UI 里占的不止一行。固定行高的虚拟列表要先想好怎么处理它。
+   *
+   * ⚠️ `ranges` 里的偏移量指的是 **`text`** 里的位置，不是 `replaced` 里的。
+   * 拿它去切 `replaced` 会切出乱码——两个字符串在第一个命中处就已经分岔了
+   */
+  replaced?: string
   /** 正文被截断了（原文比 `text` 长） */
   truncated: boolean
 }
@@ -155,6 +192,14 @@ export type SearchError =
   | { kind: 'bad_pattern'; message: string }
   /** `include` / `exclude` 里某一条通配编不出来。带上那条 `glob`：一个列表里可能有好几条，只说「通配写错了」等于让用户挨个试 */
   | { kind: 'bad_glob'; glob: string; message: string }
+  /**
+   * `replace` 模板里的 `$` 用法不支持（M2-D）。
+   *
+   * ⚠️ 替换与搜索**共用这一个错误类型**，因为两边共用同一份 `prepare`：
+   * 坏正则、坏 glob、坏 root 三种拒法在 `start_search` 与 `start_replace` 上是同一套，
+   * 只有 `bad_replacement` 是替换那边独有的（纯搜索压根不看 `replace`）
+   */
+  | { kind: 'bad_replacement'; message: string }
   | { kind: 'bad_root'; path: string }
   | { kind: 'not_found'; path: string }
 
@@ -195,6 +240,12 @@ export function describeSearchError(err: unknown): string {
     // 必须点名是哪一条——`include` 里可以有好几条，只说「通配写错了」等于让用户挨个试
     case 'bad_glob':
       return `${JSON.stringify(err.glob)} 不是合法的通配：${err.message}`
+    // 与 bad_pattern 同一条理由：模板是用户打的，Rust 侧那句已经是中文的人话
+    // （「认不出的 $ 用法：$-」这种），再包一层只会把它说糊。
+    // ⚠️ 它指向的是**替换框**而不是搜索框，但这句话本身不需要说在哪——
+    // 用户刚按下的就是替换，而 UI 该做的是把焦点移回替换框
+    case 'bad_replacement':
+      return err.message
     // 这一条对用户是**真的会发生**的：他打开的文件夹在外接盘上，盘被拔了。
     // 与 `TreeError.escape` 不同，那不是我们的 bug，所以不说「内部错误」
     case 'not_found':
@@ -221,18 +272,8 @@ export function startSearch(root: string, query: SearchQuery): Promise<string> {
   return invoke<string>('start_search', { root, query })
 }
 
-/**
- * 取消一次搜索。已经推出去的批次仍然有效，随后的 done 里 `cancelled` 为真。
- *
- * **幂等**：taskId 不认识也照样成功。「取消一个已经搜完的搜索」是正常时序——
- * 点取消的那一刻后台线程可能刚好发完 done。所以这里不需要判返回值，也没有失败分支。
- *
- * ⚠️ Rust 侧是 `task_id: String`，Tauri 2 在命令边界上转成驼峰，所以这里写 `taskId`。
- * 这是本项目第二个多单词命令参数（第一个是 `rename_entry` 的 `newName`）
- */
-export function cancelSearch(taskId: string): Promise<void> {
-  return invoke<void>('cancel_search', { taskId })
-}
+// 取消不在这个文件里：M2-D 之后搜索与替换共用同一个 `cancel_task` 命令，
+// 它的前端封装在 `src/ipc/task.ts`。放在这里的话 `replace.ts` 就得反过来 import 搜索模块
 
 export interface SearchHandlers {
   /**

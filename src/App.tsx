@@ -20,11 +20,13 @@ import {
   type CodeFontId,
   type FontVariantId,
 } from './fonts/loader'
+import { attachReplaceListeners } from './ipc/replace'
 import { attachSearchListeners } from './ipc/search'
 import { attachWindowCloseGuard } from './ipc/windowClose'
 import { createProjectTree } from './project/store'
 import { Sidebar, type TreeNotice } from './project/Sidebar'
 import { FindInFiles } from './search/FindInFiles'
+import { ReplaceConfirm } from './search/ReplaceConfirm'
 import { revealTarget } from './search/reveal'
 import type { HitRow } from './search/rows'
 import { createSearchPanel } from './search/store'
@@ -37,6 +39,7 @@ export default function App() {
   let detachKeys: (() => void) | undefined
   let detachCloseGuard: (() => void) | undefined
   let detachSearch: (() => void) | undefined
+  let detachReplace: (() => void) | undefined
   /** 卸载比 `listen` 的 promise 先落地时，拿到的注销函数要立刻用掉，见 onMount */
   let tornDown = false
   let sync: SessionSync | undefined
@@ -111,13 +114,38 @@ export default function App() {
   }
 
   /**
-   * 全局搜索面板的状态（M2-C）。
+   * 全局替换落盘之后的一句回话（M2-D）：几个开着的标签被从磁盘重读了一遍。
    *
-   * `root` 与 `openHit` 都是注入进去的，理由与 `tree` 的 `openFile` 一模一样——
-   * store 不该知道宿主长什么样，而直接 import 会让两层互相引用成环。
+   * 不并进面板底部那行总账：那一行说的是**磁盘上**发生了什么，这一句说的是**编辑器里**
+   * 跟着发生了什么——正文换了，撤销栈也重建了。不说一句的话用户看到的是
+   * 「我刚在改的文件自己动了」，而那正是他最不知道该往哪儿想的一种变化
+   */
+  const [reloadedNotice, setReloadedNotice] = createSignal<string | null>(null)
+
+  /**
+   * 全局搜索面板的状态（M2-C，M2-D 之后也管替换）。
+   *
+   * 四个注入点都是同一个道理：store 不该知道宿主长什么样，而直接 import
+   * `createWorkspace` / `createProjectTree` 会让两层互相引用成环。
    * 函数声明会提升，所以 `jumpToHit` 写在下面也接得上。
    */
-  const search = createSearchPanel({ root: () => tree.root(), openHit: jumpToHit })
+  const search = createSearchPanel({
+    root: () => tree.root(),
+    openHit: jumpToHit,
+    // 正开着且有未保存改动的那些绝对路径：落盘时递进 `skip` 让 Rust 别碰它们，
+    // 预览时也据此标出「这个文件会被跳过」。原样递，不 normalize——后端逐组件比 Path 相等
+    skipPaths: () => ws.dirtyPaths(),
+    // ⚠️ 不接 summary 这个参数：接了又不用，`noUnusedParameters` 当场报错，
+    // 而这一句要说的是「重读了几个标签」，那个数只有 `reloadUnder` 知道
+    onApplied: async () => {
+      // 理论上 root 可以在写盘途中被换掉（`closeFolder` 是命令）。那时重读的是新根
+      // 底下的标签——白跑几趟 IPC，正文一样时 `reload` 什么都不做，不会改坏任何东西
+      const at = tree.root()
+      if (at === null) return
+      const reloaded = await ws.reloadUnder(at)
+      setReloadedNotice(reloaded > 0 ? `已把 ${reloaded} 个开着的标签从磁盘重读了一遍（它们的撤销历史到此为止）` : null)
+    },
+  })
 
   /** 点一条搜索结果：打开那个文件、跳到那一行、选中那一段 */
   async function jumpToHit(hit: HitRow) {
@@ -214,6 +242,7 @@ export default function App() {
       closeFolder: () => tree.close(),
       toggleSidebar: () => setSidebarVisible((v) => !v),
       findInFiles: () => search.show(),
+      replaceInFiles: () => search.showReplace(),
     })
     detachKeys = attachKeybindingDispatch(registry)
     sync = createSessionSync({ workspace: ws, project: tree, onWarn: setSessionWarning })
@@ -242,6 +271,14 @@ export default function App() {
       if (tornDown) unlisten()
       else detachSearch = unlisten
     })
+    // 替换那三个与搜索那三个**同时挂着**：事件名不同（`vela://replace-*`），taskId 由
+    // Rust 侧同一个计数器发号、永不重复，所以两组监听与两个 TaskSlot 互不干扰。
+    // 同一条规矩：启动时挂一次、挂着不放——`replace-done` 是唯一能让 UI 停止转圈的东西，
+    // 而它到达时磁盘已经改完了，漏掉它用户面对的是一个「改完了却显示还在改」的仓库
+    void attachReplaceListeners(search.replaceHandlers).then((unlisten) => {
+      if (tornDown) unlisten()
+      else detachReplace = unlisten
+    })
   })
 
   onCleanup(() => {
@@ -249,6 +286,7 @@ export default function App() {
     sync?.stop()
     detachCloseGuard?.()
     detachSearch?.()
+    detachReplace?.()
     detachKeys?.()
     disposeCommands?.()
     // 分屏的现场由各自的 EditorPane.onDestroy 存回标签，这里不 detach
@@ -389,6 +427,16 @@ export default function App() {
             </div>
           )}
         </Show>
+        <Show when={reloadedNotice()}>
+          {(text) => (
+            <div class="notice ok">
+              <span>{text()}</span>
+              <button class="notice-close" onClick={() => setReloadedNotice(null)} title="关闭">
+                ×
+              </button>
+            </div>
+          )}
+        </Show>
         <Show when={activeDoc().lossy()}>
           <div class="notice warning">
             这个文件没能完整解码，正文里的 U+FFFD 是替换字符。<strong>原样保存会永久损坏它</strong>
@@ -447,6 +495,15 @@ export default function App() {
       {/* `.modal-backdrop` 是 position:fixed，脱离 grid 流，所以不会给行数固定的
           `.app` 多加出一行来（绝对定位的子元素不是 grid item） */}
       <Show when={pendingClose()}>{(pending) => <DiscardDialog names={pending().names} onDecide={decide} />}</Show>
+
+      {/* 全局替换的确认单（M2-D）。渲染在这里而不是面板自己里面：它是 `.modal-backdrop`，
+          要盖住整个窗口，而面板只是 `.main` 底下那 240px——挂在里面的话遮罩只罩住面板自己。
+          批准它是 Vela 里唯一一处批量写盘，也是唯一一处没有跨文件撤销的操作 */}
+      <Show when={search.confirm()}>
+        {(plan) => (
+          <ReplaceConfirm plan={plan()} onApply={() => void search.confirmApply()} onCancel={search.dismissConfirm} />
+        )}
+      </Show>
     </div>
   )
 }

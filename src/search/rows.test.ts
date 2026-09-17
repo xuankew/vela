@@ -7,16 +7,21 @@ import { describe, expect, it } from 'vitest'
  * 「没有布局」这件事缠斗一轮（`clientHeight` 恒为 0，见 `project/Sidebar.test.tsx`）。
  */
 
+import type { ReplaceSummary } from '../ipc/replace'
 import type { SearchFile, SearchSummary } from '../ipc/search'
 import { OVERSCAN } from '../project/tree'
 import {
   actionForKey,
   describeProgress,
+  describeReplaceProgress,
+  describeReplaceSummary,
   describeSummary,
   flattenFiles,
   formatDuration,
   isResultKey,
+  oneLine,
   openTarget,
+  replaceWarnings,
   RESULT_ROW_HEIGHT,
   resultWindow,
   segmentsOf,
@@ -25,7 +30,7 @@ import {
 } from './rows'
 
 /** 与 `src/ipc/search.test.ts` 的黄金 listing 同一批假数据，省得两边各编一套 */
-function file(rel: string, lines: number[], truncated = false): SearchFile {
+function file(rel: string, lines: number[], truncated = false, replaced?: string): SearchFile {
   return {
     rel,
     path: `/repo/${rel}`,
@@ -34,6 +39,8 @@ function file(rel: string, lines: number[], truncated = false): SearchFile {
       line,
       text: `let a = needle; // ${line}`,
       ranges: [{ start: 8, end: 14 }],
+      // 只有传了 `replaced` 才带上这个 key：纯搜索时 Rust 侧整个不序列化它
+      ...(replaced === undefined ? {} : { replaced }),
       truncated: false,
     })),
   }
@@ -55,7 +62,14 @@ describe('flattenFiles', () => {
   it('一个文件摊成「标题行 + 每条命中一行」，标题在前', () => {
     const rows = flattenFiles([file('src/a.ts', [3, 17])])
     expect(rows.map((r) => r.kind)).toEqual(['file', 'hit', 'hit'])
-    expect(rows[0]).toEqual({ kind: 'file', rel: 'src/a.ts', path: '/repo/src/a.ts', hits: 2, truncated: false })
+    expect(rows[0]).toEqual({
+      kind: 'file',
+      rel: 'src/a.ts',
+      path: '/repo/src/a.ts',
+      hits: 2,
+      truncated: false,
+      skipped: false,
+    })
     expect(rows[1]).toEqual({
       kind: 'hit',
       rel: 'src/a.ts',
@@ -65,6 +79,9 @@ describe('flattenFiles', () => {
       ranges: [{ start: 8, end: 14 }],
       truncated: false,
     })
+    // 纯搜索时**没有预览**。⚠️ 上面那条 `toEqual` 看不出来（vitest 忽略 undefined 值的键），
+    // 所以单独钉一次：它是「这一行没被预览过」与「预览结果是删光」两个状态的其中一半
+    expect(rows[1]?.kind === 'hit' && rows[1].replaced === undefined).toBe(true)
   })
 
   it('多个文件按顺序摊平，没有父子指针', () => {
@@ -103,6 +120,34 @@ describe('flattenFiles', () => {
   it('单文件截断这件事留在标题行上', () => {
     const rows = flattenFiles([file('min.js', [1], true)])
     expect(rows[0]).toMatchObject({ kind: 'file', truncated: true })
+  })
+
+  it('替换模式下预览原样搬到行上', () => {
+    const rows = flattenFiles([file('src/a.ts', [3], false, 'let a = hay;')])
+    const hit = rows[1]
+    expect(hit?.kind === 'hit' && hit.replaced).toBe('let a = hay;')
+  })
+
+  it('⚠️ 预览是空串时它仍然是「有预览」，不是「纯搜索」', () => {
+    const rows = flattenFiles([file('src/a.ts', [3], false, '')])
+    const hit = rows[1]
+    expect(hit?.kind === 'hit' && hit.replaced).toBe('')
+    expect(hit?.kind === 'hit' && hit.replaced === undefined).toBe(false)
+    // 空串是「把命中的地方删光」那个合法操作。用真值判断（`if (row.replaced)`）的话
+    // 它与「没预览过」合成一个分支，那一行会退回成纯搜索的样子，
+    // 而用户以为自己刚刚预览了一次删除
+  })
+
+  it('isSkipped 只标它认得的那些文件，而且只落在标题行上', () => {
+    const rows = flattenFiles([file('a.ts', [1]), file('b.ts', [2])], (p) => p === '/repo/a.ts')
+    expect(rows.map((r) => (r.kind === 'file' ? r.skipped : null))).toEqual([true, null, false, null])
+    // 命中行刻意不带这个标志：一个文件的几十条命中共享同一个命运，
+    // 在标题上说一次就够，逐行重复等于把「跳过」这件事淹没在噪音里
+  })
+
+  it('不传 isSkipped 时一个都不跳过（纯搜索那条路）', () => {
+    const rows = flattenFiles([file('a.ts', [1]), file('b.ts', [2])])
+    expect(rows.filter((r) => r.kind === 'file' && r.skipped)).toHaveLength(0)
   })
 })
 
@@ -415,5 +460,156 @@ describe('segmentsOf', () => {
         .map((s) => s.text)
         .join(''),
     ).toBe('abcdef')
+  })
+})
+
+// ───────────────────────── 替换那一半（M2-D） ─────────────────────────
+
+/** 与 Rust 侧 `替换载荷的线上形状` 的黄金 `ReplaceSummary` 逐字段相同 */
+const GOLDEN_REPLACE: ReplaceSummary = {
+  filesScanned: 120,
+  filesChanged: 3,
+  replacements: 7,
+  skippedBinary: 1,
+  skippedLossy: 2,
+  skippedUnmappable: 0,
+  skippedTooLarge: 4,
+  skippedOpen: 1,
+  unreadable: 2,
+  writeFailed: 0,
+  truncated: false,
+  cancelled: true,
+  elapsedMs: 45,
+}
+
+/** 只改关心的那几个计数器，其余保持黄金值 */
+function replace(patch: Partial<ReplaceSummary>): ReplaceSummary {
+  return { ...GOLDEN_REPLACE, ...patch }
+}
+
+/** 一份**干净**的总账：一处保留都没有 */
+const CLEAN: ReplaceSummary = replace({
+  cancelled: false,
+  skippedBinary: 0,
+  skippedLossy: 0,
+  skippedTooLarge: 0,
+  skippedOpen: 0,
+  unreadable: 0,
+})
+
+describe('oneLine', () => {
+  it('换行显示成 ↵，因为结果行是定高的', () => {
+    expect(oneLine('a\nb')).toBe('a↵b')
+    expect(oneLine('a\n\nb')).toBe('a↵↵b')
+    expect(oneLine('没有换行')).toBe('没有换行')
+    // 撑开的话 `visibleWindow` 那套 O(1) 窗口算术当场失效（它的前提是每行一样高），
+    // 溢出的话用户看到半行，会以为替换只换了一半
+  })
+})
+
+describe('describeReplaceProgress', () => {
+  it('三个数都在，而且「处」与「文件」分开说', () => {
+    expect(describeReplaceProgress({ filesScanned: 12, filesChanged: 3, replacements: 7 })).toBe(
+      '正在替换… 已改 3 个文件、7 处（扫过 12 个）',
+    )
+  })
+})
+
+describe('describeReplaceSummary', () => {
+  it('干净的那一份：换了几个文件、几处、扫过多少、多久', () => {
+    expect(describeReplaceSummary(replace({ ...CLEAN, replacements: 7, filesChanged: 3, filesScanned: 120 }))).toBe(
+      '换了 7 处，写进 3 个文件 · 扫过 120 个文件 · 45ms',
+    )
+  })
+
+  it('⚠️ 处数与文件数不是一回事，两个都得说', () => {
+    // 只报文件数的话用户不知道到底动了多少地方，
+    // 而「动了多少地方」正是他决定要不要 `git checkout` 的唯一依据
+    const text = describeReplaceSummary(replace({ ...CLEAN, replacements: 1, filesChanged: 1 }))
+    expect(text).toContain('1 处')
+    expect(text).toContain('1 个文件')
+  })
+
+  it('一处都没换时不报「0 个文件」', () => {
+    expect(describeReplaceSummary(replace({ ...CLEAN, replacements: 0, filesChanged: 0 }))).toContain('一处都没换')
+  })
+
+  it('⚠️ 已取消时必须连着说「改动不会回滚」', () => {
+    const text = describeReplaceSummary(replace({ cancelled: true, replacements: 7, filesChanged: 3 }))
+    expect(text.startsWith('已取消（改动不会回滚）')).toBe(true)
+    expect(text).toContain('7 处')
+    // 只说「已取消」的话用户会以为什么都没发生，而实际上那 3 个文件已经改完并留在磁盘上。
+    // 取消不是撤销，这句话是整条 UI 上最容易被漏掉、后果也最重的一句
+  })
+
+  it('二进制与过大是中性事实，写在总账里而不是警告里', () => {
+    const text = describeReplaceSummary(replace({ ...CLEAN, skippedBinary: 9, skippedTooLarge: 2 }))
+    expect(text).toContain('跳过 9 个二进制文件')
+    expect(text).toContain('跳过 2 个过大的文件')
+    expect(replaceWarnings(replace({ ...CLEAN, skippedBinary: 9, skippedTooLarge: 2 }))).toEqual([])
+    // 每个带图片的仓库都会跳过一堆二进制，把它们染成警告等于让警告色长期亮着，
+    // 而长期亮着的警告色等于没有警告色
+  })
+
+  it('⚠️ 截断说的是「仓库现在换了一半」，不是「少看了一些」', () => {
+    const text = describeReplaceSummary(replace({ ...CLEAN, truncated: true }))
+    expect(text).toContain('换了一半')
+    expect(text).toContain('写窄')
+    // 搜索截断的后果是少看了一些结果；替换截断的后果是仓库停在一个没法撤销的中间状态
+  })
+
+  it('耗时口径与搜索那边共用一个函数', () => {
+    expect(describeReplaceSummary(replace({ ...CLEAN, elapsedMs: 45 }))).toContain('45ms')
+    expect(describeReplaceSummary(replace({ ...CLEAN, elapsedMs: 6930 }))).toContain('6.93s')
+  })
+})
+
+describe('replaceWarnings', () => {
+  it('干净的那一份一条保留都没有', () => {
+    expect(replaceWarnings(CLEAN)).toEqual([])
+  })
+
+  it('七个计数器里只有五个上警告色，每个都点名是哪个计数器', () => {
+    const cases: [Partial<ReplaceSummary>, string][] = [
+      [{ writeFailed: 2 }, '没写成'],
+      [{ unreadable: 2 }, '读不出来'],
+      [{ skippedOpen: 1 }, '未保存的改动'],
+      [{ skippedUnmappable: 3 }, '编不回'],
+      [{ skippedLossy: 3 }, '有损'],
+    ]
+    for (const [patch, expected] of cases) {
+      const warnings = replaceWarnings(replace({ ...CLEAN, ...patch }))
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toContain(expected)
+    }
+    // `skippedBinary` 与 `skippedTooLarge` 刻意不在这里，理由见上面那条
+  })
+
+  it('⚠️ 「没写成」排在最前面：它是唯一一个用户以为成功了的', () => {
+    const warnings = replaceWarnings(replace({ ...CLEAN, writeFailed: 1, unreadable: 1, skippedOpen: 1 }))
+    expect(warnings[0]).toContain('没写成')
+    expect(warnings).toHaveLength(3)
+    // 其余四个都会让用户知道「有些文件没被碰到」，只有这一个是静默的：
+    // 总账上写着「换了 7 处」，而那 7 处里有一个文件其实没写进去
+  })
+
+  it('每条都是单独一行，不并进总账', () => {
+    // 这是 `describeReplaceSummary` 与 `replaceWarnings` 分成两个函数的全部理由：
+    // 混在一行里的话它跟在一串数字后面，用户扫一眼只看到「换了 7 处」就走了。
+    // ⚠️ 从 `CLEAN` 起步而不是黄金那一份：后者自己就带着 skippedOpen 与 skippedLossy，
+    // 于是断言测的是「一共几条」而不是「这一条有没有被并进总账」
+    const only = replace({ ...CLEAN, unreadable: 2 })
+    expect(describeReplaceSummary(only)).not.toContain('读不出来')
+    expect(replaceWarnings(only)).toHaveLength(1)
+  })
+
+  it('⚠️ 黄金总账那一份同时触发三条，而且顺序稳定', () => {
+    const warnings = replaceWarnings(GOLDEN_REPLACE)
+    expect(warnings).toHaveLength(3)
+    // 顺序是严重性：读不出来（总账不完整）→ 未保存被跳过（用户能自己解决）→ 解码有损
+    expect(warnings[0]).toContain('读不出来')
+    expect(warnings[1]).toContain('未保存')
+    expect(warnings[2]).toContain('有损')
+    // `writeFailed` 是 0，所以它不出现；它非零时会排在最前面，见上面那条
   })
 })

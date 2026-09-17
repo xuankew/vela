@@ -65,6 +65,14 @@ export interface BuiltinHooks {
    * 那句话要说的事，不该由快捷键按了没反应来表达。
    */
   findInFiles: () => void
+  /**
+   * 展开窗口底部的全局搜索面板并**直接进替换模式**（M2-D，`Mod+Shift+H`）。
+   *
+   * 与 `findInFiles` 是同一个面板、同一份状态，差别只在进去之后是不是已经开着替换那一排。
+   * 刻意不复用 `findInFiles` 再让调用方自己去翻模式：那会把「按这个键该看到什么」
+   * 拆到两个地方，而快捷键的语义是**到达某个状态**，不是执行一串动作
+   */
+  replaceInFiles: () => void
 }
 
 /**
@@ -257,13 +265,25 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     // 全局搜索（M2-C）。绑 Mod+Shift+F：VS Code 与 Sublime 的既有约定。
     // CM6 的 searchKeymap 只占了 Mod+F / Mod+G / Mod+Shift+G / Mod+Alt+Enter / Mod+D 这几条，
     // Mod+Shift+F 是空的——而它正好与「Mod+F 是文档内查找」形成一对，不用另发明。
-    // ⚠️ 这也是本项目里第一个 category 为「搜索」的命令：M2-D 的全局替换会加进来。
     registry.register({
       id: 'search.findInFiles',
       title: '在项目里搜索…',
       category: '搜索',
       keybinding: 'Mod+Shift+F',
       run: () => hooks.findInFiles(),
+    }),
+
+    // 全局替换（M2-D）。绑 Mod+Shift+H：VS Code 里「Replace in Files」就是 Cmd+Shift+H，
+    // 也与上面那条 Mod+Shift+F 形成一对（同一个面板，差一个「进去就是替换模式」）。
+    // 这个键在本项目里此前是空的：CM6 的 searchKeymap 只有 Mod-f / F3 / Mod-g / Escape /
+    // Mod-Shift-l / Mod-Alt-g / Mod-d，commands / view 的 keymap 里也没有 Mod-h；
+    // 文档内替换走的是 Mod+Shift+Enter（见下面的 editor.replaceNext）
+    registry.register({
+      id: 'search.replaceInFiles',
+      title: '在项目里替换…',
+      category: '搜索',
+      keybinding: 'Mod+Shift+H',
+      run: () => hooks.replaceInFiles(),
     }),
 
     // 行操作。快捷键沿用 CM6 defaultKeymap 已有的那一套，不另发明。

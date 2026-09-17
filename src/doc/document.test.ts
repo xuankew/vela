@@ -566,3 +566,174 @@ describe('discardChanges（M1-F：答了「不保存」之后）', () => {
     expect(doc.notice()).toBeNull()
   })
 })
+
+describe('reload（M2-D 全局替换之后对账）', () => {
+  /**
+   * 宿主上比 `harness()` 多两样东西：一个 setText 计数器，以及「正文一落地就同步回调
+   * markChanged」。两样都不是装饰：
+   *
+   * ⚠️ 计数器不能省。正文没变时 `state.text` 前后是同一个字符串，于是「压根没动」与
+   * 「动了、又写回同样的内容」在结果上不可区分。差别在**撤销栈**：setText 会重建 CM6
+   * 的 state，重建一次历史就没了——而全局替换压根没碰到的那些标签，凭什么丢历史。
+   *
+   * ⚠️ eager 回调也不能省。真实宿主（CM6 的 onUpdate）就是这么调的，靠 `replacing`
+   * 标志挡住；挡不住的话对账会把每一个被重读的标签都标脏，关窗时的「有未保存的改动」
+   * 就会凭空弹出来，而用户明明什么都没改
+   */
+  function eagerHarness() {
+    const state = { text: '', focuses: 0, pathChanges: 0, sets: 0 }
+    let doc!: DocumentModel
+    const host: DocumentHost = {
+      getText: () => state.text,
+      setText: (t) => {
+        state.sets += 1
+        state.text = t
+        doc.markChanged()
+      },
+      focus: () => {
+        state.focuses += 1
+      },
+      pathChanged: () => {
+        state.pathChanges += 1
+      },
+    }
+    doc = createDocumentModel(host)
+    return { doc, state, host }
+  }
+
+  it('磁盘上变了：采纳新正文与格式，返回 true', async () => {
+    const { doc, state } = eagerHarness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/a.txt')
+    expect(state.sets).toBe(1)
+
+    ipc.openFile.mockResolvedValueOnce(
+      textFile({ text: '换过了', format: { encoding: 'utf8', bom: true, eol: 'crlf' }, lossy: true }),
+    )
+    await expect(doc.reload()).resolves.toBe(true)
+
+    expect(state.text).toBe('换过了')
+    expect(doc.format()).toEqual({ encoding: 'utf8', bom: true, eol: 'crlf' })
+    expect(doc.lossy()).toBe(true)
+    expect(doc.busy()).toBe(false)
+    // 换正文不是用户的改动，eager 宿主回调了 markChanged 也得被 `replacing` 挡住
+    expect(doc.dirty()).toBe(false)
+  })
+
+  it('⚠️ 正文一模一样时一次 setText 都不发，返回 false', async () => {
+    const { doc, state } = eagerHarness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    expect(state.sets).toBe(1)
+
+    await expect(doc.reload()).resolves.toBe(false)
+
+    // 全局替换没碰到的那些标签走的正是这条路；撤销栈就是这么保住的
+    expect(state.sets).toBe(1)
+    expect(state.text).toBe('正文')
+    expect(doc.dirty()).toBe(false)
+  })
+
+  it('正文没变但行尾在盘上变过：正文一个字不动，格式照样对齐', async () => {
+    const { doc, state } = eagerHarness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/a.txt')
+
+    ipc.openFile.mockResolvedValueOnce(textFile({ format: { encoding: 'utf8', bom: false, eol: 'crlf' } }))
+    await expect(doc.reload()).resolves.toBe(false)
+
+    expect(state.sets).toBe(1)
+    // 状态栏显示一个过时的行尾比显示过时的正文更难察觉：那个数字没人会去核对
+    expect(doc.format()).toEqual({ encoding: 'utf8', bom: false, eol: 'crlf' })
+    expect(doc.dirty()).toBe(false)
+  })
+
+  it('脏文档一律不碰：一次 IO 都不发，返回 false', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '改过了'
+    doc.markChanged()
+
+    await expect(doc.reload()).resolves.toBe(false)
+
+    // 那份改动是磁盘上没有的唯一副本。而全局替换本来就把这个路径列进了 skip
+    // （见 ReplaceRequest.skip），两边必须说法一致：一边跳过一边覆盖的话，
+    // 用户看到的是「明明说跳过了，怎么内容还是变了」
+    expect(ipc.openFile).toHaveBeenCalledTimes(1)
+    expect(state.text).toBe('改过了')
+    expect(doc.dirty()).toBe(true)
+    expect(doc.busy()).toBe(false)
+    // 连提示都不给：对账是几十个标签批量跑的，每条都弹一句警告只会让人以为出了事。
+    // 真正要说的那句在替换总账里（`ReplaceSummary.skippedOpen`）
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('未命名文档上是空操作：磁盘上没有它', async () => {
+    const { doc, state } = harness()
+    state.text = '从没落过盘的稿子'
+
+    await expect(doc.reload()).resolves.toBe(false)
+
+    expect(ipc.openFile).not.toHaveBeenCalled()
+    expect(state.text).toBe('从没落过盘的稿子')
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('用**当前**编码重读，不让后端重新探测', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockResolvedValue(textFile({ text: '模', format: { encoding: 'gbk', bom: false, eol: 'lf' } }))
+    await doc.openAt('/misdetected.txt')
+
+    await doc.reload()
+
+    // 第二个参数就是这一条的全部内容：漏了它后端收到 None，会再探测一次，
+    // 于是「以 GBK 打开」那个用户刚刚做过的决定被悄悄扔掉
+    expect(ipc.openFile).toHaveBeenLastCalledWith('/misdetected.txt', 'gbk')
+  })
+
+  it('既不抢焦点也不重装语言槽位', async () => {
+    const { doc, state } = eagerHarness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/a.txt')
+    expect(state.focuses).toBe(1)
+
+    ipc.openFile.mockResolvedValueOnce(textFile({ text: '换过了' }))
+    await doc.reload()
+
+    // 对账是后台发生的：抢焦点的话用户正在打的字会跑到别的标签上去
+    expect(state.focuses).toBe(1)
+    // 路径没变 → 语言没变，报了宿主就白重装一次槽位
+    expect(state.pathChanges).toBe(1)
+  })
+
+  it('读失败时报错，正文与格式都保持原样，返回 false', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/a.txt')
+    ipc.openFile.mockRejectedValueOnce({ kind: 'io', reason: 'NotFound', message: '文件没了' })
+
+    await expect(doc.reload()).resolves.toBe(false)
+
+    expect(state.text).toBe('正文')
+    expect(doc.format()).toEqual({ encoding: 'utf8', bom: false, eol: 'lf' })
+    expect(doc.notice()?.level).toBe('error')
+    expect(doc.notice()?.text).toContain('文件没了')
+    expect(doc.busy()).toBe(false)
+  })
+
+  it('对账成功之后上一轮那条提示消失', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/a.txt')
+    ipc.openFile.mockRejectedValueOnce({ kind: 'io', reason: 'Io', message: '外接盘掉线了' })
+    await doc.reload()
+    expect(doc.notice()?.level).toBe('error')
+
+    ipc.openFile.mockResolvedValueOnce(textFile({ text: '回来了' }))
+    await expect(doc.reload()).resolves.toBe(true)
+
+    // 留着的话用户会一直看着一句已经不成立的报错，而它没有任何可操作的动作
+    expect(doc.notice()).toBeNull()
+  })
+})

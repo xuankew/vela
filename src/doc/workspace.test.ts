@@ -1618,3 +1618,130 @@ describe('M1-F-4：会话序列化与恢复', () => {
     expect(pane.ws.serializeSession().tabs[0]!.draft).toBe('')
   })
 })
+
+describe('M2-D-4c：全局替换之后的对账', () => {
+  /**
+   * 这一组大多用**不挂编辑器**的 workspace：`dirtyPaths` 与 `reloadUnder` 只碰标签表与
+   * 文档模型，而后台标签的 host 本来就走 snapshot 那条路。少起一个 CM6，十几条用例的
+   * 耗时就下来了。「显示中的那个标签」另有一条挂真编辑器的用例（本 describe 最后一条）。
+   */
+  async function opened(...paths: string[]): Promise<Workspace> {
+    const ws = createWorkspace()
+    for (const at of paths) {
+      // openAt 在「活动标签干净但已经有别的路径」时会新建一个标签，所以一个个开就是一个个标签
+      await ws.openAt(at)
+    }
+    return ws
+  }
+
+  /** 这一轮对账真的去读了哪些文件。⚠️ 用之前先 `mockClear`，不然数到的是 openAt 那几趟 */
+  function reread(): unknown[] {
+    return ipc.openFile.mock.calls.map((c: unknown[]) => c[0])
+  }
+
+  it('dirtyPaths：一个都不脏时是空数组', async () => {
+    const ws = await opened('/repo/a.ts', '/repo/b.ts')
+    expect(ws.dirtyPaths()).toEqual([])
+  })
+
+  it('dirtyPaths：只收**有路径的**脏标签', async () => {
+    const ws = await opened('/repo/a.ts')
+    ws.newTab()
+    // 未命名的那个也脏，但它收不进来：磁盘上没有它，落盘碰不到，不需要保护
+    ws.activeTab().doc.markChanged()
+    await ws.openAt('/repo/b.ts')
+    ws.activeTab().doc.markChanged()
+
+    // `/repo/a.ts` 干净，也不收
+    expect(ws.dirtyPaths()).toEqual(['/repo/b.ts'])
+  })
+
+  it('dirtyPaths：保存之后立刻从清单里消失', async () => {
+    const ws = await opened('/repo/a.ts')
+    ws.activeTab().doc.markChanged()
+    expect(ws.dirtyPaths()).toEqual(['/repo/a.ts'])
+
+    await ws.save()
+
+    // skip 清单是在**按下「替换全部」那一刻**才算的，所以刚存完盘的文件必须马上不在清单里，
+    // 否则它会被白白跳过一轮，而用户看到的是一句「有 1 个文件正开着且有未保存的改动」的假话
+    expect(ws.dirtyPaths()).toEqual([])
+  })
+
+  it('reloadUnder：只重读 root 底下的标签，兄弟前缀不算', async () => {
+    const ws = await opened('/repo/a.ts', '/repo-other/b.ts', '/other/c.ts')
+    ipc.openFile.mockClear()
+
+    await ws.reloadUnder('/repo')
+
+    // ⚠️ 前缀是 `'/repo/'` 而不是 `'/repo'`：少了那个斜杠，`/repo-other/b.ts` 会被当成
+    // `/repo` 底下的一员。正文一样时 reload 什么都不写，但那一趟读盘已经发生了
+    expect(reread()).toEqual(['/repo/a.ts'])
+  })
+
+  it('reloadUnder：root 带不带结尾斜杠都一样', async () => {
+    const ws = await opened('/repo/a.ts')
+    ipc.openFile.mockClear()
+
+    await ws.reloadUnder('/repo/')
+
+    // 项目根来自对话框，macOS 上选到卷根时它就是一个裸 `/`，两种写法都得认
+    expect(reread()).toEqual(['/repo/a.ts'])
+  })
+
+  it('reloadUnder：未命名标签一次 IO 都不发', async () => {
+    const ws = createWorkspace()
+    ws.activeTab().doc.markChanged()
+    ipc.openFile.mockClear()
+
+    await expect(ws.reloadUnder('/repo')).resolves.toBe(0)
+
+    expect(ipc.openFile).not.toHaveBeenCalled()
+  })
+
+  it('reloadUnder：脏标签不碰，也不算进返回值', async () => {
+    const ws = await opened('/repo/a.ts')
+    ws.activeTab().doc.markChanged()
+    ipc.openFile.mockClear()
+
+    await expect(ws.reloadUnder('/repo')).resolves.toBe(0)
+
+    expect(ipc.openFile).not.toHaveBeenCalled()
+    // 这里刻意**没有**再判一次 dirty：那条规矩只该有 `DocumentModel.reload` 一个真相来源。
+    // 两边各写一遍的话哪天分岔，失败方式是「用户没保存的稿子被刚落盘的结果覆盖」
+    expect(tabText(ws.activeTab())).toBe('正文')
+  })
+
+  it('reloadUnder：返回的是正文**真的**换过了的标签数，标签表本身一点没动', async () => {
+    const ws = await opened('/repo/a.ts', '/repo/b.ts')
+    const before = ws.tabs()
+    ipc.openFile.mockImplementation(async (path: string) =>
+      textFile({ text: path === '/repo/a.ts' ? '换过了' : '正文' }),
+    )
+
+    // b.ts 盘上没变 → reload 一个字都不动，也就不该被数进来（那个数是要报给用户的）
+    await expect(ws.reloadUnder('/repo')).resolves.toBe(1)
+
+    const [a, b] = ws.tabs()
+    expect(tabText(a!)).toBe('换过了')
+    expect(tabText(b!)).toBe('正文')
+    // 对账不重建标签：重建的话每块分屏记着的 tabId 会全部失配
+    expect(ws.tabs()).toBe(before)
+  })
+
+  it('reloadUnder：显示中的那个标签走真编辑器，正文与度量都跟着换，而且不算用户改动', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/repo/a.ts')
+    expect(pane.doc).toBe('正文')
+    ipc.openFile.mockResolvedValueOnce(textFile({ text: '换过了\n第二行' }))
+
+    await expect(pane.ws.reloadUnder('/repo')).resolves.toBe(1)
+
+    expect(pane.doc).toBe('换过了\n第二行')
+    expect(pane.ws.metrics()).toMatchObject({ lines: 2, chars: 7 })
+    // `replacing` 标志存在的理由在这里被真 CM6 考验一次：挡不住的话每个被重读的标签
+    // 都会凭空变脏，关窗时的「有未保存的改动」就是这么来的
+    expect(pane.ws.activeTab().doc.dirty()).toBe(false)
+    expect(pane.ws.anyDirty()).toBe(false)
+  })
+})
