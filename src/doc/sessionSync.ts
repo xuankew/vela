@@ -1,4 +1,5 @@
-import { describeSessionError, loadSession, saveSession } from '../ipc/session'
+import { describeSessionError, loadSession, saveSession, type Session } from '../ipc/session'
+import type { ProjectTree } from '../project/store'
 import type { Workspace } from './workspace'
 
 /**
@@ -18,6 +19,16 @@ import type { Workspace } from './workspace'
  *
  * 2. **关窗放行前必须再存一次**。节流那一轮最长要等 5 秒，而 `close_window` 是
  *    `Window::destroy()`，webview 当场就没了——最后 5 秒里敲的字全丢。
+ *
+ * ## 存档有两半（M2-B-4）
+ *
+ * 标签页那一半来自 `workspace.serializeSession()`，项目树那一半来自 `tree.serializeState()`。
+ * **这两个 store 彼此不知道对方存在**——树管「磁盘上有什么」，workspace 管「打开了哪些
+ * 标签」，关掉文件夹不动任何标签，反过来也一样。于是「拼成一份 `Session`」与
+ * 「启动时拆开分别交回去」这两件事只能发生在这一层，它本来就是唯一同时看得见两者的地方。
+ *
+ * 这也让上面那条轮询策略**免费**覆盖了树：指纹是整份 `Session` 的 `JSON.stringify`，
+ * 摊开/收起一层就是一次指纹变化，不需要在树那边另挂一套「改动时打个标记」。
  */
 
 /** 自动保存的最小间隔。5 秒是「崩了最多丢 5 秒」与「打字时别一直写盘」之间的取舍 */
@@ -36,6 +47,13 @@ export type Scheduler = (tick: () => void, intervalMs: number) => Unschedule
 
 export interface SessionSyncOptions {
   workspace: Workspace
+  /**
+   * 项目树。没注入就只存标签页那一半（`project` 恒为 `null`）。
+   *
+   * 做成可选而不是必填：这一层的用例绝大多数与树无关，逼着它们都造一个
+   * `createProjectTree` 只会把定时器测试拖进 IPC mock。
+   */
+  project?: ProjectTree
   /**
    * 出问题时说一句话（存档读不回来、写不下去、草稿被丢）。
    *
@@ -62,6 +80,7 @@ export interface SessionSync {
 
 export function createSessionSync(options: SessionSyncOptions): SessionSync {
   const ws = options.workspace
+  const tree = options.project
   const warn = options.onWarn ?? (() => {})
   const intervalMs = options.intervalMs ?? SESSION_SYNC_INTERVAL_MS
   const schedule =
@@ -81,8 +100,11 @@ export function createSessionSync(options: SessionSyncOptions): SessionSync {
   let tail: Promise<void> = Promise.resolve()
 
   async function doWrite(): Promise<void> {
-    const session = ws.serializeSession()
-    // 指纹只用来跟自己做相等比较，不需要与线上的字节完全一致
+    // 两半在这里拼成一份。`ws.serializeSession()` 的 `project` 恒为 null（workspace
+    // 不知道树存在），所以顺序是固定的：先摊开 workspace 那半，再盖上树这半。
+    const session: Session = { ...ws.serializeSession(), project: tree?.serializeState() ?? null }
+    // 指纹只用来跟自己做相等比较，不需要与线上的字节完全一致。
+    // ⚠️ 必须在**拼接之后**算：算早了就只覆盖标签页那一半，摊开/收起文件夹永远不会触发写
     const fingerprint = JSON.stringify(session)
     if (fingerprint === lastSent) return
     try {
@@ -109,8 +131,18 @@ export function createSessionSync(options: SessionSyncOptions): SessionSync {
     async start() {
       try {
         const saved = await loadSession()
-        // null = 第一次启动，还没有存档。静默地留着 workspace 自带的那个空标签
-        if (saved !== null) await ws.restoreSession(saved)
+        // null = 第一次启动，还没有存档。静默地留着 workspace 自带的那个空标签、
+        // 以及树自带的「打开文件夹…」空状态
+        if (saved !== null) {
+          // 两半**并行**装回去：它们之间没有任何依赖（workspace 读的是文件内容，
+          // 树读的是目录列举），串起来等于把「几十个文件」与「几十层目录」两笔启动
+          // 开销相加而不是取最大值。两边内部各自也已经是并行的。
+          //
+          // `saved.project` 不需要 `?? null` 兜：Rust 侧 `project` 没有
+          // `skip_serializing_if`，缺键的旧存档在 `Deserialize` 里就被填成 `None`，
+          // 到前端手上必然是 `null` 或一个对象——这条由 `wire_contract.rs` 钉住。
+          await Promise.all([ws.restoreSession(saved), tree?.restoreState(saved.project)])
+        }
       } catch (err) {
         // 存档存在但读不回来（损坏 / 版本不认 / 超上限）。这不是启动失败：
         // 说一句，然后照常用现在这个空 workspace 跑

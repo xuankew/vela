@@ -88,6 +88,27 @@ export class EditorController {
     this.applyScroll(snapshot)
   }
 
+  /**
+   * 跳到某个位置：选中 `anchor..head`，把它带到视口中间，然后拿回焦点。
+   *
+   * 一次 dispatch 做完三件事——分成三次的话中间那两帧会画出「光标已经跳了但还没滚过去」
+   * 的样子，看着像闪了一下。
+   *
+   * `y: 'center'` 而不是默认的 `'nearest'`：贴着视口上边或下边的话，人真正想看的
+   * 那些上下文正好被裁掉，而「跳过去看一眼周围」正是点搜索结果的全部目的。
+   *
+   * 放在这一层而不是 App 里：`EditorView.scrollIntoView` 属于 CM6，而这里正是 CM6 的
+   * 边界。M2-E 的 Goto Anything 跳行是第二个消费者，用的是同一个原语。
+   */
+  reveal(anchor: number, head: number) {
+    this.assertAlive()
+    this.view.dispatch({
+      selection: { anchor, head },
+      effects: EditorView.scrollIntoView(anchor, { y: 'center' }),
+    })
+    this.view.focus()
+  }
+
   focus() {
     this.assertAlive()
     this.view.focus()

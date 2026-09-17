@@ -24,9 +24,7 @@ export function DiscardDialog(props: DiscardDialogProps) {
   onMount(() => saveButton.focus())
 
   const title = () =>
-    props.names.length === 1
-      ? `「${props.names[0]}」有未保存的改动`
-      : `${props.names.length} 个文档有未保存的改动`
+    props.names.length === 1 ? `「${props.names[0]}」有未保存的改动` : `${props.names.length} 个文档有未保存的改动`
 
   return (
     <div

@@ -69,14 +69,13 @@ export interface EncodingChoice {
  */
 // 回调的返回类型必须显式标出来：ternary 两支的元素类型不同（一支只剩 "gbk" 字面量），
 // flatMap 会把 U 推成其中一支，再跟这里的注解打起来（TS2322）
-export const ENCODING_CHOICES: EncodingChoice[] = ENCODING_IDS.flatMap(
-  (encoding): EncodingChoice[] =>
-    encoding === 'gbk'
-      ? [{ encoding, bom: false, label: ENCODING_LABELS[encoding] }]
-      : [
-          { encoding, bom: false, label: ENCODING_LABELS[encoding] },
-          { encoding, bom: true, label: `${ENCODING_LABELS[encoding]} BOM` },
-        ],
+export const ENCODING_CHOICES: EncodingChoice[] = ENCODING_IDS.flatMap((encoding): EncodingChoice[] =>
+  encoding === 'gbk'
+    ? [{ encoding, bom: false, label: ENCODING_LABELS[encoding] }]
+    : [
+        { encoding, bom: false, label: ENCODING_LABELS[encoding] },
+        { encoding, bom: true, label: `${ENCODING_LABELS[encoding]} BOM` },
+      ],
 )
 
 const BOM_SUFFIX = '-bom'
@@ -114,9 +113,7 @@ export type ReadError =
   | { kind: 'directory'; path: string }
   | { kind: 'too_large'; bytes: number; limit: number }
 
-export type WriteError =
-  | { kind: 'io'; reason: string; message: string }
-  | { kind: 'no_parent'; path: string }
+export type WriteError = { kind: 'io'; reason: string; message: string } | { kind: 'no_parent'; path: string }
 
 export type FsError = ReadError | WriteError
 

@@ -108,7 +108,8 @@ export function createCommandRegistry(options: CommandRegistryOptions): CommandR
       }
       if (entries.has(def.id)) throw new Error(`命令 id "${def.id}" 重复注册`)
       // 解析放在注册时而不是首次按键时：声明写错要立刻炸，而不是等到用户按下才发现
-      const declared = def.keybinding === undefined ? [] : Array.isArray(def.keybinding) ? def.keybinding : [def.keybinding]
+      const declared =
+        def.keybinding === undefined ? [] : Array.isArray(def.keybinding) ? def.keybinding : [def.keybinding]
       const bindings = declared.map((source) => parseKeybinding(source, platform))
       entries.set(def.id, { def, bindings, order: nextOrder++ })
       return () => {
@@ -139,7 +140,9 @@ export function createCommandRegistry(options: CommandRegistryOptions): CommandR
           enabled: isEnabled(entry, context),
           keybindings: entry.bindings.map((b) => formatKeybinding(b, platform)),
         }))
-        .sort((a, b) => (a.category === b.category ? (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : a.category < b.category ? -1 : 1))
+        .sort((a, b) =>
+          a.category === b.category ? (a.id < b.id ? -1 : a.id > b.id ? 1 : 0) : a.category < b.category ? -1 : 1,
+        )
     },
 
     findForKey(event, ctx) {

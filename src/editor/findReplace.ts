@@ -154,8 +154,8 @@ export function collectMatches(
  */
 function isMatchAt(state: EditorState, query: SearchQuery, from: number, to: number): boolean {
   if (from === to) return false
-  const match = iterateMatches(state, query, from, to, 1).next().value
-  return match !== undefined && match.from === from && match.to === to
+  for (const match of iterateMatches(state, query, from, to, 1)) return match.from === from && match.to === to
+  return false
 }
 
 /**
@@ -166,7 +166,10 @@ function isMatchAt(state: EditorState, query: SearchQuery, from: number, to: num
  */
 function firstMatchAfter(state: EditorState, query: SearchQuery, from: number): Match | null {
   const length = state.doc.length
-  const windows: [number, number][] = [[from, length], [0, Math.min(from, length)]]
+  const windows: [number, number][] = [
+    [from, length],
+    [0, Math.min(from, length)],
+  ]
   for (const [start, end] of windows) {
     for (const match of iterateMatches(state, query, start, end, 1)) return match
   }
@@ -249,9 +252,19 @@ export const replaceAllCommand: Command = (view) => {
 
 // ---------- 面板 ----------
 
+/**
+ * `never` 参数位是为了让任意形状的事件处理函数都能赋进来（`() => void`、
+ * `(e: KeyboardEvent) => void` 都算），同时又把对象/数组挡在联合类型外面——
+ * `setAttribute` 只吃字符串，值类型留成 `unknown` 的话 `String(value)` 会静默
+ * 往 DOM 属性里写 `[object Object]`。
+ */
+type AttrHandler = (event: never) => void
+
+type AttrValue = string | number | boolean | AttrHandler | null | undefined
+
 function elt<T extends HTMLElement>(
   tag: string,
-  attrs: Record<string, unknown> | null = null,
+  attrs: Record<string, AttrValue> | null = null,
   children: (Node | string)[] = [],
 ): T {
   const node = document.createElement(tag) as T

@@ -107,6 +107,28 @@ pub struct SessionTab {
     pub scroll_left: f64,
 }
 
+/// 项目树那一头的现场（M2-B-4）。
+///
+/// 与标签页是**两套独立的状态**：树管「磁盘上有什么」，标签管「打开了哪些文档」。
+/// 关掉文件夹不动任何标签，反过来也一样。所以它在存档里也是一个独立的可选部分，
+/// 而不是塞进 `SessionTab` 里的某个字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProject {
+    /// 项目根的绝对路径。恢复时原样喂给 `list_dir`，前端不做任何路径算术
+    pub root: String,
+    /// 摊开着的层的 `rel`，含 `""`（根本身）。
+    ///
+    /// 只存 `rel` 不存 `path`：`rel` 是缓存与展开集合的键（`src/project/store.ts`
+    /// 不变量 3），而且它天然不含 root，换过文件夹也不会指到别处去。
+    ///
+    /// 条数上限**不在这一侧**：真正要花代价的是「每条 `rel` 一次 `list_dir` 往返」，
+    /// 那是前端的启动成本，由 `src/project/store.ts` 的 `MAX_RESTORED_EXPANDED` 兜住。
+    /// Rust 这边管的是 4MiB 的 payload 预算，`MAX_SESSION_BYTES` 已经在管了。
+    /// 两边各截一次的结果是「谁也说不清最终是多少条」，所以刻意只留一处。
+    pub expanded: Vec<String>,
+}
+
 /// 一次完整的会话快照。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +147,31 @@ pub struct Session {
     /// 分屏里」。放开的话 `Tab.snapshot` 就不再是「没显示时的唯一真相」，
     /// 撤销历史与滚动位置会分叉成两份——所以这里直接拒。
     pub panes: Vec<usize>,
+    /// 项目树。`None` = 上次没打开任何文件夹。
+    ///
+    /// ## 为什么加了它 `SESSION_VERSION` 还是 1
+    ///
+    /// 版本号的全部作用是「不认识就整份作废」，而这里**不存在读不懂的情形**：
+    /// 读的方向上，`Raw::project` 带 `#[serde(default)]`，M1-F 时代写下的存档（没有这个
+    /// key）解析成 `None`，等价于「上次没打开文件夹」——正是当时的事实；
+    /// 写的方向上，serde 默认**忽略**未知字段，所以旧版 Vela 读到新存档只会当没看见。
+    /// 两个方向都优雅降级，没有哪一边会得到一个半对半错的现场，于是没有作废的必要。
+    ///
+    /// 反过来说， bump 版本号的代价是确定的：所有 M1-F 用户重启一次就丢光会话。
+    /// 为一次纯增量的可选字段付这个代价不划算。
+    ///
+    /// ⚠️ 这条推理只对「**新增可选字段**」成立。哪天要改已有字段的含义、要删字段、
+    /// 或者要收紧 `validate`（让原本合法的存档变非法），版本号就必须动——那时
+    /// 「整份作废」比「解析成一半对一半错」好排查得多，见 `SESSION_VERSION` 的文档。
+    ///
+    /// ## 为什么刻意**不**用 `skip_serializing_if = "Option::is_none"`
+    ///
+    /// 省掉的只有 `"project":null` 这十几个字节，换来的是黄金 JSON 少了一个必然出现的
+    /// key。少了它，「字段名写错」这件事在契约测试里就没有对照物——而字段名写错的
+    /// 失败方式恰恰是静默的（见本文件头部）。前端 `Session.project` 也因此可以写成
+    /// `SessionProject | null` 而不是 `?:`，符合 `src/ipc/session.ts` 那条「可空字段
+    /// 一律显式 `null`」的规矩。
+    pub project: Option<SessionProject>,
 }
 
 impl<'de> Deserialize<'de> for Session {
@@ -145,6 +192,11 @@ impl<'de> Deserialize<'de> for Session {
             focused: usize,
             tabs: Vec<SessionTab>,
             panes: Vec<usize>,
+            /// 唯一一个带 `default` 的字段，也就是唯一一个**后加的**字段。
+            /// M1-F 的存档里没有它，缺 key 时解析成 `None`（= 上次没打开文件夹）。
+            /// 其余字段刻意不给默认值，理由见 `lossy_与_format_缺失时整份作废`。
+            #[serde(default)]
+            project: Option<SessionProject>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -154,6 +206,7 @@ impl<'de> Deserialize<'de> for Session {
             focused: raw.focused,
             tabs: raw.tabs,
             panes: raw.panes,
+            project: raw.project,
         };
         session.validate().map_err(serde::de::Error::custom)?;
         Ok(session)
@@ -193,6 +246,25 @@ impl Session {
                 return Err(format!("tabs[{i}].main={} 越界", tab.main));
             }
         }
+        // 项目这一部分**只**校验一件事：root 不能是空字符串。
+        //
+        // 空 root 会让 `list_dir` 收到一个相对路径，那是 `bad_root`；虽然也能被兜住，
+        // 但一个空的绝对路径不可能是任何一次 dialog 的返回值，它只可能来自手改或磁盘
+        // 错误，属于「这份存档不可信」。
+        //
+        // 刻意**不**在这里检查路径形状（是不是绝对、存不存在、是不是目录）：那三种情况的
+        // 正确反应是「树照常建起来，在那一行显示一句错误」，而不是「整份会话作废、
+        // 连标签都不恢复」。项目文件夹被移动/删除是常态（换机器、改名、外挂盘没插），
+        // 为它赔上整个会话是把两种处境混成了一种。`project/tree.rs` 的 `bad_root` /
+        // `not_found` 已经走在那条行内错误的通道上，这里再判一遍只会抢在它前面。
+        //
+        // 同理不校验 `expanded`：里面的 `rel` 会逐条送去 `list_dir`，越界的、重复的、
+        // 指向文件的，都会在那一层自己变成一句错误，不影响别的层。
+        if let Some(project) = &self.project {
+            if project.root.is_empty() {
+                return Err("project.root 是空字符串".into());
+            }
+        }
         Ok(())
     }
 }
@@ -209,15 +281,28 @@ pub struct SessionReport {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionError {
-    Io { reason: String, message: String },
+    Io {
+        reason: String,
+        message: String,
+    },
     /// 路径没有目录部分，无法确定临时文件放哪
-    NoParent { path: String },
+    NoParent {
+        path: String,
+    },
     /// 文件不是合法 JSON，或者形状对不上（下标越界之类）
-    Corrupt { message: String },
+    Corrupt {
+        message: String,
+    },
     /// `version` 不认识，整份作废
-    Version { found: u32, expected: u32 },
+    Version {
+        found: u32,
+        expected: u32,
+    },
     /// 把所有草稿都丢光了还是超过预算——只有元信息本身就有 4MB，实践中到不了这里
-    TooLarge { bytes: usize, limit: usize },
+    TooLarge {
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 impl SessionError {
@@ -371,6 +456,9 @@ mod tests {
             focused: 0,
             tabs: tabs.clone(),
             panes: (0..tabs.len()).collect(),
+            // 与项目树无关的用例占绝大多数，所以默认不开文件夹；
+            // 要测项目的那几条自己覆写这个字段
+            project: None,
         }
     }
 
@@ -409,6 +497,13 @@ mod tests {
                 },
             ],
             panes: vec![1, 0],
+            // 空字符串 `""` 是**根**那一层的 rel，不是「没有值」。它在 `expanded` 里
+            // 必须能原样往返：丢了它，恢复出来的树是收起的，用户点开过的文件夹全缩回去了，
+            // 而这件事没有任何报错——正是本模块最怕的那一类失败。
+            project: Some(SessionProject {
+                root: "/Users/me/code/vela".into(),
+                expanded: vec!["".into(), "src".into(), "src/project".into()],
+            }),
         };
 
         let report = save_session(&path, original.clone()).unwrap();
@@ -510,10 +605,7 @@ mod tests {
             session_json(&ok_tab, 0, ""),
         ] {
             fs::write(&path, &raw).unwrap();
-            assert!(
-                matches!(load_session(&path), Err(SessionError::Corrupt { .. })),
-                "这份越界会话被接受了：{raw}"
-            );
+            assert!(matches!(load_session(&path), Err(SessionError::Corrupt { .. })), "这份越界会话被接受了：{raw}");
         }
     }
 
@@ -550,6 +642,7 @@ mod tests {
             focused: 0,
             tabs: vec![tab(Some("/a"), None)],
             panes: vec![0, 0],
+            project: None,
         };
 
         match save_session(&path, duplicated.clone()) {
@@ -584,6 +677,101 @@ mod tests {
         assert!(matches!(load_session(&path), Err(SessionError::Corrupt { .. })));
     }
 
+    /// **M1-F 时代写下的存档必须还能读回来。**
+    ///
+    /// 这条是「加了 `project` 却不 bump `SESSION_VERSION`」那个决定的唯一依据：那个推理
+    /// 成立与否，取决于旧文件解析成什么。要是这里变成 `Err(Version)` 或 `Err(Corrupt)`，
+    /// 所有已经装了 M1-F 的用户重启一次就丢光会话——而他们只会认为「这功能坏了」。
+    ///
+    /// 摘掉键而不是另写一份字面量：字面量会与真实格式各自漂移，而「从当前格式里摘掉
+    /// 这个键」永远精确等于「上一版写出来的东西」。
+    #[test]
+    fn 缺少_project_键的旧存档照常解析() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        let mut with_project = minimal();
+        with_project.project = Some(SessionProject { root: "/repo".into(), expanded: vec!["".into()] });
+        let current = serde_json::to_string(&with_project).unwrap();
+
+        let legacy = current.replacen(r#","project":{"root":"/repo","expanded":[""]}"#, "", 1);
+        assert_ne!(legacy, current, "没摘掉 project 键——上面的字面量与真实格式不一致了");
+
+        fs::write(&path, &legacy).unwrap();
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(loaded.project, None, "旧存档该解析成「没打开文件夹」");
+        // 关键在**其余部分一个字都没变**：降级只能是「少了新功能」，不能是「旧功能也坏了」
+        assert_eq!(loaded.tabs, with_project.tabs);
+        assert_eq!(loaded.panes, with_project.panes);
+
+        // 结构体形态走同一条路（前端 invoke 的 payload 也可能不带这个键）
+        assert_eq!(serde_json::from_str::<Session>(&legacy).unwrap().project, None);
+    }
+
+    /// `"project": null` 与「没有这个键」必须是同一件事。
+    ///
+    /// 前端**总是**带上这个键（没开文件夹时传 `null`），所以这条路径才是常态；
+    /// 上一条测的缺键反而是特例。两条都钉住，是因为 serde 对「缺失」与「null」的
+    /// 处理并不显然一致，而这里正好两种都会出现。
+    #[test]
+    fn project_为_null_等于没打开文件夹() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        // minimal() 的 project 就是 None，而序列化时**不**省略该键（见字段文档）
+        assert!(serde_json::to_string(&minimal()).unwrap().ends_with(r#","project":null}"#));
+
+        save_session(&path, minimal()).unwrap();
+        assert_eq!(load_session(&path).unwrap().unwrap().project, None);
+    }
+
+    /// 空 root 不可能是任何一次 dialog 的返回值，它只可能来自手改或磁盘错误。
+    ///
+    /// 但**只**拦这一条：文件夹被移动/删除是常态（换机器、外挂盘没插），那种情况的
+    /// 正确反应是「树照常建起来、那一行显示一句错误」，而不是「整份会话作废、
+    /// 连标签都不恢复」。见 `validate` 里的注释。
+    #[test]
+    fn 空的项目根被拒() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        let mut s = minimal();
+        s.project = Some(SessionProject { root: String::new(), expanded: vec!["".into()] });
+
+        match save_session(&path, s.clone()) {
+            Err(SessionError::Corrupt { message }) => assert!(message.contains("project.root"), "{message}"),
+            other => panic!("期望 Corrupt，实际 {other:?}"),
+        }
+        assert!(!path.exists(), "被拒的保存不该留下文件");
+
+        fs::write(&path, serde_json::to_vec(&s).unwrap()).unwrap();
+        assert!(matches!(load_session(&path), Err(SessionError::Corrupt { .. })));
+
+        // 反面对照：一个**不存在**的路径必须被接受。它会在 `list_dir` 那里变成
+        // `not_found`，显示在根行上——赔掉整个会话是错的
+        s.project = Some(SessionProject { root: "/这个文件夹已经不在了".into(), expanded: vec!["".into()] });
+        save_session(&path, s).unwrap();
+        assert!(load_session(&path).unwrap().unwrap().project.is_some());
+    }
+
+    /// `expanded` 的上限**不在这里**。
+    ///
+    /// 前端 `src/project/store.ts` 的 `MAX_RESTORED_EXPANDED` 已经在截断了，Rust 再截一遍
+    /// 就有两个真相。它要限的成本（每条 `rel` 一次 `list_dir` 往返）是**前端**的成本，
+    /// 由前端自己兜住才对；Rust 这一侧管的是 4MiB 的 payload 预算，那已经有
+    /// `MAX_SESSION_BYTES` 在拦。这条用例钉住「Rust 不动 expanded」，免得将来有人
+    /// 出于「多一层保险」在这里加个截断，然后两边各截一次、谁也说不清最终是多少条。
+    #[test]
+    fn 展开列表原样往返不在_rust_侧截断() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+        let mut s = minimal();
+        let expanded: Vec<String> = (0..900).map(|i| format!("d{i}")).collect();
+        s.project = Some(SessionProject { root: "/repo".into(), expanded: expanded.clone() });
+
+        save_session(&path, s).unwrap();
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(loaded.project.unwrap().expanded, expanded, "Rust 侧不该动 expanded");
+    }
+
     #[test]
     fn 超过预算时从最大的草稿开始丢() {
         let dir = tempfile::tempdir().unwrap();
@@ -593,11 +781,7 @@ mod tests {
         let small = "s".repeat(MAX_SESSION_BYTES / 8);
         let medium = "m".repeat(MAX_SESSION_BYTES / 4);
         let large = "L".repeat(MAX_SESSION_BYTES);
-        let s = session(vec![
-            tab(None, Some(&small)),
-            tab(None, Some(&medium)),
-            tab(None, Some(&large)),
-        ]);
+        let s = session(vec![tab(None, Some(&small)), tab(None, Some(&medium)), tab(None, Some(&large))]);
 
         let report = save_session(&path, s).unwrap();
         assert_eq!(report.dropped_drafts, 1, "该丢一个，实际丢了 {}", report.dropped_drafts);

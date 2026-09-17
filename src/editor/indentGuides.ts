@@ -39,7 +39,7 @@ export function buildGuides(state: EditorState, firstLine: number, lastLine: num
     const wsEnd = indentWidth(text)
     // 逐档推进。RangeSetBuilder 要求 from 升序、同 from 时 to 升序，
     // 外层按行号递增、内层按 offset 递增，两个条件自动满足。
-    for (let offset = 0; offset < wsEnd; ) {
+    for (let offset = 0; offset < wsEnd;) {
       const step = text[offset] === '\t' ? 1 : spacesPerLevel
       if (offset + step > wsEnd) break
       builder.add(line.from + offset, line.from + offset + step, guideMark)

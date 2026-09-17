@@ -147,7 +147,7 @@ describe('错误落地成人能读的话', () => {
   })
 
   it('Rust 侧将来加了变体而前端没跟上时，不会抛', () => {
-    expect(describeFsError({ kind: 'brand_new_variant' } as unknown)).toBe('[object Object]')
+    expect(describeFsError({ kind: 'brand_new_variant' })).toBe('[object Object]')
   })
 
   it('不是 IPC 错误时退回 Error / 字符串', () => {

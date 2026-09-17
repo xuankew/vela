@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { undo } from '@codemirror/commands'
-import { Compartment, EditorSelection, type EditorState } from '@codemirror/state'
+import {
+  Compartment,
+  EditorSelection,
+  type EditorState,
+  type StateEffect,
+  type TransactionSpec,
+} from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EditorController } from './controller'
@@ -178,7 +184,7 @@ describe('state 里的 onUpdate 是 CM6 → 外部的唯一回路', () => {
     const c = new EditorController(host, stateFor('abc', true, makeSlot(), onUpdate))
     c.view.dispatch({ changes: { from: 3, insert: '\ndef' } })
     expect(onUpdate).toHaveBeenCalledTimes(1)
-    expect(onUpdate.mock.calls[0][0]).toEqual({
+    expect(onUpdate.mock.calls[0]![0]).toEqual({
       docChanged: true,
       selectionChanged: false,
       lines: 2,
@@ -200,7 +206,7 @@ describe('state 里的 onUpdate 是 CM6 → 外部的唯一回路', () => {
     const c = new EditorController(host, stateFor('abc', true, makeSlot(), onUpdate))
     c.view.dispatch({ selection: EditorSelection.cursor(2) })
     expect(onUpdate).toHaveBeenCalledTimes(1)
-    expect(onUpdate.mock.calls[0][0]).toMatchObject({ docChanged: false, selectionChanged: true })
+    expect(onUpdate.mock.calls[0]![0]).toMatchObject({ docChanged: false, selectionChanged: true })
     c.destroy()
   })
 
@@ -221,6 +227,89 @@ describe('state 里的 onUpdate 是 CM6 → 外部的唯一回路', () => {
   })
 })
 
+describe('reveal（搜索结果与跳行共用的那一个原语）', () => {
+  /**
+   * 取出 `reveal` 那一次 dispatch 交进去的 spec。
+   *
+   * 之所以盯 dispatch 而不只看结果：这一条要钉的性质是「**一次** dispatch 做完三件事」。
+   * 分成三次的话中间那两帧会画出「光标已经跳了但还没滚过去」的样子，看着像闪了一下——
+   * 而选区与焦点两条断言在分成三次的写法下照样全绿。
+   */
+  function spyDispatch(c: EditorController): TransactionSpec {
+    const dispatch = vi.spyOn(c.view, 'dispatch')
+    c.reveal(4, 10)
+    expect(dispatch).toHaveBeenCalledTimes(1)
+    const spec = dispatch.mock.calls[0]![0]!
+    dispatch.mockRestore()
+    return spec
+  }
+
+  /**
+   * 把 spec 上那一份 effects 摊成数组（CM6 允许「单个」与「数组」两种写法）。
+   *
+   * 用 `'length' in …` 而不是 `Array.isArray` 收窄：后者对 readonly 数组会收成 `any[]`，
+   * 于是后面每一处访问都变成 unsafe member access，而 lint 是门禁的一部分。
+   */
+  function effectsOf(spec: TransactionSpec): readonly StateEffect<unknown>[] {
+    const raw = spec.effects
+    if (raw === undefined) return []
+    return 'length' in raw ? raw : [raw]
+  }
+
+  it('选区落到 anchor..head，光标也拿回来了', () => {
+    const c = new EditorController(host, stateFor('let a = needle;'))
+    c.reveal(8, 14)
+
+    const main = c.view.state.selection.main
+    expect(main.anchor).toBe(8)
+    expect(main.head).toBe(14)
+    expect(c.view.state.sliceDoc(main.from, main.to)).toBe('needle')
+    expect(document.activeElement).toBe(c.view.contentDOM)
+    c.destroy()
+  })
+
+  it('一次 dispatch 里同时带着选区与那一个「滚进视口」的效果', () => {
+    const c = new EditorController(host, stateFor('let a = needle;'))
+    const spec = spyDispatch(c)
+
+    expect(spec.selection).toEqual({ anchor: 4, head: 10 })
+    expect(effectsOf(spec)).toHaveLength(1)
+    c.destroy()
+  })
+
+  it('⚠️ 滚的是 y:center 而不是默认的 nearest', () => {
+    const c = new EditorController(host, stateFor('let a = needle;'))
+    const value = effectsOf(spyDispatch(c))[0]!.value as { y?: string }
+
+    // 读的是 CM6 那个滚动目标对象的字段名（`StateEffect` 只公开 value，类型标记不在公开面上）。
+    // 贴着视口上边或下边的话，人真正想看的那些上下文正好被裁掉，而「跳过去看一眼周围」
+    // 正是点搜索结果的全部目的——这一条值得钉住，哪怕代价是 CM6 改内部字段时它会红
+    // （红比悄悄退回 nearest 好）
+    expect(value.y).toBe('center')
+    c.destroy()
+  })
+
+  it('anchor 与 head 反着给也照样是一个方向正确的选区', () => {
+    const c = new EditorController(host, stateFor('let a = needle;'))
+    c.reveal(14, 8)
+
+    const main = c.view.state.selection.main
+    // CM6 自己会规范化 from/to，这里要钉的是「反着给不会抛、也不会选出别的东西」
+    expect(main.from).toBe(8)
+    expect(main.to).toBe(14)
+    c.destroy()
+  })
+
+  it('锚点相同的两个位置就是把光标放过去，不选中任何东西', () => {
+    const c = new EditorController(host, stateFor('let a = needle;'))
+    c.reveal(0, 0)
+
+    expect(c.view.state.selection.main.empty).toBe(true)
+    expect(c.view.state.selection.main.anchor).toBe(0)
+    c.destroy()
+  })
+})
+
 describe('destroy', () => {
   it('销毁后再操作会抛错，且重复销毁是安全的', () => {
     const c = new EditorController(host, stateFor('x'))
@@ -229,6 +318,7 @@ describe('destroy', () => {
     expect(() => c.destroy()).not.toThrow()
     expect(() => c.restore(snap)).toThrow(/已销毁/)
     expect(() => c.focus()).toThrow(/已销毁/)
+    expect(() => c.reveal(0, 0)).toThrow(/已销毁/)
   })
 
   it('销毁后 DOM 里的编辑器被摘掉', () => {

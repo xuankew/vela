@@ -74,6 +74,27 @@ export interface SessionTab {
   scrollLeft: number
 }
 
+/**
+ * 项目树那一头的现场。与 Rust `session::SessionProject` 一一对应。
+ *
+ * 与标签页是**两套独立的状态**：树管「磁盘上有什么」，标签管「打开了哪些文档」。
+ * 关掉文件夹不动任何标签，反过来也一样，所以它在存档里也是一个独立的可选部分。
+ */
+export interface SessionProject {
+  /** 项目根的绝对路径。恢复时原样喂给 `listDir`，前端不做任何路径算术 */
+  root: string
+  /**
+   * 摊开着的层的 `rel`，含 `''`（根那一层）。
+   *
+   * ⚠️ `''` 不是「没有值」，它就是根。丢了它，恢复出来的树是收起的——用户点开过的
+   * 文件夹全缩回去了，而这件事不报错，只会让人觉得「这功能没记住」。
+   *
+   * 条数上限由 `src/project/store.ts` 的 `MAX_RESTORED_EXPANDED` 负责，Rust 侧不截断
+   * （两边各截一次的结果是谁也说不清最终是多少条）。
+   */
+  expanded: string[]
+}
+
 /** 一次完整的会话快照 */
 export interface Session {
   /**
@@ -93,6 +114,19 @@ export interface Session {
    * Rust 侧的 `validate` 会直接拒掉重复的下标。
    */
   panes: number[]
+  /**
+   * 项目树。`null` = 上次没打开任何文件夹。
+   *
+   * 写成 `| null` 而不是 `?:`，与 `SessionTab.path` 同一条理由：`JSON.stringify` 会把
+   * `undefined` 的 key 整个删掉，而这个 key 在 Rust 侧是带 `#[serde(default)]` 的——
+   * 删掉恰好也能解析成 `None`，于是「拼错字段名」与「没打开文件夹」两种情况在线上
+   * 长得一模一样，错的那一种永远查不出来。永远带上 key，拼错了才会在契约测试里露出来。
+   *
+   * 加了它 `SESSION_VERSION` 仍然是 1：旧存档缺这个 key 时解析成 `null`（= 当时确实没
+   * 打开文件夹），新存档被旧版读到则整个字段被 serde 忽略。两个方向都优雅降级，
+   * 没有哪一边会得到半对半错的现场。完整推理见 Rust 侧同名字段的文档。
+   */
+  project: SessionProject | null
 }
 
 /** Rust `session::SessionReport` */

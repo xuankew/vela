@@ -307,8 +307,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   function makeTab(text = ''): Tab {
-    let tab: Tab
-    tab = createTab({
+    const tab: Tab = createTab({
       id: nextTabId++,
       text,
       config,
@@ -495,7 +494,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       return
     }
 
-    const elsewhere = new Set(panes().filter((p) => p.id !== victim.id).map((p) => p.tabId()))
+    const elsewhere = new Set(
+      panes()
+        .filter((p) => p.id !== victim.id)
+        .map((p) => p.tabId()),
+    )
     const free = rest.filter((t) => !elsewhere.has(t.id))
     if (free.length === 0) {
       const fresh = makeTab()
@@ -624,10 +627,22 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       direction: direction(),
       // 夹到 0：`findIndex` 落空时返回 -1，而 -1 对 serde 的 `usize` 是非法值，
       // 整份存档会解析失败。`focusedPane()` 本来也是「找不到就退回第一块」这个口径
-      focused: Math.max(0, paneList.findIndex((p) => p.id === focusedPaneId())),
+      focused: Math.max(
+        0,
+        paneList.findIndex((p) => p.id === focusedPaneId()),
+      ),
       tabs: list.map(serializeTab),
       // 下标一定取得到：tabsForSession 保证了显示中的标签一个都没被截掉
       panes: paneList.map((p) => indexOf.get(p.tabId())!),
+      // 这一格永远是 null，由 `sessionSync` 从项目树那边覆盖掉。
+      //
+      // 不在这里填是因为 workspace **不知道项目树存在**：树管「磁盘上有什么」，
+      // 这里管「打开了哪些标签」，两层是独立状态（`src/project/store.ts` 也不 import
+      // 本模块，否则两边成环）。返回类型仍然是完整的 `Session` 而不是 `Omit<…,'project'>`：
+      // `project: null` 本身就是一个合法的会话（= 没打开文件夹），而且
+      // `restoreSession(serializeSession())` 这条往返在测试里用了七次，
+      // 缺一个字段就得处处补，换来的只是把一句注释换成一个类型体操。
+      project: null,
     }
   }
 
@@ -701,6 +716,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   setTabs([firstTab])
   setPanes([firstPane])
   setFocusedPaneId(firstPane.id)
+  // `syncMetrics` 是普通函数（声明见上），读一次编辑器状态就把度量推进 signal。
+  // 插件把「读 signal 的函数」一律当成响应式变量、要求它待在 tracked scope 里，
+  // 但这里要的正是恢复完之后的**一次性**推送；套 createEffect 反而会让它跟着无关的 signal 重跑。
+  // eslint-disable-next-line solid/reactivity
   syncMetrics(firstTab)
 
   return {

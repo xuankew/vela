@@ -34,9 +34,14 @@ pub struct WriteReport {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WriteError {
-    Io { reason: String, message: String },
+    Io {
+        reason: String,
+        message: String,
+    },
     /// 传进来的是裸文件名（没有目录部分），无法确定临时文件放哪
-    NoParent { path: String },
+    NoParent {
+        path: String,
+    },
 }
 
 impl WriteError {
@@ -124,10 +129,7 @@ fn write_and_rename(tmp: &Path, parent: &Path, dest: &Path, bytes: &[u8]) -> Res
 /// 临时文件名带上 pid 与纳秒时间戳：同一个进程里连续保存两次、或者用户开了两个
 /// Vela 实例保存同名文件，都不该互相踩。
 fn tmp_path(parent: &Path, dest: &Path) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     parent.join(format!(".{name}.vela-tmp-{}-{stamp}", std::process::id()))
 }
@@ -147,7 +149,10 @@ mod tests {
         let path = dir.path().join("a.txt");
         let report = write_text_atomic(&path, "第一行\n第二行\n", fmt(Encoding::Utf8, LineEnding::Crlf)).unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), b"\xe7\xac\xac\xe4\xb8\x80\xe8\xa1\x8c\r\n\xe7\xac\xac\xe4\xba\x8c\xe8\xa1\x8c\r\n");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"\xe7\xac\xac\xe4\xb8\x80\xe8\xa1\x8c\r\n\xe7\xac\xac\xe4\xba\x8c\xe8\xa1\x8c\r\n"
+        );
         assert_eq!(report.bytes_written, 22);
         assert!(!report.unmappable);
     }
@@ -158,7 +163,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mixed.txt");
         write_text_atomic(&path, "第一行\r\n第二行\r\n", fmt(Encoding::Utf8, LineEnding::Crlf)).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"\xe7\xac\xac\xe4\xb8\x80\xe8\xa1\x8c\r\n\xe7\xac\xac\xe4\xba\x8c\xe8\xa1\x8c\r\n");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"\xe7\xac\xac\xe4\xb8\x80\xe8\xa1\x8c\r\n\xe7\xac\xac\xe4\xba\x8c\xe8\xa1\x8c\r\n"
+        );
         assert_eq!(read_text(&path).unwrap().text, "第一行\n第二行\n");
     }
 
@@ -212,10 +220,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no-such-dir").join("x.txt");
         let _ = write_text_atomic(&path, "x", fmt(Encoding::Utf8, LineEnding::Lf));
-        let leftovers: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let leftovers: Vec<_> =
+            fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert!(leftovers.is_empty(), "残留了 {leftovers:?}");
     }
 

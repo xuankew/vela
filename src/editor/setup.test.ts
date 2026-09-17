@@ -109,7 +109,12 @@ describe('indentLabel（状态栏那一格的文案）', () => {
 describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', () => {
   it('造出来的 state 与 buildExtensions 手工组装的等价：facet 一样齐', () => {
     const slot = new Compartment()
-    const state = createEditorState({ doc: '正文', lineWrap: true, lineWrapSlot: slot, languageSlot: new Compartment() })
+    const state = createEditorState({
+      doc: '正文',
+      lineWrap: true,
+      lineWrapSlot: slot,
+      languageSlot: new Compartment(),
+    })
     expect(state.doc.toString()).toBe('正文')
     expect(state.facet(EditorView.darkTheme)).toBe(true)
     expect(() => getSearchQuery(state)).not.toThrow()

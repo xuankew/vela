@@ -9,10 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  *
  * workspace 与编辑器是**真的**。这一层的全部价值就在于它读写的是真现场：拿替身
  * workspace 的话，「敲了字之后存档里到底有没有那个字」这条最关键的断言就成了自己
- * 跟自己玩。
+ * 跟自己玩。项目树同理（M2-B-4）：要测的正是「摊开一层会不会触发一次写」，
+ * 拿替身树等于把被测的那条链路自己先短路掉。
  */
 
-const { session, ipc, dialog } = vi.hoisted(() => ({
+const { session, ipc, dialog, project } = vi.hoisted(() => ({
   session: { loadSession: vi.fn(), saveSession: vi.fn() },
   ipc: {
     openFile: vi.fn(),
@@ -21,6 +22,7 @@ const { session, ipc, dialog } = vi.hoisted(() => ({
     ENCODING_LABELS: { utf8: 'UTF-8', utf16_le: 'UTF-16 LE', utf16_be: 'UTF-16 BE', gbk: 'GBK' },
   },
   dialog: { open: vi.fn(), save: vi.fn() },
+  project: { listDir: vi.fn(), describeTreeError: (err: unknown) => `模拟树错误：${JSON.stringify(err)}` },
 }))
 
 // 只盖掉两个 command。`describeSessionError` 用真的：提示文案本身就是要断言的东西
@@ -29,11 +31,14 @@ vi.mock('../ipc/session', async (importOriginal) => ({
   ...session,
 }))
 vi.mock('../ipc/fs', () => ipc)
+vi.mock('../ipc/project', () => project)
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
 
 import type { EditorState } from '@codemirror/state'
+import { createRoot } from 'solid-js'
 import { EditorController } from '../editor/controller'
 import type { TextFile, WriteReport } from '../ipc/fs'
+import type { DirEntry } from '../ipc/project'
 import {
   SESSION_VERSION,
   describeSessionError,
@@ -41,12 +46,8 @@ import {
   type SessionReport,
   type SessionTab,
 } from '../ipc/session'
-import {
-  createSessionSync,
-  SESSION_SYNC_INTERVAL_MS,
-  type Scheduler,
-  type SessionSync,
-} from './sessionSync'
+import { createProjectTree, type ProjectTree } from '../project/store'
+import { createSessionSync, SESSION_SYNC_INTERVAL_MS, type Scheduler, type SessionSync } from './sessionSync'
 import { createWorkspace, type Workspace } from './workspace'
 
 function textFile(overrides: Partial<TextFile> = {}): TextFile {
@@ -78,7 +79,9 @@ function sessionTab(overrides: Partial<SessionTab> = {}): SessionTab {
 }
 
 function sessionOf(tabs: SessionTab[], overrides: Partial<Session> = {}): Session {
-  return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], ...overrides }
+  // `project: null` 属于基底：`Partial<Session>` 里它是可选的，不写死一个值，
+  // 展开之后类型就成了 `| undefined`，而线上的 `Session.project` 只能是值或 null
+  return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], project: null, ...overrides }
 }
 
 /**
@@ -156,13 +159,49 @@ function remountAll(ws: Workspace) {
   }
 }
 
-function harness() {
+/** 待回收的 Solid 计算作用域 */
+const disposers: (() => void)[] = []
+
+/** 表驱动的假目录：rel → 条目。表里没有的 rel 一律 `not_found` */
+type FakeFs = Record<string, DirEntry[]>
+
+function dirEntry(rel: string, isDir = false): DirEntry {
+  return { name: rel.slice(rel.lastIndexOf('/') + 1), rel, path: `/repo/${rel}`, isDir }
+}
+
+/**
+ * 一棵**真的**项目树，只有 `list_dir` 是假的。
+ *
+ * 必须建在 `createRoot` 里：store 用了 `createMemo`，在作用域外建的话 Solid 会打印
+ * 「computations created outside a `createRoot` or `render` will never be disposed」，
+ * 而那条警告会把真正要看的东西淹掉。
+ */
+function makeTree(fs: FakeFs = {}): ProjectTree {
+  project.listDir.mockImplementation(async (_root: string, rel: string) => {
+    const entries = fs[rel]
+    if (!entries) {
+      // Rust 的 Err 是被序列化后原样抛出的普通对象，包一层 Error 会让
+      // describeTreeError 走到兜底分支上去（这里那个函数也是假的，但形状要保持一致）
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      throw { kind: 'not_found', path: `/repo/${rel}` }
+    }
+    return { rel, entries }
+  })
+  return createRoot((teardown) => {
+    disposers.push(teardown)
+    return createProjectTree({})
+  })
+}
+
+function harness(tree?: ProjectTree) {
   const ws = createWorkspace({ promptDiscard: async () => 'cancel' })
   const editor = attachEditor(ws, ws.panes()[0]!.id, ws.activeTab().snapshot.state)
   const clock = fakeClock()
   const warnings: string[] = []
   const sync: SessionSync = createSessionSync({
     workspace: ws,
+    // 不注入树的老调用方也必须照常工作（`project` 恒为 null），所以这里是可选的
+    project: tree,
     onWarn: (text) => warnings.push(text),
     schedule: clock.schedule,
   })
@@ -190,6 +229,7 @@ beforeEach(() => {
   ipc.saveFile.mockReset()
   dialog.open.mockReset()
   dialog.save.mockReset()
+  project.listDir.mockReset()
   session.loadSession.mockReset()
   session.saveSession.mockReset()
   ipc.openFile.mockResolvedValue(textFile())
@@ -199,6 +239,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  for (const dispose of disposers.splice(0)) dispose()
   for (const { controller, host } of liveEditors.splice(0)) {
     controller.destroy()
     host.remove()
@@ -268,7 +309,7 @@ describe('start：启动时读回上次的会话', () => {
     const warnings: string[] = []
     const clock = fakeClock()
     const sync = createSessionSync({
-      workspace: { ...ws, restoreSession } as unknown as Workspace,
+      workspace: { ...ws, restoreSession },
       onWarn: (t) => warnings.push(t),
       schedule: clock.schedule,
     })
@@ -503,5 +544,157 @@ describe('stop', () => {
     const h = harness()
     expect(() => h.sync.stop()).not.toThrow()
     expect(h.clock.cancelled).toBe(0)
+  })
+})
+
+describe('项目树那一半（M2-B-4）', () => {
+  /** 一个两层的小仓库：根下有 src 与 README.md，src 下有 a.ts */
+  const FS: FakeFs = {
+    '': [dirEntry('src', true), dirEntry('README.md')],
+    src: [dirEntry('src/a.ts')],
+  }
+
+  /** `list_dir` 收到的 (root, rel) 序列。并行读回来的顺序不保证，所以断言前先排序 */
+  function listed(): string[] {
+    return project.listDir.mock.calls.map((c) => `${c[0] as string}|${c[1] as string}`).sort()
+  }
+
+  it('没打开文件夹时 project 是 null，而不是整个键消失', async () => {
+    const h = harness(makeTree(FS))
+    await h.sync.start()
+    await h.clock.fire()
+
+    expect(lastSaved().project).toBeNull()
+    // 键必须在：`JSON.stringify` 删掉 undefined 的键，而「缺键」与「字段名拼错」
+    // 在线上长得一模一样
+    expect(session.saveSession.mock.calls[0]![0] as Record<string, unknown>).toHaveProperty('project', null)
+  })
+
+  it('没注入树的老调用方照常工作，project 也是 null', async () => {
+    const h = harness()
+    await h.sync.start()
+    await h.clock.fire()
+
+    expect(lastSaved().project).toBeNull()
+    expect(h.warnings).toEqual([])
+  })
+
+  it('打开文件夹之后，那一半被拼进存档；标签那一半一个字不变', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    await h.sync.start()
+
+    await tree.openAt('/repo')
+    await h.clock.fire()
+
+    const saved = lastSaved()
+    expect(saved.project).toEqual({ root: '/repo', expanded: [''] })
+    // 拼的是**同一个对象**，不是把 workspace 那半覆盖掉：
+    // `serializeSession` 返回的 project 恒为 null，展开顺序错了就会是这样
+    expect(saved.tabs).toHaveLength(1)
+    expect(saved.panes).toEqual([0])
+    expect(saved.version).toBe(SESSION_VERSION)
+  })
+
+  it('只摊开一层（不动任何标签）也会触发一次写', async () => {
+    // ⚠️ 这条钉的是「指纹在拼接**之后**算」。算早了的话，摊开/收起文件夹永远不会
+    // 被认成改动，存档就悄悄停在旧的展开状态——不报错，用户重启后发现树缩回去了
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    await h.sync.start()
+    await tree.openAt('/repo')
+    await h.clock.fire()
+    expect(session.saveSession).toHaveBeenCalledTimes(1)
+
+    await tree.toggle('src')
+    await h.clock.fire()
+    expect(session.saveSession).toHaveBeenCalledTimes(2)
+    expect(lastSaved().project).toEqual({ root: '/repo', expanded: ['', 'src'] })
+  })
+
+  it('收起之后要再写一次：比对的对象是「上次写出去的」，不是「以前写过没有」', async () => {
+    // 摊开 → 收起，序列化结果回到了最初那份，但**盘上那份还停在摊开的状态**。
+    // 所以这里必须再写一次。要是 `lastSent` 记的是「见过的所有指纹」，
+    // 这一下就会被跳过，重启后树是摊开的——正是用户刚才亲手收起的那一层。
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    await h.sync.start()
+    await tree.openAt('/repo')
+    await h.clock.fire()
+    await tree.toggle('src')
+    await h.clock.fire()
+    expect(session.saveSession).toHaveBeenCalledTimes(2)
+
+    await tree.toggle('src')
+    await h.clock.fire()
+    expect(session.saveSession).toHaveBeenCalledTimes(3)
+    expect(lastSaved().project).toEqual({ root: '/repo', expanded: [''] })
+
+    // 现场没再动过，这一轮就该什么都不写
+    await h.clock.fire()
+    expect(session.saveSession).toHaveBeenCalledTimes(3)
+  })
+
+  it('start 把 project 交回给树，并按 expanded 逐层读回来', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    session.loadSession.mockResolvedValue(
+      sessionOf([sessionTab({ path: '/a.txt' })], { project: { root: '/repo', expanded: ['', 'src'] } }),
+    )
+
+    await h.sync.start()
+
+    expect(tree.root()).toBe('/repo')
+    // 两层都读了，而且是并行发出的（顺序不保证，所以排序后比）
+    expect(listed()).toEqual(['/repo|', '/repo|src'])
+    // 标签那一半同时装好了：两半是并行的，不是「先标签，成了才轮到树」
+    expect(h.ws.tabs()).toHaveLength(1)
+    expect(h.ws.activeTab().doc.path()).toBe('/a.txt')
+    expect(h.warnings).toEqual([])
+  })
+
+  it('存档里 project 是 null 时树保持空，标签照常恢复', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    session.loadSession.mockResolvedValue(sessionOf([sessionTab({ path: '/a.txt' })]))
+
+    await h.sync.start()
+
+    expect(tree.root()).toBeNull()
+    expect(project.listDir).not.toHaveBeenCalled()
+    expect(h.ws.tabs()).toHaveLength(1)
+  })
+
+  it('存档里那一层已经不存在时，别的层照常恢复，不牵连标签也不报警', async () => {
+    // 文件夹被移动/删除是常态（换机器、外挂盘没插）。为它赔掉整个会话是错的，
+    // 所以这条路径既不该抛，也不该走 onWarn。
+    //
+    // 而那一层自己也**画不出错误行**：行是从 listings 摊出来的，一个磁盘上已经不存在的
+    // `rel` 压根不在任何 listing 里，没有行可挂。错误只是记在 store 的 errors 表里。
+    // 这是对的——那个文件夹没了，树上就该什么都不显示，而不是凭空多出一行红字。
+    const tree = makeTree({ '': [dirEntry('src', true)] })
+    const h = harness(tree)
+    session.loadSession.mockResolvedValue(
+      sessionOf([sessionTab({ path: '/a.txt' })], { project: { root: '/repo', expanded: ['', '已经没了'] } }),
+    )
+
+    await h.sync.start()
+
+    expect(tree.root()).toBe('/repo')
+    expect(tree.rows().map((r) => r.name)).toEqual(['repo', 'src'])
+    expect(h.ws.tabs()).toHaveLength(1)
+    expect(h.warnings).toEqual([])
+  })
+
+  it('saveNow（关窗放行前那一次）也带上树那一半', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    await h.sync.start()
+    await tree.openAt('/repo')
+    await tree.toggle('src')
+
+    await h.sync.saveNow()
+
+    expect(lastSaved().project).toEqual({ root: '/repo', expanded: ['', 'src'] })
   })
 })

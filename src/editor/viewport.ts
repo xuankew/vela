@@ -22,7 +22,7 @@ export const DECO_MARGIN_PX = 2000
 export function visibleSpan(view: EditorView): { from: number; to: number } | null {
   const ranges = view.visibleRanges
   if (ranges.length === 0) return null
-  return { from: ranges[0].from, to: ranges[ranges.length - 1].to }
+  return { from: ranges[0]!.from, to: ranges[ranges.length - 1]!.to }
 }
 
 export interface CoveredRange {

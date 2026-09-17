@@ -65,6 +65,9 @@ describe('EditorPane（Solid ↔ CM6 边界）', () => {
     )
 
     controller?.view.dispatch({ changes: { from: 3, insert: '\nc' } })
+    // 测试要的就是「同步读到当前值」。放进 createEffect 里读，断言会推到下一个 tick 才跑，
+    // 用例反而会绿得毫无意义。
+    // eslint-disable-next-line solid/reactivity
     expect(lines()).toBe(3)
   })
 

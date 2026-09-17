@@ -39,10 +39,7 @@ export interface ViewConfig {
   readonly peerStates: () => Iterable<EditorState>
 }
 
-export function createViewConfig(
-  lineWrap = true,
-  peerStates: () => Iterable<EditorState> = () => [],
-): ViewConfig {
+export function createViewConfig(lineWrap = true, peerStates: () => Iterable<EditorState> = () => []): ViewConfig {
   return { lineWrap, lineWrapSlot: new Compartment(), peerStates }
 }
 
@@ -110,10 +107,9 @@ export function buildState(
 export function createTab(init: CreateTabInit): Tab {
   // 每标签一个实例：语言是标签的属性，共享实例会让改一个标签的语言波及全部
   const languageSlot = new Compartment()
-  // `tab` 在自己的初始化表达式里被三个闭包引用。闭包只会在 createTab 返回之后被调用，
-  // 所以这不是 TDZ 问题；写成两段赋值只是为了让 host 能拿到标签自己。
-  let tab: Tab
-  tab = {
+  // `tab` 在自己的初始化表达式里被三个闭包引用。闭包捕获的是绑定而不是值，
+  // 而且只会在 createTab 返回之后才被调用，所以写成 const 也撞不上 TDZ。
+  const tab: Tab = {
     id: init.id,
     snapshot: {
       state: buildState(init.text ?? '', init.config, languageSlot, init.onUpdate),

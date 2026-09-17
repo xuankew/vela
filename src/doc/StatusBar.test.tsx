@@ -20,20 +20,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  */
 
 const { ipc, dialog } = vi.hoisted(() => ({
-  ipc: { openFile: vi.fn(), saveFile: vi.fn() },
+  ipc: {
+    openFile: vi.fn<typeof import('../ipc/fs').openFile>(),
+    saveFile: vi.fn<typeof import('../ipc/fs').saveFile>(),
+  },
   dialog: { open: vi.fn(), save: vi.fn() },
 }))
 
 vi.mock('../ipc/fs', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../ipc/fs')>()),
-  openFile: (...args: unknown[]) => ipc.openFile(...args),
-  saveFile: (...args: unknown[]) => ipc.saveFile(...args),
+  openFile: ipc.openFile,
+  saveFile: ipc.saveFile,
 }))
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
 
 import { EditorSelection } from '@codemirror/state'
 import { EditorController } from '../editor/controller'
-import type { FileFormat, TextFile } from '../ipc/fs'
+import type { TextFile } from '../ipc/fs'
 import { StatusBar } from './StatusBar'
 import { createWorkspace, type Workspace } from './workspace'
 
@@ -45,7 +48,7 @@ const liveEditors: { controller: EditorController; host: HTMLElement }[] = []
 function textFile(overrides: Partial<TextFile> = {}): TextFile {
   return {
     text: '正文',
-    format: { encoding: 'utf8', bom: false, eol: 'lf' } as FileFormat,
+    format: { encoding: 'utf8', bom: false, eol: 'lf' },
     lossy: false,
     bytes: 6,
     ...overrides,
@@ -99,7 +102,9 @@ function cell(titled: string): string | undefined {
 
 /** 像用户那样拨一下下拉：先设 value，再派发 change（Solid 的 onChange 收的就是这个） */
 function pick(titled: string, value: string) {
-  const select = cellElements().find((c) => c.title === titled)?.querySelector('select')
+  const select = cellElements()
+    .find((c) => c.title === titled)
+    ?.querySelector('select')
   if (!select) throw new Error(`「${titled}」那一格里没有下拉`)
   select.value = value
   select.dispatchEvent(new Event('change', { bubbles: true }))
@@ -131,22 +136,12 @@ describe('StatusBar', () => {
   it('空文档：七格齐全，语言是 Markdown，选区那两格不出现', () => {
     mount()
 
-    expect(cells()).toEqual([
-      '空文档',
-      '行 1，列 1',
-      '2 空格',
-      'UTF-8',
-      'LF',
-      'Markdown',
-      '1 行 · 0 字符',
-    ])
+    expect(cells()).toEqual(['空文档', '行 1，列 1', '2 空格', 'UTF-8', 'LF', 'Markdown', '1 行 · 0 字符'])
   })
 
   it('编码、BOM 与换行符照文件原样报出来，不美化', async () => {
     const ws = mount()
-    ipc.openFile.mockResolvedValue(
-      textFile({ format: { encoding: 'utf16_le', bom: true, eol: 'crlf' }, lossy: true }),
-    )
+    ipc.openFile.mockResolvedValue(textFile({ format: { encoding: 'utf16_le', bom: true, eol: 'crlf' }, lossy: true }))
 
     await ws.openAt('/x/win.txt')
 

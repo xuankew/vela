@@ -32,13 +32,14 @@ vi.mock('../editor/language', async (importOriginal) => {
     loadSupport: (choice: LanguageChoice) =>
       lazyLoad.held
         ? new Promise<LanguageSupport | null>((resolve) => {
-            lazyLoad.parked.push(() =>
-              void real.loadSupport(choice).then((support) => {
-                // 记一笔「晚到的结果真的落地了」：断言的是「落地了却没被采用」，
-                // 没这一笔就只能靠 sleep 猜，猜短了用例就是空跑
-                lazyLoad.landings.push(support)
-                resolve(support)
-              }),
+            lazyLoad.parked.push(
+              () =>
+                void real.loadSupport(choice).then((support) => {
+                  // 记一笔「晚到的结果真的落地了」：断言的是「落地了却没被采用」，
+                  // 没这一笔就只能靠 sleep 猜，猜短了用例就是空跑
+                  lazyLoad.landings.push(support)
+                  resolve(support)
+                }),
             )
           })
         : real.loadSupport(choice),
@@ -1341,7 +1342,9 @@ describe('M1-F-4：会话序列化与恢复', () => {
   }
 
   function sessionOf(tabs: SessionTab[], overrides: Partial<Session> = {}): Session {
-    return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], ...overrides }
+    // `project: null` 是基底的一部分：这些用例都只关心标签页那一半，
+    // 而 `Partial<Session>` 里它是可选的——不写死一个值，展开之后类型就成了 `| undefined`
+    return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], project: null, ...overrides }
   }
 
   /**
@@ -1485,6 +1488,10 @@ describe('M1-F-4：会话序列化与恢复', () => {
 
   it('一个文件读不回来不影响其余标签：错误落在那个标签自己的提示条上', async () => {
     ipc.openFile.mockImplementation(async (path: string) => {
+      // 抛的**就是**那个普通对象：Tauri 的 invoke 在 Rust command 返回 Err 时拒绝的正是
+      // 这个序列化结果，下游断言也靠 `kind` 字面量认它。换成 Error 实例等于测一个
+      // 生产环境里根本不存在的形状。
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
       if (path === '/gone.txt') throw { kind: 'io', reason: 'NotFound', message: '没了' }
       return textFile({ text: `${path} 的正文` })
     })

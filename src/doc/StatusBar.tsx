@@ -38,6 +38,9 @@ const SAVE = 'save:'
  * （和语言槽位同一条理由），而「轻量编辑器里从状态栏改缩进」这件事本身就不是刚需。
  */
 export function StatusBar(props: StatusBarProps) {
+  // `workspace` 是 createWorkspace() 返回的普通对象（一组访问器），不是 signal；
+  // App 只建它一次、也从不换引用，响应式读取全走 `ws.tabs()` 这类访问器，别名不需要被追踪。
+  // eslint-disable-next-line solid/reactivity
   const ws = props.workspace
   const doc = () => ws.activeTab().doc
   const m = () => ws.metrics()

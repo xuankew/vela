@@ -153,7 +153,13 @@ describe('conflicts', () => {
   it('注销一方后冲突消失', () => {
     const registry = makeRegistry()
     registry.register({ id: 'a.first', title: '先', category: 'a', keybinding: 'Mod+P', run: () => {} })
-    const dispose = registry.register({ id: 'a.second', title: '后', category: 'a', keybinding: 'Mod+P', run: () => {} })
+    const dispose = registry.register({
+      id: 'a.second',
+      title: '后',
+      category: 'a',
+      keybinding: 'Mod+P',
+      run: () => {},
+    })
     expect(registry.conflicts()).toHaveLength(1)
     dispose()
     expect(registry.conflicts()).toEqual([])

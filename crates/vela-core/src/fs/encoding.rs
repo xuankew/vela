@@ -82,12 +82,7 @@ pub fn decode(bytes: &[u8]) -> Decoded {
 
     // ASCII 是合法 UTF-8，所以绝大多数源代码文件都在这一行就返回了，不必进 encoding_rs
     if let Ok(text) = std::str::from_utf8(bytes) {
-        return Decoded {
-            text: text.to_owned(),
-            encoding: Encoding::Utf8,
-            bom: false,
-            lossy: false,
-        };
+        return Decoded { text: text.to_owned(), encoding: Encoding::Utf8, bom: false, lossy: false };
     }
 
     decode_with(bytes, Encoding::Gbk, false)

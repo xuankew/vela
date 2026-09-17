@@ -102,11 +102,7 @@ mod tests {
 
             let report = write_text_atomic(&path, &read_back.text, read_back.format).unwrap();
             assert!(!report.unmappable, "有字符无法映射：{format:?}");
-            assert_eq!(
-                fs::read(&path).unwrap(),
-                payload,
-                "「打开→保存」改动了文件字节：{format:?}"
-            );
+            assert_eq!(fs::read(&path).unwrap(), payload, "「打开→保存」改动了文件字节：{format:?}");
         }
     }
 
@@ -145,11 +141,11 @@ mod tests {
             fs::write(&path, b"token=1").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
-            write_text_atomic(&path, "token=2", FileFormat {
-                encoding: Encoding::Utf8,
-                bom: false,
-                eol: LineEnding::Lf,
-            })
+            write_text_atomic(
+                &path,
+                "token=2",
+                FileFormat { encoding: Encoding::Utf8, bom: false, eol: LineEnding::Lf },
+            )
             .unwrap();
 
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -162,12 +158,8 @@ mod tests {
     fn 保存后目录里不留临时文件() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
-        write_text_atomic(
-            &path,
-            "内容",
-            FileFormat { encoding: Encoding::Utf8, bom: false, eol: LineEnding::Lf },
-        )
-        .unwrap();
+        write_text_atomic(&path, "内容", FileFormat { encoding: Encoding::Utf8, bom: false, eol: LineEnding::Lf })
+            .unwrap();
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

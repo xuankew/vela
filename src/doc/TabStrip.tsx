@@ -21,6 +21,9 @@ export interface TabStripProps {
  * 不是把它搬到当前分屏来（见 `workspace.activateTab`），长得和后台标签一样就无从解释。
  */
 export function TabStrip(props: TabStripProps) {
+  // 与 StatusBar 同理：`workspace` 是 createWorkspace() 返回的普通对象，不是 signal，
+  // App 只建一次也从不换引用；响应式读取全走 `ws.tabs()` 这类访问器。
+  // eslint-disable-next-line solid/reactivity
   const ws = props.workspace
   /** 正在被拖的标签。不是 signal：拖拽过程中没有任何渲染依赖它 */
   let draggedId: number | null = null

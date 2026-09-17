@@ -67,9 +67,9 @@ function pixel(x, y) {
 
   const t = y / SIZE
   // 背景：Tokyo Night 系的深蓝垂直渐变
-  let r = lerp(0x1a, 0x24, t)
-  let g = lerp(0x1b, 0x28, t)
-  let b = lerp(0x26, 0x3b, t)
+  const r = lerp(0x1a, 0x24, t)
+  const g = lerp(0x1b, 0x28, t)
+  const b = lerp(0x26, 0x3b, t)
 
   const MAST_TOP = 92
   const MAST_BOTTOM = 424

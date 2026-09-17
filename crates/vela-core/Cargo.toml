@@ -1,6 +1,6 @@
 [package]
 name = "vela-core"
-description = "Vela 的框架无关内核：文件 IO、编码探测、行尾、原子写入、会话存档"
+description = "Vela 的框架无关内核：文件 IO、编码探测、行尾、原子写入、会话存档、目录树、全文搜索"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,14 @@ publish.workspace = true
 
 [dependencies]
 encoding_rs.workspace = true
+# M2-C 全局搜索：`ignore` 负责遍历与 .gitignore 过滤，`grep-*` 是 ripgrep 的库化产物
+# （`grep-regex` 编正则、`grep-searcher` 按行扫正文、`grep-matcher` 是两者的接口 trait），
+# `globset` 负责 include/exclude 通配。五条都是 Unlicense OR MIT
+globset.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
 serde.workspace = true
 # M1-F 起是运行时依赖：会话存档就是 Rust 侧自己序列化出来的 JSON。
 # 在那之前它只服务于「线上契约」黄金 JSON 测试

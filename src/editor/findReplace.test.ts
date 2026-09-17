@@ -149,9 +149,10 @@ describe('collectMatches：与 CM6 自己的匹配集合对齐', () => {
     applyQuery(view, { search: 'foo' })
     expect(selectMatches(view)).toBe(true)
     const cm6Ranges = view.state.selection.ranges.map((r) => [r.from, r.to])
-    const mine = collectMatches(view.state, getSearchQuery(view.state), 0, view.state.doc.length, NO_LIMIT).map(
-      (m) => [m.from, m.to],
-    )
+    const mine = collectMatches(view.state, getSearchQuery(view.state), 0, view.state.doc.length, NO_LIMIT).map((m) => [
+      m.from,
+      m.to,
+    ])
     expect(mine).toEqual(cm6Ranges)
     expect(mine).toHaveLength(4)
   })

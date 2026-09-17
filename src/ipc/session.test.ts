@@ -22,6 +22,7 @@ import {
   SESSION_VERSION,
   type PaneDirectionId,
   type Session,
+  type SessionProject,
   type SessionReport,
   type SessionTab,
 } from './session'
@@ -32,7 +33,7 @@ import {
  * 多光标、非零滚动、column 方向。
  */
 const GOLDEN_SESSION =
-  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1]}'
+  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"root":"/Users/me/code/vela","expanded":["","src/doc"]}}'
 
 /**
  * 同一份数据在 `JSON.stringify` 之后的样子。与上面**只差三处**：`0.0` 变成 `0`。
@@ -42,10 +43,10 @@ const GOLDEN_SESSION =
  * 把两个字面量并排放在这里，是为了让这点差异**看得见**，而不是让人对着两个文件犯嘀咕。
  */
 const GOLDEN_SESSION_JS =
-  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0}],"panes":[0,1]}'
+  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0}],"panes":[0,1],"project":{"root":"/Users/me/code/vela","expanded":["","src/doc"]}}'
 
-/** 437 = GOLDEN_SESSION 的 UTF-8 字节数（不是字符数，中文占 3 字节），下面有用例钉住这条关系 */
-const GOLDEN_REPORT = '{"bytesWritten":437,"droppedDrafts":0}'
+/** 504 = GOLDEN_SESSION 的 UTF-8 字节数（不是字符数，中文占 3 字节），下面有用例钉住这条关系 */
+const GOLDEN_REPORT = '{"bytesWritten":504,"droppedDrafts":0}'
 
 /** 与 GOLDEN_SESSION 语义相同的对象字面量，用来做 deep-equal 与「前端能不能造出来」的检查 */
 function sampleSession(): Session {
@@ -82,6 +83,9 @@ function sampleSession(): Session {
       },
     ],
     panes: [0, 1],
+    // 空字符串是**根**那一层的 rel。它出现在契约里，是为了让「两边对根怎么表示」这件事
+    // 有个对照物——漂了的表现是重启后树整个收起，而不是一条报错
+    project: { root: '/Users/me/code/vela', expanded: ['', 'src/doc'] },
   }
 }
 
@@ -94,7 +98,7 @@ describe('Rust → 前端 的字段名', () => {
     const parsed = JSON.parse(GOLDEN_SESSION) as Session
     // 键顺序就是 JSON.parse 的插入顺序，所以 stringify 相等 == 字段集合与顺序都相等
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SESSION_JS)
-    expect(Object.keys(parsed)).toEqual(['version', 'direction', 'focused', 'tabs', 'panes'])
+    expect(Object.keys(parsed)).toEqual(['version', 'direction', 'focused', 'tabs', 'panes', 'project'])
     expect(Object.keys(parsed.tabs[0]!)).toEqual([
       'path',
       'format',
@@ -137,9 +141,10 @@ describe('Rust → 前端 的字段名', () => {
   it('f64 的 0.0 与 JS 的 0 是同一个数，不是漂移', () => {
     expect(JSON.parse('{"scrollTop":0.0}')).toEqual({ scrollTop: 0 })
     expect(JSON.stringify({ scrollTop: 0 })).toBe('{"scrollTop":0}')
-    expect(JSON.parse(GOLDEN_SESSION).tabs[0].scrollTop).toBe(0)
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    expect(parsed.tabs[0]!.scrollTop).toBe(0)
     // 小数照常往返
-    expect(JSON.parse(GOLDEN_SESSION).tabs[1].scrollTop).toBe(120.5)
+    expect(parsed.tabs[1]!.scrollTop).toBe(120.5)
   })
 
   it('SessionReport 的字段名是 camelCase', () => {
@@ -154,10 +159,58 @@ describe('Rust → 前端 的字段名', () => {
   it('版本号与标签上限与 Rust 侧同值', () => {
     // SESSION_VERSION 对不上时 Rust 会整份作废存档，所以这两个数字是契约的一部分
     expect(SESSION_VERSION).toBe(1)
-    expect(JSON.parse(GOLDEN_SESSION).version).toBe(SESSION_VERSION)
+    expect((JSON.parse(GOLDEN_SESSION) as Session).version).toBe(SESSION_VERSION)
     // 64 个标签的元信息最多几十 KB，离 4MB 的 IPC 上限有两个数量级——
     // 这是「丢草稿一定能把体积压下来」这条路走得通的前提
     expect(MAX_SESSION_TABS).toBe(64)
+  })
+})
+
+describe('project 字段（M2-B-4）', () => {
+  it('SessionProject 的字段名与顺序与 Rust 侧一致', () => {
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    const project = parsed.project
+    expect(project).not.toBeNull()
+    expect(Object.keys(project!)).toEqual(['root', 'expanded'])
+    expect(project!.root).toBe('/Users/me/code/vela')
+
+    const golden = '{"root":"/r","expanded":["","src","src/doc"]}'
+    const made: SessionProject = { root: '/r', expanded: ['', 'src', 'src/doc'] }
+    expect(JSON.stringify(made)).toBe(golden)
+    expect(JSON.parse(golden)).toEqual(made)
+  })
+
+  it('expanded 里的空字符串就是根那一层，不是「没有值」', () => {
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    expect(parsed.project!.expanded).toEqual(['', 'src/doc'])
+    // 漂了的表现是重启后树整个收起：`''` 变成 `undefined` 或被过滤掉，
+    // `flattenRows` 就只画出根那一行，而控制台一行错都没有
+    expect(parsed.project!.expanded[0]).toBe('')
+    expect(parsed.project!.expanded.filter((rel) => rel === '')).toHaveLength(1)
+  })
+
+  it('project 永远出现在序列化结果里，不会被 undefined 吃掉', () => {
+    // Rust 侧刻意不用 skip_serializing_if，前端也就不写 `?:`。
+    // 两条合起来的效果是：字段名拼错会在上面的键顺序断言里当场红，
+    // 而不是悄悄退化成「上次没打开文件夹」
+    expect(JSON.stringify(sampleSession())).toContain('"project":{')
+    const closed: Session = { ...sampleSession(), project: null }
+    expect(JSON.stringify(closed)).toContain('"project":null')
+    expect(Object.keys(closed)).toContain('project')
+  })
+
+  it('发出去的 payload 永远带 project 键，哪怕没打开文件夹', async () => {
+    // 缺键的**旧存档**由 Rust 的 `Deserialize` 填成 `null` 再序列化回来，前端压根看不到
+    // 那种形状（那条在 `wire_contract.rs` 的 `缺少_project_键的旧存档照常解析` 里钉）。
+    // 前端这边的义务只有一个：自己发出去的东西永远带上这个键。
+    invoke.mockResolvedValue(JSON.parse(GOLDEN_REPORT))
+    await saveSession({ ...sampleSession(), project: null })
+    const sent = invoke.mock.calls[0]![1] as { session: Session }
+    expect(Object.keys(sent.session)).toContain('project')
+    expect(sent.session.project).toBeNull()
+    // 而不是 undefined——后者会被 JSON.stringify 整个删掉，落到线上就成了「缺键」，
+    // 与「字段名拼错」长得一模一样
+    expect(JSON.stringify(sent.session)).toContain('"project":null')
   })
 })
 
@@ -235,7 +288,7 @@ describe('错误落地成人能读的话', () => {
   })
 
   it('Rust 侧将来加了变体而前端没跟上时，不会抛', () => {
-    expect(describeSessionError({ kind: 'brand_new_variant' } as unknown)).toBe('[object Object]')
+    expect(describeSessionError({ kind: 'brand_new_variant' })).toBe('[object Object]')
   })
 
   it('不是 IPC 错误时退回 Error / 字符串', () => {

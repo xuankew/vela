@@ -1,0 +1,11 @@
+# 生成物：格式化了下次生成又会被覆盖回去，只会制造无意义的 diff
+pnpm-lock.yaml
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# PLAN.md / M0-REPORT.md 是手写文档，里面有大量刻意压成单行的 Markdown 表格
+# 和多层 `>` 引用块。prettier 会重排表格列宽、拆行，产出的 diff 与内容无关，
+# 还会把「哪一列写什么」这个人肉排版决定抢过去。文档不归 formatter 管。
+*.md

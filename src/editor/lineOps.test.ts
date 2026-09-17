@@ -21,7 +21,12 @@ function run(command: StateCommand, doc: string, ranges?: [number, number][]): s
   // 用 holder 对象而不是捕获的 let：TS 看不出 dispatch 闭包是同步跑的，
   // 会把 `next` 收窄成 null，到 `next?.toString()` 就变成 never 上的属性访问。
   const out: { doc: Text | null } = { doc: null }
-  const accepted = command({ state, dispatch: (tr) => { out.doc = tr.state.doc } })
+  const accepted = command({
+    state,
+    dispatch: (tr) => {
+      out.doc = tr.state.doc
+    },
+  })
   expect(accepted).toBe(out.doc !== null)
   return out.doc?.toString() ?? null
 }
@@ -75,13 +80,23 @@ describe('排序的作用范围', () => {
   it('选区行范围重叠时合并成一块，而不是下发 CM6 会拒绝的重叠变更', () => {
     // 两个选区都覆盖 'b\na' 这一段
     const doc = 'b\na\nc'
-    expect(run(sortLinesAscending, doc, [[0, 3], [2, 5]])).toBe('a\nb\nc')
+    expect(
+      run(sortLinesAscending, doc, [
+        [0, 3],
+        [2, 5],
+      ]),
+    ).toBe('a\nb\nc')
   })
 
   it('相邻两行的选区合并成一块（跨过中间那个换行符）', () => {
     const doc = 'c\nb\na'
     // [0,1]='c' 与 [2,3]='b' 相邻 → 合成 c/b 一块，'a' 不参与
-    expect(run(sortLinesAscending, doc, [[0, 1], [2, 3]])).toBe('b\nc\na')
+    expect(
+      run(sortLinesAscending, doc, [
+        [0, 1],
+        [2, 3],
+      ]),
+    ).toBe('b\nc\na')
   })
 
   it('末尾换行符原样保留：CM6 把它算作一个空行，排序后空行落到最前', () => {
@@ -120,7 +135,12 @@ describe('排序口径', () => {
 
   it('多块里只要有一块需要改就下发；两块都没变才拒绝', () => {
     const doc = 'a\nb\n---\nd\nc'
-    expect(run(sortLinesAscending, doc, [[0, 3], [8, 11]])).toBe('a\nb\n---\nc\nd')
+    expect(
+      run(sortLinesAscending, doc, [
+        [0, 3],
+        [8, 11],
+      ]),
+    ).toBe('a\nb\n---\nc\nd')
     expect(run(sortLinesAscending, doc, [[0, 3]])).toBeNull()
   })
 
@@ -132,7 +152,12 @@ describe('排序口径', () => {
       extensions: [EditorState.allowMultipleSelections.of(true)],
     })
     let count = 0
-    sortLinesAscending({ state, dispatch: () => { count += 1 } })
+    sortLinesAscending({
+      state,
+      dispatch: () => {
+        count += 1
+      },
+    })
     expect(count).toBe(1)
   })
 })

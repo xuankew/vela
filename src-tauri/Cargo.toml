@@ -16,8 +16,22 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# M2-C 的事件载荷（`{ taskId, batch }` 那一类）要 derive Serialize。
+# 用 workspace 里那一份：许可证已核实（MIT OR Apache-2.0），而且 Tauri 本来就带着它，
+# 所以这一行不往 Cargo.lock 里加任何新东西
+serde = { workspace = true }
 # 原生「打开 / 另存为」对话框。用 JS 侧的 plugin-dialog 调用（前端本来就需要拿到路径
 # 去做窗口标题、脏标记与后续保存），所以 Rust 侧只需要把插件注册进 Builder。
 tauri-plugin-dialog = "2"
+# 右键菜单的「删除」= 移到废纸篓（M2-B-5）。许可证已核实（闭源硬约束，见 PLAN.md）：
+# trash 5.2.9 = MIT。macOS 那一侧走 objc2/cocoa-foundation，Linux 走 D-Bus 或 CLI，
+# 而 CI 的 rust job 在 ubuntu 上只**编译**它——`trash::delete` 是系统调用，
+# 刻意不进 vela-core（单测会把临时文件塞进开发机的真实废纸篓），见 `vela-core/src/project/ops.rs`
+trash = "5.2"
 # 文件 IO 的真正实现住在框架无关的 vela-core 里，这一层只是 Tauri command 适配器
 vela-core = { path = "../crates/vela-core" }
+
+[dev-dependencies]
+# 只为了把三个搜索事件载荷的形状钉成黄金 JSON（与 `src/ipc/search.test.ts` 对照）。
+# 生产代码不序列化 JSON，Tauri 自己那一份不对外露。许可证同上：MIT OR Apache-2.0
+serde_json = { workspace = true }

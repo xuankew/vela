@@ -33,6 +33,10 @@ function makeHooks(): BuiltinHooks {
     closePane: vi.fn(),
     focusNextPane: vi.fn(),
     focusPreviousPane: vi.fn(),
+    openFolder: vi.fn(),
+    closeFolder: vi.fn(),
+    toggleSidebar: vi.fn(),
+    findInFiles: vi.fn(),
   }
 }
 
@@ -119,9 +123,12 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('三十四条命令全部注册成功，且互不抢占快捷键', () => {
+  it('三十八条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
+    // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按前缀分组的：
+    // 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」 < 「视图」 < 「项目」
     expect(registry.list().map((c) => c.id)).toEqual([
+      'search.findInFiles',
       'file.new',
       'file.open',
       'file.save',
@@ -156,6 +163,9 @@ describe('内置命令', () => {
       'view.decreaseFontSize',
       'view.increaseFontSize',
       'view.resetFontSize',
+      'view.toggleSidebar',
+      'project.closeFolder',
+      'project.openFolder',
     ])
     expect(registry.conflicts()).toEqual([])
   })
@@ -200,6 +210,10 @@ describe('内置命令', () => {
     expect(enabled.get('file.new')).toBe(true)
     expect(enabled.get('file.open')).toBe(true)
     expect(enabled.get('view.resetFontSize')).toBe(true)
+    // 项目三条同理：空窗口里最该能做的就是「打开一个文件夹」
+    expect(enabled.get('project.openFolder')).toBe(true)
+    expect(enabled.get('project.closeFolder')).toBe(true)
+    expect(enabled.get('view.toggleSidebar')).toBe(true)
   })
 
   it('编辑器挂上之后保存类立即可用', () => {
@@ -264,15 +278,15 @@ describe('M1-C-1：行操作与排序去重', () => {
   })
 
   it('Alt+Shift+A / D / U 排序与去重', async () => {
-    expect((await pressKey('banana\napple\ncherry', 0, macOptionEvent('KeyA', 'Å', true), 'editor.sortLinesAsc')).text).toBe(
-      'apple\nbanana\ncherry',
-    )
-    expect((await pressKey('banana\napple\ncherry', 0, macOptionEvent('KeyD', 'Î', true), 'editor.sortLinesDesc')).text).toBe(
-      'cherry\nbanana\napple',
-    )
-    expect((await pressKey('a\nb\na\nc\nb', 0, macOptionEvent('KeyU', 'Û', true), 'editor.removeDuplicateLines')).text).toBe(
-      'a\nb\nc',
-    )
+    expect(
+      (await pressKey('banana\napple\ncherry', 0, macOptionEvent('KeyA', 'Å', true), 'editor.sortLinesAsc')).text,
+    ).toBe('apple\nbanana\ncherry')
+    expect(
+      (await pressKey('banana\napple\ncherry', 0, macOptionEvent('KeyD', 'Î', true), 'editor.sortLinesDesc')).text,
+    ).toBe('cherry\nbanana\napple')
+    expect(
+      (await pressKey('a\nb\na\nc\nb', 0, macOptionEvent('KeyU', 'Û', true), 'editor.removeDuplicateLines')).text,
+    ).toBe('a\nb\nc')
   })
 
   it('Option+Z 在 macOS 上是 `Ω`，命令仍然命中——这是 Alt+Z 曾整条失效的回归', () => {
@@ -381,7 +395,9 @@ describe('M1-D-5：分屏命令的接线', () => {
   it('Mod+Alt+←→ 切分屏焦点，不与 Mod+Alt+↑↓ 加光标互抢', () => {
     const { registry } = makeRegistry(fakeController(false))
     expect(registry.findForKey(event('ArrowRight', { metaKey: true, altKey: true }))?.id).toBe('editor.focusNextPane')
-    expect(registry.findForKey(event('ArrowLeft', { metaKey: true, altKey: true }))?.id).toBe('editor.focusPreviousPane')
+    expect(registry.findForKey(event('ArrowLeft', { metaKey: true, altKey: true }))?.id).toBe(
+      'editor.focusPreviousPane',
+    )
     expect(registry.findForKey(event('ArrowUp', { metaKey: true, altKey: true }))?.id).toBe('editor.addCursorAbove')
     expect(registry.findForKey(event('ArrowDown', { metaKey: true, altKey: true }))?.id).toBe('editor.addCursorBelow')
   })
@@ -411,11 +427,94 @@ describe('M1-D-5：分屏命令的接线', () => {
 
   it('没有编辑器时五条一律置灰，执行返回 false 而不是抛错', async () => {
     const { registry, hooks } = makeRegistry(null)
-    for (const id of ['editor.splitRight', 'editor.splitDown', 'editor.closePane', 'editor.focusNextPane', 'editor.focusPreviousPane']) {
+    for (const id of [
+      'editor.splitRight',
+      'editor.splitDown',
+      'editor.closePane',
+      'editor.focusNextPane',
+      'editor.focusPreviousPane',
+    ]) {
       expect(registry.list().find((c) => c.id === id)?.enabled, `${id} 应当置灰`).toBe(false)
       expect(await registry.execute(id), `${id} 应当 no-op`).toBe(false)
     }
     expect(hooks.splitRight).not.toHaveBeenCalled()
+  })
+})
+
+describe('M2-B：项目与侧边栏命令的接线', () => {
+  it('三条命令各分派到自己的 hook', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    await registry.execute('project.openFolder')
+    await registry.execute('project.closeFolder')
+    await registry.execute('view.toggleSidebar')
+    expect(hooks.openFolder).toHaveBeenCalledOnce()
+    expect(hooks.closeFolder).toHaveBeenCalledOnce()
+    expect(hooks.toggleSidebar).toHaveBeenCalledOnce()
+  })
+
+  it('Mod+B 命中显示/隐藏侧边栏，且不与任何已有绑定互抢', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.findForKey(event('b', { metaKey: true }))?.id).toBe('view.toggleSidebar')
+    // 少一个 Cmd 就是普通字符输入，不该被命令接管
+    expect(registry.findForKey(event('b'))).toBeNull()
+  })
+
+  it('两条 project.* 刻意不绑快捷键，但仍进注册表——命令面板要能调它们', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    const listed = new Map(registry.list().map((c) => [c.id, c.keybindings]))
+    expect(listed.get('project.openFolder')).toEqual([])
+    expect(listed.get('project.closeFolder')).toEqual([])
+    // ⛔ Mod+Shift+O 留给 M2-F 的「工作区管理」，Mod+O 已经是「打开文件」。
+    // 断言它现在没被占用，是钉住「别在 M2-B 里顺手把它用掉」
+    expect(registry.findForKey(event('O', { metaKey: true, shiftKey: true }))).toBeNull()
+  })
+
+  it('没有编辑器时三条照样执行成功——这正是它们不设 when 的全部理由', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    // 空窗口里最该能做的动作就是「打开一个文件夹」。要是这里返回 false，
+    // 用户面对一个没有标签的窗口，命令面板里这三条会全是灰的，等于没有入口。
+    expect(await registry.execute('project.openFolder')).toBe(true)
+    expect(await registry.execute('project.closeFolder')).toBe(true)
+    expect(await registry.execute('view.toggleSidebar')).toBe(true)
+    expect(hooks.openFolder).toHaveBeenCalledOnce()
+    expect(hooks.closeFolder).toHaveBeenCalledOnce()
+    expect(hooks.toggleSidebar).toHaveBeenCalledOnce()
+  })
+})
+
+describe('M2-C：全局搜索命令的接线', () => {
+  it('search.findInFiles 分派到自己的 hook', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('search.findInFiles')).toBe(true)
+    expect(hooks.findInFiles).toHaveBeenCalledOnce()
+  })
+
+  it('Mod+Shift+F 命中它，而 Mod+F 仍然是文档内查找', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    // 这两个是刻意配成一对的：同一个字母，差一个 Shift，分别落到「当前文档」与「整个项目」。
+    // matchesKeybinding 对 shift 是严格相等，所以 Mod+F 不会被带 Shift 的这条吃掉
+    expect(registry.findForKey(event('F', { metaKey: true, shiftKey: true }))?.id).toBe('search.findInFiles')
+    expect(registry.findForKey(event('f', { metaKey: true }))?.id).toBe('editor.find')
+    // 少一个 Cmd 就是普通字符输入，不该被命令接管
+    expect(registry.findForKey(event('f'))).toBeNull()
+    expect(registry.findForKey(event('F', { shiftKey: true }))).toBeNull()
+  })
+
+  it('标题与分类：命令面板里要看得出这条搜的是整个项目，不是当前文档', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.get('search.findInFiles')?.title).toBe('在项目里搜索…')
+    expect(registry.get('search.findInFiles')?.category).toBe('搜索')
+    // 展示名分平台，注册表缺省 'macos'（registry.ts:90）。mods 的顺序由 MOD_ORDER 定，
+    // 是 shift 在 meta 前，所以读作 ⇧⌘F 而不是 ⌘⇧F
+    expect(registry.list().find((c) => c.id === 'search.findInFiles')?.keybindings).toEqual(['⇧⌘F'])
+  })
+
+  it('没有编辑器时照样执行成功——展开面板这件事不依赖聚焦的文档', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    // 与 M2-B 那三条同一条理由：空窗口里按 Mod+Shift+F 该看到的是面板与
+    // 「还没打开文件夹」那句话，而不是快捷键按了没反应
+    expect(await registry.execute('search.findInFiles')).toBe(true)
+    expect(hooks.findInFiles).toHaveBeenCalledOnce()
   })
 })
 
@@ -426,11 +525,13 @@ describe('M1-D-5：分屏命令的接线', () => {
  * 而这里要验的是「命令确实把 view 递给了 CM6 的入口」，不是补全面板长什么样。
  * ⚠️ 整体替换成假对象会连带删掉本模块其它导出，见 PLAN.md M1-E 实施修正 #33。
  */
-const { autocomplete } = vi.hoisted(() => ({ autocomplete: { startCompletion: vi.fn() } }))
+const { autocomplete } = vi.hoisted(() => ({
+  autocomplete: { startCompletion: vi.fn<typeof import('@codemirror/autocomplete').startCompletion>() },
+}))
 
 vi.mock('@codemirror/autocomplete', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@codemirror/autocomplete')>()),
-  startCompletion: (...args: unknown[]) => autocomplete.startCompletion(...args),
+  startCompletion: autocomplete.startCompletion,
 }))
 
 describe('M1-E-3：词补全命令的接线', () => {

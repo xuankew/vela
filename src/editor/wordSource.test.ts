@@ -182,8 +182,7 @@ describe('跨文档（「项目词典」在 M1 的落地形态）', () => {
   })
 
   it('peers 里含自己时不会重复', () => {
-    let self!: EditorState
-    self = stateFor('alpha', () => [self])
+    const self: EditorState = stateFor('alpha', () => [self])
     // ⚠️ update 之后是新 state，peers 闭包里那个 self 是旧的——正是这种情况最容易
     // 让同一个词出两遍，所以断言的是「只出一次」
     expect(labels(typing(self, ' al'))).toEqual(['alpha'])

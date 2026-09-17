@@ -13,10 +13,23 @@ publish = false
 # 许可证已核实（闭源硬约束，见 PLAN.md）：
 #   encoding_rs = (Apache-2.0 OR MIT) AND BSD-3-Clause，全宽松
 #   serde / tempfile = MIT OR Apache-2.0
+#   ignore / globset / grep-searcher / grep-regex / grep-matcher = Unlicense OR MIT
+#     （都是 ripgrep 那一套的库化产物，`cargo info` 逐个核过 license 字段）
+#
+# ⚠️ `ignore` 是个来回：M2-A 一度引入，因为「树不按 .gitignore 过滤」那个决定又摘掉了；
+# M2-C 把它加回到**搜索侧**——搜索要读每个文件的正文，不过滤就等于 grep 十万个依赖文件。
+# 两处的方向相反是权衡不同，不是写错了，两条测试也刻意方向相反。
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+
+# M2-C 全局搜索
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 
 # profile 只在 workspace 根生效，写在成员包里 cargo 会直接忽略并告警
 [profile.release]

@@ -164,7 +164,7 @@ mod tests {
     fn 有损解码会被标记出来() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("broken.bin");
-        fs::write(&path, &[0x61, 0xFF, 0xFF, 0x62]).unwrap();
+        fs::write(&path, [0x61, 0xFF, 0xFF, 0x62]).unwrap();
         assert!(read_text(&path).unwrap().lossy);
     }
 
@@ -175,7 +175,7 @@ mod tests {
         let path = dir.path().join("misdetected.txt");
         // C4 A3 既是合法 UTF-8（"ģ"）也是合法 GBK（"模"）——探测报 utf8 且 lossy = false，
         // 也就是「看起来完全正常，但正文是错的」，UI 无从警告
-        fs::write(&path, &[0xC4u8, 0xA3]).unwrap();
+        fs::write(&path, [0xC4u8, 0xA3]).unwrap();
 
         let guessed = read_text(&path).unwrap();
         assert_eq!(guessed.format.encoding, Encoding::Utf8);

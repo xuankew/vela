@@ -1,0 +1,14 @@
+# 与代码库现有风格对齐，而不是反过来把代码改成 rustfmt 的默认口味。
+#
+# `use_small_heuristics = "Max"` 是关键：默认的 "Default" 会把 `struct_lit_width` 压到 18、
+# `single_line_if_else_max_width` 压到 50，于是 `Decoded { text, encoding, bom, lossy }` 这种
+# 一行放得下的结构体字面量会被摊成五行。本仓库的 Rust 代码是紧凑单行风格（`fs/encoding.rs`、
+# `session/mod.rs` 通篇如此），用默认值跑 `cargo fmt` 会产生 90 处纯排版差异——
+# 那不是格式化，那是把一份手写的排版整个重画一遍，review 时看不出任何语义信息。
+# 换成 "Max" 后 90 → 32 处，再把 `max_width` 放宽到 120（前端 prettier 同宽）32 → 21 处。
+#
+# ⚠️ 这两项都是 **stable** rustfmt 选项，不需要 nightly。加任何 unstable 选项
+# （`wrap_comments` / `imports_granularity` / `group_imports` 等）都会让
+# `cargo fmt` 在 stable 工具链上**静默忽略**它，CI 里就成了「配了但没生效」的假保险。
+use_small_heuristics = "Max"
+max_width = 120

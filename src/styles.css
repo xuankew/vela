@@ -245,12 +245,46 @@ select {
 
 /* ---------- 主体 ---------- */
 
+/* M2-C 新加的一层**纵向** flex：上面是正文区（侧边栏 + 编辑区），下面是全局搜索的结果面板。
+
+   ⛔ 刻意不给 `.app` 的 grid 加第六行：那里行数固定为五行，而本文件顶部那条注释正是在
+   警告「多一行就会把 1fr 挤到错误的行上」。这一层整个占住原来那个 `1fr` 行，
+   grid 那边一个字都不用改。
+
+   面板收起时 `<Show>` 直接不渲染，`.body-row` 的 `flex: 1` 就把它撑满整层——
+   与加这一层之前**逐像素相同**，所以没开过搜索的用户看不出任何变化 */
+.main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* M2-B 新增的一层：侧边栏 + 正文区横向并排。它原来是 `.app` 第四行那份 1fr 的 grid item，
+   M2-C 之后降级成 `.main` 的 flex 子项，`.body` 也跟着降一级。
+   分隔线沿用 `.body` 那套「gap 露出底色」的做法，于是侧边栏与正文之间那条竖线
+   跟两块分屏之间那条完全一样——不给侧边栏加 border，理由同下：border 参与盒模型，
+   而 CM6 靠父容器的 clientHeight 算可视行数 */
+.body-row {
+  display: flex;
+  gap: 1px;
+  background: var(--vela-border);
+  /* 当 `.main` 的 flex 子项之后才需要的两个值：不给 `flex: 1` 它就只按内容高，
+     不给 `min-height: 0` 它会被内容撑破，把底部面板整个挤出可视区 */
+  flex: 1;
+  min-height: 0;
+}
+
 .body {
   display: flex;
   /* 分隔线用 gap 露出底色，不给分屏加 border：border 会参与盒模型，
      而 CM6 靠父容器的 clientHeight 算可视行数，多一条边框就少算一行 */
   gap: 1px;
   background: var(--vela-border);
+  /* 三个值都是当 flex 子项之后才需要的：不给 flex:1 它就只按内容宽，
+     不给 min-width:0 它拒绝收缩到内容宽以下（于是窄窗口里侧边栏被挤没），
+     不给 min-height:0 它会被内容撑破 1fr 的高度 */
+  flex: 1;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -307,6 +341,215 @@ select {
    1px border 会占掉 1px 宽——这是引导线唯一可接受的代价，也是各编辑器通用的做法。 */
 .vela-indent-guide {
   border-left: 1px solid var(--vela-guide);
+}
+
+/* ---------- 侧边栏：项目文件树（M2-B）---------- */
+
+/* ⚠️ 这一整段的行高**只能**引用 `--vela-tree-row-height`。
+   那个变量由 src/project/Sidebar.tsx 从 `tree.ts` 的 `ROW_HEIGHT` 注入，
+   是虚拟滚动窗口算术（`visibleWindow`）唯一的高度来源。这里再写一个 `22px` 字面量，
+   两处就会各自悄悄漂移——漂移的方向只有两种：行叠在一起，或者行间露出空隙。
+   两种都很难看出是「高度有两个真相」造成的。 */
+
+.sidebar {
+  /* 固定宽，不参与 flex 伸缩：文件树里的路径本来就要靠 hover 的 title 看全，
+     让它跟着窗口宽度变只会让「同一棵树在不同窗口下长得不一样」 */
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--vela-bg-alt);
+  font-size: 12px;
+}
+
+.sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+/* 根目录名是唯一需要伸缩的一格：窗口再窄也先把省略号让给它，
+   而不是把右边那两个动作按钮挤出去 */
+.sidebar-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vela-fg);
+  font-size: 11px;
+}
+
+/* ↻ 与 × 是两个小图标动作。全局的 button 规则（边框 + 面板底色 + 3px 内边距）
+   是给工具栏那种 28px 高的控件写的，塞进 26px 的头里会把整条撑高 */
+.sidebar-act {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.sidebar-act:hover {
+  border: none;
+  color: var(--vela-fg);
+}
+
+/* 没有项目时的空状态。它是一条**该被点**的入口，所以给正常的按钮外观，
+   但只占满头部那一行的高度，不做成居中的大块空状态图 */
+.sidebar-open {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+/* 滚动容器。tabIndex=0 让它能收键盘事件（见 Sidebar.tsx 的 onKeyDown）。
+   `outline: none` 是必需的：默认焦点环会画在滚动区外侧，
+   而这块紧贴侧边栏边框，焦点环有一半会被裁掉，看着像渲染出错 */
+.tree-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  outline: none;
+  /* 占位撑出总高，窗口层绝对定位浮在上面 */
+  position: relative;
+}
+
+.tree-spacer {
+  position: relative;
+}
+
+/* 用 transform 而不是 top：改 top 会让浏览器重排整棵子树，
+   而 transform 只走合成层——这正是「十万行的仓库滚起来不卡」的第二个依据
+   （第一个是 <For> 复用 DOM，见 Sidebar.tsx 的注释） */
+.tree-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: var(--vela-tree-row-height);
+  color: var(--vela-fg);
+  white-space: nowrap;
+  cursor: default;
+  /* 行上有 title 提示完整路径，但拖拽/双击时不该顺手选中一片文件名 */
+  user-select: none;
+  /* padding-left 是 Sidebar.tsx 按 `depth * 12 + 6` 写在行内样式上的，
+     所以这里刻意不设 padding-left，免得两个地方各算一半 */
+}
+
+.tree-row:hover {
+  background: var(--vela-bg-panel);
+}
+
+/* 选中行用左侧色条标出。inset 阴影不参与布局——换成 border-left 会把这一行的
+   内容整体右推 2px，而缩进是靠 padding-left 精确算出来的，推一下就和上下层错位 */
+.tree-row.selected {
+  background: var(--vela-bg-panel);
+  box-shadow: inset 2px 0 0 var(--vela-accent);
+}
+
+.tree-twisty {
+  flex: 0 0 12px;
+  width: 12px;
+  color: var(--vela-fg-dim);
+  font-size: 10px;
+  text-align: center;
+}
+
+/* 读失败的那一行只把箭头染红，不染整行：整行红会被读成「这个文件出问题了」，
+   而实际说的是「它下面那一层没读出来」——真正的错误文本在 .tree-note.bad 里 */
+.tree-row.failed .tree-twisty {
+  color: var(--vela-bad);
+}
+
+.tree-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 「读取中…」与错误文本都占同一行的剩余空间，绝不另起一行——
+   多一行就不再是 ROW_HEIGHT，窗口算术立刻失准 */
+.tree-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+}
+
+.tree-note.bad {
+  color: var(--vela-bad);
+}
+
+/* ---------- 文件树右键菜单（M2-B-5）---------- */
+
+/* fixed 而不是 absolute：菜单跟着**光标**走，而光标坐标（clientX/clientY）是视口口径的。
+   它被渲染在 `.sidebar` 里但不在 `.tree-window` 里——后者带 transform，会成为 fixed
+   子元素的包含块，菜单就会跟着滚动跑（见 Sidebar.tsx 里那条注释）。
+   z-index 与 `.modal-backdrop` 同为 10：两者刻意不会同时在屏幕上，选中一项时菜单先关、
+   对话框后开。 */
+.tree-menu {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 150px;
+  padding: 3px 0;
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 5px;
+  /* 阴影是这里唯一能说明「这一块浮在正文上面」的东西：只靠底色差的话，
+     菜单压在编辑器上时看着像是一块没画完的面板 */
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+  font-size: 12px;
+}
+
+.tree-menu-sep {
+  height: 1px;
+  margin: 3px 0;
+  background: var(--vela-border);
+}
+
+/* 全局的 button 规则是给工具栏那种带边框的小方块写的，菜单项要的是「整行都能点、
+   看起来不像一排按钮」。`transform: none` 尤其不能省：全局 :active 会把元素下推 1px，
+   在一个竖排的菜单里那一下位移看着像整条菜单抖了一下 */
+.tree-menu-item {
+  padding: 3px 14px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  color: var(--vela-fg);
+  font-size: 12px;
+  text-align: left;
+}
+
+.tree-menu-item:hover {
+  background: var(--vela-accent);
+  border: none;
+  color: #1a1b26;
+}
+
+.tree-menu-item:active {
+  transform: none;
 }
 
 /* ---------- 状态栏 ---------- */
@@ -413,6 +656,13 @@ select {
   border-left-color: var(--vela-bad);
 }
 
+/* 「已移到废纸篓」「已复制路径」这类**回话**（M2-B-5）。
+   只染左侧色条不染文字：一次做成的事不该在窗口顶上亮着一句彩色文本，
+   而完全没有标记的话它又和「有损解码」那种真警告混在一起分不清 */
+.notice.ok {
+  border-left-color: var(--vela-accent);
+}
+
 .notice-close {
   margin-left: auto;
   padding: 0 4px;
@@ -463,8 +713,260 @@ select {
   color: var(--vela-fg-dim);
 }
 
+/* 「起个名字」的输入框（M2-B-5：新建文件 / 新建文件夹 / 重命名）。
+   占满一行：名字是整个对话框里唯一要输入的东西，窄窄一格会让长文件名看不见自己
+   打到了哪里。字体用 UI 那一套而不是代码字体——输入的是文件名不是代码，
+   而 `--vela-font-ui` 正是工具栏与状态栏用的那个。 */
+.modal-input {
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 3px 6px;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+}
+
+.modal-input:focus {
+  outline: none;
+  border-color: var(--vela-accent);
+}
+
+/* 失败原因就地显示在输入框下面，不落到窗口顶上的提示条：对话框还开着，
+   用户要边看这句话边改名字，而提示条在屏幕另一头 */
+.modal-error {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--vela-bad);
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* ---------- 全局搜索面板（M2-C）---------- */
+
+.find-panel {
+  /* 定高、不参与伸缩：面板一伸缩，编辑区的高度就跟着变，而 CM6 是按父容器的
+     clientHeight 算可视行数的——高度在两次测量之间变化会让它的行高缓存失准。
+     要调高度就改这一个数字。
+     `max-height: 50%` 是给矮窗口的：半屏高的小窗里 240px 会把编辑区压成一条缝，
+     而百分比对着 `.main` 算，`.main` 的高度是 grid 那份 1fr，是确定的 */
+  flex: 0 0 240px;
+  max-height: 50%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--vela-bg-alt);
+  border-top: 1px solid var(--vela-border);
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+}
+
+.find-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+/* 搜索词是唯一需要伸缩的一格：窗口再窄也先把省略号让给它，
+   而不是把右边那三个开关和两个按钮挤出去 */
+.find-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 6px;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+}
+
+.find-input:focus {
+  outline: none;
+  border-color: var(--vela-accent);
+}
+
+/* `.*` / `Aa` / `ab` 三个开关。等宽的小方块，关着的时候是暗的——
+   开着的那几个必须一眼就能数出来有几个，所以用实色而不是只改边框 */
+.find-opt {
+  flex: 0 0 auto;
+  min-width: 26px;
+  padding: 2px 4px;
+  font-family: var(--vela-font-code);
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+.find-opt.on {
+  color: var(--vela-bg-alt);
+  background: var(--vela-accent);
+  border-color: var(--vela-accent);
+}
+
+/* 清空与收起是「反向」动作，只做小图标：不给按钮外观，也不给颜色 */
+.find-act {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.find-act:hover {
+  border: none;
+  color: var(--vela-fg);
+}
+
+/* 两个反向动作一起推到右边 */
+.find-tail {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.find-status {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+.find-status-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.find-error {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vela-bad);
+}
+
+/* 「有东西没读成」那一句。与 `.notice.warning` 同一套视觉语言（左侧色条 + 语义色文字），
+   因为它说的正是同一类事：一个看起来很确定的答案其实是假的 */
+.find-warning {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--vela-warn);
+  border-left: 3px solid var(--vela-warn);
+}
+
+/* 滚动容器。tabIndex=0 让它能收键盘事件（见 FindInFiles.tsx 的 onListKey）。
+   `outline: none` 与 `.tree-scroll` 同理：默认焦点环有一半会被面板边框裁掉 */
+.find-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  outline: none;
+  position: relative;
+}
+
+.find-spacer {
+  position: relative;
+}
+
+/* transform 而不是 top：改 top 会重排整棵子树，transform 只走合成层。
+   两万条结果滚起来不靠这个是不行的 */
+.find-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.find-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--vela-search-row-height);
+  padding-left: 6px;
+  white-space: nowrap;
+  cursor: default;
+  /* 行上有 title 给完整路径，但拖拽时不该顺手选中一片代码 */
+  user-select: none;
+}
+
+/* 命中行缩进一层：分组关系只靠「缩进 + 顺序」表达，行对象里没有父子指针
+   （理由见 rows.ts 的 flattenFiles），所以视觉上必须自己把这两级分开 */
+.find-row:not(.file) {
+  padding-left: 18px;
+}
+
+.find-row:hover {
+  background: var(--vela-bg-panel);
+}
+
+/* 与 `.tree-row.selected` 同一套：inset 阴影不参与布局，
+   换成 border-left 会把这一行的内容整体右推 2px，缩进就和文件行错位了 */
+.find-row.selected {
+  background: var(--vela-bg-panel);
+  box-shadow: inset 2px 0 0 var(--vela-accent);
+}
+
+.find-rel {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.find-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+/* 行号定宽 + 右对齐：不定的话三位数与四位数会把后面的正文推来推去，
+   一屏结果读下来眼睛没有一条可以顺着走的竖线 */
+.find-line {
+  flex: 0 0 44px;
+  font-family: var(--vela-font-code);
+  font-size: 11px;
+  text-align: right;
+  color: var(--vela-fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 正文用代码字体：这一格里是从源文件里抠出来的一行代码，
+   而「代码区一律用 --vela-font-code」是本项目字体分派那条决策的一部分 */
+.find-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--vela-font-code);
+  font-size: 11px;
+}
+
+/* `<mark>` 的 UA 样式是黄底黑字，在这个暗色面板上是一块刺眼的补丁。
+   只改颜色不加底色：一行里可能有三四处命中，都涂上底色的话整行看起来像被选中了，
+   而「选中」在这块面板上已经有自己的视觉（左侧色条 + 面板底色） */
+.find-mark {
+  background: none;
+  color: var(--vela-accent);
+  font-weight: 600;
 }

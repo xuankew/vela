@@ -14,14 +14,7 @@ import {
   type DecorationSet,
   type ViewUpdate,
 } from '@codemirror/view'
-import {
-  defaultKeymap,
-  history,
-  historyKeymap,
-  indentWithTab,
-  indentMore,
-  indentLess,
-} from '@codemirror/commands'
+import { defaultKeymap, history, historyKeymap, indentWithTab, indentMore, indentLess } from '@codemirror/commands'
 import {
   foldGutter,
   foldKeymap,
@@ -156,7 +149,7 @@ function buildCodeDecorations(view: EditorView, from: number, to: number): Decor
     enter: (node) => {
       if (!CODE_BLOCK_NODES.has(node.name)) return
       // 逐行盖过去而不是只标节点首行：代码块跨多行，每行都要换字体
-      for (let pos = node.from; pos <= node.to; ) {
+      for (let pos = node.from; pos <= node.to;) {
         const line = view.state.doc.lineAt(pos)
         if (!marked.has(line.number)) {
           marked.add(line.number)

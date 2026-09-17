@@ -1,14 +1,16 @@
 import { startCompletion } from '@codemirror/autocomplete'
-import { addCursorAbove, addCursorBelow, copyLineDown, copyLineUp, deleteLine, moveLineDown, moveLineUp } from '@codemirror/commands'
+import {
+  addCursorAbove,
+  addCursorBelow,
+  copyLineDown,
+  copyLineUp,
+  deleteLine,
+  moveLineDown,
+  moveLineUp,
+} from '@codemirror/commands'
 import { foldAll, unfoldAll } from '@codemirror/language'
 // selectNextOccurrence 与查找替换那几个都住在 search 包里，不在 commands 包
-import {
-  findNext,
-  findPrevious,
-  openSearchPanel,
-  selectMatches,
-  selectNextOccurrence,
-} from '@codemirror/search'
+import { findNext, findPrevious, openSearchPanel, selectMatches, selectNextOccurrence } from '@codemirror/search'
 import type { Command } from '@codemirror/view'
 import { replaceAllCommand, replaceNextCommand } from '../editor/findReplace'
 import { removeDuplicateLines, sortLinesAscending, sortLinesDescending } from '../editor/lineOps'
@@ -47,6 +49,22 @@ export interface BuiltinHooks {
   closePane: () => void
   focusNextPane: () => void
   focusPreviousPane: () => void
+  // 项目三条（M2-B）。都作用于侧边栏那棵树，而不是 `ctx.editor`——
+  // 没有编辑器聚焦时它们照样该能用，所以 `when` 一律不设。
+  /** 弹原生目录对话框，选中之后打开成项目根并把侧边栏显示出来 */
+  openFolder: () => void | Promise<void>
+  /** 关掉当前项目根。不动任何已打开的标签 */
+  closeFolder: () => void
+  /** 显示/隐藏侧边栏 */
+  toggleSidebar: () => void
+  /**
+   * 展开窗口底部的全局搜索面板，并把焦点放进搜索词输入框（M2-C）。
+   *
+   * 与项目三条同一条道理：它作用于那个面板而不是 `ctx.editor`，
+   * 所以没有编辑器聚焦时也照样该能用——空窗口里搜不了东西，但那是「还没打开文件夹」
+   * 那句话要说的事，不该由快捷键按了没反应来表达。
+   */
+  findInFiles: () => void
 }
 
 /**
@@ -60,12 +78,7 @@ export interface BuiltinHooks {
  * 我们永远递 `ctx.editor!.view`，而 `EditorView` 结构上就有 `{ state, dispatch }`，
  * 于是 StateCommand 靠参数逆变也能塞进来，两边都不用改。
  */
-function cmCommand(
-  id: string,
-  title: string,
-  command: Command,
-  keybinding?: string | string[],
-): CommandDefinition {
+function cmCommand(id: string, title: string, command: Command, keybinding?: string | string[]): CommandDefinition {
   return {
     id,
     title,
@@ -214,6 +227,45 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       run: () => hooks.closePane(),
     }),
 
+    // 项目（M2-B）。
+    // ⛔ 「打开文件夹」刻意不绑快捷键：`Mod+Shift+O` 在 PLAN §3.4 里留给 M2-F 的
+    // 「工作区管理」，而 `Mod+O` 已经是「打开文件」。侧边栏头部与工具栏的按钮就是它的入口。
+    registry.register({
+      id: 'project.openFolder',
+      title: '打开文件夹…',
+      category: '项目',
+      run: () => hooks.openFolder(),
+    }),
+    // 没有 `when`：`AppContext` 里只有 `editor`，而「有没有打开项目」不属于编辑器状态。
+    // 不加 `project` 字段是为了不给命令中心添一个所有 `editor.*` 都不关心的依赖——
+    // `closeFolder` 在没有项目时本来就是空操作，命令面板里灰不灰只是观感问题。
+    registry.register({
+      id: 'project.closeFolder',
+      title: '关闭文件夹',
+      category: '项目',
+      run: () => hooks.closeFolder(),
+    }),
+    registry.register({
+      id: 'view.toggleSidebar',
+      title: '显示/隐藏侧边栏',
+      category: '视图',
+      // Mod+B 是 VS Code 的既有约定，CM6 没有占用它
+      keybinding: 'Mod+B',
+      run: () => hooks.toggleSidebar(),
+    }),
+
+    // 全局搜索（M2-C）。绑 Mod+Shift+F：VS Code 与 Sublime 的既有约定。
+    // CM6 的 searchKeymap 只占了 Mod+F / Mod+G / Mod+Shift+G / Mod+Alt+Enter / Mod+D 这几条，
+    // Mod+Shift+F 是空的——而它正好与「Mod+F 是文档内查找」形成一对，不用另发明。
+    // ⚠️ 这也是本项目里第一个 category 为「搜索」的命令：M2-D 的全局替换会加进来。
+    registry.register({
+      id: 'search.findInFiles',
+      title: '在项目里搜索…',
+      category: '搜索',
+      keybinding: 'Mod+Shift+F',
+      run: () => hooks.findInFiles(),
+    }),
+
     // 行操作。快捷键沿用 CM6 defaultKeymap 已有的那一套，不另发明。
     registry.register(cmCommand('editor.moveLineUp', '上移当前行', moveLineUp, 'Alt+Up')),
     registry.register(cmCommand('editor.moveLineDown', '下移当前行', moveLineDown, 'Alt+Down')),
@@ -227,7 +279,9 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     // 因为 CM6 原生的 selectSelectionMatches 在已经有多个选区时直接拒绝（Cmd+D 按几下再
     // Cmd+Shift+L 就成了死路）。
     registry.register(cmCommand('editor.selectNextOccurrence', '选中下一个相同内容', selectNextOccurrence, 'Mod+D')),
-    registry.register(cmCommand('editor.selectAllOccurrences', '选中全部相同内容', selectAllOccurrences, 'Mod+Shift+L')),
+    registry.register(
+      cmCommand('editor.selectAllOccurrences', '选中全部相同内容', selectAllOccurrences, 'Mod+Shift+L'),
+    ),
     registry.register(cmCommand('editor.addCursorAbove', '在上方添加光标', addCursorAbove, 'Mod+Alt+Up')),
     registry.register(cmCommand('editor.addCursorBelow', '在下方添加光标', addCursorBelow, 'Mod+Alt+Down')),
     // ⛔ `selectLine`（CM6 绑 Alt-l，macOS 上覆盖成 Ctrl-l）与 `simplifySelection`（Escape）
