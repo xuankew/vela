@@ -32,6 +32,7 @@ const {
   watchCmd,
   shardCmd,
   assetCmd,
+  settingsCmd,
 } = vi.hoisted(() => {
   /**
    * 会话存档这一头（M1-F）。App 一挂载就会 `load_session`，关窗放行后会 `save_session`，
@@ -149,6 +150,31 @@ const {
     result: null,
     error: null,
   }
+  /**
+   * 分层配置这一头（M4-A）。`load_settings` / `save_settings` 也走 `tauriCore.invoke`。
+   *
+   * ⚠️ `loaded` 必须是**完整的 `LoadedSettings` 形状**而不是 undefined：App 一挂载，roots
+   * 那个 effect 就会 `settings.load(...)`，而 store 的 `load` 要在返回值上取
+   * `.settings.fontSize` —— undefined 上取属性会抛在一条 await 之后，变成一条没人接的
+   * rejection，用例看到的只是「字体没生效」，真正的原因被吞了（与 `projectCmd.stats`
+   * 那条逐字同一类坑）。默认给一份「两层都 absent、配置是内置默认」的空现场。
+   *
+   * ⚠️ `saved` 记的是每次 `save_settings` 收到的那份 **settings**（不是整个 args）：
+   * 写穿那几条用例要验「改了字号 → 存出去的 settings.fontSize 是新值」，
+   * 而参数名 `settings` 漂了的话这里会收到 undefined，断言当场红。
+   */
+  const settingsCmd: { loaded: unknown; loadError: unknown; saved: unknown[] } = {
+    loaded: {
+      settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' },
+      report: {
+        userLayer: { status: 'absent' },
+        projectLayer: { status: 'absent' },
+        ignoredProjectKeys: [],
+      },
+    },
+    loadError: null,
+    saved: [],
+  }
   return {
     ipc: {
       openFile: vi.fn<typeof import('./ipc/fs').openFile>(),
@@ -168,6 +194,7 @@ const {
     watchCmd,
     shardCmd,
     assetCmd,
+    settingsCmd,
   }
 })
 
@@ -308,6 +335,12 @@ beforeEach(async () => {
   assetCmd.calls = []
   assetCmd.result = null
   assetCmd.error = null
+  settingsCmd.loaded = {
+    settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' },
+    report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
+  }
+  settingsCmd.loadError = null
+  settingsCmd.saved = []
   disk = {}
   projectCmd.fs = {
     '': [dirEntry('src', 'src', true), dirEntry('README.md', 'README.md', false), dirEntry('docs', 'docs', true)],
@@ -326,6 +359,19 @@ beforeEach(async () => {
     if (cmd === 'save_session') {
       sessionCmd.saved.push(args?.session)
       return { bytesWritten: 120, droppedDrafts: sessionCmd.droppedDrafts }
+    }
+    if (cmd === 'load_settings') {
+      // 与 load_session 同一条理由：Rust 的 Err 是被序列化后原样抛出的普通对象，
+      // 不包 new Error，被测的才是 store 里那条真正的错误处理路径
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      if (settingsCmd.loadError !== null) throw settingsCmd.loadError
+      return settingsCmd.loaded
+    }
+    if (cmd === 'save_settings') {
+      // 🔴 参数名 `settings` 在这儿被真的读一遍：漂了的话这里收到 undefined，
+      // 而写穿那几条用例会把它当成「存了个空配置」，红线落在断言上而不是静默通过
+      settingsCmd.saved.push(args?.settings)
+      return { bytesWritten: 80 }
     }
     if (cmd === 'list_dir') {
       // `args` 的值是 unknown：`String(unknown)` 会走到 Object 的默认字符串化，
@@ -4203,5 +4249,111 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
 
     // 而「没有编辑器就置灰」这半边在 `commands/palette.test.ts` 里翻着 `setEditor` 钉过：
     // jsdom 里造不出一块「聚焦的只读分片」，硬造等于把 M2-H 那一组重写一遍
+  })
+})
+
+describe('分层配置接线（M4-A）', () => {
+  function selectByTitle(prefix: string): HTMLSelectElement {
+    const el = [...container.querySelectorAll('select')].find((s) => s.title.startsWith(prefix))
+    if (!el) throw new Error(`找不到 title 以「${prefix}」开头的 select`)
+    return el
+  }
+  const fontSelect = () => selectByTitle('正文与 UI 字体')
+  const codeFontSelect = () => selectByTitle('代码区字体')
+
+  /** Solid 的 onChange 直接挂在元素上，dispatch 一个 bubbles 的 change 就能命中 */
+  function changeSelect(el: HTMLSelectElement, value: string): void {
+    el.value = value
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+  }
+
+  /**
+   * 换一份持久化配置，重走一遍启动。
+   *
+   * settings 只在挂载时的那个 effect 里 `load` 一次，所以改完 mock 必须重挂——直接在跑着的
+   * App 上改 `settingsCmd.loaded` 什么都不会发生，用例会绿得毫无意义（与 `restartWith` 同一条理由）。
+   */
+  async function restartWithSettings(loaded: unknown, loadError: unknown = null): Promise<void> {
+    dispose()
+    container.remove()
+    settingsCmd.loaded = loaded
+    settingsCmd.loadError = loadError
+    settingsCmd.saved = []
+    mountApp()
+    await flush()
+  }
+
+  it('挂载后应用的是内置默认配置，CSS 变量与两个字体 select 同步', () => {
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
+    expect(fontSelect().value).toBe('screen-gb')
+    expect(codeFontSelect().value).toBe('maple-cn')
+    // 装回默认不写盘：load 只读，不该在启动时就产生一次 save_settings
+    expect(settingsCmd.saved).toEqual([])
+  })
+
+  it('Mod+= 改字号后写穿到 save_settings，存的正是新档位那一整份', async () => {
+    press('=', modInit())
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('15px')
+    await flush()
+    // 写队列是异步的：一次改动最终只落一次盘，且存的是**当前值**（不是旧值）
+    expect(settingsCmd.saved).toHaveLength(1)
+    expect(settingsCmd.saved[0]).toEqual({ fontSize: 15, fontVariant: 'screen-gb', codeFont: 'maple-cn' })
+  })
+
+  it('字号 select 改动同时更新 CSS 变量并写穿', async () => {
+    changeSelect(fontSizeSelect(), '18')
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toEqual({ fontSize: 18, fontVariant: 'screen-gb', codeFont: 'maple-cn' })
+  })
+
+  it('正文字体 select 改动写穿到 save_settings', async () => {
+    changeSelect(fontSelect(), 'screen-r')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toEqual({ fontSize: 14, fontVariant: 'screen-r', codeFont: 'maple-cn' })
+  })
+
+  it('代码区字体 select 改动写穿到 save_settings', async () => {
+    changeSelect(codeFontSelect(), 'inherit')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toEqual({ fontSize: 14, fontVariant: 'screen-gb', codeFont: 'inherit' })
+  })
+
+  it('重启后装回持久化的配置，CSS 变量与 select 都反映盘上的值', async () => {
+    await restartWithSettings({
+      settings: { fontSize: 18, fontVariant: 'system-mono', codeFont: 'inherit' },
+      report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
+    })
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
+    expect(fontSelect().value).toBe('system-mono')
+    expect(codeFontSelect().value).toBe('inherit')
+    // 装回只读、不写穿：一次启动不该因为「读到了盘上的值」再存一遍
+    expect(settingsCmd.saved).toEqual([])
+  })
+
+  it('盘上的字体 ID 不认识时退回注册表默认，档外字号退回默认档', async () => {
+    await restartWithSettings({
+      settings: { fontSize: 17, fontVariant: 'toString', codeFont: '不存在的字体' },
+      report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
+    })
+    // 17 不在 FONT_SIZES 里、'toString' 命中的是原型链而不是注册表：三个都被 sanitize 打回默认
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
+    expect(fontSelect().value).toBe('screen-gb')
+    expect(codeFontSelect().value).toBe('maple-cn')
+  })
+
+  it('load_settings 出错时提示条报出来，字体退回内置默认而不拦启动', async () => {
+    await restartWithSettings(
+      {
+        settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' },
+        report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
+      },
+      { kind: 'io', reason: 'PermissionDenied', message: '读不了配置' },
+    )
+    // 编辑器照常挂载（启动没被拦下），提示条把那句错误说出来
+    expect(container.querySelector('.editor-container .cm-editor')).not.toBeNull()
+    expect(notices().map((n) => n.level)).toContain('warning')
+    expect(notices().some((n) => n.text.includes('读不了配置'))).toBe(true)
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
   })
 })

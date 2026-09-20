@@ -1,0 +1,262 @@
+/**
+ * 字体 / 字号这一层的**持久化状态**（PLAN.md §3.6 M4-A）。
+ *
+ * 在 M4-A 之前，`fontKey` / `codeFontKey` / `fontSize` 是 `App.tsx` 里三个**只活在内存里**
+ * 的信号：调好字号、重启就回到 14px。这一层把它们接到 `vela-core::settings` 的三层配置上，
+ * 于是「我设的字号」跟着人走（用户全局层 `~/.vela/settings.json`），换项目也在。
+ *
+ * ## 这一层管什么、不管什么
+ *
+ * 管：三个值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
+ * 用户全局层。还管「从 Rust 读回来的值不一定合法」这件事——配置文件可能被手改成任何
+ * 字符串，`fontSize` 可能是 17 这种档外值，`fontVariant` 可能是一个不存在的 ID。
+ * **sanitize 归这一层**：读到不认识的字体 ID 回退注册表默认，读到档外字号回退默认档位。
+ * （Rust 侧刻意不夹范围、不校验 ID，理由见 `ipc/settings.ts` 的 `Settings` 文档：
+ * 合法 ID 清单与档位都是 UI 概念，夹一次就够，夹两次的结果是谁也说不清最终是多少。）
+ *
+ * 不管：字体注册表本身（`fonts/loader.ts`）、字号档位清单的**语义**（这里只负责夹）。
+ *
+ * ## 🔴 项目层在 v1 是「接好线但空转」的
+ *
+ * 三个键全是**个人偏好**，只认「内置默认 + 用户全局」。打开一个带 `.vela/settings.json`
+ * 的仓库**不会**改掉你的字号——Rust 的 `resolve` 已经把项目层的偏好键丢进
+ * `report.ignoredProjectKeys` 了。这一层把那份 `report` 原样暴露出去（[`SettingsStore.report`]），
+ * 由 `App.tsx` 决定要不要据此说一句「这个仓库想改你的字号，但字号只认全局」。
+ * ⚠️ 于是 `load` 在 roots 变化时**仍然要重跑**：v1 里合并出的配置不随 roots 变（项目层
+ * 不生效），但那份**账单**会变——换一个仓库，它想覆盖的键可能不一样。
+ *
+ * ## 写穿用一条队列，不用定时器
+ *
+ * 与 `doc/sessionSync.ts` 同一套做法：所有写挂在一条 promise 链尾巴上，任意时刻最多一个
+ * 写在飞，于是「快速连按 `Cmd+=`」不会让两次原子写以乱序 rename 收场（那样盘上可能停在
+ * 中间某一档）。再加一个指纹跳过没变化的写。⛔ 不用 `vi.useFakeTimers()`——理由与
+ * sessionSync 逐字相同：假表会把 `requestAnimationFrame` 一起冻住，而 CM6 跑在 rAF 上。
+ * 这里压根没有定时器，所以那条顾虑不适用，但队列本身是需要的（为了写序）。
+ */
+
+import { createSignal, type Accessor } from 'solid-js'
+import {
+  applyCodeFont,
+  applyFontVariant,
+  CODE_FONTS,
+  DEFAULT_CODE_FONT,
+  DEFAULT_VARIANT,
+  FONT_VARIANTS,
+  type CodeFontId,
+  type FontVariantId,
+} from '../fonts/loader'
+import {
+  describeSettingsError,
+  loadSettings,
+  saveSettings,
+  type LoadedSettings,
+  type Settings,
+  type SettingsReport,
+} from '../ipc/settings'
+
+/**
+ * 字号档位。工具栏的 select 直接列这些值，所以冒出一个档外值（17px）会让 select 变空白——
+ * 这正是 sanitize 要把档外值打回默认的原因。
+ *
+ * ⚠️ 这是**纯 UI 概念**，Rust 侧不知道它存在（`Settings.fontSize` 是个裸 `u32`）。
+ * 从 `App.tsx` 挪到这一层，是因为夹档位是 sanitize 的一部分，而 sanitize 归这一层。
+ */
+export const FONT_SIZES: readonly number[] = [12, 13, 14, 15, 16, 18, 20]
+
+/**
+ * 内置默认字号。与 Rust `settings::DEFAULT_FONT_SIZE` 同值——两边各写一份、由
+ * `wire_contract.rs` 与 `ipc/settings.test.ts` / 本层的 `store.test.ts` 各钉一条，
+ * 没有代码生成（与 `MAX_SESSION_TABS` 同一套做法）。
+ */
+export const DEFAULT_FONT_SIZE = 14
+
+/** 档外字号一律打回默认。`FONT_SIZES` 里没有的值（17、0、负数、NaN）都不该进信号 */
+function sanitizeFontSize(n: number): number {
+  return FONT_SIZES.includes(n) ? n : DEFAULT_FONT_SIZE
+}
+
+/**
+ * 不认识的字体 ID 打回注册表默认。
+ *
+ * ⚠️ 用 `hasOwnProperty` 而不是 `in`：`in` 会命中原型链，于是 `"toString"` 这种字符串
+ * 会被当成合法 ID。配置文件是**不可信输入**（可能被手改、可能来自克隆的仓库），
+ * 这类「看起来是键、其实是 Object.prototype 上的东西」正是它该挡的。
+ */
+function sanitizeFontVariant(id: string): FontVariantId {
+  return Object.prototype.hasOwnProperty.call(FONT_VARIANTS, id) ? (id as FontVariantId) : DEFAULT_VARIANT
+}
+
+function sanitizeCodeFont(id: string): CodeFontId {
+  return Object.prototype.hasOwnProperty.call(CODE_FONTS, id) ? (id as CodeFontId) : DEFAULT_CODE_FONT
+}
+
+export interface SettingsStoreOptions {
+  /**
+   * 出问题时说一句话（配置读不回来、写不下去）。没注入就什么都不说。
+   *
+   * 与 sessionSync 的 `onWarn` 同一条理由：配置是**偏好**，读不回来最坏是「用默认字号」，
+   * 不值得为它拦下启动；但「我设的没记住」这件事该让用户知道一句，而不是静默回退。
+   */
+  onWarn?: (text: string) => void
+}
+
+export interface SettingsStore {
+  /** 当前正文字体 ID（已 sanitize，一定是注册表里的合法值） */
+  readonly fontKey: Accessor<FontVariantId>
+  /** 当前代码区字体 ID（已 sanitize） */
+  readonly codeFontKey: Accessor<CodeFontId>
+  /** 当前字号（已夹到 `FONT_SIZES` 里的某一档） */
+  readonly fontSize: Accessor<number>
+  /**
+   * 最近一次 [`SettingsStore.load`] 的账单；`null` = 还没 load 过。
+   * `report().ignoredProjectKeys` 非空表示当前仓库的 `.vela/settings.json` 试图改偏好键、
+   * 已被忽略（v1 里三个键全是偏好类，所以它写的任何键都会落在这儿）。
+   */
+  readonly report: Accessor<SettingsReport | null>
+
+  /** 用户改了正文字体：更新 + 应用 + 写穿 */
+  setFontVariant: (id: FontVariantId) => void
+  /** 用户改了代码区字体：更新 + 应用 + 写穿 */
+  setCodeFont: (id: CodeFontId) => void
+  /** 用户选了字号（会夹到档位）：更新 + 应用 + 写穿 */
+  setFontSize: (n: number) => void
+  /** `Cmd/Ctrl + =/-`：在档位之间走一步。档外（被手改过）时回到默认档 */
+  stepFontSize: (delta: number) => void
+  /** `Cmd/Ctrl + 0`：回到默认字号 */
+  resetFontSize: () => void
+
+  /**
+   * 从 Rust 读回合并好的配置，sanitize 后灌进信号并应用。**不写穿**。
+   *
+   * 启动时调一次（roots 为空），之后每次工作区的根变化再调（多根只认第一个，
+   * 由 Rust 侧取 `roots[0]`）。并发安全：用一个代号挡住「迟到的旧 load 盖掉新 load」。
+   */
+  load: (roots: readonly string[]) => Promise<void>
+  /**
+   * 立刻把当前信号值应用到 DOM（CSS 变量 + 注入 webfont），不等任何 IPC。
+   * 首屏用：在第一次 `load` 回来之前，先让默认字体开始注入，避免一段系统字体的空窗。
+   */
+  applyNow: () => void
+}
+
+export function createSettingsStore(options: SettingsStoreOptions = {}): SettingsStore {
+  const warn = options.onWarn ?? (() => {})
+
+  const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
+  const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
+  const [fontSize, setFontSizeSignal] = createSignal(DEFAULT_FONT_SIZE)
+  const [report, setReport] = createSignal<SettingsReport | null>(null)
+
+  /** 写队列的尾巴。所有写挂在它后面，于是任意时刻最多一个写在飞（见文件头） */
+  let tail: Promise<void> = Promise.resolve()
+  /** 上一次**成功写出去**的那份配置的指纹。没变化就跳过，省一次原子写 */
+  let lastSent: string | null = null
+  /** load 的代号：每次 load 自增，回来时只有「还是最新那次」才允许灌信号 */
+  let loadGen = 0
+
+  function applyFontSizeVar(n: number): void {
+    document.documentElement.style.setProperty('--vela-font-size', `${n}px`)
+  }
+
+  function currentSettings(): Settings {
+    return { fontSize: fontSize(), fontVariant: fontKey(), codeFont: codeFontKey() }
+  }
+
+  async function doWrite(): Promise<void> {
+    const settings = currentSettings()
+    const fingerprint = JSON.stringify(settings)
+    if (fingerprint === lastSent) return
+    try {
+      await saveSettings(settings)
+      // 只在**成功**之后更新指纹：一次瞬时故障不该把这轮改动永久跳过（与 sessionSync 同）
+      lastSent = fingerprint
+    } catch (err) {
+      warn(describeSettingsError(err))
+    }
+  }
+
+  function persist(): void {
+    // doWrite 自己吞掉了所有异常，于是 tail 永远不会 reject，不需要 catch 兜底
+    tail = tail.then(doWrite)
+  }
+
+  function applyNow(): void {
+    applyFontSizeVar(fontSize())
+    // 字体是动态 import，注入有真实异步成本；`void` 掉——首屏不等它，到达后浏览器自己
+    // 用 font-display: swap 重排。两个 family 同时驻留（正文 + 代码区），互不干扰
+    void applyFontVariant(fontKey())
+    void applyCodeFont(codeFontKey())
+  }
+
+  async function load(roots: readonly string[]): Promise<void> {
+    const gen = ++loadGen
+    let loaded: LoadedSettings
+    try {
+      // `loadSettings` 几乎不 reject（任何一层坏掉都退化成默认并记进账单）；唯一的 reject
+      // 是 Rust 侧算不出主目录——环境问题。退化成「保持当前值」，不拦启动
+      loaded = await loadSettings([...roots])
+    } catch (err) {
+      warn(describeSettingsError(err))
+      return
+    }
+    // 迟到的旧 load 不许盖掉新的：roots 快速连变时会有多个 load 在飞
+    if (gen !== loadGen) return
+
+    const s = loaded.settings
+    // 直接写信号（不走 mutator）：load 是「把盘上的值装回来」，不是用户改动，**不该写穿**
+    setFontSizeSignal(sanitizeFontSize(s.fontSize))
+    setFontKey(sanitizeFontVariant(s.fontVariant))
+    setCodeFontKey(sanitizeCodeFont(s.codeFont))
+    setReport(loaded.report)
+    applyNow()
+  }
+
+  // ⚠️ 这些 mutator 都是**具名函数**而不是对象字面量里的方法：`App.tsx` 会把它们当裸引用
+  // 递出去（`adjustFontSize: settings.stepFontSize`），方法里的 `this` 在那种调用下是
+  // undefined。互相调用一律走这些局部函数，不碰 `this`
+  function setFontVariant(id: FontVariantId): void {
+    setFontKey(id)
+    void applyFontVariant(id)
+    persist()
+  }
+
+  function setCodeFont(id: CodeFontId): void {
+    setCodeFontKey(id)
+    void applyCodeFont(id)
+    persist()
+  }
+
+  function setFontSize(n: number): void {
+    const clamped = sanitizeFontSize(n)
+    setFontSizeSignal(clamped)
+    applyFontSizeVar(clamped)
+    persist()
+  }
+
+  function stepFontSize(delta: number): void {
+    const index = FONT_SIZES.indexOf(fontSize())
+    // 档外（被手改过、或还没 sanitize）时回到默认档，而不是从 -1 起步
+    const next =
+      index < 0 ? DEFAULT_FONT_SIZE : FONT_SIZES[Math.min(FONT_SIZES.length - 1, Math.max(0, index + delta))]!
+    // next 一定是合法档位，走 setFontSize 会再 sanitize 一次（无副作用），顺带写穿
+    setFontSize(next)
+  }
+
+  function resetFontSize(): void {
+    setFontSize(DEFAULT_FONT_SIZE)
+  }
+
+  return {
+    fontKey,
+    codeFontKey,
+    fontSize,
+    report,
+    setFontVariant,
+    setCodeFont,
+    setFontSize,
+    stepFontSize,
+    resetFontSize,
+    load,
+    applyNow,
+  }
+}

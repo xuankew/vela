@@ -9,10 +9,10 @@
 //! 放进 vela-core 就意味着 `cargo test` 会把临时文件真的塞进开发机的废纸篓，
 //! 而 CI 的 ubuntu runner 上压根没有废纸篓可用。
 //!
-//! ## 接受路径的命令，按能力分组（M3-A-7 之后共十五个）
+//! ## 接受路径的命令，按能力分组（M4-A 之后共十七个）
 //!
-//! ⚠️ 最后两个**不住在本文件里**：第十三个（`set_watched`）在 `src/watcher.rs`，
-//! 第十四个（`open_large`）在 `src/shard.rs`，理由各写在那儿开头。
+//! ⚠️ 其中两个**不住在本文件里**：`set_watched` 在 `src/watcher.rs`，
+//! `open_large` 在 `src/shard.rs`，理由各写在那儿开头。
 //! 它们照样列在下面这张表里：这张表是「谁能碰到磁盘」的账，按文件分家就漏了一笔。
 //! （`read_lines` / `close_large` 不在表里——它们收的是一个整数句柄，
 //! 而那个句柄只可能来自 `open_large` 的返回值。）
@@ -33,6 +33,13 @@
 //! | **建文件索引**（只读名字） | `index_project` | `roots` |
 //! | **模糊匹配**（只读名字） | `query_project` | `roots` + needle + 一份最近清单 |
 //! | **订阅改动**（只读名字） | `set_watched` | 一组绝对路径（`doc.path()`） |
+//! | **读分层配置** | `load_settings` | `roots`（只取第一个根推项目层路径） |
+//! | **写分层配置** | `save_settings` | 无路径参数：写 `~/.vela/settings.json`，home 由 Rust 算 |
+//!
+//! ⚠️ 最后两行（配置）里**只有 `load_settings` 收前端给的路径**（`roots[0]`，dialog 授权过的
+//! 目录，与 `index_project` 同一信任面，且只拼写死的 `.vela/settings.json`）；`save_settings`
+//! 的落点完全由 Rust 侧 `home_dir()` 算出，前端**无法**影响它写到哪——这正是 `home_dir`
+//! 那个 helper 存在的理由，与 `session_path` 同一条安全姿势。
 //!
 //! 另存为没有自己的命令：它是前端先用 dialog 插件拿到新路径，再调同一个 `save_file`。
 //!
@@ -173,6 +180,7 @@ use vela_core::search::{
     SearchBatch, SearchError, SearchQuery, SearchSummary,
 };
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
+use vela_core::settings::{self as settings_store, LoadedSettings, SaveReport, Settings};
 
 /// 读一个文本文件。
 ///
@@ -426,6 +434,46 @@ pub async fn load_session(app: AppHandle) -> Result<Option<Session>, SessionErro
 pub async fn save_session(app: AppHandle, session: Session) -> Result<SessionReport, SessionError> {
     let path = session_path(&app)?;
     session_store::save_session(&path, session)
+}
+
+/// 用户主目录（`~`）。配置的用户全局层 `~/.vela/settings.json` 从这里推出。
+///
+/// ⚠️ **只能由这里算出来**，与 [`session_path`] 同一条安全姿势：一旦让前端传 `home`，
+/// `save_settings` 就成了「往任意目录写一份 `.vela/settings.json`」的原语——而配置是
+/// 启动即读、内容会灌进 UI 信号的东西。拿不到主目录时映射成 [`WriteError::Io`]，
+/// 前端当日志展示（reason 只是标签，用户看的是 message）。
+fn home_dir(app: &AppHandle) -> Result<PathBuf, WriteError> {
+    app.path()
+        .home_dir()
+        .map_err(|e| WriteError::Io {
+            reason: "HomeDir".to_owned(), message: format!("拿不到用户主目录：{e}")
+        })
+}
+
+/// 读回合并好的分层配置（内置默认 → 用户全局 → 项目级）。
+///
+/// `roots` 是当前工作区的根清单，**只取第一个**推项目层路径（多根裁定见 PLAN §3.6
+/// 「M4-A 实施修正」）；空清单 = 没打开文件夹，项目层为 `Absent`。
+///
+/// ⚠️ 本体 [`settings_store::load`] **不失败**：任何一层坏掉都退化成默认值并记进账单，
+/// 配置永远不该拦下启动。这里唯一的 `Err` 来自算不出主目录——那是环境问题，不是配置问题。
+#[command]
+pub async fn load_settings(app: AppHandle, roots: Vec<String>) -> Result<LoadedSettings, WriteError> {
+    let home = home_dir(&app)?;
+    // 只认第一个根：`roots` 来自 dialog 授权过的目录（与 index_project 同一信任面），
+    // 相对部分 `.vela/settings.json` 是写死的常量，前端没有输入框能改它
+    let project_root = roots.first().map(Path::new);
+    Ok(settings_store::load(&home, project_root))
+}
+
+/// 把配置写进**用户全局层**（`~/.vela/settings.json`），原子。
+///
+/// 🔴 v1 只写用户全局层：三个键都是偏好类、只认全局，没有需要落到项目层的键
+/// （理由见 [`settings_store::save`] 的文档）。`settings` 是前端把三个信号拼成的完整配置。
+#[command]
+pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<SaveReport, WriteError> {
+    let home = home_dir(&app)?;
+    settings_store::save(&home, &settings)
 }
 
 // ─── M2-C 全文搜索 / M2-D 全局替换：event 流 + 唯一一份 managed state ────────

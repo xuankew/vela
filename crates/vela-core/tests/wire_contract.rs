@@ -32,6 +32,10 @@ use vela_core::session::{
     load_session, save_session, PaneDirection, Session, SessionError, SessionProject, SessionReport, SessionRoot,
     SessionTab, MAX_SESSION_BYTES, SESSION_FILE_NAME, SESSION_VERSION,
 };
+use vela_core::settings::{
+    load as load_settings, save as save_settings, user_settings_path, LayerStatus, LoadedSettings, SaveReport,
+    Settings, SettingsReport, DEFAULT_CODE_FONT, DEFAULT_FONT_SIZE, DEFAULT_FONT_VARIANT,
+};
 use vela_core::watcher::FileChange;
 
 #[test]
@@ -1415,4 +1419,124 @@ fn 分片接不住的编码在契约上有其名() {
         Err(ReadError::TooLarge { limit, .. }) => assert_eq!(limit, MAX_SHARD_BYTES),
         other => panic!("期望 TooLarge，实际 {other:?}"),
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 分层配置（M4-A）。与 session 同一套钉法：合并后的最终配置是**具体的三键对象**
+// （没有 Option），账单（report）里的两层状态用 snake_case 的 `status` 打标签。
+// 前端 `src/ipc/settings.ts` 的镜像类型与 `src/ipc/settings.test.ts` 的黄金 JSON 是另一半。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `Settings`（合并后的最终配置）的线上形状：紧凑、camelCase、字段顺序 = 声明顺序。
+///
+/// 这个类型同时是 `save` 命令的**入参**（前端把三个信号拼成它发回来），所以它必须能
+/// 反序列化——下面紧跟一条 `from_str` 钉住这一点。
+#[test]
+fn settings_的线上形状() {
+    let json = serde_json::to_string(&Settings::default()).unwrap();
+    assert_eq!(json, r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn"}"#);
+
+    // save 命令收的就是这个形状，必须能原样读回来
+    let parsed: Settings = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, Settings::default());
+
+    // 非默认值也一样：字段是具体值不是 Option，任何一档都走同一条反序列化路径
+    let custom = r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit"}"#;
+    let parsed: Settings = serde_json::from_str(custom).unwrap();
+    assert_eq!(
+        (parsed.font_size, parsed.font_variant.as_str(), parsed.code_font.as_str()),
+        (16, "screen-r", "inherit")
+    );
+}
+
+/// 内置默认值两边各钉一条：这三个常量前端也各写一份（`App.tsx` 的 `DEFAULT_FONT_SIZE`、
+/// `fonts/loader.ts` 的 `DEFAULT_VARIANT` / `DEFAULT_CODE_FONT`），没有代码生成，
+/// 与 `MAX_SESSION_TABS` 同一套做法。漂了这条就红。
+#[test]
+fn 内置默认配置被钉住() {
+    assert_eq!(DEFAULT_FONT_SIZE, 14);
+    assert_eq!(DEFAULT_FONT_VARIANT, "screen-gb");
+    assert_eq!(DEFAULT_CODE_FONT, "maple-cn");
+    assert_eq!(Settings::default().font_size, DEFAULT_FONT_SIZE);
+}
+
+/// `LayerStatus` 的三种线上形状。`status` 是标签字段（snake_case），
+/// 只有 `corrupt` 带一个 `reason`（事实，文案归前端）。
+#[test]
+fn layer_status_的三种线上形状() {
+    assert_eq!(serde_json::to_string(&LayerStatus::Absent).unwrap(), r#"{"status":"absent"}"#);
+    assert_eq!(serde_json::to_string(&LayerStatus::Present).unwrap(), r#"{"status":"present"}"#);
+    assert_eq!(
+        serde_json::to_string(&LayerStatus::Corrupt { reason: "坏".into() }).unwrap(),
+        r#"{"status":"corrupt","reason":"坏"}"#
+    );
+}
+
+/// `LoadedSettings`（`load` 命令的返回值）的完整线上形状。
+///
+/// 这里刻意让**两层各走一条不同的下场**：用户层 `present`、项目层 `corrupt`，
+/// 再让项目层试图写一个偏好键（`fontSize`）落进 `ignoredProjectKeys`——
+/// 把「一层坏掉不拦另一层」「项目层的偏好键被忽略并记账」两件事一次钉住。
+#[test]
+fn loaded_settings_的线上形状() {
+    let loaded = LoadedSettings {
+        settings: Settings { font_size: 16, font_variant: "screen-r".into(), code_font: "inherit".into() },
+        report: SettingsReport {
+            user_layer: LayerStatus::Present,
+            project_layer: LayerStatus::Corrupt { reason: "坏".into() },
+            ignored_project_keys: vec!["fontSize".into()],
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&loaded).unwrap(),
+        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
+    );
+}
+
+/// `SaveReport` 的线上形状：只有一个 camelCase 的 `bytesWritten`。
+#[test]
+fn save_report_的线上形状() {
+    assert_eq!(serde_json::to_string(&SaveReport { bytes_written: 42 }).unwrap(), r#"{"bytesWritten":42}"#);
+}
+
+/// 端到端：`load` 在两层都不存在时给出内置默认 + 两层 `absent`，
+/// 且这份返回值的线上形状与前端镜像类型对得上。
+///
+/// 走的是真实的 `load`（真读磁盘），不是手搓结构体——钉住「空现场」这条最常见路径
+/// 的**线上字节**，前端启动时第一次调 `load_settings` 收到的就是这个。
+#[test]
+fn 空现场下_load_的线上形状() {
+    let home = tempfile::tempdir().unwrap();
+    let loaded = load_settings(home.path(), None);
+    assert_eq!(
+        serde_json::to_string(&loaded).unwrap(),
+        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn"},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
+    );
+}
+
+/// `save` 落盘的是**紧凑契约的 pretty 版**，读回来与 `load` 合并出的配置一致，
+/// 且 `bytesWritten` 等于文件真实字节数（与 session 的 `落盘字节与契约字面量一致` 同一姿势）。
+///
+/// ⚠️ 存的是 pretty JSON（用户会手改这个 dotfile），所以这里的字面量带缩进和换行；
+/// 但 `Settings` 的**字段集合与顺序**与上面紧凑那条完全一致，只是排版不同。
+#[test]
+fn save_落盘再_load_回来一致() {
+    let home = tempfile::tempdir().unwrap();
+    let settings = Settings { font_size: 18, font_variant: "system-mono".into(), code_font: "inherit".into() };
+
+    let report = save_settings(home.path(), &settings).unwrap();
+    let path = user_settings_path(home.path());
+    assert_eq!(report.bytes_written, fs::read(&path).unwrap().len() as u64);
+
+    // pretty 排版：三键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\"\n}"
+    );
+
+    // 读回来：用户层生效，项目层 absent
+    let loaded = load_settings(home.path(), None);
+    assert_eq!(loaded.settings, settings);
+    assert_eq!(loaded.report.user_layer, LayerStatus::Present);
+    assert_eq!(loaded.report.project_layer, LayerStatus::Absent);
 }

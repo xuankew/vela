@@ -18,16 +18,7 @@ import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
 import { createWorkspace, MAX_PANES, type DiscardDecision, type Pane } from './doc/workspace'
 import { EditorPane } from './editor/EditorPane'
-import {
-  applyCodeFont,
-  applyFontVariant,
-  CODE_FONTS,
-  DEFAULT_CODE_FONT,
-  DEFAULT_VARIANT,
-  FONT_VARIANTS,
-  type CodeFontId,
-  type FontVariantId,
-} from './fonts/loader'
+import { CODE_FONTS, FONT_VARIANTS, type CodeFontId, type FontVariantId } from './fonts/loader'
 import { QuickOpen } from './goto/QuickOpen'
 import { createQuickOpen, type Commit } from './goto/store'
 import { symbolTable } from './goto/syntax'
@@ -46,6 +37,7 @@ import { ReplaceConfirm } from './search/ReplaceConfirm'
 import { revealTarget } from './search/reveal'
 import type { HitRow } from './search/rows'
 import { createSearchPanel } from './search/store'
+import { createSettingsStore, FONT_SIZES } from './settings/store'
 import { BUILTIN_TOOLS } from './tools/builtin'
 import { createToolBox } from './tools/store'
 
@@ -92,9 +84,6 @@ const MarkdownPreview = lazy(() => import('./md/MarkdownPreview').then((m) => ({
  */
 const CommandPalette = lazy(() => import('./commands/CommandPalette').then((m) => ({ default: m.CommandPalette })))
 const ToolBox = lazy(() => import('./tools/ToolBox').then((m) => ({ default: m.ToolBox })))
-
-const FONT_SIZES = [12, 13, 14, 15, 16, 18, 20]
-const DEFAULT_FONT_SIZE = 14
 
 /**
  * 编辑器那一层要说的话（见下面 `editorNotice` 那条注释）。
@@ -144,9 +133,21 @@ export default function App() {
   let tornDown = false
   let sync: SessionSync | undefined
 
-  const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
-  const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
-  const [fontSize, setFontSize] = createSignal(DEFAULT_FONT_SIZE)
+  /**
+   * 配置这一层的提示（M4-A）：配置读不回来、写不下去。
+   *
+   * 与 `sessionWarning` 同一类——说的不是**某一个文档**，所以不塞进 `doc.notice()`。
+   * 它是 `createSettingsStore` 的 `onWarn` 落点：配置是偏好，读不回来最坏是「用默认字号」，
+   * 不该拦启动，但「我设的没记住」这件事得让用户看见一句，而不是静默回退。
+   */
+  const [settingsNotice, setSettingsNotice] = createSignal<string | null>(null)
+
+  /**
+   * 字体 / 字号的持久化状态（M4-A）。三个值跟着**人**走（用户全局层 `~/.vela/settings.json`），
+   * 换项目也在。sanitize（档外字号、不认识的字体 ID）与写穿都在这一层里，理由见
+   * `src/settings/store.ts` 的模块文档。
+   */
+  const settings = createSettingsStore({ onWarn: setSettingsNotice })
 
   /**
    * 会话这一层的提示：存档读不回来、写不下去、草稿超预算被丢。
@@ -197,6 +198,22 @@ export default function App() {
    * 也和 workspace 的 `promptDiscard` 同一条道理——store 不该知道宿主长什么样。
    */
   const tree = createProjectTree({ openFile: (path) => ws.openAt(path) })
+
+  /**
+   * 工作区的根一变就重读分层配置（M4-A）。
+   *
+   * 多根只认**第一个**（Rust 侧取 `roots[0]` 推项目层路径，裁定见 PLAN §3.6「M4-A 实施修正」）。
+   * 🔴 v1 里三个键全是个人偏好、项目层不生效，所以重读**不会改变**合并出的配置——
+   * 重跑的唯一理由是刷新那份账单（`settings.report()` 里的 `ignoredProjectKeys`），
+   * 以及为「第一个 project-safe 键」（M3-A-7 推来的 asset 落地目录）提前把线接好。
+   *
+   * 建在组件体内而不是 `onMount` 里：`createEffect` 要跟着组件的 owner 一起 dispose，
+   * 理由与下面 `fileWatch` 那条逐字相同。第一次跑时 roots 还是空的（会话尚未恢复），
+   * 于是先按「没有项目层」读一遍用户全局；恢复出根之后这个 effect 自己会再跑一次。
+   */
+  createEffect(() => {
+    void settings.load(tree.roots())
+  })
 
   /**
    * 外部改动监听（M2-G）。盯的是**打开着的文件**，与上面两套状态都不重叠：
@@ -747,36 +764,11 @@ export default function App() {
   /** 命令面板（M3-B-1d）。它自己也出现在自己那份清单里，理由与安全性见 `commands/palette.ts` */
   const palette = createCommandPalette({ registry, context: appContext })
 
-  function applyFontSize() {
-    document.documentElement.style.setProperty('--vela-font-size', `${fontSize()}px`)
-  }
-
-  /** 只在预设档位之间走：字号同时被工具栏的 select 显示，冒出 17px 这种档外值会让 select 变空白 */
-  function stepFontSize(delta: number) {
-    const index = FONT_SIZES.indexOf(fontSize())
-    const next =
-      index < 0 ? DEFAULT_FONT_SIZE : FONT_SIZES[Math.min(FONT_SIZES.length - 1, Math.max(0, index + delta))]!
-    setFontSize(next)
-    applyFontSize()
-  }
-
-  /** 字体是动态 import，切换有真实异步成本，所以要 await 完再让 UI 认为切换结束 */
-  async function switchFont(id: FontVariantId) {
-    setFontKey(id)
-    await applyFontVariant(id)
-  }
-
-  /** 代码区字体与正文字体正交，独立切换、独立注入，两个 family 同时驻留 */
-  async function switchCodeFont(id: CodeFontId) {
-    setCodeFontKey(id)
-    await applyCodeFont(id)
-  }
-
   onMount(() => {
-    applyFontSize()
-    // 字体注入与编辑器挂载并行：编辑器不等字体，到达后浏览器自己用 font-display: swap 重排
-    void switchFont(DEFAULT_VARIANT)
-    void switchCodeFont(DEFAULT_CODE_FONT)
+    // 首屏先把**默认**字体注入起来，不等配置那次 IPC 回来；随后上面 roots 那个 effect
+    // 会 `settings.load(...)` 把持久化的值装回来并覆盖。字体注入与编辑器挂载并行：
+    // 编辑器不等字体，到达后浏览器自己用 font-display: swap 重排
+    settings.applyNow()
     disposeCommands = registerBuiltinCommands(registry, {
       newDocument: () => {
         ws.newTab()
@@ -785,11 +777,11 @@ export default function App() {
       saveFile: ws.save,
       saveFileAs: ws.saveAs,
       applyLineWrap: (on) => ws.setLineWrap(on),
-      adjustFontSize: stepFontSize,
-      resetFontSize: () => {
-        setFontSize(DEFAULT_FONT_SIZE)
-        applyFontSize()
-      },
+      // 字号的档位夹取与写穿都在 store 里，这里只把命令接到 store 的方法上。
+      // ⚠️ 递的是**裸引用**（`settings.stepFontSize` 而不是 `(d) => settings.stepFontSize(d)`）：
+      // store 里这些是具名函数、不依赖 `this`，正是为了能被这样递出去
+      adjustFontSize: settings.stepFontSize,
+      resetFontSize: settings.resetFontSize,
       splitRight: () => ws.split('row'),
       splitDown: () => ws.split('column'),
       closePane: () => ws.closePane(ws.focusedPaneId()),
@@ -929,8 +921,8 @@ export default function App() {
         <div class="toolbar-group">
           <span class="toolbar-label">字体</span>
           <select
-            value={fontKey()}
-            onChange={(e) => void switchFont(e.currentTarget.value as FontVariantId)}
+            value={settings.fontKey()}
+            onChange={(e) => settings.setFontVariant(e.currentTarget.value as FontVariantId)}
             title="正文与 UI 字体"
           >
             {Object.values(FONT_VARIANTS).map((v) => (
@@ -938,8 +930,8 @@ export default function App() {
             ))}
           </select>
           <select
-            value={codeFontKey()}
-            onChange={(e) => void switchCodeFont(e.currentTarget.value as CodeFontId)}
+            value={settings.codeFontKey()}
+            onChange={(e) => settings.setCodeFont(e.currentTarget.value as CodeFontId)}
             title="代码区字体（代码块 / 表格）"
           >
             {Object.values(CODE_FONTS).map((v) => (
@@ -947,11 +939,8 @@ export default function App() {
             ))}
           </select>
           <select
-            value={fontSize()}
-            onChange={(e) => {
-              setFontSize(Number(e.currentTarget.value))
-              applyFontSize()
-            }}
+            value={settings.fontSize()}
+            onChange={(e) => settings.setFontSize(Number(e.currentTarget.value))}
             title="字号（也可用 Cmd/Ctrl + = / - / 0）"
           >
             {FONT_SIZES.map((s) => (
@@ -1023,6 +1012,16 @@ export default function App() {
             <div class="notice warning">
               <span>{text()}</span>
               <button class="notice-close" onClick={() => setSessionWarning(null)} title="关闭">
+                ×
+              </button>
+            </div>
+          )}
+        </Show>
+        <Show when={settingsNotice()}>
+          {(text) => (
+            <div class="notice warning">
+              <span>{text()}</span>
+              <button class="notice-close" onClick={() => setSettingsNotice(null)} title="关闭">
                 ×
               </button>
             </div>

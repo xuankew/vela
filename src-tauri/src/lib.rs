@@ -88,6 +88,8 @@ pub fn run() {
             commands::close_window,
             commands::load_session,
             commands::save_session,
+            commands::load_settings,
+            commands::save_settings,
             commands::start_search,
             commands::start_replace,
             commands::cancel_task,
