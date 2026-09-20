@@ -34,7 +34,8 @@ use vela_core::session::{
 };
 use vela_core::settings::{
     load as load_settings, save as save_settings, user_settings_path, LayerStatus, LoadedSettings, SaveReport,
-    Settings, SettingsReport, DEFAULT_CODE_FONT, DEFAULT_FONT_SIZE, DEFAULT_FONT_VARIANT,
+    Settings, SettingsReport, DEFAULT_CODE_FONT, DEFAULT_FONT_SIZE, DEFAULT_FONT_VARIANT, DEFAULT_LETTER_SPACING,
+    DEFAULT_LINE_HEIGHT,
 };
 use vela_core::watcher::FileChange;
 
@@ -1429,35 +1430,60 @@ fn 分片接不住的编码在契约上有其名() {
 
 /// `Settings`（合并后的最终配置）的线上形状：紧凑、camelCase、字段顺序 = 声明顺序。
 ///
-/// 这个类型同时是 `save` 命令的**入参**（前端把三个信号拼成它发回来），所以它必须能
+/// 这个类型同时是 `save` 命令的**入参**（前端把信号拼成它发回来），所以它必须能
 /// 反序列化——下面紧跟一条 `from_str` 钉住这一点。
+///
+/// ⚠️ `letterSpacing` 的默认值在线上是 `0.0` 而不是 `0`：serde_json 对 `f64` 永远带小数点，
+/// 而 JS 那边 `JSON.stringify(0)` 写的是 `0`。两者是**同一个 JSON number**，
+/// `JSON.parse("0.0") === JSON.parse("0")`、Rust 侧 `from_str` 也一样，所以两边都能读回来；
+/// 只是「落盘字节」这一层不同——前端存的是 `0`，Rust 存的是 `0.0`。与 session 的
+/// `scrollTop: 0.0` 同一条取舍（见上面 `session_的线上形状` 的注释）。前端的黄金字面量
+/// 因此写 `0`，这里写 `0.0`，各自钉住自己那一侧的输出。
 #[test]
 fn settings_的线上形状() {
     let json = serde_json::to_string(&Settings::default()).unwrap();
-    assert_eq!(json, r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn"}"#);
+    assert_eq!(
+        json,
+        r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0}"#
+    );
 
-    // save 命令收的就是这个形状，必须能原样读回来
+    // save 命令收的就是这个形状，必须能原样读回来（含 JS 那侧会发的整数字面量 `0`）
     let parsed: Settings = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, Settings::default());
+    assert_eq!(
+        serde_json::from_str::<Settings>(
+            r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0}"#
+        )
+        .unwrap(),
+        Settings::default(),
+        "JS 发的整数 0 必须读成 0.0"
+    );
 
     // 非默认值也一样：字段是具体值不是 Option，任何一档都走同一条反序列化路径
-    let custom = r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit"}"#;
+    let custom =
+        r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05}"#;
     let parsed: Settings = serde_json::from_str(custom).unwrap();
     assert_eq!(
         (parsed.font_size, parsed.font_variant.as_str(), parsed.code_font.as_str()),
         (16, "screen-r", "inherit")
     );
+    assert_eq!((parsed.line_height, parsed.letter_spacing), (2.0, 0.05));
 }
 
-/// 内置默认值两边各钉一条：这三个常量前端也各写一份（`App.tsx` 的 `DEFAULT_FONT_SIZE`、
-/// `fonts/loader.ts` 的 `DEFAULT_VARIANT` / `DEFAULT_CODE_FONT`），没有代码生成，
-/// 与 `MAX_SESSION_TABS` 同一套做法。漂了这条就红。
+/// 内置默认值两边各钉一条：这五个常量前端也各写一份（`App.tsx` 的 `DEFAULT_FONT_SIZE`、
+/// `fonts/loader.ts` 的 `DEFAULT_VARIANT` / `DEFAULT_CODE_FONT`、`settings/store.ts` 的
+/// `DEFAULT_LINE_HEIGHT` / `DEFAULT_LETTER_SPACING`），没有代码生成，与 `MAX_SESSION_TABS`
+/// 同一套做法。漂了这条就红。
 #[test]
 fn 内置默认配置被钉住() {
     assert_eq!(DEFAULT_FONT_SIZE, 14);
     assert_eq!(DEFAULT_FONT_VARIANT, "screen-gb");
     assert_eq!(DEFAULT_CODE_FONT, "maple-cn");
+    assert_eq!(DEFAULT_LINE_HEIGHT, 1.75);
+    assert_eq!(DEFAULT_LETTER_SPACING, 0.0);
     assert_eq!(Settings::default().font_size, DEFAULT_FONT_SIZE);
+    assert_eq!(Settings::default().line_height, DEFAULT_LINE_HEIGHT);
+    assert_eq!(Settings::default().letter_spacing, DEFAULT_LETTER_SPACING);
 }
 
 /// `LayerStatus` 的三种线上形状。`status` 是标签字段（snake_case），
@@ -1480,7 +1506,13 @@ fn layer_status_的三种线上形状() {
 #[test]
 fn loaded_settings_的线上形状() {
     let loaded = LoadedSettings {
-        settings: Settings { font_size: 16, font_variant: "screen-r".into(), code_font: "inherit".into() },
+        settings: Settings {
+            font_size: 16,
+            font_variant: "screen-r".into(),
+            code_font: "inherit".into(),
+            line_height: 2.0,
+            letter_spacing: 0.05,
+        },
         report: SettingsReport {
             user_layer: LayerStatus::Present,
             project_layer: LayerStatus::Corrupt { reason: "坏".into() },
@@ -1489,7 +1521,7 @@ fn loaded_settings_的线上形状() {
     };
     assert_eq!(
         serde_json::to_string(&loaded).unwrap(),
-        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
+        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
     );
 }
 
@@ -1510,7 +1542,7 @@ fn 空现场下_load_的线上形状() {
     let loaded = load_settings(home.path(), None);
     assert_eq!(
         serde_json::to_string(&loaded).unwrap(),
-        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn"},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
+        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
     );
 }
 
@@ -1519,19 +1551,27 @@ fn 空现场下_load_的线上形状() {
 ///
 /// ⚠️ 存的是 pretty JSON（用户会手改这个 dotfile），所以这里的字面量带缩进和换行；
 /// 但 `Settings` 的**字段集合与顺序**与上面紧凑那条完全一致，只是排版不同。
+/// ⚠️ `letterSpacing` 在 pretty 输出里同样是 `0.0`（带小数点）——前端存这一份时写的是 `0`，
+/// 两种写法读回来都是同一个数（见 `settings_的线上形状` 的注释）。
 #[test]
 fn save_落盘再_load_回来一致() {
     let home = tempfile::tempdir().unwrap();
-    let settings = Settings { font_size: 18, font_variant: "system-mono".into(), code_font: "inherit".into() };
+    let settings = Settings {
+        font_size: 18,
+        font_variant: "system-mono".into(),
+        code_font: "inherit".into(),
+        line_height: 2.0,
+        letter_spacing: 0.0,
+    };
 
     let report = save_settings(home.path(), &settings).unwrap();
     let path = user_settings_path(home.path());
     assert_eq!(report.bytes_written, fs::read(&path).unwrap().len() as u64);
 
-    // pretty 排版：三键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
+    // pretty 排版：五键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
-        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\"\n}"
+        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\",\n  \"lineHeight\": 2.0,\n  \"letterSpacing\": 0.0\n}"
     );
 
     // 读回来：用户层生效，项目层 absent

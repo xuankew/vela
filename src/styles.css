@@ -21,6 +21,11 @@
   --vela-font-ui: -apple-system, BlinkMacSystemFont, sans-serif;
   --vela-font-size: 14px;
   --vela-line-height: 1.75;
+  /* 字间距。默认 `normal`（= 不额外加间距），由 settings store 在改动时覆盖成 `<n>em`。
+     ⚠️ 兜底值写 `normal` 而不是 `0em`：默认状态编辑器一个像素都不该动，而 `normal`
+     与「压根没声明 letter-spacing」是同一件事，`0em` 严格说是另一回事。
+     与 `--vela-line-height` 一样被 CM6 与 `.md-preview-body` 同时消费。 */
+  --vela-letter-spacing: normal;
 
   /* 临时暗色配色，正式主题系统在 M4 接管 */
   --vela-bg: #1a1b26;
@@ -100,6 +105,94 @@ body {
   color: var(--vela-fg-dim);
   font-size: 11px;
   margin-right: 2px;
+}
+
+/* ---------- 外观浮层（M4-B）---------- */
+
+/* 锚定下拉：容器 relative，面板 absolute 挂在按钮下方。⚠️ 刻意不铺全屏 backdrop——
+   调行高/字间距时要看得见编辑器实时变化，一块盖住编辑器的遮罩正好毁掉这件事。
+   点浮层外面关闭由组件里的 document pointerdown 监听负责，不靠 catcher。 */
+.appearance {
+  position: relative;
+  display: inline-flex;
+}
+
+.appearance-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 240px;
+  padding: 10px;
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.appearance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.appearance-label {
+  color: var(--vela-fg-dim);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.appearance-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 步进器：− [读数] +。读数是 span 不是 input——连续量由 store 夹取归一化，
+   不给用户直接敲数的入口，省掉一层「敲进去的非法值怎么显示」的麻烦 */
+.appearance-stepper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.appearance-stepper button {
+  width: 26px;
+  padding: 3px 0;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.appearance-value {
+  min-width: 52px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--vela-fg);
+}
+
+.appearance-foot {
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid var(--vela-border);
+  padding-top: 8px;
+}
+
+/* 恢复默认是「反向操作」，按项目规矩给最小视觉重量：小号、浅灰、无强调色 */
+.appearance-reset {
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+  background: transparent;
+  border-color: transparent;
+}
+
+.appearance-reset:hover {
+  color: var(--vela-fg);
+  border-color: var(--vela-border);
 }
 
 button {
@@ -1998,6 +2091,7 @@ select {
   font-family: var(--vela-font-editor);
   font-size: var(--vela-font-size);
   line-height: var(--vela-line-height);
+  letter-spacing: var(--vela-letter-spacing, normal);
   color: var(--vela-fg);
   /* 一条没有空格的超长 URL 不该把整栏撑宽 */
   overflow-wrap: break-word;

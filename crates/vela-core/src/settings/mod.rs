@@ -9,9 +9,9 @@
 //!
 //! 合并顺序是「后一层盖前一层」，但 🔴 **不是每一层都能写每一个键**，见下面「可写层」。
 //!
-//! ## 🔴「哪一层能改哪些键」：v1 三个键都是偏好类，项目层写了也忽略
+//! ## 🔴「哪一层能改哪些键」：v1 五个键都是偏好类，项目层写了也忽略
 //!
-//! 用户裁定：字号 / 正文字体 / 代码字体是**个人偏好**，只认「内置默认 + 用户全局」两层。
+//! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距是**个人偏好**，只认「内置默认 + 用户全局」两层。
 //! 打开一个带 `.vela/settings.json` 的仓库**不会**突然改掉你的字号——那样太突兀，
 //! 而且一个克隆来的仓库不该有这种权力（它连你的磁盘都能碰到，见 `commands.rs` 的信任面那张表）。
 //!
@@ -74,11 +74,30 @@ pub const DEFAULT_FONT_VARIANT: &str = "screen-gb";
 /// 内置默认代码区字体 ID。与前端 `src/fonts/loader.ts` 的 `DEFAULT_CODE_FONT` 同值。
 pub const DEFAULT_CODE_FONT: &str = "maple-cn";
 
+/// 内置默认行高（无单位倍数）。与前端 `src/settings/store.ts` 的 `DEFAULT_LINE_HEIGHT` 同值，
+/// 两边各写一份、各钉一条（同 `DEFAULT_FONT_SIZE` 的做法）。
+///
+/// ⚠️ Rust 不夹范围：合法区间（前端 `LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX`）是 UI 概念，
+/// 夹一次就够，归前端。`1.75` 与 `styles.css` 里 `--vela-line-height` 的初值同值，
+/// 于是「没存过配置」与「这一轮之前」渲染逐像素一致。
+pub const DEFAULT_LINE_HEIGHT: f64 = 1.75;
+
+/// 内置默认字间距（em）。`0.0` = 不额外加间距，对应 CSS 的 `letter-spacing: normal`。
+///
+/// ⚠️ 前端把 `0` 翻译成 `normal` 而不是 `0em`：默认值下编辑器一个像素都不该动，
+/// 而 `normal` 与「压根没声明 letter-spacing」是同一件事，`0em` 严格说是另一回事
+/// （`normal` 允许字体自带的字距调整）。区间与步进同样是 UI 概念，归前端夹。
+pub const DEFAULT_LETTER_SPACING: f64 = 0.0;
+
 /// 合并之后的**最终配置**：每个键都是具体值，没有 `Option`。
 ///
 /// 这是 `load` 交出去、`save` 收进来的形状。前端拿到它直接往信号里灌，
 /// 不需要再处理「这个键有没有值」——所有缺口都已经被下面两层填上了。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// ⚠️ 只派生 `PartialEq` 不派生 `Eq`：`line_height` / `letter_spacing` 是 `f64`，
+/// 而 `f64` 没有 `Eq`（NaN != 自身）。这两个值由前端夹在有限区间里、不会是 NaN，
+/// 但类型上拿不到 `Eq`，于是整个结构体也只能到 `PartialEq` 为止。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// 编辑器字号（px）。**偏好类**，只认内置默认 + 用户全局。
@@ -90,6 +109,10 @@ pub struct Settings {
     pub font_variant: String,
     /// 代码区字体 ID（`CodeFontId`）。**偏好类**。同上。
     pub code_font: String,
+    /// 行高（无单位倍数）。**偏好类**。Rust 不夹范围，归前端（同 `font_size`）。
+    pub line_height: f64,
+    /// 字间距（em）。**偏好类**。`0.0` = `normal`。Rust 不夹范围，归前端。
+    pub letter_spacing: f64,
 }
 
 impl Default for Settings {
@@ -99,6 +122,8 @@ impl Default for Settings {
             font_size: DEFAULT_FONT_SIZE,
             font_variant: DEFAULT_FONT_VARIANT.to_owned(),
             code_font: DEFAULT_CODE_FONT.to_owned(),
+            line_height: DEFAULT_LINE_HEIGHT,
+            letter_spacing: DEFAULT_LETTER_SPACING,
         }
     }
 }
@@ -111,12 +136,16 @@ impl Default for Settings {
 /// 只派生 `Deserialize`：写盘走的是具体的 [`Settings`]（整份重写用户全局层），
 /// 这个类型只是**读**的形状。`#[serde(default)]` 让缺键 = `None`，
 /// 未知键被 serde 默认忽略（forward-compat，见模块文档）。
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+///
+/// ⚠️ 同 [`Settings`]：含 `f64`，只到 `PartialEq` 为止，没有 `Eq`。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SettingsLayer {
     pub font_size: Option<u32>,
     pub font_variant: Option<String>,
     pub code_font: Option<String>,
+    pub line_height: Option<f64>,
+    pub letter_spacing: Option<f64>,
 }
 
 /// 一层配置文件在读取时的下场。
@@ -141,13 +170,15 @@ pub struct SettingsReport {
     pub project_layer: LayerStatus,
     /// 项目层试图写「仅全局」的偏好键、因而被忽略的键名（wire 名，前端可直接引用）。
     ///
-    /// v1 里三个键全是偏好类，所以项目层写的任何键都会落在这里。前端可以据此说一句
+    /// v1 里五个键全是偏好类，所以项目层写的任何键都会落在这里。前端可以据此说一句
     /// 「这个仓库的 `.vela/settings.json` 想改你的 <键>，但 <键> 只认用户全局，已忽略」。
     pub ignored_project_keys: Vec<String>,
 }
 
 /// `load` 的返回值：合并好的配置 + 那份账单。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// ⚠️ 只到 `PartialEq`：内含 [`Settings`]，而 `Settings` 带 `f64`、拿不到 `Eq`。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadedSettings {
     pub settings: Settings,
@@ -203,7 +234,7 @@ fn read_layer(path: &Path) -> (Option<SettingsLayer>, LayerStatus) {
 
 /// 把两层文件内容合并成最终配置，并记账项目层被忽略的键。
 ///
-/// 🔴 **可写层门在这里**：v1 三个键都是偏好类，只有 `user`（用户全局）能盖过内置默认；
+/// 🔴 **可写层门在这里**：v1 五个键都是偏好类，只有 `user`（用户全局）能盖过内置默认；
 /// `project`（项目级）里的同名键一律**丢弃并记账**。将来加 project-safe 键时，
 /// 就在这个函数里给那个键加一条「也接受 project」的分支——门已经在这儿了，不用临时搭。
 pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<String>) {
@@ -220,6 +251,12 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     if let Some(v) = user.code_font {
         settings.code_font = v;
     }
+    if let Some(v) = user.line_height {
+        settings.line_height = v;
+    }
+    if let Some(v) = user.letter_spacing {
+        settings.letter_spacing = v;
+    }
 
     // 项目层：v1 没有 project-safe 键，偏好键写了也忽略，只记账给前端一句话
     let mut ignored_project_keys = Vec::new();
@@ -231,6 +268,12 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     }
     if project.code_font.is_some() {
         ignored_project_keys.push("codeFont".to_owned());
+    }
+    if project.line_height.is_some() {
+        ignored_project_keys.push("lineHeight".to_owned());
+    }
+    if project.letter_spacing.is_some() {
+        ignored_project_keys.push("letterSpacing".to_owned());
     }
 
     (settings, ignored_project_keys)
@@ -392,7 +435,7 @@ mod tests {
 
     #[test]
     fn 未知键被忽略而不让整层作废() {
-        // forward-compat：新版本写下的 theme 键不该让只认三个键的这一版读不动
+        // forward-compat：新版本写下的 theme 键不该让只认五个键的这一版读不动
         let home = tempfile::tempdir().unwrap();
         write_user(home.path(), r#"{"fontSize":18,"theme":"dark","将来才有的键":123}"#);
         let loaded = load(home.path(), None);
@@ -403,12 +446,42 @@ mod tests {
     #[test]
     fn 存下来再读回来一致() {
         let home = tempfile::tempdir().unwrap();
-        let settings = Settings { font_size: 20, font_variant: "screen-r".into(), code_font: "inherit".into() };
+        let settings = Settings {
+            font_size: 20,
+            font_variant: "screen-r".into(),
+            code_font: "inherit".into(),
+            line_height: 2.0,
+            letter_spacing: 0.05,
+        };
         let report = save(home.path(), &settings).unwrap();
         assert_eq!(report.bytes_written, fs::read(user_settings_path(home.path())).unwrap().len() as u64);
 
         let loaded = load(home.path(), None);
         assert_eq!(loaded.settings, settings, "往返之后配置变了");
+    }
+
+    #[test]
+    fn 行高与字间距能存回来() {
+        // 专门钉住两个 f64 键的往返：`1.75` 与 `0.05` 在 JSON 里都能精确表示，
+        // serde 写回来再读回来必须逐位相等（不是「差不多」）
+        let home = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"lineHeight":2.0,"letterSpacing":0.05}"#);
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.line_height, 2.0);
+        assert_eq!(loaded.settings.letter_spacing, 0.05);
+        // 没写的键留给内置默认
+        assert_eq!(loaded.settings.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn 项目层写行高与字间距也被忽略并记账() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_project(root.path(), r#"{"lineHeight":2.5,"letterSpacing":0.2}"#);
+        let loaded = load(home.path(), Some(root.path()));
+        assert_eq!(loaded.settings.line_height, DEFAULT_LINE_HEIGHT, "项目层不该改行高");
+        assert_eq!(loaded.settings.letter_spacing, DEFAULT_LETTER_SPACING, "项目层不该改字间距");
+        assert_eq!(loaded.report.ignored_project_keys, vec!["lineHeight".to_owned(), "letterSpacing".to_owned()]);
     }
 
     #[test]
@@ -421,15 +494,16 @@ mod tests {
     }
 
     #[test]
-    fn 存下来的文件是干净的三键_json() {
-        // 整份重写：只含这三个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
+    fn 存下来的文件是干净的五个键_json() {
+        // 整份重写：只含这五个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
         let home = tempfile::tempdir().unwrap();
-        save(home.path(), &Settings { font_size: 16, font_variant: "screen-gb".into(), code_font: "maple-cn".into() })
-            .unwrap();
+        save(home.path(), &Settings::default()).unwrap();
         let text = fs::read_to_string(user_settings_path(home.path())).unwrap();
-        assert!(text.contains("\"fontSize\": 16"), "{text}");
+        assert!(text.contains("\"fontSize\": 14"), "{text}");
         assert!(text.contains("\"fontVariant\": \"screen-gb\""), "{text}");
         assert!(text.contains("\"codeFont\": \"maple-cn\""), "{text}");
+        assert!(text.contains("\"lineHeight\": 1.75"), "{text}");
+        assert!(text.contains("\"letterSpacing\": 0.0"), "{text}");
         assert!(!text.contains("null"), "不该写 null 键：{text}");
     }
 

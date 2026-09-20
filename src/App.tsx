@@ -18,7 +18,6 @@ import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
 import { createWorkspace, MAX_PANES, type DiscardDecision, type Pane } from './doc/workspace'
 import { EditorPane } from './editor/EditorPane'
-import { CODE_FONTS, FONT_VARIANTS, type CodeFontId, type FontVariantId } from './fonts/loader'
 import { QuickOpen } from './goto/QuickOpen'
 import { createQuickOpen, type Commit } from './goto/store'
 import { symbolTable } from './goto/syntax'
@@ -37,7 +36,8 @@ import { ReplaceConfirm } from './search/ReplaceConfirm'
 import { revealTarget } from './search/reveal'
 import type { HitRow } from './search/rows'
 import { createSearchPanel } from './search/store'
-import { createSettingsStore, FONT_SIZES } from './settings/store'
+import { AppearancePopover } from './settings/AppearancePopover'
+import { createSettingsStore } from './settings/store'
 import { BUILTIN_TOOLS } from './tools/builtin'
 import { createToolBox } from './tools/store'
 
@@ -919,34 +919,12 @@ export default function App() {
         </div>
 
         <div class="toolbar-group">
-          <span class="toolbar-label">字体</span>
-          <select
-            value={settings.fontKey()}
-            onChange={(e) => settings.setFontVariant(e.currentTarget.value as FontVariantId)}
-            title="正文与 UI 字体"
-          >
-            {Object.values(FONT_VARIANTS).map((v) => (
-              <option value={v.id}>{v.label}</option>
-            ))}
-          </select>
-          <select
-            value={settings.codeFontKey()}
-            onChange={(e) => settings.setCodeFont(e.currentTarget.value as CodeFontId)}
-            title="代码区字体（代码块 / 表格）"
-          >
-            {Object.values(CODE_FONTS).map((v) => (
-              <option value={v.id}>{v.label}</option>
-            ))}
-          </select>
-          <select
-            value={settings.fontSize()}
-            onChange={(e) => settings.setFontSize(Number(e.currentTarget.value))}
-            title="字号（也可用 Cmd/Ctrl + = / - / 0）"
-          >
-            {FONT_SIZES.map((s) => (
-              <option value={s}>{s}px</option>
-            ))}
-          </select>
+          <span class="toolbar-label">外观</span>
+          {/* M4-B：字号 / 行高 / 字间距 / 正文字体 / 代码字体收进一个下拉。
+              刻意是锚定下拉而不是全屏遮罩——调行高/字间距时要看得见编辑器实时变化。
+              字号的 Cmd/Ctrl + = / - / 0 三条命令仍在（见下面 registry 接线），
+              这个浮层只是给不记快捷键的人一个入口 */}
+          <AppearancePopover settings={settings} />
         </div>
 
         <div class="toolbar-group">

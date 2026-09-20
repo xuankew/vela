@@ -165,7 +165,7 @@ const {
    */
   const settingsCmd: { loaded: unknown; loadError: unknown; saved: unknown[] } = {
     loaded: {
-      settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' },
+      settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn', lineHeight: 1.75, letterSpacing: 0 },
       report: {
         userLayer: { status: 'absent' },
         projectLayer: { status: 'absent' },
@@ -336,7 +336,7 @@ beforeEach(async () => {
   assetCmd.result = null
   assetCmd.error = null
   settingsCmd.loaded = {
-    settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' },
+    settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn', lineHeight: 1.75, letterSpacing: 0 },
     report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   }
   settingsCmd.loadError = null
@@ -776,7 +776,22 @@ function replaceSummary(overrides: Partial<ReplaceSummary> = {}): ReplaceSummary
   }
 }
 
+/**
+ * M4-B 之后字号 / 字体那三组 select 都收进了「外观」浮层，默认关着、不在 DOM 里。
+ * 于是取 select 之前得先把浮层点开——`ensureAppearanceOpen` 幂等，已开着就不动。
+ */
+function appearanceToggle(): HTMLButtonElement {
+  const el = [...container.querySelectorAll('button')].find((b) => b.textContent === '外观')
+  if (!el) throw new Error('找不到「外观」按钮')
+  return el
+}
+
+function ensureAppearanceOpen(): void {
+  if (!container.querySelector('.appearance-pop')) appearanceToggle().click()
+}
+
 function fontSizeSelect(): HTMLSelectElement {
+  ensureAppearanceOpen()
   const el = [...container.querySelectorAll('select')].find((s) => s.title.startsWith('字号'))
   if (!el) throw new Error('找不到字号 select')
   return el
@@ -4254,6 +4269,8 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
 
 describe('分层配置接线（M4-A）', () => {
   function selectByTitle(prefix: string): HTMLSelectElement {
+    // M4-B：字体 select 收进了「外观」浮层，取之前先把它点开
+    ensureAppearanceOpen()
     const el = [...container.querySelectorAll('select')].find((s) => s.title.startsWith(prefix))
     if (!el) throw new Error(`找不到 title 以「${prefix}」开头的 select`)
     return el
@@ -4297,34 +4314,107 @@ describe('分层配置接线（M4-A）', () => {
     await flush()
     // 写队列是异步的：一次改动最终只落一次盘，且存的是**当前值**（不是旧值）
     expect(settingsCmd.saved).toHaveLength(1)
-    expect(settingsCmd.saved[0]).toEqual({ fontSize: 15, fontVariant: 'screen-gb', codeFont: 'maple-cn' })
+    expect(settingsCmd.saved[0]).toEqual({
+      fontSize: 15,
+      fontVariant: 'screen-gb',
+      codeFont: 'maple-cn',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+    })
   })
 
   it('字号 select 改动同时更新 CSS 变量并写穿', async () => {
     changeSelect(fontSizeSelect(), '18')
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
     await flush()
-    expect(settingsCmd.saved.at(-1)).toEqual({ fontSize: 18, fontVariant: 'screen-gb', codeFont: 'maple-cn' })
+    expect(settingsCmd.saved.at(-1)).toEqual({
+      fontSize: 18,
+      fontVariant: 'screen-gb',
+      codeFont: 'maple-cn',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+    })
   })
 
   it('正文字体 select 改动写穿到 save_settings', async () => {
     changeSelect(fontSelect(), 'screen-r')
     await flush()
-    expect(settingsCmd.saved.at(-1)).toEqual({ fontSize: 14, fontVariant: 'screen-r', codeFont: 'maple-cn' })
+    expect(settingsCmd.saved.at(-1)).toEqual({
+      fontSize: 14,
+      fontVariant: 'screen-r',
+      codeFont: 'maple-cn',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+    })
   })
 
   it('代码区字体 select 改动写穿到 save_settings', async () => {
     changeSelect(codeFontSelect(), 'inherit')
     await flush()
-    expect(settingsCmd.saved.at(-1)).toEqual({ fontSize: 14, fontVariant: 'screen-gb', codeFont: 'inherit' })
+    expect(settingsCmd.saved.at(-1)).toEqual({
+      fontSize: 14,
+      fontVariant: 'screen-gb',
+      codeFont: 'inherit',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+    })
+  })
+
+  /** 外观浮层里那一行步进器（行高 / 字间距）：[−, +] 两个按钮 */
+  function stepperButtons(label: string): NodeListOf<HTMLButtonElement> {
+    ensureAppearanceOpen()
+    const rows = [...container.querySelectorAll<HTMLElement>('.appearance-row')]
+    const rowEl = rows.find((r) => r.querySelector('.appearance-label')?.textContent === label)
+    if (!rowEl) throw new Error(`找不到「${label}」那一行`)
+    return rowEl.querySelectorAll<HTMLButtonElement>('.appearance-stepper button')
+  }
+
+  it('行高步进器改动更新 CSS 变量并写穿（浮点尾巴被归一化掉）', async () => {
+    stepperButtons('行高')[1]!.click()
+    expect(document.documentElement.style.getPropertyValue('--vela-line-height')).toBe('1.8')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toMatchObject({ lineHeight: 1.8 })
+  })
+
+  it('字间距步进器改动写穿：CSS 落成 em，存的是数字', async () => {
+    stepperButtons('字间距')[1]!.click()
+    expect(document.documentElement.style.getPropertyValue('--vela-letter-spacing')).toBe('0.01em')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toMatchObject({ letterSpacing: 0.01 })
+  })
+
+  it('「恢复默认」把五项一起打回内置默认并写穿', async () => {
+    changeSelect(fontSizeSelect(), '20')
+    stepperButtons('行高')[1]!.click()
+    const reset = [...container.querySelectorAll<HTMLButtonElement>('.appearance-reset')][0]!
+    reset.click()
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
+    expect(document.documentElement.style.getPropertyValue('--vela-line-height')).toBe('1.75')
+    expect(document.documentElement.style.getPropertyValue('--vela-letter-spacing')).toBe('normal')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toEqual({
+      fontSize: 14,
+      fontVariant: 'screen-gb',
+      codeFont: 'maple-cn',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+    })
   })
 
   it('重启后装回持久化的配置，CSS 变量与 select 都反映盘上的值', async () => {
     await restartWithSettings({
-      settings: { fontSize: 18, fontVariant: 'system-mono', codeFont: 'inherit' },
+      settings: {
+        fontSize: 18,
+        fontVariant: 'system-mono',
+        codeFont: 'inherit',
+        lineHeight: 2,
+        letterSpacing: 0.05,
+      },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
+    expect(document.documentElement.style.getPropertyValue('--vela-line-height')).toBe('2')
+    expect(document.documentElement.style.getPropertyValue('--vela-letter-spacing')).toBe('0.05em')
     expect(fontSelect().value).toBe('system-mono')
     expect(codeFontSelect().value).toBe('inherit')
     // 装回只读、不写穿：一次启动不该因为「读到了盘上的值」再存一遍
@@ -4333,7 +4423,13 @@ describe('分层配置接线（M4-A）', () => {
 
   it('盘上的字体 ID 不认识时退回注册表默认，档外字号退回默认档', async () => {
     await restartWithSettings({
-      settings: { fontSize: 17, fontVariant: 'toString', codeFont: '不存在的字体' },
+      settings: {
+        fontSize: 17,
+        fontVariant: 'toString',
+        codeFont: '不存在的字体',
+        lineHeight: 1.75,
+        letterSpacing: 0,
+      },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
     // 17 不在 FONT_SIZES 里、'toString' 命中的是原型链而不是注册表：三个都被 sanitize 打回默认
@@ -4345,7 +4441,13 @@ describe('分层配置接线（M4-A）', () => {
   it('load_settings 出错时提示条报出来，字体退回内置默认而不拦启动', async () => {
     await restartWithSettings(
       {
-        settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' },
+        settings: {
+          fontSize: 14,
+          fontVariant: 'screen-gb',
+          codeFont: 'maple-cn',
+          lineHeight: 1.75,
+          letterSpacing: 0,
+        },
         report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
       },
       { kind: 'io', reason: 'PermissionDenied', message: '读不了配置' },

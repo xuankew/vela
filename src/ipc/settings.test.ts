@@ -26,16 +26,21 @@ import {
 } from './settings'
 
 /**
- * Rust 侧 `settings_的线上形状` 断言的就是这个字面量，逐字符相同。
- * 这是**内置默认**（三层合并的最底层），也是空现场下 `load` 交出来的配置。
+ * Rust 侧 `settings_的线上形状` 断言的就是这个字面量的**字段集合与顺序**，但字节的 f64
+ * 写法两边不同：这是**内置默认**（三层合并的最底层），也是空现场下 `load` 交出来的配置。
  *
- * ⚠️ 与 session 不同，这里没有 `0.0` vs `0` 的 f64 差异：三个键全是整数与字符串，
- * 所以「Rust 序列化」与「JS `JSON.stringify`」逐字节相同，只需要一份字面量。
+ * ⚠️ 🔴 `letterSpacing` 的默认值在 **JS 侧写 `0`**（`JSON.stringify(0)` → `"0"`），而
+ * Rust 侧 `serde_json` 对 `f64` 永远带小数点、写 `0.0`。两者是**同一个 JSON number**
+ * （`JSON.parse("0") === JSON.parse("0.0")`，Rust 的 `from_str` 也一样），所以两边都能
+ * 读回来——只是「落盘/序列化字节」这一层不同。与 session 的 `scrollTop: 0.0` 同一条取舍。
+ * 于是 Rust 的黄金字面量写 `letterSpacing:0.0`，这里写 `letterSpacing:0`，各钉各那一侧的输出。
  */
-const GOLDEN_SETTINGS = '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn"}'
+const GOLDEN_SETTINGS =
+  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0}'
 
 /** 非默认值的一份配置，用来钉「任何一档都走同一条反序列化路径」（字段是具体值不是 Option） */
-const GOLDEN_SETTINGS_CUSTOM = '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit"}'
+const GOLDEN_SETTINGS_CUSTOM =
+  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05}'
 
 /**
  * Rust 侧 `loaded_settings_的线上形状` 断言的就是这个字面量。
@@ -44,17 +49,17 @@ const GOLDEN_SETTINGS_CUSTOM = '{"fontSize":16,"fontVariant":"screen-r","codeFon
  * 两件事一次钉住。
  */
 const GOLDEN_LOADED =
-  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
+  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
 
 /** Rust 侧 `空现场下_load_的线上形状`：两层都 absent、配置是内置默认、没有键被忽略 */
 const GOLDEN_LOADED_EMPTY =
-  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn"},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
+  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
 
 /** Rust 侧 `save_report_的线上形状` */
 const GOLDEN_SAVE_REPORT = '{"bytesWritten":42}'
 
 function sampleSettings(): Settings {
-  return { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn' }
+  return { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn', lineHeight: 1.75, letterSpacing: 0 }
 }
 
 beforeEach(() => {
@@ -66,7 +71,7 @@ describe('Rust → 前端 的字段名', () => {
     const parsed = JSON.parse(GOLDEN_SETTINGS) as Settings
     // 键顺序就是 JSON.parse 的插入顺序，所以 stringify 相等 == 字段集合与顺序都相等
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SETTINGS)
-    expect(Object.keys(parsed)).toEqual(['fontSize', 'fontVariant', 'codeFont'])
+    expect(Object.keys(parsed)).toEqual(['fontSize', 'fontVariant', 'codeFont', 'lineHeight', 'letterSpacing'])
   })
 
   it('解析出来的值与前端能造出来的对象完全相等', () => {
@@ -76,8 +81,25 @@ describe('Rust → 前端 的字段名', () => {
 
   it('非默认配置也原样往返：字段是具体值不是 Option', () => {
     const parsed = JSON.parse(GOLDEN_SETTINGS_CUSTOM) as Settings
-    expect(parsed).toEqual({ fontSize: 16, fontVariant: 'screen-r', codeFont: 'inherit' })
+    expect(parsed).toEqual({
+      fontSize: 16,
+      fontVariant: 'screen-r',
+      codeFont: 'inherit',
+      lineHeight: 2,
+      letterSpacing: 0.05,
+    })
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SETTINGS_CUSTOM)
+  })
+
+  it('Rust 发的 0.0 与 JS 发的 0 读回来是同一个数', () => {
+    // 🔴 这一条专门钉 f64 那个跨语言差异：Rust 侧 `letterSpacing` 默认序列化成 `0.0`，
+    // JS 侧是 `0`。两者 parse 出来必须 `===`，否则「Rust 存的配置」与「JS 存的配置」
+    // 在 store 里会被当成两个不同的值，触发一次多余的写盘
+    expect((JSON.parse('{"letterSpacing":0.0}') as { letterSpacing: number }).letterSpacing).toBe(
+      (JSON.parse('{"letterSpacing":0}') as { letterSpacing: number }).letterSpacing,
+    )
+    // Rust 的 pretty 输出同理：`lineHeight: 2.0` 读回来是 `2`
+    expect((JSON.parse('{"lineHeight":2.0}') as { lineHeight: number }).lineHeight).toBe(2)
   })
 
   it('LayerStatus 的三种形状：status 是标签字段，只有 corrupt 带 reason', () => {
@@ -113,14 +135,16 @@ describe('Rust → 前端 的字段名', () => {
 })
 
 describe('内置默认值两边各钉一条', () => {
-  it('黄金字面量里的三个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
+  it('黄金字面量里的五个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
     // Rust 侧 `内置默认配置被钉住` 断言 DEFAULT_FONT_SIZE==14 / DEFAULT_FONT_VARIANT=="screen-gb"
-    // / DEFAULT_CODE_FONT=="maple-cn"。这里钉的是**同一个字面量**的前端那一半：
-    // 改了任一边而没改另一边，两条测试会一起红。
+    // / DEFAULT_CODE_FONT=="maple-cn" / DEFAULT_LINE_HEIGHT==1.75 / DEFAULT_LETTER_SPACING==0.0。
+    // 这里钉的是**同一个字面量**的前端那一半：改了任一边而没改另一边，两条测试会一起红。
     const parsed = JSON.parse(GOLDEN_SETTINGS) as Settings
     expect(parsed.fontSize).toBe(14)
     expect(parsed.fontVariant).toBe('screen-gb')
     expect(parsed.codeFont).toBe('maple-cn')
+    expect(parsed.lineHeight).toBe(1.75)
+    expect(parsed.letterSpacing).toBe(0)
   })
 
   it('字体注册表的默认 ID 就是契约里的默认值', () => {
@@ -161,12 +185,12 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     expect(invoke).toHaveBeenCalledWith('save_settings', { settings })
   })
 
-  it('发出去的 settings payload 永远带齐三个键', async () => {
+  it('发出去的 settings payload 永远带齐五个键', async () => {
     invoke.mockResolvedValue(JSON.parse(GOLDEN_SAVE_REPORT))
     await saveSettings(sampleSettings())
     const sent = invoke.mock.calls[0]![1] as { settings: Settings }
-    expect(Object.keys(sent.settings)).toEqual(['fontSize', 'fontVariant', 'codeFont'])
-    // 三个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
+    expect(Object.keys(sent.settings)).toEqual(['fontSize', 'fontVariant', 'codeFont', 'lineHeight', 'letterSpacing'])
+    // 五个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
     // 落到 Rust 侧就成了「缺键」，而 Settings 没有 #[serde(default)]，缺键直接拒）
     expect(JSON.stringify(sent.settings)).toBe(GOLDEN_SETTINGS)
   })

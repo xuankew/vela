@@ -91,12 +91,18 @@ const completionTheme = EditorView.theme({
  * - UI → `--vela-font-ui`
  *
  * 通过 CSS variable 暴露，M4 做主题系统时直接接管这里。
+ *
+ * 🔴 `letterSpacing` 挂在 `&`（整个编辑器根）上，与 `.md-preview-body` 用的是同一个
+ * `--vela-letter-spacing`。⚠️ **真机待验**：CM6 的光标坐标靠 DOM 测量算出来，字间距非
+ * `normal` 时字符前进宽度变了，光标落点与选区高亮的横向对齐是否仍逐像素准确，jsdom 量
+ * 不出来（没有真实布局），得在真机上确认。默认值是 `normal`，所以不改字间距的用户不受影响。
  */
 const fontTheme = EditorView.theme({
   '&': {
     fontFamily: 'var(--vela-font-editor)',
     fontSize: 'var(--vela-font-size, 14px)',
     lineHeight: 'var(--vela-line-height, 1.7)',
+    letterSpacing: 'var(--vela-letter-spacing, normal)',
   },
   '.cm-scroller': {
     fontFamily: 'var(--vela-font-editor)',
@@ -111,12 +117,14 @@ const fontTheme = EditorView.theme({
  *
  * 刻意写成 fontTheme 的**完整替代**而不是只覆盖 fontFamily：两个主题同时挂载时
  * 谁生效取决于 CM6 的样式模块顺序，那是个隐式契约，不如让调用方二选一。
+ * ⚠️ 于是 `letterSpacing` 也得在这里再写一遍——它是 fontTheme 的完整替代，少一条就少了字间距。
  */
 const codeDocFontTheme = EditorView.theme({
   '&': {
     fontFamily: 'var(--vela-font-code)',
     fontSize: 'var(--vela-font-size, 14px)',
     lineHeight: 'var(--vela-line-height, 1.7)',
+    letterSpacing: 'var(--vela-letter-spacing, normal)',
   },
   '.cm-scroller': {
     fontFamily: 'var(--vela-font-code)',

@@ -4,21 +4,24 @@
  * 在 M4-A 之前，`fontKey` / `codeFontKey` / `fontSize` 是 `App.tsx` 里三个**只活在内存里**
  * 的信号：调好字号、重启就回到 14px。这一层把它们接到 `vela-core::settings` 的三层配置上，
  * 于是「我设的字号」跟着人走（用户全局层 `~/.vela/settings.json`），换项目也在。
+ * M4-B 又加进来两个偏好——**行高**与**字间距**（收进「外观」浮层的那个步进器），
+ * 五个值走完全相同的一条路：sanitize → 灌信号 → 应用 CSS 变量 → 写穿用户全局层。
  *
  * ## 这一层管什么、不管什么
  *
- * 管：三个值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
+ * 管：五个值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
  * 用户全局层。还管「从 Rust 读回来的值不一定合法」这件事——配置文件可能被手改成任何
- * 字符串，`fontSize` 可能是 17 这种档外值，`fontVariant` 可能是一个不存在的 ID。
- * **sanitize 归这一层**：读到不认识的字体 ID 回退注册表默认，读到档外字号回退默认档位。
+ * 字符串，`fontSize` 可能是 17 这种档外值，`fontVariant` 可能是一个不存在的 ID，
+ * `lineHeight` 可能是一个区间外的数或 NaN。**sanitize 归这一层**：读到不认识的字体 ID
+ * 回退注册表默认，读到档外字号回退默认档位，读到区间外的行高/字间距夹回区间。
  * （Rust 侧刻意不夹范围、不校验 ID，理由见 `ipc/settings.ts` 的 `Settings` 文档：
- * 合法 ID 清单与档位都是 UI 概念，夹一次就够，夹两次的结果是谁也说不清最终是多少。）
+ * 合法 ID 清单、档位与区间都是 UI 概念，夹一次就够，夹两次的结果是谁也说不清最终是多少。）
  *
  * 不管：字体注册表本身（`fonts/loader.ts`）、字号档位清单的**语义**（这里只负责夹）。
  *
  * ## 🔴 项目层在 v1 是「接好线但空转」的
  *
- * 三个键全是**个人偏好**，只认「内置默认 + 用户全局」。打开一个带 `.vela/settings.json`
+ * 五个键全是**个人偏好**，只认「内置默认 + 用户全局」。打开一个带 `.vela/settings.json`
  * 的仓库**不会**改掉你的字号——Rust 的 `resolve` 已经把项目层的偏好键丢进
  * `report.ignoredProjectKeys` 了。这一层把那份 `report` 原样暴露出去（[`SettingsStore.report`]），
  * 由 `App.tsx` 决定要不要据此说一句「这个仓库想改你的字号，但字号只认全局」。
@@ -90,6 +93,51 @@ function sanitizeCodeFont(id: string): CodeFontId {
   return Object.prototype.hasOwnProperty.call(CODE_FONTS, id) ? (id as CodeFontId) : DEFAULT_CODE_FONT
 }
 
+/**
+ * 行高（无单位倍数）的区间、步进与默认值。M4-B 加的，收进「外观」浮层里那个步进器。
+ *
+ * ⚠️ 与字号档位（`FONT_SIZES`）不同，行高是**连续**的：步进器每次走 `LINE_HEIGHT_STEP`，
+ * 但手改配置读进来的值不必落在步进的整数倍上，只要在区间内就照用（sanitize 只夹 + 归一化
+ * 到两位小数，不打回默认）。默认 `1.75` 与 Rust `settings::DEFAULT_LINE_HEIGHT` 同值、
+ * 也与 `styles.css` 里 `--vela-line-height` 的初值同值——两边各写一份、各钉一条。
+ */
+export const LINE_HEIGHT_MIN = 1.0
+export const LINE_HEIGHT_MAX = 3.0
+export const LINE_HEIGHT_STEP = 0.05
+export const DEFAULT_LINE_HEIGHT = 1.75
+
+/**
+ * 字间距（em）的区间、步进与默认值。默认 `0` = CSS `letter-spacing: normal`。
+ *
+ * ⚠️ 区间含负值（`-0.05`）：让字挤一点是合法需求。上限 `0.5em` 是「散排标题」那一档，
+ * 再大就没意义了。与 Rust `settings::DEFAULT_LETTER_SPACING` 同值。
+ */
+export const LETTER_SPACING_MIN = -0.05
+export const LETTER_SPACING_MAX = 0.5
+export const LETTER_SPACING_STEP = 0.01
+export const DEFAULT_LETTER_SPACING = 0
+
+/**
+ * 连续型偏好（行高 / 字间距）的 sanitize：非有限数打回默认，其余夹进区间 + 归一化到两位小数。
+ *
+ * 🔴 归一化那一步是**必需的**，不是美化：步进是浮点加法，`1.75 + 0.05` 在 IEEE-754 下是
+ * `1.8000000000000003`。不归一化的话这个尾巴会（a）显示在步进器上、（b）存进配置文件、
+ * （c）让写队列的指纹比较永远判「变了」（每次步进都产生一个新尾巴），白白多写盘。
+ * 两位小数足够：行高步进 0.05、字间距步进 0.01，都比它细不了。
+ */
+function sanitizeStepper(n: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(n)) return fallback
+  return Math.round(Math.min(max, Math.max(min, n)) * 100) / 100
+}
+
+function sanitizeLineHeight(n: number): number {
+  return sanitizeStepper(n, LINE_HEIGHT_MIN, LINE_HEIGHT_MAX, DEFAULT_LINE_HEIGHT)
+}
+
+function sanitizeLetterSpacing(n: number): number {
+  return sanitizeStepper(n, LETTER_SPACING_MIN, LETTER_SPACING_MAX, DEFAULT_LETTER_SPACING)
+}
+
 export interface SettingsStoreOptions {
   /**
    * 出问题时说一句话（配置读不回来、写不下去）。没注入就什么都不说。
@@ -107,10 +155,14 @@ export interface SettingsStore {
   readonly codeFontKey: Accessor<CodeFontId>
   /** 当前字号（已夹到 `FONT_SIZES` 里的某一档） */
   readonly fontSize: Accessor<number>
+  /** 当前行高（无单位倍数，已夹到 `LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX`、归一化到两位小数） */
+  readonly lineHeight: Accessor<number>
+  /** 当前字间距（em，已夹到 `LETTER_SPACING_MIN..=LETTER_SPACING_MAX`；`0` = `normal`） */
+  readonly letterSpacing: Accessor<number>
   /**
    * 最近一次 [`SettingsStore.load`] 的账单；`null` = 还没 load 过。
    * `report().ignoredProjectKeys` 非空表示当前仓库的 `.vela/settings.json` 试图改偏好键、
-   * 已被忽略（v1 里三个键全是偏好类，所以它写的任何键都会落在这儿）。
+   * 已被忽略（v1 里五个键全是偏好类，所以它写的任何键都会落在这儿）。
    */
   readonly report: Accessor<SettingsReport | null>
 
@@ -124,6 +176,18 @@ export interface SettingsStore {
   stepFontSize: (delta: number) => void
   /** `Cmd/Ctrl + 0`：回到默认字号 */
   resetFontSize: () => void
+  /** 用户设了行高（会夹 + 归一化）：更新 + 应用 + 写穿 */
+  setLineHeight: (n: number) => void
+  /** 外观浮层里的行高步进器：走一步 `LINE_HEIGHT_STEP` */
+  stepLineHeight: (delta: number) => void
+  /** 回到默认行高 */
+  resetLineHeight: () => void
+  /** 用户设了字间距（会夹 + 归一化）：更新 + 应用 + 写穿 */
+  setLetterSpacing: (n: number) => void
+  /** 外观浮层里的字间距步进器：走一步 `LETTER_SPACING_STEP` */
+  stepLetterSpacing: (delta: number) => void
+  /** 回到默认字间距 */
+  resetLetterSpacing: () => void
 
   /**
    * 从 Rust 读回合并好的配置，sanitize 后灌进信号并应用。**不写穿**。
@@ -145,6 +209,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
   const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
   const [fontSize, setFontSizeSignal] = createSignal(DEFAULT_FONT_SIZE)
+  const [lineHeight, setLineHeightSignal] = createSignal(DEFAULT_LINE_HEIGHT)
+  const [letterSpacing, setLetterSpacingSignal] = createSignal(DEFAULT_LETTER_SPACING)
   const [report, setReport] = createSignal<SettingsReport | null>(null)
 
   /** 写队列的尾巴。所有写挂在它后面，于是任意时刻最多一个写在飞（见文件头） */
@@ -158,8 +224,27 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     document.documentElement.style.setProperty('--vela-font-size', `${n}px`)
   }
 
+  function applyLineHeightVar(n: number): void {
+    // 无单位倍数：`--vela-line-height` 被 CM6 的 fontTheme 与 `.md-preview-body` 同时消费，
+    // 两边都要的是「相对字号的倍数」，写 `String(n)`（不是 `${n}px`）
+    document.documentElement.style.setProperty('--vela-line-height', String(n))
+  }
+
+  function applyLetterSpacingVar(n: number): void {
+    // 🔴 `0` 翻译成 `normal` 而不是 `0em`：默认值下编辑器一个像素都不该动，而 `normal`
+    // 与「压根没声明 letter-spacing」是同一件事，`0em` 严格说是另一回事（`normal` 允许
+    // 字体自带的字距调整）。非零才用 `em`（相对字号，跟着字号缩放）
+    document.documentElement.style.setProperty('--vela-letter-spacing', n === 0 ? 'normal' : `${n}em`)
+  }
+
   function currentSettings(): Settings {
-    return { fontSize: fontSize(), fontVariant: fontKey(), codeFont: codeFontKey() }
+    return {
+      fontSize: fontSize(),
+      fontVariant: fontKey(),
+      codeFont: codeFontKey(),
+      lineHeight: lineHeight(),
+      letterSpacing: letterSpacing(),
+    }
   }
 
   async function doWrite(): Promise<void> {
@@ -182,6 +267,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
 
   function applyNow(): void {
     applyFontSizeVar(fontSize())
+    applyLineHeightVar(lineHeight())
+    applyLetterSpacingVar(letterSpacing())
     // 字体是动态 import，注入有真实异步成本；`void` 掉——首屏不等它，到达后浏览器自己
     // 用 font-display: swap 重排。两个 family 同时驻留（正文 + 代码区），互不干扰
     void applyFontVariant(fontKey())
@@ -207,6 +294,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setFontSizeSignal(sanitizeFontSize(s.fontSize))
     setFontKey(sanitizeFontVariant(s.fontVariant))
     setCodeFontKey(sanitizeCodeFont(s.codeFont))
+    setLineHeightSignal(sanitizeLineHeight(s.lineHeight))
+    setLetterSpacingSignal(sanitizeLetterSpacing(s.letterSpacing))
     setReport(loaded.report)
     applyNow()
   }
@@ -246,16 +335,55 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setFontSize(DEFAULT_FONT_SIZE)
   }
 
+  function setLineHeight(n: number): void {
+    const clamped = sanitizeLineHeight(n)
+    setLineHeightSignal(clamped)
+    applyLineHeightVar(clamped)
+    persist()
+  }
+
+  function stepLineHeight(delta: number): void {
+    // 从当前值起步（不是从默认）：连续量没有「档」，每次走一个 STEP，再由 sanitize 夹 + 归一化
+    setLineHeight(lineHeight() + delta * LINE_HEIGHT_STEP)
+  }
+
+  function resetLineHeight(): void {
+    setLineHeight(DEFAULT_LINE_HEIGHT)
+  }
+
+  function setLetterSpacing(n: number): void {
+    const clamped = sanitizeLetterSpacing(n)
+    setLetterSpacingSignal(clamped)
+    applyLetterSpacingVar(clamped)
+    persist()
+  }
+
+  function stepLetterSpacing(delta: number): void {
+    setLetterSpacing(letterSpacing() + delta * LETTER_SPACING_STEP)
+  }
+
+  function resetLetterSpacing(): void {
+    setLetterSpacing(DEFAULT_LETTER_SPACING)
+  }
+
   return {
     fontKey,
     codeFontKey,
     fontSize,
+    lineHeight,
+    letterSpacing,
     report,
     setFontVariant,
     setCodeFont,
     setFontSize,
     stepFontSize,
     resetFontSize,
+    setLineHeight,
+    stepLineHeight,
+    resetLineHeight,
+    setLetterSpacing,
+    stepLetterSpacing,
+    resetLetterSpacing,
     load,
     applyNow,
   }
