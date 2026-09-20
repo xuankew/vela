@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
+import { undo } from '@codemirror/commands'
 import { EditorView } from '@codemirror/view'
 import { render } from 'solid-js/web'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { detectPlatform } from './commands/keybinding'
 import type { TextFile } from './ipc/fs'
+import type { FileMatch, FileQuery, IndexStats } from './ipc/project'
+import { OUTLINE_ROW_HEIGHT } from './md/outline'
 
 /**
  * App 的接线测试：工具栏 → 命令中心 → 文档模型 → CM6 → signal → DOM 文本，整条链真的跑起来。
@@ -17,7 +20,19 @@ import type { TextFile } from './ipc/fs'
  * 或者等 M1-H 的 CI 里加一个 Tauri driver。
  */
 
-const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd, replaceCmd } = vi.hoisted(() => {
+const {
+  ipc,
+  dialog,
+  tauriEvent,
+  tauriCore,
+  sessionCmd,
+  projectCmd,
+  searchCmd,
+  replaceCmd,
+  watchCmd,
+  shardCmd,
+  assetCmd,
+} = vi.hoisted(() => {
   /**
    * 会话存档这一头（M1-F）。App 一挂载就会 `load_session`，关窗放行后会 `save_session`，
    * 所以这两个 command 的返回值必须有明确的形状：`load_session` 答 `undefined` 会被当成
@@ -36,8 +51,31 @@ const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd, r
    * 文件树这一头（M2-B）。`list_dir` 走的是 `tauriCore.invoke`，与 session 同一个入口，
    * 所以这里只放数据：`fs` 是 rel → 条目 的表，`calls` 记录调用顺序（懒加载与缓存命中
    * 都只能从「读了哪几层、读了几次」上看出来）。
+   *
+   * 跳转浮层那一头（M2-E）也住在这里，因为它调的 `index_project` / `query_project`
+   * 与 `list_dir` 同属 `./ipc/project`：`indexed` 是每次建索引收到的那份根清单，
+   * `queries` 是查询的三个入参。⚠️ M2-F 起这两条命令收的是 `roots: string[]`，
+   * 所以 `indexed` 的元素是一个数组而不是一个字符串——单根时是 `['/repo']`。
+   * ⚠️ `stats` 与 `result` 必须是**完整形状**而不是 undefined——
+   * `show()` 里那句 `stats.truncated` 在 undefined 上取属性会抛在一条 await 之后，
+   * 测试看到的只是「浮层里一个结果都没有」，而真正的原因被吞了。
+   * 类型写在注解上，用例才能直接改这两个字段。
    */
-  const projectCmd: { fs: Record<string, unknown[]>; calls: string[] } = { fs: {}, calls: [] }
+  const projectCmd: {
+    fs: Record<string, unknown[]>
+    calls: string[]
+    indexed: string[][]
+    queries: { roots: string[]; needle: string; recent: string[] }[]
+    stats: IndexStats
+    result: FileQuery
+  } = {
+    fs: {},
+    calls: [],
+    indexed: [],
+    queries: [],
+    stats: { files: 3, unreadable: 0, truncated: false, elapsedMs: 12 },
+    result: { matches: [], total: 0 },
+  }
   /**
    * 全局搜索这一头（M2-C）。`start_search` 与 `cancel_task` 也走 `tauriCore.invoke`。
    *
@@ -49,7 +87,7 @@ const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd, r
    * 「被请求取消过的 taskId」而不是「被取消过的搜索」。区分它们靠 id 本身，
    * 而前端刻意不解析 id 的前缀（见 src/ipc/task.ts）
    */
-  const searchCmd: { calls: { root: string; query: unknown }[]; cancelled: string[]; taskId: string } = {
+  const searchCmd: { calls: { roots: string[]; query: unknown }[]; cancelled: string[]; taskId: string } = {
     calls: [],
     cancelled: [],
     taskId: 'task-1',
@@ -61,9 +99,55 @@ const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd, r
    * 而前端有两个 TaskSlot（见 src/search/store.ts）。写成同一个字符串的话，
    * 「落盘的事件被搜索那个 slot 认下来了」这类接线错误在测试里根本看不出来
    */
-  const replaceCmd: { calls: { root: string; request: unknown }[]; taskId: string } = {
+  const replaceCmd: { calls: { roots: string[]; request: unknown }[]; taskId: string } = {
     calls: [],
     taskId: 'task-r1',
+  }
+  /**
+   * 文件监听这一头（M2-G）。`set_watched` 也走 `tauriCore.invoke`，`sent` 记的是每次
+   * 收到的那份**完整**清单（前端的顺序：去重 + 排序）。
+   *
+   * ⚠️ `stats` 必须是完整形状而不是 undefined：`describeWatchStats` 要在它上面取三个字段，
+   * 而那一句在 `send` 的 try 里——取属性抛出来会被当成「同步失败」咽成提示条上的一句话，
+   * 于是用例看到的是「多了一行莫名其妙的警告」，而不是「命令回错了东西」
+   */
+  const watchCmd: { sent: string[][]; stats: WatchStats } = {
+    sent: [],
+    stats: { dirs: 1, files: 1, failed: 0, skipped: 0, truncated: false },
+  }
+  /**
+   * 只读分片这一头（M2-H）。三条命令都走 `tauriCore.invoke`，而这一份**刻意不 mock
+   * `./ipc/shard`**：`openLarge` / `readLines` / `closeLarge` 的参数名正是那条契约里
+   * 最容易漂的一半（漂了的失败方式是「滚不动」，见 `src/ipc/shard.ts` 的模块文档），
+   * 让它们真的跑一遍，参数名对不上时这里立刻读不出来。
+   *
+   * `createShardView` 也是**真的**：App 是在 `render()` 里挂的，Solid 的 root 在，
+   * 那个 memo 有地方待。于是这一组用例验的是「打开一个大文件 → 屏幕上出现只读分片」
+   * 整条链，而不是各段各自绿。
+   *
+   * ⚠️ `handle` 从 1 开始，与 Rust 侧一致（0 永远不是合法句柄）；`closed` 记的是
+   * 被关过的句柄，读一个已关句柄要回 `null` 而不是回一页——那是「迟到的读请求」
+   * 唯一正确的形状
+   */
+  const shardCmd: { header: ShardHeader; opened: string[]; reads: number[]; closed: number[] } = {
+    header: { totalLines: 5_000, bytes: 104_857_600, encoding: 'utf8', bom: false, eol: 'lf', lossy: false },
+    opened: [],
+    reads: [],
+    closed: [],
+  }
+  /**
+   * 图片粘贴落地这一头（M3-A-7）。`store_image` 也走 `tauriCore.invoke`，而这一份
+   * **刻意不 mock `./ipc/asset`**：`docPath` / `dataBase64` 这两个参数名正是那条契约里
+   * 最容易漂的一半（漂了的失败方式是 Rust 那边收到 `None`，然后回一句「不是图片」，
+   * 而真正的图明明在剪贴板里）。让它们真的跑一遍，`calls` 里记下来的就是线上形状
+   *
+   * ⚠️ `result` 是**整个** StoredImage 而不是只有 `rel`：`landPastedImage` 插进正文的
+   * 是 `rel`，而「插的那一行与后端答的那一行是同一个」正是这里要钉的东西
+   */
+  const assetCmd: { calls: { docPath: string; dataBase64: string }[]; result: StoredImage | null; error: unknown } = {
+    calls: [],
+    result: null,
+    error: null,
   }
   return {
     ipc: {
@@ -81,6 +165,9 @@ const { ipc, dialog, tauriEvent, tauriCore, sessionCmd, projectCmd, searchCmd, r
     projectCmd,
     searchCmd,
     replaceCmd,
+    watchCmd,
+    shardCmd,
+    assetCmd,
   }
 })
 
@@ -99,9 +186,35 @@ vi.mock('@tauri-apps/api/core', () => tauriCore)
 
 import App from './App'
 import { MAX_PANES } from './doc/workspace'
+import type { StoredImage } from './ipc/asset'
 import { REPLACE_DONE_EVENT, REPLACE_FAILED_EVENT, REPLACE_PROGRESS_EVENT, type ReplaceSummary } from './ipc/replace'
 import { SEARCH_BATCH_EVENT, SEARCH_DONE_EVENT, SEARCH_FAILED_EVENT } from './ipc/search'
+import type { ShardHeader } from './ipc/shard'
+import { FILE_CHANGED_EVENT, type FileChangeKind, type WatchStats } from './ipc/watch'
 import { REQUEST_CLOSE_EVENT } from './ipc/windowClose'
+
+/**
+ * 🔴 预热那几个**按需加载**的模块（M3-C-1 起 `md/MarkdownPreview` 走 Solid 的 `lazy()`，
+ * `exportDocument` 走动态 `import('./md/preview')` / `import('./md/export')`；
+ * M3-C-2 起两块浮层的 UI 也走 `lazy()`）。
+ *
+ * ⚠️ 生产里那一次 import 是读一个本地文件，毫秒以下；而在 vitest 里它是 vite-node 去取一份
+ * 转换过的模块，**横跨好几个宏任务**。下面那些用例等的是一个 `setTimeout(0)`，
+ * 而 `settle` 又必须比 `PANEL_DEBOUNCE_MS`（150ms）短两个数量级——否则「接线接错了」
+ * 会退化成「过了 150ms 总归会渲染」，那几条用例就废了。
+ *
+ * 🔴 于是这里先把模块图焐热：焐热之后 `import()` 只剩微任务，一个 `flush()` 就够。
+ * ⛔ 不靠多加几次 `flush()` 蒙过去——那种写法在**冷缓存**那一条上必然偶发失败
+ * （实测正是如此：同一个 describe 里第一条红、后面几条绿，因为第一条已经把缓存焐热了，
+ * 于是加 flush 只能把偶发挪个位置，治不了）
+ */
+await Promise.all([
+  import('./md/MarkdownPreview'),
+  import('./md/preview'),
+  import('./md/export'),
+  import('./tools/ToolBox'),
+  import('./commands/CommandPalette'),
+])
 
 /**
  * `Mod` 在不同平台上是不同物理键，而 jsdom 的 UA 不含 "Mac" → detectPlatform() 判成 linux。
@@ -114,6 +227,44 @@ let dispose: () => void
 
 /** `listen` 收到的回调，按事件名收着。测试里手动触发，等于模拟 Rust 侧发事件 */
 const listeners = new Map<string, (payload: unknown) => void>()
+
+/**
+ * 从 invoke 的入参里取出那份根清单。
+ *
+ * ⚠️ 与下面 `recent` 同一条理由：`roots` 是 M2-F 起那四条命令（建索引、查文件、搜索、替换）
+ * 唯一的「改哪儿/搜哪儿」的来源，而它现在是一个数组。直接 `args.roots as string[]` 会让
+ * 「前端递了个单根字符串上去」这种回归变成断言里的一个字符串——`toEqual(['/repo'])` 会红，
+ * 但红得莫名其妙；逐条验类型则让它当场变成 `[]`，一眼看出是形状错了而不是内容错了。
+ * 空数组是**合法**的（Rust 侧回一份全零的账），所以这里不补默认值也不拦。
+ */
+const rootsOf = (args?: Record<string, unknown>): string[] => {
+  const raw = args?.roots
+  return Array.isArray(raw) ? raw.filter((r): r is string => typeof r === 'string') : []
+}
+
+/**
+ * 从一个 `unknown` 里取一个数：不是数就是 0。
+ *
+ * ⚠️ 刻意不抛。参数名漂了的时候，正确的症状是「句柄成了 0 → 每页都回 null → 界面
+ * 永远加载中」，那正是 `src/ipc/shard.ts` 里点名的那条安静失败；在这儿抛一个
+ * TypeError 反而会把线索盖住
+ */
+const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+
+/**
+ * `store_image` 的缺省答复。
+ *
+ * ⚠️ 是一份**合法**的 StoredImage 而不是 null：`landPastedImage` 跑在一个 `void` 掉的
+ * promise 里，`stored.rel` 取在 null 上会变成一条没人接的 rejection，而用例看到的
+ * 只是「正文里没多那一行」——线索全被吞掉。名字用的是 Rust 侧 `asset.rs` 里
+ * `TINY_PNG` 真实落出来的那一个，所以这一串十六进制与后端对得上，不是随手编的
+ */
+const STORED: StoredImage = {
+  rel: 'assets/pasted-ad48c1765eb1b87d.png',
+  path: '/repo/assets/pasted-ad48c1765eb1b87d.png',
+  bytes: 67,
+  reused: false,
+}
 
 /**
  * 「磁盘上现在是什么」，按绝对路径。
@@ -137,11 +288,26 @@ beforeEach(async () => {
   sessionCmd.saved = []
   sessionCmd.droppedDrafts = 0
   projectCmd.calls = []
+  projectCmd.indexed = []
+  projectCmd.queries = []
+  projectCmd.stats = { files: 3, unreadable: 0, truncated: false, elapsedMs: 12 }
+  projectCmd.result = { matches: [], total: 0 }
   searchCmd.calls = []
   searchCmd.cancelled = []
   searchCmd.taskId = 'task-1'
   replaceCmd.calls = []
   replaceCmd.taskId = 'task-r1'
+  watchCmd.sent = []
+  watchCmd.stats = { dirs: 1, files: 1, failed: 0, skipped: 0, truncated: false }
+  // ⚠️ `opened` 一并清掉：句柄是拿它的长度发的号，不清的话第二个用例里的句柄就成了 2，
+  // 而「关掉再打开拿到的是新句柄」这类断言会读到一个跨用例漂过来的数
+  shardCmd.header = { totalLines: 5_000, bytes: 104_857_600, encoding: 'utf8', bom: false, eol: 'lf', lossy: false }
+  shardCmd.opened = []
+  shardCmd.reads = []
+  shardCmd.closed = []
+  assetCmd.calls = []
+  assetCmd.result = null
+  assetCmd.error = null
   disk = {}
   projectCmd.fs = {
     '': [dirEntry('src', 'src', true), dirEntry('README.md', 'README.md', false), dirEntry('docs', 'docs', true)],
@@ -174,10 +340,25 @@ beforeEach(async () => {
         // eslint-disable-next-line @typescript-eslint/only-throw-error
         throw { kind: 'not_found', path: `${root}/${rel}` }
       }
-      return { rel, entries }
+      return { rel, entries: (entries as { rel: string }[]).map((e) => ({ ...e, path: `${root}/${e.rel}` })) }
+    }
+    if (cmd === 'index_project') {
+      projectCmd.indexed.push(rootsOf(args))
+      return projectCmd.stats
+    }
+    if (cmd === 'query_project') {
+      const roots = rootsOf(args)
+      const needle = typeof args?.needle === 'string' ? args.needle : ''
+      // ⚠️ `recent` 必须逐条验类型再收：它是 MRU 清单，「递没递上去」正是几条用例要钉的东西。
+      // 直接 `args.recent as string[]` 会让一个漏递的 undefined 变成断言里的 undefined，
+      // 而 `toEqual([])` 与 `toBeUndefined()` 都能被人误读成「递了个空清单」
+      const raw = args?.recent
+      const recent = Array.isArray(raw) ? raw.filter((r): r is string => typeof r === 'string') : []
+      projectCmd.queries.push({ roots, needle, recent })
+      return projectCmd.result
     }
     if (cmd === 'start_search') {
-      searchCmd.calls.push({ root: typeof args?.root === 'string' ? args.root : '', query: args?.query })
+      searchCmd.calls.push({ roots: rootsOf(args), query: args?.query })
       // ⚠️ 必须返回一个**字符串** taskId。落到下面那个 `return undefined` 的话，store 会把
       // undefined 认成当前任务，随后每一个事件都对不上号——面板永远停在「正在搜索…」，
       // 而后台其实早就搜完了，没有任何报错可查
@@ -186,12 +367,64 @@ beforeEach(async () => {
     if (cmd === 'start_replace') {
       // 记**整个 request**而不是只记 query：`skip` 那一半（正开着且有未保存改动的路径）
       // 是这条命令唯一由前端递进去的保护，漏递的失败方式是「用户的稿子被落盘盖掉」
-      replaceCmd.calls.push({ root: typeof args?.root === 'string' ? args.root : '', request: args?.request })
+      replaceCmd.calls.push({ roots: rootsOf(args), request: args?.request })
       return replaceCmd.taskId
     }
     if (cmd === 'cancel_task') {
       searchCmd.cancelled.push(typeof args?.taskId === 'string' ? args.taskId : '')
       return undefined
+    }
+    if (cmd === 'set_watched') {
+      // ⚠️ 这一条**不能**落到下面那个 `return undefined`：`send` 拿到 undefined 之后
+      // 会在 `describeWatchStats` 里取属性，抛出来的错被同一个 try 咽成提示条上一句
+      // 「文件监听没能同步：undefined」，于是每条 App 用例都平白多一行警告，
+      // 而真正的原因（命令没实现）被藏起来了
+      const raw = args?.paths
+      watchCmd.sent.push(Array.isArray(raw) ? raw.filter((p): p is string => typeof p === 'string') : [])
+      return watchCmd.stats
+    }
+    if (cmd === 'open_large') {
+      const path = typeof args?.path === 'string' ? args.path : ''
+      shardCmd.opened.push(path)
+      // 句柄从 1 开始、永不复用（与 Rust 侧同一条规矩）：拿「开过几次」当发号器就够了
+      return { handle: shardCmd.opened.length, header: shardCmd.header }
+    }
+    if (cmd === 'read_lines') {
+      // 🔴 三个参数名都在这儿被真的读一遍。`ipc/shard.ts` 那段模块文档说的「安静的漂移」
+      // 就是指这一行：名字对不上时 `args.handle` 是 undefined，而下面那个 `num()`
+      // 会把它夹成 0——0 不是合法句柄，于是每一页都回 null，界面上是「永远加载中」
+      const handle = num(args?.handle)
+      const start = num(args?.start)
+      const count = num(args?.count)
+      shardCmd.reads.push(handle)
+      if (shardCmd.closed.includes(handle)) return null
+      const total = shardCmd.header.totalLines
+      const from = Math.min(start, total)
+      const n = Math.max(0, Math.min(count, total - from))
+      return {
+        start: from,
+        lines: Array.from({ length: n }, (_, i) => `第 ${from + i + 1} 行`),
+        truncated: false,
+        lossy: false,
+      }
+    }
+    if (cmd === 'close_large') {
+      shardCmd.closed.push(num(args?.handle))
+      return undefined
+    }
+    if (cmd === 'store_image') {
+      // 🔴 两个参数名都在这儿被真的读一遍。`docPath` 漂了的话 Rust 侧推不出目录，
+      // 而 `dataBase64` 漂了的话它连一个字节都收不到——两种漂法在真机上都是
+      // 「粘了没反应」，只有这一行能把它们变成一条红的断言
+      assetCmd.calls.push({
+        docPath: typeof args?.docPath === 'string' ? args.docPath : '',
+        dataBase64: typeof args?.dataBase64 === 'string' ? args.dataBase64 : '',
+      })
+      // 与 load_session 同一条理由：Rust 的 Err 是被序列化后原样抛出的普通对象，
+      // 包一层 new Error 就会让 describeAssetError 走到「兜底」那条分支上去
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      if (assetCmd.error !== null) throw assetCmd.error
+      return assetCmd.result ?? STORED
     }
     return undefined
   })
@@ -311,8 +544,13 @@ function tabs(): HTMLElement[] {
 }
 
 /** 假文件树的一个条目。`path` 一律按 `/repo` 拼，与 `projectCmd.fs` 的 key 对得上 */
+/**
+ * 一条目录项。`path` 留空，由 `list_dir` 那个假实现按**这次请求的根**填上——
+ * 写死 `/repo/` 的话多根用例里两个根会长出一模一样的绝对路径，
+ * 而「两个根都有 src」正是 M2-F 要演的那个场面
+ */
 function dirEntry(name: string, rel: string, isDir: boolean) {
-  return { name, rel, path: `/repo/${rel}`, isDir }
+  return { name, rel, path: '', isDir }
 }
 
 function sidebar(): HTMLElement | null {
@@ -327,11 +565,14 @@ function treeNames(): string[] {
   return treeRowEls().map((el) => el.querySelector('.tree-name')?.textContent ?? '')
 }
 
-/** 按 rel 找那一行。根行的 rel 是空字符串，它的 path 就是 rootPath 本身 */
-function treeRow(rel: string): HTMLElement {
-  const path = rel === '' ? '/repo' : `/repo/${rel}`
+/**
+ * 按 rel 找那一行。根行的 rel 是空字符串，它的 path 就是那个根本身。
+ * `root` 默认 `/repo`：绝大多数用例只有一个根，多根的那几条显式递第二个
+ */
+function treeRow(rel: string, root = '/repo'): HTMLElement {
+  const path = rel === '' ? root : `${root}/${rel}`
   const el = treeRowEls().find((e) => e.title === path)
-  if (!el) throw new Error(`树里找不到 ${rel}（渲染出来的有：${treeNames().join('、')}）`)
+  if (!el) throw new Error(`树里找不到 ${path}（渲染出来的有：${treeNames().join('、')}）`)
   return el
 }
 
@@ -699,8 +940,11 @@ describe('文件生命周期接线', () => {
 
   it('打开失败时报出错误，并且另开一个干净标签来承载——草稿一动不动', async () => {
     typeText('手稿')
-    dialog.open.mockResolvedValue('/huge.log')
-    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: 5_000_000, limit: 4_194_304 })
+    dialog.open.mockResolvedValue('/gone.txt')
+    // ⚠️ 这里刻意**不用** `too_large`：那一条自 M2-H 起不是失败，是「改走只读分片」，
+    // 一个字都不该说（那一半在下面那个 describe 里）。拿它当通用失败的样例，
+    // 会让这条用例在分片那条路修好之前就红，而红的原因与它要钉的东西无关
+    ipc.openFile.mockRejectedValue({ kind: 'io', reason: 'NotFound', message: '文件没了' })
 
     button('打开…').click()
     await flush()
@@ -709,7 +953,7 @@ describe('文件生命周期接线', () => {
     const list = notices()
     expect(list).toHaveLength(1)
     expect(list[0]!.level).toBe('error')
-    expect(list[0]!.text).toContain('too_large')
+    expect(list[0]!.text).toContain('NotFound')
     expect(view().state.doc.toString()).toBe('')
     expect(statusName()).toBe('空文档')
 
@@ -1042,7 +1286,7 @@ describe('分屏接线', () => {
 describe('会话恢复接线（M1-F）', () => {
   /**
    * 存档里的一个标签。字段形状由 `src/ipc/session.ts` 与 Rust 侧的契约测试钉住，
-   * 这里只负责填内容——重复写全 14 个字段会让每条用例的重点淹在样板里。
+   * 这里只负责填内容——重复写全 `SessionTab` 那 9 个字段会让每条用例的重点淹在样板里。
    */
   function savedTab(over: Record<string, unknown> = {}) {
     return {
@@ -1060,7 +1304,22 @@ describe('会话恢复接线（M1-F）', () => {
   }
 
   function savedSession(tabs: unknown[], over: Record<string, unknown> = {}) {
-    return { version: 1, direction: 'row', focused: 0, tabs, panes: [0], ...over }
+    // `project`、`recent` 与 `recentProjects` 是基底的一部分：Rust 侧那三个字段都带
+    // `#[serde(default)]`，于是**线上永远不会缺这三个键**（旧存档在反序列化时就被填成
+    // null / 空数组）。这里少写一个，恢复会在读到它时抛，而那个抛被 `sessionSync`
+    // 的 catch 咽下去变成一条 warn——另一份现场已经装好了，用例照样绿，
+    // 只有「恢复其实失败了一半」这件事没人看见
+    return {
+      version: 1,
+      direction: 'row',
+      focused: 0,
+      tabs,
+      panes: [0],
+      project: null,
+      recent: [],
+      recentProjects: [],
+      ...over,
+    }
   }
 
   /** 最近一次写出去的存档 */
@@ -1277,6 +1536,39 @@ describe('侧边栏接线（M2-B）', () => {
     expect(projectCmd.calls).toEqual([])
   })
 
+  it('点 + 把一个文件夹追加到工作区：头部改口报「2 个文件夹」，两个根各读各的盘', async () => {
+    await openProject()
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('repo')
+
+    // 一次可以多选：真实对话框收的是 `multiple: true`，挑中的按顺序追加到后面
+    dialog.open.mockResolvedValue(['/notes'])
+    sidebarAct('添加文件夹').click()
+    await flush()
+
+    expect(dialog.open).toHaveBeenLastCalledWith({ multiple: true, directory: true })
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('2 个文件夹')
+    // 两个根各自摊开一层，谁也不吃谁的孩子——这是「每个根都是独立一棵树」的可见证据。
+    // ⚠️ 只断言到第 5 行：jsdom 里 `clientHeight` 恒为 0，虚拟窗口只渲染 OVERSCAN 那几行，
+    // 第 8 行压根没进 DOM。跨根那一条边界（`docs` 紧接着 `notes`）在前 5 行里已经看得见
+    expect(treeNames().slice(0, 5)).toEqual(['repo', 'src', 'README.md', 'docs', 'notes'])
+    expect(container.querySelector('.sidebar-title')?.getAttribute('title')).toBe('/repo\n/notes')
+    // 每个根自己那条根行都是 level 1：`aria-level` 按根重新起算，不是一路数下去
+    expect(treeRow('', '/notes').getAttribute('aria-level')).toBe('1')
+  })
+
+  it('+ 的对话框取消时工作区一动不动：追加失败不该留下半个根', async () => {
+    await openProject()
+
+    dialog.open.mockResolvedValue(null)
+    sidebarAct('添加文件夹').click()
+    await flush()
+
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('repo')
+    expect(treeNames()).toEqual(['repo', 'src', 'README.md', 'docs'])
+    // 只读过最初那一个根的根层：取消之后不该有任何一次「补读」
+    expect(projectCmd.calls).toEqual([''])
+  })
+
   it('树是懒加载的：只有点开的那一层才去读盘', async () => {
     await openProject()
 
@@ -1307,7 +1599,7 @@ describe('侧边栏接线（M2-B）', () => {
   it('点头部的 × 关掉根：树回到空状态，但侧边栏本身留着', async () => {
     await openProject()
 
-    sidebarAct('关闭文件夹').click()
+    sidebarAct('关闭所有文件夹').click()
 
     // 刻意不跟着收起：那条「打开文件夹…」正是用户下一步要点的东西，
     // 顺手把栏藏掉等于把他刚用过的入口拿走
@@ -1381,6 +1673,9 @@ describe('侧边栏接线（M2-B）', () => {
       ],
       panes: [0],
       project,
+      // 与上面 `savedSession` 同一条理由：线上这两个键永远在，缺了恢复只会失败一半
+      recent: [],
+      recentProjects: [],
     }
   }
 
@@ -1388,7 +1683,10 @@ describe('侧边栏接线（M2-B）', () => {
     ipc.openFile.mockResolvedValue(textFile({ text: '磁盘上的样子' }))
     projectCmd.calls = []
 
-    await restartWith(archiveWith({ root: '/repo', expanded: ['', 'src'] }))
+    // ⚠️ 这里是**新形状**：`{root, expanded}` → `{roots:[…]}` 的兼容在 Rust 的
+    // `SessionProject::deserialize` 里，而这一层的 `loadSession` 是假的，压根不过 Rust。
+    // 前端拿到手的恒为已经归一化过的那一份
+    await restartWith(archiveWith({ roots: [{ root: '/repo', expanded: ['', 'src'] }] }))
 
     // 树恢复好了却看不见，等于没恢复——所以侧边栏要跟着存档一起回来
     expect(sidebar()).not.toBeNull()
@@ -1398,6 +1696,10 @@ describe('侧边栏接线（M2-B）', () => {
     expect([...projectCmd.calls].sort()).toEqual(['', 'src'])
     // 标签那一半同时装好了：两半是并行的
     expect(statusName()).toBe('a.txt')
+    // 一条 warn 都没有 = 恢复真的走完了。`sessionSync` 的 catch 会把 `restoreSession`
+    // 里的任何抛变成一条提示，而那之前标签已经装好了——只看上面两条断言的话，
+    // 「恢复失败了一半」与「恢复成功」长得一模一样
+    expect(notices()).toEqual([])
   })
 
   it('上次没开文件夹：侧边栏保持收起，不弹一条空栏出来', async () => {
@@ -1418,7 +1720,7 @@ describe('侧边栏接线（M2-B）', () => {
     await openProject()
     expect(button('侧边栏开')).toBeDefined()
 
-    sidebarAct('关闭文件夹').click()
+    sidebarAct('关闭所有文件夹').click()
     await flush()
     // 侧边栏本身留着，显示那个「打开文件夹…」的空状态——那正是用户下一步要点的东西
     expect(sidebar()).not.toBeNull()
@@ -1536,8 +1838,9 @@ describe('全局搜索接线（M2-C）', () => {
 
     // 发出去的 query **只有四个 key**：include / exclude 刻意不发，Rust 侧容器上有
     // `#[serde(default)]`，缺 key 就是「不限」。前端替它补两个空数组等于把默认值抄两份
+    // ⚠️ `roots` 是数组，单根时也是长度为 1 的数组——顺序就是 `rootIndex` 的语义
     expect(searchCmd.calls).toEqual([
-      { root: '/repo', query: { pattern: 'needle', literal: false, caseSensitive: false, wholeWord: false } },
+      { roots: ['/repo'], query: { pattern: 'needle', literal: false, caseSensitive: false, wholeWord: false } },
     ])
     expect(findStatus()).toBe('正在搜索… 已扫过 0 个文件')
 
@@ -1548,6 +1851,8 @@ describe('全局搜索接线（M2-C）', () => {
           {
             rel: 'src/a.ts',
             path: '/repo/src/a.ts',
+            // ⚠️ `rootIndex` 在契约上总是出现（M2-F），单根时恒为 0
+            rootIndex: 0,
             // 偏移量是 UTF-16 码元，与 String.prototype.slice、与 CM6 的文档位置同一口径
             hits: [
               { line: 1, text: 'let a = needle;', ranges: [{ start: 8, end: 14 }], truncated: false },
@@ -1685,6 +1990,7 @@ describe('全局替换接线（M2-D）', () => {
           {
             rel: 'README.md',
             path: '/repo/README.md',
+            rootIndex: 0,
             hits: [
               {
                 line: 1,
@@ -1699,6 +2005,7 @@ describe('全局替换接线（M2-D）', () => {
           {
             rel: 'src/a.ts',
             path: '/repo/src/a.ts',
+            rootIndex: 0,
             hits: [
               {
                 line: 1,
@@ -1802,9 +2109,11 @@ describe('全局替换接线（M2-D）', () => {
 
     // ⚠️ `skip` 里必须带着那个脏标签的绝对路径，原样递：后端逐组件比 Path 相等，
     // 前端自己 normalize 一遍就会「少保护一个文件」，而那意味着用户的稿子被落盘盖掉
+    // ⚠️ `roots` 递的是**当前**那份根清单，而 `previewKey` 指纹已经保证它与用户在预览里
+    // 看到的那一份逐字段相同——多一个根就是改了用户没批准过的文件夹
     expect(replaceCmd.calls).toEqual([
       {
-        root: '/repo',
+        roots: ['/repo'],
         request: {
           query: { pattern: 'needle', literal: false, caseSensitive: false, wholeWord: false, replace: 'NEEDLE' },
           skip: ['/repo/src/a.ts'],
@@ -1900,5 +2209,1999 @@ describe('全局替换接线（M2-D）', () => {
     })
     expect(findStatus()).toContain('已取消（改动不会回滚）')
     expect(findButton('取消')).toBeNull()
+  })
+})
+
+/** 浮层的根节点。没展开时是 null——「此刻它不该在」正是几条用例要钉的东西 */
+function palette(): HTMLElement | null {
+  return container.querySelector<HTMLElement>('.palette-backdrop')
+}
+
+function paletteInput(): HTMLInputElement {
+  const el = palette()?.querySelector<HTMLInputElement>('.palette-input')
+  if (!el) throw new Error('浮层里没有输入框')
+  return el
+}
+
+function paletteRows(): HTMLElement[] {
+  return [...container.querySelectorAll<HTMLElement>('.palette-row')]
+}
+
+function paletteRowTexts(): string[] {
+  return paletteRows().map((el) => el.querySelector('.palette-text')?.textContent ?? '')
+}
+
+function paletteStatus(): string {
+  return container.querySelector('.palette-status')?.textContent ?? ''
+}
+
+/** 往浮层的输入框里敲字。与 `typeSearch` 同一条路：普通 `<input>`，不是 CM6 的事务 */
+function typeGoto(text: string): void {
+  const el = paletteInput()
+  el.value = text
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
+/** 在浮层里按一个键。bubbles 是必需的：Solid 把 keydown 委托在 document 上 */
+function pressInPalette(key: string): KeyboardEvent {
+  const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+  paletteInput().dispatchEvent(event)
+  return event
+}
+
+/** 一条索引命中。`score` 只影响 Rust 侧的排序，而桩是按数组顺序原样回的 */
+function matchOf(rel: string, score = 10): FileMatch {
+  // `rootIndex` 在契约上不是可选的（M2-F）。浮层这一层还只画单根的候选
+  return { rel, path: `/repo/${rel}`, score, rootIndex: 0 }
+}
+
+/** 光标现在在第几行（1 起算）。跳行那两条用例只认这个数 */
+function cursorLine(): number {
+  const v = view()
+  return v.state.doc.lineAt(v.state.selection.main.head).number
+}
+
+describe('跳转浮层接线（M2-E）', () => {
+  it('默认不渲染浮层；展开时它是 .app 的最后一个孩子，不给那个行数固定的 grid 多加一行', async () => {
+    expect(palette()).toBeNull()
+
+    await openProject()
+    press('p', modInit())
+    await flush()
+
+    const app = container.querySelector('.app')!
+    expect([...app.children].map((el) => el.className)).toEqual([
+      'toolbar',
+      'tab-strip',
+      'notices',
+      'main',
+      'statusbar',
+      'palette-backdrop',
+    ])
+    // ⚠️ 排在最后不是随手放的：它的 z-index 比两个模态都高（styles.css 里写着理由），
+    // 于是「DOM 里靠后的在上面」这条直觉在这里也成立。`.palette-backdrop` 是 fixed，
+    // 不参与 grid 布局——正文区那一行 `1fr` 一个字都没被它挤走
+  })
+
+  it('空窗口里按 Mod+P：浮层展开、一个 IPC 都不发，状态行说清楚缺什么', async () => {
+    press('p', modInit())
+    await flush()
+
+    expect(palette()).not.toBeNull()
+    expect(projectCmd.indexed).toEqual([])
+    expect(projectCmd.queries).toEqual([])
+    // 「按了没反应」与「按了但缺前提」是两回事：前者用户只会以为快捷键坏了
+    expect(paletteStatus()).toBe('先打开一个文件夹，才能按名字找文件')
+    expect(paletteInput().value).toBe('')
+  })
+
+  it('Mod+P 建一次索引并自动查一遍空词，焦点落在输入框上', async () => {
+    await openProject()
+    expect(projectCmd.indexed).toEqual([])
+
+    press('p', modInit())
+    await flush()
+
+    // ⚠️ 两层方括号：外层是「建过几次索引」，里层是那一次收到的根清单。
+    // M2-F 起 `index_project` 收的是 `roots: string[]`，单根时是长度为 1 的数组
+    expect(projectCmd.indexed).toEqual([['/repo']])
+    // 刚展开时一个字都没打，查的是空词——那一批就是「随便给我最近用过的」
+    expect(projectCmd.queries).toEqual([{ roots: ['/repo'], needle: '', recent: [] }])
+    expect(document.activeElement).toBe(paletteInput())
+  })
+
+  it('Mod+R 进去就是列标题模式：输入框里已经有 @，而且一个字节都不去查索引', async () => {
+    typeText('# 一级标题\n\n正文一段\n\n## 二级标题\n')
+
+    press('r', modInit())
+    await flush()
+
+    expect(paletteInput().value).toBe('@')
+    expect(paletteRowTexts()).toEqual(['一级标题', '二级标题'])
+    // 标题级别靠缩进表达，`.symbol` 那个类同时决定它用正文字体而不是代码字体
+    expect(paletteRows().every((el) => el.classList.contains('symbol'))).toBe(true)
+    expect(projectCmd.indexed).toEqual([])
+    expect(projectCmd.queries).toEqual([])
+  })
+
+  it('敲字就去查，needle 原样递上去；回车把选中的那个文件真的打开', async () => {
+    await openProject()
+    projectCmd.result = { matches: [matchOf('src/a.ts'), matchOf('src/b.ts')], total: 2 }
+    ipc.openFile.mockResolvedValue(textFile({ text: '从浮层打开的正文' }))
+
+    press('p', modInit())
+    await flush()
+    typeGoto('a.ts')
+    await flush()
+
+    expect(projectCmd.queries.at(-1)).toEqual({ roots: ['/repo'], needle: 'a.ts', recent: [] })
+    expect(paletteRowTexts()).toEqual(['src/a.ts', 'src/b.ts'])
+    // ⚠️ Rust 侧已经按分数排好序了，前端**不许**再排一遍。桩按数组顺序原样回，
+    // 所以这个数组的顺序正是「前端有没有偷偷重排」的照妖镜
+    expect(paletteRows()[0]!.title).toBe('/repo/src/a.ts')
+
+    pressInPalette('Enter')
+    await flush()
+
+    expect(ipc.openFile).toHaveBeenCalledWith('/repo/src/a.ts')
+    expect(palette()).toBeNull()
+    expect(view().state.doc.toString()).toBe('从浮层打开的正文')
+    expect(statusName()).toBe('a.ts')
+  })
+
+  it('落地之后 MRU 记上了，下一次展开浮层就把它递给 Rust 去加分', async () => {
+    await openProject()
+    projectCmd.result = { matches: [matchOf('src/a.ts')], total: 1 }
+    ipc.openFile.mockResolvedValue(textFile())
+
+    press('p', modInit())
+    await flush()
+    pressInPalette('Enter')
+    await flush()
+
+    projectCmd.queries.length = 0
+    press('p', modInit())
+    await flush()
+
+    // `recent` 是绝对路径，最新的在前。⚠️ 它**只用来加分**：Rust 侧拿它与索引里已有的
+    // rel 比对，比不上的直接忽略，不会因为一份伪造的清单去多读一个文件
+    expect(projectCmd.queries.at(-1)?.recent).toEqual(['/repo/src/a.ts'])
+  })
+
+  /**
+   * ⚠️ 光标落点必须在**同步**那一拍上断言，不能等 `flush()`。
+   *
+   * 这不是偷懒，是 jsdom 的保真度到此为止。实测的事件顺序（探针记录）：
+   *
+   * 1. `reveal` 派发交易，state 的光标确实到了 278；
+   * 2. 紧接着 `view.focus()` → jsdom 把 DOM 选区挪到 `(contentDOM, 0)`，而 CM6 的
+   *    `updateSelection()` 那一下 `Selection.collapse()` 在 jsdom 里**没有落住**；
+   * 3. jsdom 随后补发 `selectionchange`，CM6 的 `DOMObserver.onSelectionChange`
+   *    看见「DOM 选区在编辑器里、且与 state 不一致」，判定成用户拖了光标，
+   *    于是 `applyDOMChange` 把 state 的光标**改回 0**。
+   *
+   * 真浏览器里第 2 步的 `collapse()` 会落住，第 3 步的 `readSelectionRange()`
+   * 因为两边一致直接返回 false，不会有这次回改——CM6 自己那条
+   * 「浏览器在 focus 时把光标挪到了元素开头」的兜底也正是为这种情形写的。
+   *
+   * 所以这里断言的是产品真正做的那件事（算出 278 并派发出去），而「落定之后光标
+   * 停在第 42 行」由下面那条 `a.ts:42` 用例覆盖——它的 `reveal` 跑在 `openAt` 之后
+   * 的微任务里，jsdom 那条 `selectionchange` 早已消化完，全程不回改，
+   * `cursorLine()` 稳稳地是 42。两条走的是同一段 `revealTarget` + `controller.reveal`。
+   */
+  it(':42 回车把当前文档跳到第 42 行，而且不发一次 IPC', async () => {
+    typeText(Array.from({ length: 60 }, (_, i) => `第 ${i + 1} 行`).join('\n'))
+    expect(statusCounts()).toBe('60 行 · 410 字符')
+    expect(cursorLine()).toBe(1)
+
+    press('p', modInit())
+    await flush()
+    expect(paletteInput().value).toBe('')
+    typeGoto(':42')
+    await flush()
+    expect(paletteInput().value).toBe(':42')
+    expect(paletteStatus()).toBe('跳到第 42 行（Enter 落地）')
+
+    // 跳行没有候选可列，浮层里是空的——那不是一个错误状态
+    expect(paletteRows()).toHaveLength(0)
+    expect(projectCmd.queries).toEqual([])
+
+    pressInPalette('Enter')
+    // 第 42 行的行首 = 前 9 行各 5 字 + 第 10–41 行各 6 字 + 41 个换行 = 278
+    expect(view().state.selection.main.head).toBe(278)
+    expect(view().state.selection.main.empty).toBe(true)
+
+    await flush()
+    expect(palette()).toBeNull()
+    // 跳行只动光标，一个字符都不该改
+    expect(statusCounts()).toBe('60 行 · 410 字符')
+  })
+
+  it('文件名后面补 :42 与先打 :42 是同一个落点', async () => {
+    await openProject()
+    projectCmd.result = { matches: [matchOf('src/a.ts')], total: 1 }
+    ipc.openFile.mockResolvedValue(
+      textFile({ text: Array.from({ length: 60 }, (_, i) => `第 ${i + 1} 行`).join('\n') }),
+    )
+
+    press('p', modInit())
+    await flush()
+    typeGoto('a.ts:42')
+    await flush()
+
+    // ⚠️ 递上去的 needle 里**没有** `:42`：那一截是行号，不是文件名的一部分，
+    // 带着它去模糊匹配的话 `src/a.ts` 反而匹配不上
+    expect(projectCmd.queries.at(-1)?.needle).toBe('a.ts')
+
+    pressInPalette('Enter')
+    await flush()
+
+    expect(statusName()).toBe('a.ts')
+    expect(cursorLine()).toBe(42)
+  })
+
+  it('Escape 收起浮层，一个文件都不打开', async () => {
+    await openProject()
+    projectCmd.result = { matches: [matchOf('src/a.ts')], total: 1 }
+
+    press('p', modInit())
+    await flush()
+    const event = pressInPalette('Escape')
+    await flush()
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(palette()).toBeNull()
+    expect(ipc.openFile).not.toHaveBeenCalled()
+  })
+
+  it('点浮层里的行等于选中并落地，不必先按 Enter', async () => {
+    await openProject()
+    projectCmd.result = { matches: [matchOf('src/a.ts'), matchOf('src/b.ts')], total: 2 }
+    ipc.openFile.mockResolvedValue(textFile({ text: '第二份' }))
+
+    press('p', modInit())
+    await flush()
+    paletteRows()[1]!.click()
+    await flush()
+
+    expect(ipc.openFile).toHaveBeenCalledWith('/repo/src/b.ts')
+    expect(palette()).toBeNull()
+    expect(view().state.doc.toString()).toBe('第二份')
+  })
+})
+
+describe('最近项目接线（M2-F）', () => {
+  /** 候选前面那一格。文件模式里装根名，项目模式里装父目录——同一个节点，两种读法 */
+  function paletteRoots(): (string | null)[] {
+    return paletteRows().map((el) => el.querySelector('.palette-root')?.textContent ?? null)
+  }
+
+  function sidebarTitle(): string {
+    return container.querySelector('.sidebar-title')?.textContent ?? ''
+  }
+
+  /** 用工具栏的「文件夹…」把整个工作区换成 `path`。在 App 里这是用户的一次点击 */
+  async function switchTo(path: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    button('文件夹…').click()
+    await flush()
+  }
+
+  it('空窗口里按 Mod+Shift+O：浮层展开、一个 IPC 都不发，状态行说清楚怎么才会有东西', async () => {
+    press('O', { ...modInit(), shiftKey: true })
+    await flush()
+
+    expect(palette()).not.toBeNull()
+    expect(paletteRows()).toHaveLength(0)
+    expect(projectCmd.indexed).toEqual([])
+    expect(projectCmd.queries).toEqual([])
+    // 与 Mod+P 那句同一条理由：「按了没反应」与「按了但还缺前提」是两回事
+    expect(paletteStatus()).toBe('还没有别的项目：先用「文件夹…」打开一个，换过一次之后这里就有东西了')
+    expect(paletteInput().placeholder).toBe('按名字或路径找最近项目…')
+  })
+
+  it('换过一次工作区之后，刚离开的那一个就出现在 Mod+Shift+O 里，点它把整棵树装回来', async () => {
+    await openProject()
+    expect(sidebarTitle()).toBe('repo')
+
+    await switchTo('/notes')
+    expect(sidebarTitle()).toBe('notes')
+
+    press('O', { ...modInit(), shiftKey: true })
+    await flush()
+
+    expect(paletteRowTexts()).toEqual(['repo'])
+    // ⚠️ 这一格是**父目录**，不是根名：`/repo` 的父目录就是 `/`。
+    // 两个同名项目全靠它分开，而这一条也顺带钉住「浮层没有把 rootIndex 那套拿过来用」
+    expect(paletteRoots()).toEqual(['/'])
+    expect(paletteRows()[0]!.title).toBe('/repo')
+    // 项目那一路压根不问索引：那 40–205ms 与它无关
+    expect(projectCmd.indexed).toEqual([])
+    expect(projectCmd.queries).toEqual([])
+    expect(paletteStatus()).toBe('1 个最近项目')
+
+    // 装回来的那一趟真的去读了盘：不然用户看到的是一棵空树
+    const before = projectCmd.calls.length
+    paletteRows()[0]!.click()
+    await flush()
+
+    expect(palette()).toBeNull()
+    expect(sidebarTitle()).toBe('repo')
+    expect(projectCmd.calls.length).toBeGreaterThan(before)
+    // 切项目不动任何标签：那半份现场与树是两套独立状态（M2-B-4 的前提）。
+    // 起始那个未保存的空标签还在原位，一次 openFile 都没被顺手发出去
+    expect(statusName()).toBe('空文档')
+    expect(ipc.openFile).not.toHaveBeenCalled()
+  })
+
+  it('⚠️ 多根工作区是**整份**记下来的：候选读作「repo +1」，点它两个根一起回来', async () => {
+    await openProject()
+    dialog.open.mockResolvedValue(['/notes'])
+    sidebarAct('添加文件夹').click()
+    await flush()
+    expect(sidebarTitle()).toBe('2 个文件夹')
+
+    await switchTo('/scratch')
+
+    press('O', { ...modInit(), shiftKey: true })
+    await flush()
+
+    // 记成「一个根一条」的话这里会是两行 `repo` 与 `notes`，而切回去就只剩一个根——
+    // 「我刚才那两个文件夹呢」这件事没有任何提示
+    expect(paletteRowTexts()).toEqual(['repo +1'])
+    expect(paletteRows()[0]!.title).toBe('/repo\n/notes')
+
+    paletteRows()[0]!.click()
+    await flush()
+
+    expect(sidebarTitle()).toBe('2 个文件夹')
+    expect(treeNames().slice(0, 5)).toEqual(['repo', 'src', 'README.md', 'docs', 'notes'])
+  })
+
+  it('从项目模式切到 Mod+P：那一次必须把索引补建上，否则列表空空如也', async () => {
+    await openProject()
+    await switchTo('/notes')
+
+    press('O', { ...modInit(), shiftKey: true })
+    await flush()
+    expect(projectCmd.indexed).toEqual([])
+
+    // 浮层已经开着，`show` 走的是「换一个意图」那条分支——它**不**重建索引。
+    // 而项目模式压根没建过，所以这里靠 `indexed()` 补一次
+    press('p', modInit())
+    await flush()
+
+    expect(projectCmd.indexed).toEqual([['/notes']])
+    expect(paletteInput().placeholder).toBe('按名字找文件…（:42 跳行，@ 列标题）')
+  })
+
+  it('打字就地过滤最近项目，按父目录也认', async () => {
+    await openProject()
+    await switchTo('/notes')
+    await switchTo('/scratch')
+
+    press('O', { ...modInit(), shiftKey: true })
+    await flush()
+    expect(paletteRowTexts()).toEqual(['notes', 'repo'])
+
+    typeGoto('rep')
+    await flush()
+    expect(paletteRowTexts()).toEqual(['repo'])
+    expect(paletteStatus()).toBe('1 个最近项目')
+  })
+})
+
+describe('文件监听接线（M2-G）', () => {
+  const README = '/repo/README.md'
+  const A_TS = '/repo/src/a.ts'
+
+  /**
+   * 把「磁盘」换成给定内容，并让 `openFile` 从它上面读。
+   *
+   * ⚠️ 用例要在**跑动中间**改它：静默重载与「用磁盘上的覆盖」读的都是改动之后那一份，
+   * 写成常量的话两者读回来的是同一份内容，断言会绿得毫无意义
+   */
+  function useDisk(contents: Record<string, string>): void {
+    disk = contents
+    ipc.openFile.mockImplementation(async (path: string) => textFile({ text: disk[path] ?? '正文' }))
+  }
+
+  /** 「打开…」→ 目录对话框选中 path。在 App 里这是用户的一次点击 */
+  async function openFromDialog(path: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    button('打开…').click()
+    await flush()
+  }
+
+  /** 一个干净的 README 标签（落在启动那个空白标签上，不新建） */
+  async function cleanTab(): Promise<void> {
+    useDisk({ [README]: 'README 的正文' })
+    await openFromDialog(README)
+    expect(statusName()).toBe('README.md')
+  }
+
+  /** README 干净 + a.ts 被敲脏，活动标签是 a.ts */
+  async function twoTabs(): Promise<void> {
+    useDisk({ [README]: 'README 的正文', [A_TS]: 'let a = 1;\n' })
+    await openFromDialog(README)
+    await openFromDialog(A_TS)
+    // ⚠️ 必须真的敲字把它改脏：`changed` 事件走静默重载还是走裁决框，判据只有 `dirty()`
+    typeText('改一下')
+    await flush()
+    expect(statusName()).toBe('● a.ts')
+  }
+
+  /** 模拟 Rust 侧推来的一条外部改动。走的是与搜索/替换同一个 `listen` 桩 */
+  function fireChanged(path: string, kind: FileChangeKind = 'changed'): Promise<void> {
+    return fireEvent(FILE_CHANGED_EVENT, { path, kind })
+  }
+
+  function labels(): string[] {
+    return [...container.querySelectorAll<HTMLButtonElement>('.modal-actions button')].map((b) => b.textContent ?? '')
+  }
+
+  it('启动就送一份空清单，之后每次标签变化都送全量', async () => {
+    // 挂载那一刻一个文件都没开，但清单**照样要送**：`set_watched([])` 是「把监听整个关掉」，
+    // 而不送的话上一次运行留下的订阅状态就没人负责（见 src/ipc/watch.ts 那条注释）
+    expect(watchCmd.sent[0]).toEqual([])
+
+    await twoTabs()
+    expect(watchCmd.sent[watchCmd.sent.length - 1]).toEqual([README, A_TS])
+
+    const count = watchCmd.sent.length
+    typeText('再改一下')
+    await flush()
+    // 改脏不惊动 IPC：脏标记不是「该盯哪些文件」的一部分，而脏文件恰恰是最该被盯着的
+    expect(watchCmd.sent).toHaveLength(count)
+  })
+
+  it('⚠️ 干净标签被外部改了：静默读回磁盘那一份，一个字都不问', async () => {
+    await cleanTab()
+    const opened = ipc.openFile.mock.calls.length
+
+    disk[README] = '别人刚写进去的正文'
+    await fireChanged(README)
+
+    expect(ipc.openFile).toHaveBeenCalledTimes(opened + 1)
+    // 这一条是整个 M2-G 存在的理由：干净文档没有需要保护的东西，弹个框只是打断用户
+    expect(modal()).toBeNull()
+    expect(view().state.doc.toString()).toBe('别人刚写进去的正文')
+    expect(statusName()).toBe('README.md')
+  })
+
+  it('脏标签被外部改了：裁决框出现，而编辑器里的正文一动不动', async () => {
+    await twoTabs()
+    const before = view().state.doc.toString()
+
+    disk[A_TS] = '别人刚写进去的代码'
+    await fireChanged(A_TS)
+
+    expect(modal()?.getAttribute('role')).toBe('alertdialog')
+    expect(modal()?.getAttribute('aria-label')).toBe('「a.ts」在 Vela 之外被改过了')
+    expect(labels()).toEqual(['用磁盘上的覆盖', '另存为…', '保留我的改动'])
+    // 全路径单独一行：两个目录里的同名文件同时出事时，只报文件名认不出来
+    expect([...container.querySelectorAll('.modal-body')].map((el) => el.textContent)).toContain(A_TS)
+    // ⚠️ 在用户裁决之前一个字节都不许动——这一份稿子只存在于内存里
+    expect(view().state.doc.toString()).toBe(before)
+    expect(statusName()).toBe('● a.ts')
+  })
+
+  it('「用磁盘上的覆盖」：读回磁盘那一份，脏标记跟着没了', async () => {
+    await twoTabs()
+    disk[A_TS] = '磁盘上换过的那一份'
+    await fireChanged(A_TS)
+
+    modalButton('用磁盘上的覆盖').click()
+    await flush()
+
+    expect(modal()).toBeNull()
+    expect(view().state.doc.toString()).toBe('磁盘上换过的那一份')
+    expect(statusName()).toBe('a.ts')
+  })
+
+  it('「保留我的改动」：对话框消失，正文与脏标记都留着', async () => {
+    await twoTabs()
+    disk[A_TS] = '磁盘上换过的那一份'
+    await fireChanged(A_TS)
+    const before = view().state.doc.toString()
+
+    modalButton('保留我的改动').click()
+    await flush()
+
+    expect(modal()).toBeNull()
+    expect(view().state.doc.toString()).toBe(before)
+    expect(statusName()).toBe('● a.ts')
+  })
+
+  it('文件被删了：干净标签也要问，而「关闭标签」直接把它摘掉', async () => {
+    await cleanTab()
+
+    await fireChanged(README, 'removed')
+
+    // 干净 + 被删 = 编辑器里这一份是**仅存的副本**，静默重载只会把它读成空
+    expect(modal()?.getAttribute('aria-label')).toBe('「README.md」在磁盘上已经没有了')
+    expect(labels()).toEqual(['关闭标签', '另存为…', '保留标签'])
+
+    modalButton('关闭标签').click()
+    await flush()
+
+    expect(modal()).toBeNull()
+    // 干净标签走的是 closeTab 的快路径，一个字节都不写、也不再问一次
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+    expect(tabs()).toHaveLength(1)
+    expect(statusName()).toBe('空文档')
+  })
+
+  it('监听不完整时那句话要让用户看见——「没订上」与「没出事」在界面上长得一样', async () => {
+    watchCmd.stats = { dirs: 1, files: 1, failed: 1, skipped: 0, truncated: false }
+
+    await cleanTab()
+
+    // 用 `toContain` 而不是全等：`.notice` 里还有那个 `×` 关闭按钮的文本
+    expect(notices().map((n) => n.level)).toContain('warning')
+    expect(
+      notices()
+        .map((n) => n.text)
+        .join(''),
+    ).toContain('文件监听不完整：有 1 个目录没订上。这些文件被外部改动时 Vela 不会提醒。')
+  })
+
+  it('⚠️ 裁决框与关闭确认不同时在场：后者优先，答完才轮到下一个冲突', async () => {
+    await twoTabs()
+    // 两个都脏、都被删：于是「关闭标签」必然把 DiscardDialog 叫出来
+    tabs()[0]!.click()
+    await flush()
+    typeText('README 也改一下')
+    await flush()
+
+    await fireChanged(README, 'removed')
+    await fireChanged(A_TS, 'removed')
+    expect(modal()?.getAttribute('aria-label')).toBe('「README.md」在磁盘上已经没有了')
+    expect([...container.querySelectorAll('.modal-body')].map((el) => el.textContent)).toContain(
+      '后面还有 1 个文件要问。',
+    )
+
+    modalButton('关闭标签').click()
+    await flush()
+
+    // 两层 .modal-backdrop 的 z-index 都是 10，谁在上面只取决于 DOM 顺序，
+    // 被压在底下那个点不着——所以同一时刻只许有一层
+    expect(container.querySelectorAll('.modal-backdrop')).toHaveLength(1)
+    expect(modal()?.getAttribute('aria-label')).toBe('「README.md」有未保存的改动')
+
+    modalButton('不保存').click()
+    await flush()
+
+    expect(container.querySelectorAll('.modal-backdrop')).toHaveLength(1)
+    expect(modal()?.getAttribute('aria-label')).toBe('「a.ts」在磁盘上已经没有了')
+    expect([...container.querySelectorAll('.modal-body')].map((el) => el.textContent)).not.toContain(
+      '后面还有 1 个文件要问。',
+    )
+  })
+})
+
+describe('只读分片接线（M2-H）', () => {
+  /**
+   * 让「打开…」这条路撞一次 `too_large`，于是 `document.ts` 改走 `open_large`。
+   *
+   * ⚠️ 走的是**真实那条路**，而不是直接给 `shardCmd` 塞一个分片：这一组要验的正是
+   * 「4 MiB 那条线之后前端会不会自己换条路」，而那半条判断在 `document.ts` 里
+   */
+  function hugeFile(path: string): void {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
+  }
+
+  function shardPane(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.shard-pane')
+  }
+
+  function shardRows(): string[] {
+    return [...container.querySelectorAll('.shard-row .shard-text')].map((r) => (r.textContent ?? '').trim())
+  }
+
+  /** 打开那个大文件并等两趟：`open_large` 一趟，建好视图之后要第一页又一趟 */
+  async function openHuge(path = '/var/log/huge.log'): Promise<void> {
+    hugeFile(path)
+    button('打开…').click()
+    await flush()
+    await flush()
+  }
+
+  it('打开一个超过 4 MiB 的文件：正文区换成只读分片，而且一个字都不抱怨', async () => {
+    await openHuge()
+
+    expect(shardCmd.opened).toEqual(['/var/log/huge.log'])
+    // 🔴 没有提示条。`too_large` 在这里不是失败，是「换一条路」；说一句「文件太大」
+    // 而屏幕上明明显示着内容，是自相矛盾
+    expect(notices()).toEqual([])
+    expect(shardPane()).not.toBeNull()
+    // 🔴 那个 CM6 编辑器**没了**，不是被盖住。留着它的话 `ws.focusedEditor()` 照样
+    // 返回那块编辑器，于是 Mod+F、Alt+Z、多光标——所有 `when: ctx.editor !== null`
+    // 的命令全部照常可用，而它们改的是那份空 buffer
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(0)
+    // 真的读了第一页：`createShardView` 建好就立刻要一页，不等组件量到 clientHeight
+    expect(shardCmd.reads.length).toBeGreaterThan(0)
+    expect(shardRows()[0]).toBe('第 1 行')
+  })
+
+  it('状态栏跟着换成一整排只读的格子', async () => {
+    shardCmd.header = { ...shardCmd.header, encoding: 'gbk', bom: true, eol: 'crlf' }
+    await openHuge()
+
+    const cells = statusCells()
+    expect(cells).toContain('只读分片')
+    expect(cells).toContain('5,000 行')
+    expect(cells).toContain('100.0 MB')
+    expect(cells).toContain('GBK BOM')
+    expect(cells).toContain('CRLF')
+    // 🔴 编码与换行符那两格压根不渲染。这是「分片标签永远不会变脏」唯一的守卫：
+    // 一旦脏了就再也关不掉（关闭确认要保存，而 `save` 在分片上一律拒绝）
+    expect(container.querySelectorAll('.statusbar select')).toHaveLength(0)
+    expect(cells.join(' ')).not.toContain('行 1，列 1')
+  })
+
+  it('🔴 分屏是**每块各判一次**：一块显示分片，另一块还是编辑器', async () => {
+    await openHuge()
+    expect(container.querySelectorAll('.shard-pane')).toHaveLength(1)
+
+    button('右分屏').click()
+    await flush()
+
+    // 新那块分屏显示一个新的空标签，于是它必须是编辑器。写成「全局判断」
+    // （`ws.tabs().some(t => t.doc.shard())`）或者把 Accessor 本身递给 `<Show when>`
+    // （一个函数引用永远为真）都会让**两块**变成只读分片
+    expect(container.querySelectorAll('.shard-pane')).toHaveLength(1)
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(1)
+
+    // 点回第一块：分片还在，而它没有被卸载过一次（`dispose` 只在关标签时调）
+    tabs()[0]!.click()
+    await flush()
+    expect(container.querySelectorAll('.shard-pane')).toHaveLength(1)
+    expect(shardCmd.closed).toEqual([])
+  })
+
+  it('关掉分片标签把 fd 还回去：这是 Vela 里唯一一个不调就会漏的资源', async () => {
+    await openHuge()
+    expect(shardCmd.closed).toEqual([])
+
+    button('右分屏').click()
+    await flush()
+    tabs()[0]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
+    await flush()
+
+    expect(shardCmd.closed).toEqual([1])
+    expect(shardPane()).toBeNull()
+    // 🔴 这里必须是 2 而不是 1：关掉的是**标签**，不是分屏，两块分屏都还在。
+    // 而空出来的那块不能没东西显示——`removeFromList` 挑不出一个「没在别的分屏里
+    // 显示着的」标签（剩下那个已经被新分屏占了），于是补一个「空文档」进来。
+    // 这条对分片和普通标签是同一条路，不是分片特有的例外
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(2)
+    expect(tabs()).toHaveLength(2)
+  })
+
+  it('⛔ 分片路径不进监听清单，外部改动的事件也不处理', async () => {
+    await openHuge()
+    expect(watchCmd.sent[watchCmd.sent.length - 1]).toEqual([])
+
+    // 清单里没有它，事件却到了（内联长成分片那一刻最容易撞上：摘订阅那次
+    // `set_watched` 还在队列上）。不处理是刻意的：分片「重读一次」是整份文件重扫一遍
+    await fireEvent(FILE_CHANGED_EVENT, { path: '/var/log/huge.log', kind: 'changed' satisfies FileChangeKind })
+    await flush()
+
+    expect(shardCmd.opened).toEqual(['/var/log/huge.log'])
+    expect(shardCmd.closed).toEqual([])
+    expect(modal()).toBeNull()
+  })
+})
+
+describe('Markdown 预览接线（M3-A-3）', () => {
+  /**
+   * 预览那一栏的工具栏按钮。**只能按 title 认**：它的文本是「开」/「关」，
+   * 而上面「换行」那一组的按钮文本逐字相同，`button('开')` 拿到的是文档序里先出现的那一个
+   */
+  function previewButton(): HTMLButtonElement {
+    const el = [...container.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.title === 'Mod+Shift+V')
+    if (!el) throw new Error('工具栏上找不到预览按钮')
+    return el
+  }
+
+  function preview(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.md-preview')
+  }
+
+  function previewBody(): string {
+    return container.querySelector('.md-preview-body')?.innerHTML ?? ''
+  }
+
+  /** 面板顶上那句话。null = 没什么要说的（`.md-preview-note` 是 `<Show>` 条件渲染的） */
+  function previewNote(): string | null {
+    return container.querySelector('.md-preview-note')?.textContent ?? null
+  }
+
+  function closePreview(): void {
+    const el = container.querySelector<HTMLButtonElement>('.md-preview-close')
+    if (!el) throw new Error('预览面板上没有那个 ×')
+    el.click()
+  }
+
+  const toggle = () => press('v', { ...modInit(), shiftKey: true })
+
+  /**
+   * 等一个宏任务。
+   *
+   * ⚠️ 它比 `PANEL_DEBOUNCE_MS`（150ms）短两个数量级，所以「渲染出来了」这件事
+   * 只可能来自 `debounced.now()` 那条**立刻**的路。等防抖的话下面那几条就退化成
+   * 「过了 150ms 总归会渲染」，接线接错了也照样绿
+   */
+  const settle = () => flush()
+
+  it('默认不渲染预览那一栏，按钮写的是「关」', () => {
+    expect(preview()).toBeNull()
+    expect(previewButton().textContent).toBe('关')
+    // 侧边栏也默认收着，所以 `.body-row` 里此刻只有正文区一个孩子
+    expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual(['body'])
+  })
+
+  it('Mod+Shift+V 与工具栏按钮走同一条路，而 Mod+V 仍然是空的', async () => {
+    toggle()
+    await settle()
+    expect(preview()).not.toBeNull()
+    expect(previewButton().textContent).toBe('开')
+
+    // 🔴 `Mod+V` 刻意不绑：它是系统粘贴，webview 之前就把那一下吃掉了，绑了也拦不到，
+    // 而万一在某些输入法下拦到了，症状是「按 Cmd+V 粘贴，预览跟着关了」——用户看不见原因
+    press('v', modInit())
+    await settle()
+    expect(preview()).not.toBeNull()
+
+    toggle()
+    await settle()
+    expect(preview()).toBeNull()
+    expect(previewButton().textContent).toBe('关')
+
+    previewButton().click()
+    await settle()
+    expect(preview()).not.toBeNull()
+  })
+
+  it('那一栏挂在 .body-row 的最后（左边写、右边看），而 .app 的 grid 子元素仍然是五个', async () => {
+    toggle()
+    await settle()
+
+    // `.body-row` 是横向 flex，孩子的顺序就是屏幕上的顺序：放在 `.body` 之后 = 在右边
+    expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual([
+      'body',
+      'md-preview',
+    ])
+    // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定为五，
+    // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那一组用例钉过同一件事）
+    expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
+      'toolbar',
+      'tab-strip',
+      'notices',
+      'main',
+      'statusbar',
+    ])
+  })
+
+  it('点头上的 × 收起那一栏，工具栏按钮跟着翻回「关」', async () => {
+    toggle()
+    await settle()
+
+    closePreview()
+    await settle()
+
+    expect(preview()).toBeNull()
+    expect(previewButton().textContent).toBe('关')
+  })
+
+  it('未命名文档按 Markdown 处理：空的说一句空状态，写了内容就渲染出带 data-line 的 HTML', async () => {
+    toggle()
+    await settle()
+    expect(previewNote()).toBe('这份文档还是空的')
+    expect(previewBody()).toBe('')
+    closePreview()
+
+    typeText('# 甲\n\n正文。')
+    toggle()
+    await settle()
+
+    expect(previewNote()).toBeNull()
+    expect(previewBody()).toBe('<h1 data-line="1" id="甲">甲</h1><p data-line="3">正文。</p>')
+    // `data-line` 是同步滚动**唯一**的锚：掉一个，整份插值就失序（`md/scrollSync.ts` 文件头）
+    expect(
+      [...container.querySelectorAll('.md-preview-body [data-line]')].map((el) => el.getAttribute('data-line')),
+    ).toEqual(['1', '3'])
+  })
+
+  it('非 Markdown 文档：面板照样开，里面如实说这个语言没有预览', async () => {
+    dialog.open.mockResolvedValue('/a.ts')
+    ipc.openFile.mockResolvedValue(textFile({ text: 'const x = 1' }))
+    button('打开…').click()
+    await settle()
+
+    toggle()
+    await settle()
+
+    // 🔴 命令层刻意**不判语言**（理由写在 `builtins.ts` 的 `BuiltinHooks.togglePreview` 上）：
+    // 挂一个 `when` 的话快捷键按下去什么也不发生，用户得到的信息是零。面板开出来写一句
+    // 「TypeScript 还没有预览」，至少告诉了他「功能在，只是这个文件不行」
+    expect(preview()).not.toBeNull()
+    expect(previewNote()).toBe('TypeScript 还没有预览')
+    expect(previewBody()).toBe('')
+  })
+
+  it('换标签立刻重渲染：正文换了，而那块 CM6 实例是同一个', async () => {
+    typeText('# 甲\n')
+    toggle()
+    await settle()
+    expect(previewBody()).toContain('甲')
+
+    button('新建').click()
+    await settle()
+    expect(previewNote()).toBe('这份文档还是空的')
+    expect(previewBody()).toBe('')
+
+    tabs()[0]!.click()
+    await settle()
+    expect(previewNote()).toBeNull()
+    expect(previewBody()).toContain('甲')
+  })
+
+  it('🔴 开着预览去分屏：新分屏的编辑器一挂上来预览就跟过去，不停在「没有可预览的正文」', async () => {
+    typeText('# 甲\n')
+    toggle()
+    await settle()
+    expect(previewBody()).toContain('甲')
+
+    button('右分屏').click()
+    await settle()
+
+    expect(hosts()).toHaveLength(2)
+    // 新分屏里是一个空文档，所以该说的是这一句
+    expect(previewNote()).toBe('这份文档还是空的')
+    // ⛔ 而**不是**这一句。走到它意味着 `previewSource()` 读到的是 null：新分屏的
+    // `EditorController` 是在 `EditorPane` 的 `onMount` 里 `attach` 上来的，而那一下写的是
+    // `PaneRecord` 上一个普通可变字段，不触发任何信号。所以 `previewSource` 必须走
+    // `ws.focusedView()`（它额外读了 `attachedAt`）而不是 `ws.focusedEditor()`——
+    // 写成后者的话预览会**一直停在**这句上，直到用户在编辑器里敲一个字
+    // （`docChanged` → `revision` → effect 重跑），而「敲一个字就好了」正是最难报的 bug 形状
+    expect(previewNote()).not.toBe('这块分屏里没有可预览的正文')
+  })
+
+  it('预览跟着聚焦的那块分屏走：焦点换过去它就换文档', async () => {
+    typeInto(0, '# 甲\n')
+    button('右分屏').click()
+    await settle()
+    typeInto(1, '# 乙\n')
+
+    toggle()
+    await settle()
+    expect(previewBody()).toContain('乙')
+    expect(previewBody()).not.toContain('甲')
+
+    focusHost(0)
+    await settle()
+    expect(previewBody()).toContain('甲')
+    expect(previewBody()).not.toContain('乙')
+  })
+})
+
+describe('大纲接线（M3-A-4）', () => {
+  /**
+   * 大纲那一栏的工具栏按钮。**只能按 title 认**：它的文本是「开」/「关」，
+   * 而上面「换行」与「预览」两组的按钮文本逐字相同，`button('开')` 拿到的是
+   * 文档序里先出现的那一个
+   */
+  function outlineButton(): HTMLButtonElement {
+    const el = [...container.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.title === 'Mod+Shift+M')
+    if (!el) throw new Error('工具栏上找不到大纲按钮')
+    return el
+  }
+
+  function outline(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.outline')
+  }
+
+  function outlineRows(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('.outline-row')]
+  }
+
+  function outlineNames(): string[] {
+    return outlineRows().map((el) => el.querySelector('.outline-name')?.textContent ?? '')
+  }
+
+  /** 面板顶上那句话。null = 没什么要说的（`.outline-note` 是 `<Show>` 条件渲染的） */
+  function outlineNote(): string | null {
+    return container.querySelector('.outline-note')?.textContent ?? null
+  }
+
+  /** 撑出总滚动高度的那一格。它只由 `rows()` 算，所以是「少掉的行压根没渲染」的证据 */
+  function spacerHeight(): string {
+    return outline()?.querySelector<HTMLElement>('.outline-spacer')?.style.height ?? ''
+  }
+
+  function closeOutline(): void {
+    const el = container.querySelector<HTMLButtonElement>('.outline-close')
+    if (!el) throw new Error('大纲面板上没有那个 ×')
+    el.click()
+  }
+
+  /**
+   * 点第 index 行的标题名（「跳过去」那一下）。
+   *
+   * ⚠️ 一行的两个按钮必须分开找：折叠箭头也是 `<button>`，而它在 DOM 里**排在前面**，
+   * `querySelector('button')` 抓到的是它，于是用例会在一片绿里把「点箭头」当成「点标题」
+   */
+  function clickHeading(index: number): void {
+    const el = outlineRows()[index]?.querySelector<HTMLButtonElement>('.outline-name')
+    if (!el) throw new Error(`大纲里没有第 ${index} 行的标题`)
+    el.click()
+  }
+
+  /** 点第 index 行的折叠箭头。没有子标题时那一位是个 `<span>`，所以这里只认 `<button>` */
+  function foldAt(index: number): void {
+    const el = outlineRows()[index]?.querySelector<HTMLButtonElement>('button.outline-twisty')
+    if (!el) throw new Error(`第 ${index} 行没有可点的折叠箭头`)
+    el.click()
+  }
+
+  const toggle = () => press('m', { ...modInit(), shiftKey: true })
+
+  /**
+   * 等一个宏任务。与预览那组用例同一条理由：它比 `PANEL_DEBOUNCE_MS`（150ms）
+   * 短两个数量级，所以「列出来了」只可能来自 `debounced.now()` 那条**立刻**的路。
+   * 等防抖的话下面几条就退化成「过了 150ms 总归会列出来」，接线接错了也照样绿
+   */
+  const settle = () => flush()
+
+  it('默认不渲染大纲那一栏，按钮写的是「关」', () => {
+    expect(outline()).toBeNull()
+    expect(outlineButton().textContent).toBe('关')
+    // 侧边栏与预览也默认收着，所以 `.body-row` 里此刻只有正文区一个孩子
+    expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual(['body'])
+  })
+
+  it('Mod+Shift+M 与工具栏按钮走同一条路，而 Mod+M 仍然是空的', async () => {
+    toggle()
+    await settle()
+    expect(outline()).not.toBeNull()
+    expect(outlineButton().textContent).toBe('开')
+
+    // 🔴 `Mod+M` 刻意不绑，而它与 `Mod+V` **不是同一条理由**：`Mod+V` 是系统粘贴，
+    // `Mod+M` 在 macOS 上是「最小化窗口」——两者都在事件到达 webview 之前就被吃掉了，
+    // 绑在这儿永远收不到按键，而万一收到了，症状是「按 Cmd+M 最小化，大纲跟着关了」
+    press('m', modInit())
+    await settle()
+    expect(outline()).not.toBeNull()
+
+    toggle()
+    await settle()
+    expect(outline()).toBeNull()
+    expect(outlineButton().textContent).toBe('关')
+
+    outlineButton().click()
+    await settle()
+    expect(outline()).not.toBeNull()
+  })
+
+  it('那一栏挂在侧边栏之后、.body 之前，而 .app 的 grid 子元素仍然是五个', async () => {
+    await openProject()
+    toggle()
+    press('v', { ...modInit(), shiftKey: true })
+    await settle()
+
+    // `.body-row` 是横向 flex，孩子的顺序就是屏幕上的顺序：左边是「导航」
+    // （磁盘上有什么 → 这份文档的结构），中间是「写」，右边是「结果」。
+    // 大纲放到右边去的话它会与预览抢同一半宽，而两个同时开着是常态
+    expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual([
+      'sidebar',
+      'outline',
+      'body',
+      'md-preview',
+    ])
+    // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定为五，
+    // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那组用例钉过同一件事）
+    expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
+      'toolbar',
+      'tab-strip',
+      'notices',
+      'main',
+      'statusbar',
+    ])
+  })
+
+  it('🔴 列出来的标题与 Mod+R 浮层里那一份逐字相同', async () => {
+    typeText('# 一级标题\n\n正文一段\n\n## 二级标题\n')
+    toggle()
+    await settle()
+
+    press('r', modInit())
+    await settle()
+
+    // 两个入口读的是 `symbolTable` 那**一份**结果，所以这里比的不是「两个解析器凑巧一致」，
+    // 而是「谁要是给大纲另写一遍解析，这一条当场就红」。那种分歧没法向用户解释：
+    // 浮层里看得见的标题、大纲里没有，而两边都没报错
+    expect(paletteRowTexts()).toEqual(['一级标题', '二级标题'])
+    expect(outlineNames()).toEqual(paletteRowTexts())
+  })
+
+  it('点一行标题：光标落到那个标题的起点，走的是与 Mod+R 同一条 gotoPos', async () => {
+    // `# 甲\n\n## 乙\n` → 乙 的节点起点是 5（'#',' ','甲','\n','\n' 五个字符之后），
+    // 而它**含 `##` 那两个井号**：`DocSymbol.pos` 是 `node.from`（`goto/symbols.ts:121`）
+    typeText('# 甲\n\n## 乙\n')
+    toggle()
+    await settle()
+    expect(outlineNames()).toEqual(['甲', '乙'])
+
+    const nameBefore = statusName()
+    clickHeading(1)
+    await settle()
+
+    expect(view().state.selection.main.head).toBe(5)
+    expect(cursorLine()).toBe(3)
+    // 跳过去**没有**动正文：大纲是只读的那一栏，点它不该再多出一个脏标记。
+    // ⚠️ 比的是「点击前后同一格」而不是「干净」——这份未命名文档在 `typeText` 那一下
+    // 就已经脏了（状态栏那一格前面挂着 `●`），只有拿它当基线，这一条才真的在说
+    // 「点标题这一下没改文档」
+    expect(view().state.doc.toString()).toBe('# 甲\n\n## 乙\n')
+    expect(statusName()).toBe(nameBefore)
+  })
+
+  it('点折叠箭头收起一个子树：少掉的那几行是压根没渲染，不是被 CSS 藏起来', async () => {
+    typeText('# 甲\n\n## 乙\n\n## 丙\n\n# 丁\n')
+    toggle()
+    await settle()
+    expect(outlineNames()).toEqual(['甲', '乙', '丙', '丁'])
+    expect(spacerHeight()).toBe(`${4 * OUTLINE_ROW_HEIGHT}px`)
+
+    foldAt(0)
+    await settle()
+
+    expect(outlineNames()).toEqual(['甲', '丁'])
+    // ⚠️ 判据是 spacer 的高度，不是行的可见性：虚拟列表里总高与 `translateY` 都由
+    // `rows()` 算出来。用 `display:none` 藏行的话总高还是四行那么高，滚到底是一片空白
+    expect(spacerHeight()).toBe(`${2 * OUTLINE_ROW_HEIGHT}px`)
+
+    foldAt(0)
+    await settle()
+    expect(outlineNames()).toEqual(['甲', '乙', '丙', '丁'])
+  })
+
+  it('点头上的 × 收起那一栏，工具栏按钮跟着翻回「关」', async () => {
+    toggle()
+    await settle()
+
+    closeOutline()
+    await settle()
+
+    expect(outline()).toBeNull()
+    expect(outlineButton().textContent).toBe('关')
+  })
+
+  it('🔴 大纲与预览的可见性是独立的：关掉一个不该顺手关掉另一个', async () => {
+    toggle()
+    press('v', { ...modInit(), shiftKey: true })
+    await settle()
+    expect(outline()).not.toBeNull()
+    expect(container.querySelector('.md-preview')).not.toBeNull()
+
+    closeOutline()
+    await settle()
+    expect(outline()).toBeNull()
+    // 两个开关各管一栏。顺手一起关的话「一边看结构一边看渲染」这个常态就不存在了，
+    // 而用户找不到是哪一下把它们绑在一起的
+    expect(container.querySelector('.md-preview')).not.toBeNull()
+    expect(outlineButton().textContent).toBe('关')
+  })
+
+  it('未命名文档按 Markdown 处理：空的说一句空状态，写了标题就列出来', async () => {
+    toggle()
+    await settle()
+    expect(outlineNote()).toBe('这份文档还没有标题')
+    expect(outlineNames()).toEqual([])
+
+    typeText('# 甲\n')
+    await flush()
+    // 敲字走的是防抖那条路，所以这里必须真的走完那 150ms（`panel.test.ts` 钉的是防抖本身）
+    await new Promise((resolve) => setTimeout(resolve, 200))
+
+    expect(outlineNote()).toBeNull()
+    expect(outlineNames()).toEqual(['甲'])
+  })
+
+  it('非 Markdown 文档：面板照样开，里面如实说这个语言没有符号表', async () => {
+    dialog.open.mockResolvedValue('/a.ts')
+    ipc.openFile.mockResolvedValue(textFile({ text: 'const x = 1' }))
+    button('打开…').click()
+    await settle()
+
+    toggle()
+    await settle()
+
+    // 🔴 命令层刻意**不判语言**（理由写在 `builtins.ts` 的 `BuiltinHooks.toggleOutline` 上），
+    // 而这句措辞与 `Cmd+R` 浮层那一句**逐字相同**（`goto/store.ts:452`）：
+    // 同一个事实两种说法的话，用户会以为浮层与面板答的是两个问题
+    expect(outline()).not.toBeNull()
+    expect(outlineNote()).toBe('TypeScript 还没有符号表')
+    expect(outlineNames()).toEqual([])
+  })
+
+  it('换标签立刻重算：标题换了，而那块 CM6 实例是同一个', async () => {
+    typeText('# 甲\n')
+    toggle()
+    await settle()
+    expect(outlineNames()).toEqual(['甲'])
+
+    button('新建').click()
+    await settle()
+    expect(outlineNote()).toBe('这份文档还没有标题')
+    expect(outlineNames()).toEqual([])
+
+    tabs()[0]!.click()
+    await settle()
+    expect(outlineNote()).toBeNull()
+    expect(outlineNames()).toEqual(['甲'])
+  })
+
+  it('🔴 开着大纲去分屏：新分屏的编辑器一挂上来大纲就跟过去，不停在「没有可列的标题」', async () => {
+    typeText('# 甲\n')
+    toggle()
+    await settle()
+    expect(outlineNames()).toEqual(['甲'])
+
+    button('右分屏').click()
+    await settle()
+
+    expect(hosts()).toHaveLength(2)
+    // 新分屏里是一个空文档，所以该说的是这一句
+    expect(outlineNote()).toBe('这份文档还没有标题')
+    // ⛔ 而**不是**这一句。走到它意味着 `followedEditor()` 读到的是 null：新分屏的
+    // `EditorController` 是在 `EditorPane` 的 `onMount` 里 `attach` 上来的，而那一下写的是
+    // `PaneRecord` 上一个普通可变字段，不触发任何信号。所以那个访问器必须走
+    // `ws.focusedView()`（它额外读了 `attachedAt`）而不是 `ws.focusedEditor()`——
+    // 写成后者的话大纲会**一直停在**这句上，直到用户在编辑器里敲一个字
+    expect(outlineNote()).not.toBe('这块分屏里没有可列的标题')
+  })
+
+  it('大纲跟着聚焦的那块分屏走：焦点换过去它就换文档', async () => {
+    typeInto(0, '# 甲\n')
+    button('右分屏').click()
+    await settle()
+    typeInto(1, '# 乙\n')
+
+    toggle()
+    await settle()
+    expect(outlineNames()).toEqual(['乙'])
+
+    focusHost(0)
+    await settle()
+    expect(outlineNames()).toEqual(['甲'])
+  })
+})
+
+describe('表格对齐接线（M3-A-5）', () => {
+  const align = () => press('a', { ...modInit(), shiftKey: true })
+  const doc = () => view().state.doc.toString()
+  /** 提示条那一个节点。`notices()` 的 `level` 分不出「无色」与 `ok`，所以要自己读 className */
+  const noticeEl = () => container.querySelector('.notices .notice')
+
+  /**
+   * 往第 index 块分屏敲一份正文，并把光标摆在第 line 行（1 起）的行首。
+   *
+   * ⚠️ `typeText` 那一条把插入点留在**文档开头**（它不设 selection），而对齐认的是
+   * 光标所在的那张表，所以敲完必须自己把光标摆进去
+   */
+  function typeTable(index: number, text: string, line = 2): void {
+    pane(index).dispatch({ changes: { from: pane(index).state.doc.length, insert: text } })
+    caretIn(index, line)
+  }
+
+  function pane(index: number): EditorView {
+    const v = views()[index]
+    if (!v) throw new Error(`没有第 ${index} 块分屏`)
+    return v
+  }
+
+  /** 把第 index 块分屏的光标摆到第 line 行（1 起）的行首。纯选区变更，不进撤销栈、也不置脏 */
+  function caretIn(index: number, line: number): void {
+    pane(index).dispatch({ selection: { anchor: pane(index).state.doc.line(line).from } })
+  }
+
+  /**
+   * 从「磁盘」打开一份 Markdown。
+   *
+   * ⚠️ 要验脏标记就必须走这条路：`typeTable` 那一下自己就把文档置脏了，
+   * 于是「对齐之后是脏的」在一份草稿上永远为真，什么也证明不了。
+   * 顺带一个好处——`setText` 走的是 `restore` → `view.setState`，撤销栈是空的，
+   * 所以「再撤一步该没得撤了」这条断言数得准
+   */
+  async function openMd(text: string, path = '/notes/t.md'): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text }))
+    button('打开…').click()
+    await flush()
+  }
+
+  /** 让「打开…」撞一次 `too_large`，于是正文区换成只读分片（与 M2-H 那组同一条路） */
+  async function openShard(): Promise<void> {
+    dialog.open.mockResolvedValue('/var/log/huge.log')
+    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
+    button('打开…').click()
+    await flush()
+    await flush()
+  }
+
+  it('Mod+Shift+A 把一张歪表重排：改的是真文档，而且**只**动空白', async () => {
+    typeTable(0, '| 名字 | 数量 |\n|---|---:|\n| 中文名字很长 | 12 |')
+    align()
+    await flush()
+
+    const [head, delim, row] = doc().split('\n')
+    // 🔴 按**显示宽度**对齐，不是按字符数：`名字` 是两个字符四格宽，所以要补 8 个空格
+    // 才与 `中文名字很长`（六个字符十二格）齐。按字符数补的话这张表在等宽字体里还是歪的
+    expect(head).toBe(`| 名字${' '.repeat(9)}| 数量 |`)
+    expect(delim).toBe('| ------------ | ---: |')
+    expect(row).toBe('| 中文名字很长 |   12 |')
+    expect(noticeEl(), '对齐成功了就不该说话').toBeNull()
+  })
+
+  it('🔴 一次按键 = 一个撤销步，而它把文档标脏（跟着 ⌘S 落盘）', async () => {
+    await openMd('| a | bb |\n|---|---|\n| ccc | d |')
+    expect(statusName(), '刚从磁盘打开，是干净的').toBe('t.md')
+    caretIn(0, 2)
+
+    align()
+    await flush()
+    expect(doc()).toBe('| a   | bb  |\n| --- | --- |\n| ccc | d   |')
+    expect(statusName(), '对齐是一次真的编辑，不是预览里的把戏').toBe('● t.md')
+
+    // 撤**一步**就得整张表回去。撤出「半张表」意味着它按行发了好几个事务，
+    // 那用户在真实文档上就得按 N 次 ⌘Z
+    expect(undo(view())).toBe(true)
+    expect(doc()).toBe('| a | bb |\n|---|---|\n| ccc | d |')
+    // 再撤一步该没得撤了：对齐只占了**一部**，而不是每行一部
+    expect(undo(view()), '对齐被拆成了好几部').toBe(false)
+    // ⚠️ 徽章**不会**跟着撤销回到干净：脏标记只增不减，取舍写在 `doc/document.ts:201`
+    expect(statusName()).toBe('● t.md')
+  })
+
+  it('光标不在表格里：说一句为什么，一个字都不改，× 能关掉', async () => {
+    typeTable(0, '# 标题\n\n正文。', 1)
+    align()
+    await flush()
+
+    expect(doc()).toBe('# 标题\n\n正文。')
+    // 🔴 三句话里没有一件是出错、也没有一件是做成，所以是**无色**的 `.notice`：
+    // 染成 `warning` 会让「按错了键」看起来像故障，染成 `ok` 会让它看起来像刚改了什么。
+    // ⛔ 而命令本身刻意**不设 `when`**——设了的话这一下按下去什么也不发生，
+    // 用户得到的信息是零（与 `togglePreview` 逐字相同的理由）
+    expect(noticeEl()!.className).toBe('notice')
+    expect(noticeEl()!.textContent).toContain('光标不在表格里')
+
+    container.querySelector<HTMLButtonElement>('.notice-close')!.click()
+    expect(notices()).toEqual([])
+  })
+
+  it('已经对齐的表：说「已经对齐了」，而徽章不变', async () => {
+    const text = '| a   | bb  |\n| --- | --- |\n| ccc | d   |'
+    await openMd(text)
+    caretIn(0, 2)
+
+    align()
+    await flush()
+
+    expect(doc()).toBe(text)
+    expect(noticeEl()!.textContent).toContain('这张表已经对齐了')
+    expect(statusName(), '一个字节都没改却置了脏，⌘S 就会白写一次盘').toBe('t.md')
+  })
+
+  it('分屏时只改**聚焦**那一块，另一块一个字节不动', async () => {
+    typeTable(0, '| a | bb |\n|---|---|\n| ccc | d |')
+    button('右分屏').click()
+    await flush()
+    typeTable(1, '| x | y |\n|---|---|\n| 1 | 2 |')
+
+    focusHost(0)
+    await flush()
+    align()
+    await flush()
+
+    expect(views()[0]!.state.doc.toString()).toBe('| a   | bb  |\n| --- | --- |\n| ccc | d   |')
+    expect(views()[1]!.state.doc.toString(), '没聚焦的那块被顺手改了').toBe('| x | y |\n|---|---|\n| 1 | 2 |')
+  })
+
+  it('聚焦的是一块只读分片时，说的是「这块分屏」，而且不抛错', async () => {
+    await openShard()
+    // 那块分屏里压根没有 CM6 实例，所以 `ws.focusedEditor()` 是 null。
+    // 而这条命令**没有 `when`**（见上面那条 🔴），于是它必须自己把这句话说出来
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(0)
+    align()
+    await flush()
+
+    expect(noticeEl()!.textContent).toContain('这块分屏里没有可对齐的表格')
+    // ⛔ 不是「没有文档」：标签条上明明有一个，说没有会让用户去查自己是不是关错了
+    expect(noticeEl()!.textContent).not.toContain('没有文档')
+  })
+
+  // ⚠️ 「`Mod+Shift+A` 与 `Alt+Shift+A` 是两条命令、同一个物理键不互相吃」钉在
+  // `commands/builtins.test.ts` 里（那边有一个忠实还原 macOS 的 `macOptionEvent`：
+  // Option 按下时 `key` 会变成 `Å`，注册表只能靠 `code` 认）。这里不重复——
+  // 在 window 上手搓一个 altKey 事件，测的是我搓得像不像，不是接线对不对
+})
+
+describe('字数统计与导出 HTML 接线（M3-A-6）', () => {
+  const count = () => press('c', { ...modInit(), shiftKey: true })
+  const doExport = () => press('e', { ...modInit(), shiftKey: true })
+  /** 提示条那一个节点。`notices()` 的 `level` 分不出「无色」与 `ok`，所以要自己读 className */
+  const noticeEl = () => container.querySelector('.notices .notice')
+  const noticeText = () => noticeEl()?.textContent ?? ''
+
+  /**
+   * 从「磁盘」打开一份文档。
+   *
+   * ⚠️ 导出那几条必须走这条路而不是 `typeText`：`previewHtml` 认语言靠的是
+   * `doc.path()`，而草稿的 path 是 null——null 一律当 Markdown（见 `editor/language.ts`），
+   * 于是「`.ts` 不能导出」那一支在草稿上永远走不到
+   */
+  async function openFrom(text: string, path: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text }))
+    button('打开…').click()
+    await flush()
+  }
+
+  /** 让「打开…」撞一次 `too_large`，正文区换成只读分片（与 M2-H / M3-A-5 那两组同一条路） */
+  async function openShard(): Promise<void> {
+    dialog.open.mockResolvedValue('/var/log/huge.log')
+    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
+    button('打开…').click()
+    await flush()
+    await flush()
+  }
+
+  /** 写进 `saveFile` 的那份 HTML。没有就说明压根没写盘 */
+  function savedHtml(): string {
+    const call = ipc.saveFile.mock.calls.at(-1)
+    if (!call) throw new Error('没有调用过 saveFile')
+    return call[1]
+  }
+
+  it('Mod+Shift+C 报出真文档的字数，而它是**无色**的一条', () => {
+    typeText('你好世界')
+    count()
+
+    // 🔴 `plain` 而不是 `ok`：数一遍什么也没改，绿色会让人以为刚才那一下写了什么。
+    // 与 M3-A-5「光标不在表格里」同一条纪律
+    expect(noticeEl()!.className).toBe('notice')
+    // 中文逐字符：4 个字符就是 4 字，而 300 字/分钟 → 1 分钟
+    expect(noticeText()).toContain('4 字 · 约 1 分钟读完')
+    // 纯中文时不列「西文 0 词」那种没信息量的括注
+    expect(noticeText()).not.toContain('西文')
+  })
+
+  it('🔴 中英混排时两边各按各的口径数，并说出来', () => {
+    typeText('Vela 是一个编辑器')
+    count()
+
+    // `Vela` 是 1 个西文词（不是 4 个字），「是一个编辑器」是 6 个中文字
+    expect(noticeText()).toContain('7 字（中文 6 · 西文 1 词）')
+  })
+
+  it('空文档如实说「没有可数的字」，而不是报一个 0', () => {
+    count()
+    expect(noticeText()).toContain('这份文档里没有可数的字')
+  })
+
+  it('🔴 字数**不进状态栏**', () => {
+    typeText('你好世界')
+    count()
+
+    // 这条钉的是一个设计决定而不是一个 bug：`syncMetrics` 在每一个事务上跑
+    // （包括只动了光标的），而字数是一次全文扫描。塞进状态栏等于每敲一个键就重扫一遍；
+    // 防抖能压住频率，压不住「那个数字会自己跳一下」。完整论证在 `src/doc/stats.ts` 文件头
+    expect(statusCells().join(' | ')).not.toContain('读完')
+    expect(statusCells().join(' | ')).not.toContain('字（')
+  })
+
+  it('切标签后这句话消失——它说的永远是「此刻这一块」', () => {
+    typeText('你好世界')
+    count()
+    expect(noticeEl()).not.toBeNull()
+
+    // 🔴 不跟着标签走。让它留着的话屏幕上挂着的是**另一个文档**的字数——
+    // 一个自信地错着的数字，比空着更糟（`App.tsx` 里那条 `createEffect(on(…))` 就是为它写的）
+    press('n', modInit())
+    expect(noticeEl()).toBeNull()
+  })
+
+  it('聚焦的是一块只读分片时，说的是「这块分屏」，而且不抛错', async () => {
+    await openShard()
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(0)
+
+    count()
+    expect(noticeText()).toContain('这块分屏里没有可统计的正文')
+    // ⛔ 不是「没有文档」：标签条上明明有一个
+    expect(noticeText()).not.toContain('没有文档')
+  })
+
+  it('Mod+Shift+E 把一份 Markdown 写成单文件 HTML，默认名剥掉 .md', async () => {
+    await openFrom('# 标题\n\n正文一句话。\n', '/notes/t.md')
+    dialog.save.mockResolvedValue('/out/t.html')
+
+    doExport()
+    await flush()
+    await flush()
+
+    expect(dialog.save).toHaveBeenCalledWith({
+      defaultPath: 't.html',
+      filters: [{ name: 'HTML', extensions: ['html', 'htm'] }],
+    })
+    // 🔴 写盘走的是**已有的** `save_file`，没有为导出新增一个 Tauri 命令；
+    // 而那份落盘格式是写死的（utf8 / 无 BOM / LF），⛔ 不继承源文件的编码——
+    // 源文件是 GBK 的话，导出件继承过来会让浏览器按 `<meta charset="utf-8">` 读出一堆乱码
+    expect(ipc.saveFile).toHaveBeenCalledWith('/out/t.html', expect.stringContaining('<h1'), {
+      encoding: 'utf8',
+      bom: false,
+      eol: 'lf',
+    })
+    expect(savedHtml()).toContain('<!DOCTYPE html>')
+    expect(savedHtml()).toContain('<title>t.md</title>')
+    // 🔴 正文那一段来自 `md/render.ts`，所以它的白名单与转义**原样**是导出件的安全边界
+    expect(savedHtml()).toContain('正文一句话。')
+    // `ok` 而不是无色：这一次**真的写了一个文件**，与上面那几句「没什么可做」不是一类事
+    expect(noticeEl()!.className).toBe('notice ok')
+    expect(noticeText()).toContain('已导出到 /out/t.html')
+  })
+
+  it('🔴 源文档里的裸 HTML 到了导出件里也只是文字', async () => {
+    await openFrom('# 标题\n\n<script>alert(document.cookie)</script>\n', '/notes/evil.md')
+    dialog.save.mockResolvedValue('/out/evil.html')
+
+    doExport()
+    await flush()
+    await flush()
+
+    // 导出件是在**浏览器**里打开的，不是在 Vela 的 webview 里——一份带脚本的 HTML
+    // 被用户邮件发给别人，那就是一个可执行文件。这条断言钉的是「导出没有把预览的
+    // 安全边界放宽」，跨模块的那一半在 `md/export.test.ts`
+    expect(savedHtml()).not.toContain('<script')
+    expect(savedHtml()).toContain('&lt;script&gt;')
+    // ⚠️ 不能写成 `<pre class="md-raw">`：`render.ts` 在同一个标签上还带了一个
+    // `data-line`，属性顺序与个数都不是这里该钉的东西，钉「裸 HTML 被降级成了一个
+    // `<pre>`」这件事就够了
+    expect(savedHtml()).toContain('<pre class="md-raw"')
+  })
+
+  it('对话框取消：一个字节都不写，也一句话都不说', async () => {
+    await openFrom('# 标题\n', '/notes/t.md')
+    dialog.save.mockResolvedValue(null)
+
+    doExport()
+    await flush()
+    await flush()
+
+    expect(dialog.save).toHaveBeenCalledOnce()
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+    // 用户自己按了取消，那不是错误也不是成就，说什么都是噪音
+    expect(noticeEl()).toBeNull()
+  })
+
+  it('未命名草稿也能导出，默认名叫「空文档.html」', async () => {
+    typeText('# 随手记\n')
+    dialog.save.mockResolvedValue('/out/x.html')
+
+    doExport()
+    await flush()
+    await flush()
+
+    expect(dialog.save).toHaveBeenCalledWith({
+      defaultPath: '空文档.html',
+      filters: [{ name: 'HTML', extensions: ['html', 'htm'] }],
+    })
+    expect(savedHtml()).toContain('<title>空文档</title>')
+  })
+
+  it('不是 Markdown 时拒绝，并把那个语言名说出来', async () => {
+    await openFrom('第一行\n', '/notes/a.txt')
+
+    doExport()
+    await flush()
+
+    // 措辞与预览面板那句「X 还没有预览」同一个模子：如实说「这个语言没有」，
+    // 而不是让用户去猜快捷键是不是坏了
+    expect(noticeText()).toContain('不能导出 HTML，只有 Markdown 有预览')
+    expect(noticeText()).toContain('纯文本')
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+    expect(dialog.save, '拒绝了就不该弹对话框').not.toHaveBeenCalled()
+  })
+
+  it('文档是空的时拒绝，不去写一个只有样式的空壳', async () => {
+    doExport()
+    await flush()
+
+    expect(noticeText()).toContain('这份文档还是空的，没有什么可导出的')
+    expect(dialog.save).not.toHaveBeenCalled()
+  })
+
+  it('写盘失败时是 **error** 级，而原因复用 describeFsError', async () => {
+    await openFrom('# 标题\n', '/notes/t.md')
+    dialog.save.mockResolvedValue('/out/t.html')
+    ipc.saveFile.mockRejectedValue({ kind: 'io', reason: 'PermissionDenied', message: '没权限' })
+
+    doExport()
+    await flush()
+    await flush()
+
+    // 🔴 红色是必要的：写盘失败与「光标不在表格里」用同一个灰色的话，
+    // 用户会以为那只是一句提示，然后照着一个**不存在**的路径去找文件
+    expect(noticeEl()!.className).toBe('notice error')
+    expect(noticeText()).toContain('导出失败：')
+    expect(noticeText()).toContain('PermissionDenied')
+  })
+
+  it('聚焦的是一块只读分片时拒绝导出', async () => {
+    await openShard()
+
+    doExport()
+    await flush()
+
+    expect(noticeText()).toContain('这块分屏里没有可导出的正文')
+    expect(dialog.save).not.toHaveBeenCalled()
+  })
+
+  // ⚠️ 「解析超时（`partial`）时拒绝导出」那一支在这儿**测不到**：jsdom 里
+  // `ensureSyntaxTree` 总是同步解析完，200ms 那个预算碰不到。它由 `md/preview.ts`
+  // 自己的用例钉住（那边能造出超时），这里不假装覆盖了
+})
+
+describe('图片粘贴落地接线（M3-A-7）', () => {
+  /** 提示条那一个节点。`notices()` 的 `level` 分不出「无色」与 `ok`，所以要自己读 className */
+  const noticeEl = () => container.querySelector('.notices .notice')
+  const noticeText = () => noticeEl()?.textContent ?? ''
+
+  /**
+   * 从「磁盘」打开一份文档到**聚焦的那块分屏**。
+   *
+   * ⚠️ 必须走这条路而不是 `typeText`：接不接图片认的是 `doc.path()`，而草稿的 path
+   * 是 null——null 一律当 Markdown（见 `editor/language.ts`），于是「`.ts` 不接」
+   * 那一支在草稿上永远走不到
+   */
+  async function openFrom(text: string, path: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text }))
+    button('打开…').click()
+    await flush()
+  }
+
+  /** 把光标挪到正文末尾，好让「插在光标处」这件事有一个可断言的落点 */
+  function toEnd(index = 0): void {
+    const v = views()[index]
+    if (!v) throw new Error(`没有第 ${index} 块分屏`)
+    v.dispatch({ selection: { anchor: v.state.doc.length } })
+  }
+
+  function shot(name = 'shot.png'): File {
+    return new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], name, { type: 'image/png' })
+  }
+
+  /**
+   * 往指定那块分屏派发一个**真的** paste 事件。
+   *
+   * ⚠️ 不是 `ClipboardEvent`：jsdom 的构造器不接受 `clipboardData`（那一项被忽略），
+   * 而 CM6 只读这一个属性、不检查事件的具体类型（同一条做法在 `src/editor/paste.test.ts`）。
+   * 派发在 `contentDOM` 上，于是走的是 CM6 自己的事件分发链，
+   * 连带验住「插件的处理器排在内置处理器之前」那半个前提
+   */
+  function paste(data: { files?: File[]; text?: string }, index = 0): void {
+    const v = views()[index]
+    if (!v) throw new Error(`没有第 ${index} 块分屏`)
+    const event = new Event('paste', { bubbles: true, cancelable: true })
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        getData: (format: string) => (format === 'text/plain' ? (data.text ?? '') : ''),
+        files: data.files ?? [],
+        items: [],
+      },
+    })
+    v.contentDOM.dispatchEvent(event)
+  }
+
+  it('Markdown 文档里粘一张图：落盘、插一行相对链接、一句话都不说', async () => {
+    await openFrom('# 标题\n', '/repo/README.md')
+    toEnd()
+
+    paste({ files: [shot()] })
+    await flush()
+    await flush()
+
+    expect(assetCmd.calls.map((c) => c.docPath)).toEqual(['/repo/README.md'])
+    // 🔴 参数名在这儿被真的读了一遍：`dataBase64` 漂了的话 Rust 那侧一个字节都收不到，
+    // 而这一格会是空串
+    expect(assetCmd.calls[0]?.dataBase64).toBe('iVBORw==')
+    expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+    // 成功是**静默**的：插进去的那一行就是全部的反馈，与 M3-A-5「对齐成功了就不该说话」同一条口径
+    expect(notices()).toEqual([])
+    // 正文里多了一行，那份文档就得显示成脏的——它必须跟着 ⌘S 落盘
+    expect(statusName()).toBe('● README.md')
+  })
+
+  it('🔴 分屏之下跟着**收到事件的那块**走，不是跟着焦点走', async () => {
+    await openFrom('let a = 1', '/repo/src/a.ts')
+    button('右分屏').click()
+    await flush()
+    await openFrom('# 笔记\n', '/repo/docs/intro.md')
+    // 焦点留在第 0 块（一个 `.ts`）：要是接线读的是 `activeTab()`，这次粘贴会被判成
+    // 「不是 Markdown」而整个拒绝，图片一张都落不了地
+    focusHost(0)
+
+    toEnd(1)
+    paste({ files: [shot()] }, 1)
+    await flush()
+    await flush()
+
+    expect(assetCmd.calls.map((c) => c.docPath)).toEqual(['/repo/docs/intro.md'])
+    expect(views()[1]!.state.doc.toString()).toBe('# 笔记\n![](assets/pasted-ad48c1765eb1b87d.png)')
+    expect(views()[0]!.state.doc.toString()).toBe('let a = 1')
+  })
+
+  it('不是 Markdown 的文档不接：不发命令、正文不动，但要说清为什么', async () => {
+    await openFrom('let a = 1', '/repo/src/a.ts')
+    toEnd()
+
+    paste({ files: [shot()] })
+    await flush()
+
+    expect(assetCmd.calls).toEqual([])
+    expect(view().state.doc.toString()).toBe('let a = 1')
+    // `plain`：往 `.rs` 里粘截图不是故障，也不是我们没做成——是这件事本来就不该做。
+    // ⚠️ 但它**必须说出口**：CM6 的默认粘贴不认文件，不说的话这就是一次彻底的静默
+    expect(noticeEl()!.className).toBe('notice')
+    expect(noticeText()).toContain('这份文档不是 Markdown')
+  })
+
+  it('未命名草稿不接，并说清下一步是 ⌘S', async () => {
+    typeText('# 草稿')
+    toEnd()
+
+    paste({ files: [shot()] })
+    await flush()
+
+    expect(assetCmd.calls).toEqual([])
+    expect(noticeEl()!.className).toBe('notice')
+    expect(noticeText()).toContain('先存一次（⌘S）')
+    // 正文一个字都没动：链接不能指向一个还不存在的 assets/
+    expect(view().state.doc.toString()).toBe('# 草稿')
+  })
+
+  it('剪贴板里有正文时不接图，正文照常粘进来', async () => {
+    await openFrom('# 标题\n', '/repo/README.md')
+    toEnd()
+
+    paste({ text: '一段话', files: [shot()] })
+    await flush()
+
+    // 🔴 从网页复制一段带插图的文字，用户要的是文字。接了图就等于把他的复制
+    // 凭空吞掉一半，而且没有任何提示
+    expect(assetCmd.calls).toEqual([])
+    expect(view().state.doc.toString()).toBe('# 标题\n一段话')
+  })
+
+  it('后端拒收时那句话落到提示条上，而且是 **error** 级', async () => {
+    await openFrom('# 标题\n', '/repo/README.md')
+    assetCmd.error = { kind: 'unsupported', reason: 'SVG 是 XML，能带脚本，不收' }
+    toEnd()
+
+    paste({ files: [new File(['<svg/>'], 'a.svg', { type: 'image/svg+xml' })] })
+    await flush()
+    await flush()
+
+    // 🔴 红色是必要的：这一支是「用户什么都做对了，而我们没做成」，
+    // 与「先存一次」那种无色的提示不是一类事
+    expect(noticeEl()!.className).toBe('notice error')
+    expect(noticeText()).toContain('SVG 是 XML')
+    expect(view().state.doc.toString()).toBe('# 标题\n')
+  })
+
+  it('图片超过上限时连读都不读', async () => {
+    await openFrom('# 标题\n', '/repo/README.md')
+    // ⚠️ 只造一个「自称很大」的 File：真的去分配 32MB 以上没有任何额外信息量，
+    // 而 `file.size` 是这条判断唯一读的东西。`type` 必须有——挑文件那一步先认 MIME，
+    // 少了它这次粘贴会在 jsdom 的事件派发里静默抛掉（jsdom 把监听器的异常转给
+    // 虚拟控制台，不往外抛），用例看到的只是「什么都没发生」
+    const arrayBuffer = vi.fn()
+    const huge = { size: 40 * 1024 * 1024, type: 'image/png', arrayBuffer } as unknown as File
+    toEnd()
+
+    paste({ files: [huge] })
+    await flush()
+
+    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(assetCmd.calls).toEqual([])
+    expect(noticeEl()!.className).toBe('notice')
+    expect(noticeText()).toContain('40.0 MB')
+    expect(noticeText()).toContain('超过上限 32 MB')
+  })
+})
+
+/**
+ * 工具箱与命令面板的接线（M3-B-1e，M3-B-3 又加了两条，M3-B-4 再加一条）。
+ *
+ * 这一组钉的是**接线本身**，两块浮层内部的行为各有自己的组件测试
+ * （`tools/ToolBox.test.tsx`、`commands/CommandPalette.test.tsx`）。
+ * 于是在 App 这一层只问七件事：
+ * 1. 两个快捷键各自开对了浮层；
+ * 2. 🔴 **第一条内置工具真的接上了**，而且在浮层里跑得出来（`BUILTIN_TOOLS` 递没递进去、
+ *    `host.readEditor` 接的是不是聚焦那块分屏，都只有这一层看得见）；
+ * 3. 🔴 换到第二条工具、动一格选项，重跑用的是新的那一份——左栏点得到、选项条改得动、
+ *    输入格与输出格跟着动，这三半只有在真浮层里连起来走一遍才算接上了；
+ * 4. 🔴 **纯生成器（`input: 'none'`）那一类也接上了**，而且它的输出格在打开那一刻就有东西——
+ *    这一类不吃输入，所以 `prefill` 那条路走不到，工作区只剩输出格与「重新生成」，
+ *    少接一步的症状是「点开之后一片空」，那与「输出会出现在这里」是两种不同的空；
+ * 5. 🔴 命令面板里**看得见内置命令**——面板是在组件体里建的，而内置命令是在 `onMount`
+ *    里注册的，Solid 的 `createMemo` 又是急切求值的，所以少了 `palette.ts` 里那一格
+ *    `generation`，这里会是一份永远只有工具的空清单（那个 bug 是量出来的，不是推出来的）；
+ * 6. 面板里挑「工具箱…」能把工具箱打开——两扇门通向同一个地方；
+ * 7. 置灰状态读的是**聚焦的那块分屏**，也就是 `App.tsx` 里那条挂了三个里程碑的 TODO 的验收。
+ */
+describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M3-B-5 / M3-B-6）', () => {
+  /** 工具箱那块大浮层。⚠️ 与上面 M2-E 那个 `palette()`（跳转浮层）不是一回事 */
+  function toolboxEl(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.toolbox-backdrop')
+  }
+
+  /** 命令面板本体。⛔ 不能查 `.palette-backdrop`：跳转浮层用的也是那个类名 */
+  function commandPaletteEl(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.palette.wide')
+  }
+
+  /**
+   * 面板里的命令行。
+   *
+   * ⛔ 不能用上面 M2-E 那个 `paletteRows()`：它查的是 `.palette-row`，
+   * 而命令面板每一行的类名是 `.palette-row command`——那个函数会把这边的行一起捞进去
+   */
+  function commandRows(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('.palette-row.command')]
+  }
+
+  /** 每一行的 `title` 就是命令 id（`CommandPalette.tsx` 上那句注释解释了为什么要给） */
+  function commandRowIds(): string[] {
+    return commandRows().map((el) => el.getAttribute('title') ?? '')
+  }
+
+  function commandInput(): HTMLInputElement {
+    const el = commandPaletteEl()?.querySelector<HTMLInputElement>('.palette-input')
+    if (!el) throw new Error('命令面板里没有输入框')
+    return el
+  }
+
+  function typeCommand(text: string): void {
+    const el = commandInput()
+    el.value = text
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+
+  function pressInCommandPalette(key: string): KeyboardEvent {
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+    commandInput().dispatchEvent(event)
+    return event
+  }
+
+  /** 在浮层本体上按一个键。bubbles 是必需的：Solid 把 keydown 委托在 document 上 */
+  function pressInToolbox(key: string): KeyboardEvent {
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+    toolboxEl()!.dispatchEvent(event)
+    return event
+  }
+
+  const shiftMod = (): KeyboardEventInit => ({ ...modInit(), shiftKey: true })
+
+  it('一开始两块浮层都不在', () => {
+    expect(toolboxEl()).toBeNull()
+    expect(commandPaletteEl()).toBeNull()
+  })
+
+  it('Mod+Shift+T 打开工具箱，已经落地的六个工具都接上了', async () => {
+    expect(press('t', shiftMod()).defaultPrevented).toBe(true)
+    // 🔴 `ToolBox` 走 Solid 的 `lazy()`（M3-C-2），第一次触发要等一个微任务才渲染进 `Suspense`。
+    // 顶层预热焐热的是**模块**、不是 `lazy` 自己那份 memo，所以必须 `await flush()`，
+    // ⛔ 不能靠「前面的用例先开过一次」——那样单独跑这一条（`-t`）就会红
+    await flush()
+    expect(toolboxEl()).not.toBeNull()
+    expect(commandPaletteEl()).toBeNull()
+    expect(toolboxEl()?.querySelector('.toolbox-filter')).not.toBeNull()
+
+    // 🔴 这几行是 M3-B-2 / M3-B-3 / M3-B-4 / M3-B-5 / M3-B-6 的验收：`BUILTIN_TOOLS` 不再是空的，
+    // 于是「打开工具箱」之后用户看到的是一块能干活的浮层，而不是「工具箱还是空的」。
+    // ⚠️ 顺序跟着 `CATEGORY_ORDER`（format → encode → generate → convert → test → text），⛔ 不是跟着数组顺序
+    const rows = [...(toolboxEl()?.querySelectorAll('.toolbox-row') ?? [])]
+    expect(rows.map((el) => el.getAttribute('title'))).toEqual([
+      'JSON 格式化 / 压缩',
+      'Base64 / URL 编解码',
+      'UUID 生成（v4）',
+      '时间戳互转',
+      '正则测试器',
+      '命名风格转换',
+    ])
+    expect([...(toolboxEl()?.querySelectorAll('.toolbox-group') ?? [])].map((el) => el.textContent)).toEqual([
+      '格式化',
+      '编解码',
+      '生成器',
+      '转换',
+      '测试器',
+      '文本',
+    ])
+    // 而工作区跟着选中了第一个——左栏点得到与工作区能跑是同一件事的两半
+    expect(toolboxEl()?.querySelector('.toolbox-current')?.textContent).toBe('JSON 格式化 / 压缩')
+  })
+
+  it('🔴 切到纯生成器：没有输入格，而输出格在打开那一刻就有一个 UUID', async () => {
+    // `input: 'none'` 这一类走的是与上面两条**完全不同**的一支：`store.ts` 的 `prefill`
+    // 只给 `input: 'editor'` 的工具预填，而这一类连输入格都不画（`runNow` 里硬写了 `''`）。
+    // ⚠️ 于是这里能看见的错只有一种：**打开之后输出格是空的**。那与 `OUTPUT_PLACEHOLDER`
+    // 不一样——占位符说的是「还没东西可跑」，而生成器从来不需要用户先给东西
+    press('t', shiftMod())
+    await flush()
+    const rows = [...toolboxEl()!.querySelectorAll<HTMLElement>('.toolbox-row')]
+    rows[2]!.click()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(toolboxEl()!.querySelector('.toolbox-current')?.textContent).toBe('UUID 生成（v4）')
+
+    expect(toolboxEl()!.querySelector('.toolbox-text.input')).toBeNull()
+    const output = toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.output')?.value ?? ''
+    expect(output).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+
+    // 而「从编辑器取」与「跳到出错处」两个按钮都不该出现——它们对生成器没有意义，
+    // 出现的话就是两个按下去什么都不发生的控件（`ToolBox.test.tsx` 里钉过互斥，这里是 App 层）
+    const actions = [...toolboxEl()!.querySelectorAll<HTMLButtonElement>('.toolbox-actions button')].map(
+      (el) => el.textContent,
+    )
+    expect(actions).toEqual(['重新生成', '复制结果', '插回编辑器'])
+  })
+
+  it('在工具箱里真跑一次：「从编辑器取」→ 输出格里是格式化好的 JSON', async () => {
+    // 端到端的一条：命令 → 浮层 → 工具 → 编辑器。上面那几条只证明「画出来了」，
+    // 这一条证明**接进去的 `run` 真的是 `builtin.ts` 里那一个**，
+    // 而 `host.readEditor` 接的真的是聚焦那块分屏（`input: 'text'` 的工具不自动预填，
+    // 所以必须走那一个按钮——见 `store.ts` 的 `prefill`）
+    typeText('{"b":1,"a":2}')
+    press('t', shiftMod())
+    await flush()
+
+    const take = [...toolboxEl()!.querySelectorAll<HTMLButtonElement>('.toolbox-actions button')].find(
+      (el) => el.textContent === '从编辑器取',
+    )
+    take!.click()
+    // ⚠️ 那一次运行是**防抖**的（`TOOL_DEBOUNCE_MS` 150ms），所以要等真的过去
+    await new Promise((resolve) => setTimeout(resolve, 200))
+
+    expect(toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.input')?.value).toBe('{"b":1,"a":2}')
+    expect(toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.output')?.value).toBe(
+      '{\n  "b": 1,\n  "a": 2\n}',
+    )
+  })
+
+  it('在工具箱里切到第二个工具、改一格选项：中文 → base64 → 再解回来', async () => {
+    // 🔴 这一条钉的是**选项条**那条线：换工具之后工作区画的是新工具的那一格下拉，
+    // 而改了它之后重跑用的是新值。上面那两条只走缺省选项，所以少接一步
+    // （比如 `commitText` 没调 `setOption`，或者 `setOption` 没 `scheduleRun`）只有这里能看见
+    typeText('中文')
+    press('t', shiftMod())
+    await flush()
+    const rows = [...toolboxEl()!.querySelectorAll<HTMLElement>('.toolbox-row')]
+    rows[1]!.click()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(toolboxEl()!.querySelector('.toolbox-current')?.textContent).toBe('Base64 / URL 编解码')
+
+    const take = [...toolboxEl()!.querySelectorAll<HTMLButtonElement>('.toolbox-actions button')].find(
+      (el) => el.textContent === '从编辑器取',
+    )
+    take!.click()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    // 缺省那一格是「Base64 编码」，于是打开工具就能直接粘东西进去
+    expect(toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.input')?.value).toBe('中文')
+    expect(toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.output')?.value).toBe('5Lit5paH')
+
+    // ⚠️ Solid 的 `onChange` 对应的是原生 `change`，不是 `input`
+    const select = toolboxEl()!.querySelector<HTMLSelectElement>('.toolbox-options select')!
+    expect(select.value).toBe('Base64 编码')
+    select.value = 'Base64 解码'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    // 🔴 换了模式**立刻拿现在输入格里的那一份重跑**，⛔ 不是把上一次的输出接回来当输入。
+    // 于是「中文」被当 base64 去解，报错指到了那个汉字上——这一句钉住的正是这个口径：
+    // 悄悄把输出喂回输入的话，用户看到的是「中文」，而他并不知道输入格已经换过了
+    expect(toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.output')?.value).toBe(
+      '第 1 行第 1 列：Base64 的字母表里没有这个字符（U+4E2D）\n  中文\n  ^',
+    )
+
+    // 输入格换成刚才编出来的那一串，再跑一次：这一格走的是 `setInput`，上面走的是 `setOption`
+    const input = toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.input')!
+    input.value = '5Lit5paH'
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(toolboxEl()!.querySelector<HTMLTextAreaElement>('.toolbox-text.output')?.value).toBe('中文')
+  })
+
+  it('Esc 收起工具箱', async () => {
+    press('t', shiftMod())
+    await flush()
+    expect(toolboxEl()).not.toBeNull()
+    expect(pressInToolbox('Escape').defaultPrevented).toBe(true)
+    expect(toolboxEl()).toBeNull()
+  })
+
+  it('🔴 Mod+Shift+P 打开命令面板，里面是**内置命令**而不是空清单', async () => {
+    expect(press('p', shiftMod()).defaultPrevented).toBe(true)
+    // 🔴 `CommandPalette` 也走 `lazy()`（M3-C-2），理由与上面打开工具箱那条逐字相同
+    await flush()
+    expect(commandPaletteEl()).not.toBeNull()
+    expect(toolboxEl()).toBeNull()
+
+    const ids = commandRowIds()
+    // 三条各代表一批：内置命令（onMount 里才注册）、工具投影出来的（组件体里就注册了）、
+    // 以及面板自己。少了 `generation` 那一格的话，前两条里只剩「工具」那一批还在
+    expect(ids).toContain('file.save')
+    expect(ids).toContain('editor.toggleLineWrap')
+    expect(ids).toContain('toolbox.open')
+    expect(ids).toContain('commandPalette.open')
+    // 🔴 PLAN §1.5 那三条触达路径里的**第一条**：工具被投影成了命令，于是在面板里搜得到。
+    // 这一条在 `tools/registry.test.ts` 里钉过单元层，这里是 App 层——
+    // 少接一步（`App.tsx` 里没调 `installTools`，或者没把 `BUILTIN_TOOLS` 递进去）只有这里能看见
+    expect(ids).toContain('tool.json.format')
+    // ⚠️ 另外五个也要在：`installTools` 收的是 `BUILTIN_TOOLS` 整个数组，
+    // 而「只装了前一个」这种错在上一行是看不出来的
+    expect(ids).toContain('tool.codec')
+    expect(ids).toContain('tool.uuid')
+    expect(ids).toContain('tool.timestamp')
+    expect(ids).toContain('tool.regex')
+    expect(ids).toContain('tool.naming')
+    expect(ids.length).toBeGreaterThan(40)
+    expect(commandPaletteEl()?.querySelector('.palette-status')?.textContent).toBe(`共 ${ids.length} 条命令`)
+  })
+
+  it('Esc 收起命令面板', async () => {
+    press('p', shiftMod())
+    await flush()
+    expect(commandPaletteEl()).not.toBeNull()
+    expect(pressInCommandPalette('Escape').defaultPrevented).toBe(true)
+    expect(commandPaletteEl()).toBeNull()
+  })
+
+  it('在面板里挑「工具箱…」：面板收起、工具箱展开', async () => {
+    press('p', shiftMod())
+    await flush()
+    typeCommand('工具箱')
+    expect(commandRowIds()).toEqual(['toolbox.open'])
+
+    pressInCommandPalette('Enter')
+    // 🔴 `commit()` 先收起面板、再执行 `toolbox.open`。面板收起是同步的，而工具箱是一块
+    // **冷的** `lazy()`（单独跑这一条时它还没被任何用例焐热过），所以要 `await flush()` 才渲染出来
+    await flush()
+
+    // 🔴 `commit()` 是**先收起再执行**的，所以这两个断言不是废话：
+    // 顺序反了的话工具箱会先展开、再被面板那一下收起，用户按完什么都没发生
+    expect(commandPaletteEl()).toBeNull()
+    expect(toolboxEl()).not.toBeNull()
+  })
+
+  it('面板里的置灰读的是聚焦的那块分屏，不是建面板那一刻的快照', async () => {
+    // `App.tsx` 里那条挂了三个里程碑的 TODO 说的就是这件事：`registry` 的 `getContext`
+    // 是「被调用时求值」的，而面板要的是「订阅」。验收的办法是把**同一个** `appContext`
+    // 交给两边——于是这里只要证明面板读到的确实是活的 `ws.focusedEditor()`
+    typeText('# 标题\n')
+    press('p', shiftMod())
+    await flush()
+
+    // 空文档也有一块真的 CM6 分屏，所以 `editor.*` 一条都不该置灰。
+    // ⛔ 反过来（`context` 被写死成 `{ editor: null }`）的话这里会是一片灰
+    expect(commandRows().filter((el) => el.classList.contains('disabled'))).toEqual([])
+    const wrap = commandRows().find((el) => el.getAttribute('title') === 'editor.toggleLineWrap')
+    expect(wrap?.getAttribute('aria-disabled')).toBe('false')
+
+    // 而「没有编辑器就置灰」这半边在 `commands/palette.test.ts` 里翻着 `setEditor` 钉过：
+    // jsdom 里造不出一块「聚焦的只读分片」，硬造等于把 M2-H 那一组重写一遍
   })
 })

@@ -20,6 +20,11 @@ tauri = { version = "2", features = [] }
 # 用 workspace 里那一份：许可证已核实（MIT OR Apache-2.0），而且 Tauri 本来就带着它，
 # 所以这一行不往 Cargo.lock 里加任何新东西
 serde = { workspace = true }
+# 粘贴图片落地（M3-A-7）要把剪贴板里的二进制字节过一遍 JSON，走 base64。
+# 许可证已核实（闭源硬约束，见 PLAN.md）：base64 0.22 = MIT OR Apache-2.0。
+# 用 workspace 里那一份：Tauri 本来就带着它，Cargo.lock 里 0.22.1 已经在，
+# 所以这一行不往 Cargo.lock 里加任何新东西
+base64 = "0.22"
 # 原生「打开 / 另存为」对话框。用 JS 侧的 plugin-dialog 调用（前端本来就需要拿到路径
 # 去做窗口标题、脏标记与后续保存），所以 Rust 侧只需要把插件注册进 Builder。
 tauri-plugin-dialog = "2"
@@ -28,6 +33,15 @@ tauri-plugin-dialog = "2"
 # 而 CI 的 rust job 在 ubuntu 上只**编译**它——`trash::delete` 是系统调用，
 # 刻意不进 vela-core（单测会把临时文件塞进开发机的真实废纸篓），见 `vela-core/src/project/ops.rs`
 trash = "5.2"
+# 外部改动监听（M2-G，PLAN.md §3.4「文件监听」）。许可证已核实（闭源硬约束，见 PLAN.md）：
+# notify 8.2.0 = CC0-1.0，notify-debouncer-full 0.6.0 = MIT OR Apache-2.0，
+# 两者的 rust-version 都是 1.77，工作区是 1.77.2。
+# ⚠️ 与 `trash` 同一条理由，watcher **不进 vela-core**：一个真的 watcher 在单测里
+# 既要等 FSEvents/inotify 的异步回调、又会漏文件描述符。vela-core 那一侧
+# （`watcher/mod.rs`）只留「该盯哪些目录」、「两份计划之间动哪几个订阅」与
+# 「一条事件算哪一种变化」三件同步的事，落地层在 `src/watcher.rs`
+notify = "8.2"
+notify-debouncer-full = "0.6"
 # 文件 IO 的真正实现住在框架无关的 vela-core 里，这一层只是 Tauri command 适配器
 vela-core = { path = "../crates/vela-core" }
 
@@ -35,3 +49,6 @@ vela-core = { path = "../crates/vela-core" }
 # 只为了把三个搜索事件载荷的形状钉成黄金 JSON（与 `src/ipc/search.test.ts` 对照）。
 # 生产代码不序列化 JSON，Tauri 自己那一份不对外露。许可证同上：MIT OR Apache-2.0
 serde_json = { workspace = true }
+# M2-E：`ProjectIndexCache` 的缓存策略要有真的目录树才能测（见 `commands.rs` 的
+# `每次_index_project_都重建`）。许可证已核实，见根 `Cargo.toml`：MIT OR Apache-2.0
+tempfile = { workspace = true }

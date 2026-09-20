@@ -1,6 +1,8 @@
 import { createSignal, type Accessor } from 'solid-js'
 import { save as pickToSave } from '@tauri-apps/plugin-dialog'
 import { describeFsError, ENCODING_LABELS, openFile, saveFile, type EncodingId, type FileFormat } from '../ipc/fs'
+import { openLarge } from '../ipc/shard'
+import { createShardView, type ShardView } from './shardView'
 
 /**
  * 单个文档的生命周期：路径、格式、脏标记，以及打开/保存/另存为。
@@ -56,11 +58,38 @@ export interface DocumentModel {
    */
   readonly lossy: Accessor<boolean>
   readonly notice: Accessor<Notice | null>
+  /**
+   * 只读分片（M2-H）。`null` = 这个文档的正文**就在内存里**，CM6 那份 buffer 是真的。
+   *
+   * 非 `null` 时相反：正文在 Rust 那边按页取，内存里的 buffer 是**空的**。于是四件事
+   * 跟着变，每一件都有它自己的守卫：
+   *
+   * - 编辑：`EditorPane` 压根不渲染（见 `App.tsx`），`ws.focusedEditor()` 是 null，
+   *   所有 `editor.*` 命令的 `when` 一起失效——不是「禁用」，是**不存在**
+   * - 保存：`save` / `saveAs` 在这一层拒掉。🔴 尤其是 `saveAs`：它写的是
+   *   `host.getText()`，那份空 buffer 落盘就是一个**零字节文件**，把原文件覆盖掉
+   * - 脏标记：永远不会脏（没人能改那份空 buffer），所以关闭确认压根不会问
+   * - 状态栏：`ws.metrics()` 报的是上一个标签的数，所以 `StatusBar` 自己分叉，
+   *   改报「只读 · N 行 · X MB」
+   *
+   * ⚠️ `format()` 在分片模式下**只为显示**（状态栏那两格读它，而它们会被禁用）。
+   * ⛔ 不要拿它去调 `saveFile`
+   */
+  readonly shard: Accessor<ShardView | null>
   /** 编辑器正文变化时由宿主调用 */
   markChanged: () => void
   dismissNotice: () => void
   /** 打开一个已知路径。将来的「最近文件」与拖拽落文件都走这里 */
   openAt: (path: string) => Promise<void>
+  /**
+   * 关掉分片、把那个 fd 还回去（`ipc/shard.ts` 的 `closeLarge`：Vela 里唯一一个
+   * 「不调就会漏」的 IPC）。**幂等**，没有分片时什么都不做。
+   *
+   * 两处调用点，都在 `workspace.ts`：标签关闭（`dropTab`）与窗口关闭
+   * （`requestWindowClose`）。第三处——「外部改了文件之后重开分片」——是这一层
+   * 自己的 `reload`，不经过这个方法
+   */
+  releaseShard: () => void
   /**
    * 会话恢复：把一份完整的文档现场（正文、路径、格式、脏标记、lossy）一次装进来，
    * **不碰磁盘**。
@@ -115,6 +144,9 @@ export interface DocumentModel {
    * 的话，用户看到的是「明明跳过了，怎么内容还是变了」
    *
    * @returns 正文有没有真的换过。未命名、脏、读失败、以及内容没变都是 false
+   *
+   * ⚠️ 分片标签走的是**另一条实现**（整个重开一次分片），返回值一律 true：
+   * 那份正文不在内存里，没法逐字比对，而能走到这一步说明磁盘上刚刚发生过一次写
    */
   reload: () => Promise<boolean>
 }
@@ -124,6 +156,19 @@ function baseName(path: string): string {
   return cut < 0 ? path : path.slice(cut + 1)
 }
 
+/**
+ * `open_file` 撞了 4 MiB 的内联上限（`vela_core::fs::read` 的 `MAX_INLINE_BYTES`）。
+ *
+ * 收 `unknown` 是因为 `invoke` 的 reject 值就是它，而这一层只认**一个** kind：
+ * 别的错误照原样冒上去，由调用点那句统一的 `describeFsError` 兜住。
+ *
+ * ⚠️ 这里判的是「该换一条路」，**不是**「打开失败」——所以命中它的时候一个字都不能
+ * 说，改走分片。只有分片自己也接不住（超过 256 MiB、UTF-16）才轮得到报错
+ */
+function isTooLarge(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { kind?: unknown }).kind === 'too_large'
+}
+
 export function createDocumentModel(host: DocumentHost): DocumentModel {
   const [path, setPath] = createSignal<string | null>(null)
   const [format, setFormat] = createSignal<FileFormat>(DEFAULT_FORMAT)
@@ -131,6 +176,7 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
   const [busy, setBusy] = createSignal(false)
   const [lossy, setLossy] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice | null>(null)
+  const [shard, setShard] = createSignal<ShardView | null>(null)
 
   /**
    * 正在用后端的正文整篇替换编辑器内容。
@@ -161,22 +207,75 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
   async function openAt(target: string) {
     setBusy(true)
     try {
-      const file = await openFile(target)
-      replaceText(file.text)
-      setPath(target)
-      // 必须在 replaceText 之后：重建 state 会把语言槽位清空，这里再把新语言装进去。
-      // 反过来的话语言会装到一个马上被丢弃的 state 上，且静默无报错
-      host.pathChanged()
-      setFormat(file.format)
-      setDirty(false)
-      setLossy(file.lossy)
-      setNotice(null)
-      host.focus()
+      try {
+        await openInline(target)
+      } catch (err) {
+        // 4 MiB 以上改走只读分片：这不是失败，是换一条路，所以一个字都不说
+        if (!isTooLarge(err)) throw err
+        await openAsShard(target)
+      }
     } catch (err) {
+      // 两条路的失败汇到同一句文案：分片自己也有上限（256 MiB）与接不住的编码（UTF-16），
+      // 而用户不关心是哪一条路拒的，只关心为什么打不开
       setNotice({ level: 'error', text: `打不开：${describeFsError(err)}` })
     } finally {
       setBusy(false)
     }
+  }
+
+  async function openInline(target: string) {
+    const file = await openFile(target)
+    // 从分片切回内联时那个 fd 不会自己消失。⚠️ 这是**资源**收尾而不是状态校验：
+    // 判错一次的后果是漏一个 fd（见 `ipc/shard.ts` 的 `closeLarge`）
+    releaseShard()
+    replaceText(file.text)
+    setPath(target)
+    // 必须在 replaceText 之后：重建 state 会把语言槽位清空，这里再把新语言装进去。
+    // 反过来的话语言会装到一个马上被丢弃的 state 上，且静默无报错
+    host.pathChanged()
+    setFormat(file.format)
+    setDirty(false)
+    setLossy(file.lossy)
+    setNotice(null)
+    host.focus()
+  }
+
+  /**
+   * 只读分片这条路。⚠️ 抛出去的错误由 `openAt` 那句统一文案接住，这里**不**自己写 notice。
+   *
+   * `open_large` 会**整份扫一遍**文件建行索引，所以它自己可能失败也可能慢；
+   * 慢的时候 `busy` 已经在 `openAt` 里置上了，状态栏那一格会显示「读写中…」
+   */
+  async function openAsShard(target: string) {
+    const opened = await openLarge(target)
+    // 先拿到新句柄再关旧的：反过来一旦 `open_large` 失败，这个文档就只剩一个空 buffer
+    releaseShard()
+    setShard(createShardView(opened))
+    // 正文清空。分片的行在 Rust 那边按页取，CM6 这份 buffer 只是个占位；
+    // 🔴 留着上一个文件的正文的话，`host.getText()` 会把它当成这个文件的内容
+    replaceText('')
+    setPath(target)
+    host.pathChanged()
+    const { encoding, bom, eol } = opened.header
+    // ⚠️ 只为状态栏那两格（它们在分片模式下是禁用的）。⛔ 不要拿它去调 saveFile
+    setFormat({ encoding, bom, eol })
+    setDirty(false)
+    // 刻意**不**采纳 `header.lossy`：App 那条 lossy 提示讲的是「原样保存会永久损坏它」，
+    // 而分片模式压根不能保存，那句话在这儿没有对象。头部解码有损这件事改由分片面板
+    // 自己在只读提示里说（见 `ShardPane.tsx`）
+    setLossy(false)
+    setNotice(null)
+    host.focus()
+  }
+
+  function releaseShard() {
+    const current = shard()
+    if (current === null) return
+    // 先摘再 dispose：`dispose` 会调 `closeLarge`，那之后迟到的读页响应回来是 `null`，
+    // 而 `shardView` 对 `null` 的处理是**安静忽略**——顺序反了也不会出错，
+    // 但「屏幕上还挂着一个已经关掉的视图」这件事本身就不该发生
+    setShard(null)
+    current.dispose()
   }
 
   function restoreDraft(init: {
@@ -249,6 +348,7 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     // 未命名文档在磁盘上没有对应物；脏文档的理由见接口上那段
     // ⚠️ 两道都排在 `setBusy` 之前：它们是「压根不去读」，不是「读了但没用」
     if (target === null || dirty()) return false
+    if (shard() !== null) return await reopenShard(target)
     setBusy(true)
     try {
       const file = await openFile(target, format().encoding)
@@ -262,6 +362,49 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
       setNotice(null)
       return changed
     } catch (err) {
+      // 文件在 Vela 开着的时候长过了 4 MiB（一个正在被追加的日志正是这个样子）：
+      // 这条路本来是内联的，现在只能改走分片。⚠️ 脏文档在上面就已经返回了，
+      // 所以这里换掉正文不会吃掉任何未保存的改动
+      if (isTooLarge(err)) {
+        try {
+          await openAsShard(target)
+          return true
+        } catch (again) {
+          setNotice({ level: 'error', text: `重新读取失败：${describeFsError(again)}` })
+          return false
+        }
+      }
+      setNotice({ level: 'error', text: `重新读取失败：${describeFsError(err)}` })
+      return false
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * 分片标签的「重新读一遍」= **整个重开一次**。
+   *
+   * 那份行索引与那个 fd 都钉在旧 inode 上（见 `ipc/shard.ts` 的 `closeLarge`），
+   * 而分片模式压根没有「正文」可以原地换掉，所以看得见新内容的唯一办法是重开。
+   *
+   * 🔴 代价是**整份文件重扫一遍**。这正是 `fileWatch` 刻意不盯分片标签的理由：
+   * 大文件最常见的改动方式是**追加**（构建日志、抓取的数据），
+   * 每追加一次就重扫一遍 100 MiB 是不能接受的。于是只有用户刚刚亲手批准过的那一次
+   * 写盘（全局替换，见 `workspace.ts` 的 `reloadUnder`）会走到这里
+   *
+   * @returns 一律 true。正文不在内存里，没法逐字比对；而能走到这一步说明盘上刚写过
+   */
+  async function reopenShard(target: string): Promise<boolean> {
+    setBusy(true)
+    try {
+      const opened = await openLarge(target)
+      releaseShard()
+      setShard(createShardView(opened))
+      setNotice(null)
+      return true
+    } catch (err) {
+      // 旧的那个视图留着不动：它虽然是打开那一刻的内容，但至少还能看，
+      // 比一个空面板加一句报错有用
       setNotice({ level: 'error', text: `重新读取失败：${describeFsError(err)}` })
       return false
     } finally {
@@ -294,7 +437,22 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     }
   }
 
+  /**
+   * 分片标签上任何写动作的统一答复。
+   *
+   * ⚠️ 这不是「不该发生的场景」的防御：⌘S 与工具栏上那两个按钮在分片标签下**都是可点的**，
+   * 用户按下它们是完全正常的一次尝试。而沉默地什么都不做是最坏的回答——
+   * 他刚刚按了保存，然后什么反馈都没有
+   */
+  function refuseReadOnly(what: string) {
+    setNotice({ level: 'warning', text: `这个文件太大，Vela 以只读方式打开它，${what}。` })
+  }
+
   async function saveAs() {
+    if (shard() !== null) {
+      refuseReadOnly('不能另存为')
+      return
+    }
     const picked = await pickToSave({ defaultPath: path() ?? undefined })
     if (typeof picked === 'string') await writeTo(picked)
   }
@@ -302,6 +460,13 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
   // 具名函数而不是对象方法里的 `this.saveAs()`：JSX 里 `onClick={doc.save}` 这种
   // 解绑调用会让 `this` 变成 undefined
   async function save() {
+    // 🔴 这一道必须在这儿，不能只靠「分片标签不会脏」：`save` 还有第二个调用点是
+    // 工具栏与 ⌘S，而它们不看脏标记。真的走下去的话 `writeTo` 会拿 `host.getText()`
+    // ——那份**空** buffer——把原文件覆盖成一个零字节文件
+    if (shard() !== null) {
+      refuseReadOnly('不能保存')
+      return
+    }
     const current = path()
     if (current === null) await saveAs()
     else await writeTo(current)
@@ -318,9 +483,11 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     busy,
     lossy,
     notice,
+    shard,
     markChanged,
     dismissNotice: () => setNotice(null),
     openAt,
+    releaseShard,
     restoreDraft,
     discardChanges,
     save,

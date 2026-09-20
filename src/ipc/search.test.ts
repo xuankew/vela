@@ -46,6 +46,7 @@ import {
   type SearchDonePayload,
   type SearchError,
   type SearchFailedPayload,
+  type SearchFile,
   type SearchHit,
   type SearchQuery,
   type SearchSummary,
@@ -82,11 +83,11 @@ const GOLDEN_HIT_REPLACED =
  * 而用户以为自己刚刚预览了一次删除
  */
 const GOLDEN_HIT_DELETED = '{"line":1,"text":"needle","ranges":[],"replaced":"","truncated":false}'
-const GOLDEN_FILE = '{"rel":"src/main.rs","path":"/repo/src/main.rs","hits":[],"truncated":true}'
+const GOLDEN_FILE = '{"rel":"src/main.rs","path":"/repo/src/main.rs","rootIndex":0,"hits":[],"truncated":true}'
 /** ⚠️ `files` 为空的这一个不是「没有结果」，是一次**心跳** */
 const GOLDEN_HEARTBEAT = '{"files":[],"filesScanned":512}'
 const GOLDEN_BATCH =
-  '{"files":[{"rel":"b.md","path":"/repo/b.md","hits":[{"line":1,"text":"needle","ranges":[{"start":0,"end":6}],"truncated":false}],"truncated":false}],"filesScanned":3}'
+  '{"files":[{"rel":"b.md","path":"/repo/b.md","rootIndex":0,"hits":[{"line":1,"text":"needle","ranges":[{"start":0,"end":6}],"truncated":false}],"truncated":false}],"filesScanned":3}'
 const GOLDEN_SUMMARY =
   '{"filesScanned":120,"filesWithHits":3,"hits":7,"skippedTooLarge":1,"unreadable":2,"truncated":false,"cancelled":true,"elapsedMs":45}'
 
@@ -100,9 +101,9 @@ const GOLDEN_SUMMARY =
  * 与 Rust 侧两个测试各自的字面量一一对应
  */
 const GOLDEN_ENVELOPE_INNER_BATCH =
-  '{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}'
+  '{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","rootIndex":0,"hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}'
 const GOLDEN_ENVELOPE_BATCH =
-  '{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}}'
+  '{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","rootIndex":0,"hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}}'
 const GOLDEN_ENVELOPE_HEARTBEAT = '{"taskId":"search-7","batch":{"files":[],"filesScanned":512}}'
 const GOLDEN_ENVELOPE_DONE =
   '{"taskId":"search-7","summary":{"filesScanned":120,"filesWithHits":3,"hits":7,"skippedTooLarge":1,"unreadable":2,"truncated":false,"cancelled":true,"elapsedMs":45}}'
@@ -235,10 +236,16 @@ describe('Rust → 前端 的字段名', () => {
     // 下一段那个空串预览在真值判断下与「纯搜索」长得一模一样
     expect('replaced' in hit).toBe(false)
 
-    const file = JSON.parse(GOLDEN_FILE) as { rel: string; path: string; hits: unknown[]; truncated: boolean }
-    expect(Object.keys(file)).toEqual(['rel', 'path', 'hits', 'truncated'])
+    const file = JSON.parse(GOLDEN_FILE) as SearchFile
+    expect(JSON.stringify(file)).toBe(GOLDEN_FILE)
+    expect(Object.keys(file)).toEqual(['rel', 'path', 'rootIndex', 'hits', 'truncated'])
     expect(file.rel).toBe('src/main.rs')
     expect(file.path).toBe('/repo/src/main.rs')
+    // ⚠️ `rootIndex` 在 `path` **后面**、`hits` 前面，跟着 Rust 侧的字段声明顺序走。
+    // 它写错名字的失败方式与上面 `caseSensitive` 那条一样安静——前端读到 `undefined`，
+    // 于是每一行都被算成第 0 个根，多根工作区里点结果打开的是另一个根里的同名文件。
+    // 而且它**没有** `skip_serializing_if`，所以「单根时缺席」这种情况不存在
+    expect(file.rootIndex).toBe(0)
   })
 
   it('替换模式下 replaced 夹在 ranges 与 truncated 之间', () => {
@@ -402,16 +409,16 @@ describe('前端 → Rust 的 command 名与参数名', () => {
   it('start_search 的 query 整个对象原样递过去，字段名就是黄金字面量里那一套', async () => {
     tauriCore.invoke.mockResolvedValue('search-7')
     const query = JSON.parse(GOLDEN_QUERY) as SearchQuery
-    const taskId = await startSearch('/repo', query)
+    const taskId = await startSearch(['/repo'], query)
     expect(taskId).toBe('search-7')
-    expect(tauriCore.invoke).toHaveBeenCalledWith('start_search', { root: '/repo', query })
+    expect(tauriCore.invoke).toHaveBeenCalledWith('start_search', { roots: ['/repo'], query })
     // 发出去的字节与 Rust 侧序列化出来的字节相同，这才是「两边对得上」的强说法
     expect(JSON.stringify(sentArgs().query)).toBe(GOLDEN_QUERY)
   })
 
   it('只填搜索词时只发 pattern 这一个 key，其余六个交给 Rust 侧的默认值', async () => {
     tauriCore.invoke.mockResolvedValue('search-1')
-    await startSearch('/repo', { pattern: 'needle' })
+    await startSearch(['/repo'], { pattern: 'needle' })
     const sent = sentArgs().query as Record<string, unknown>
     expect(Object.keys(sent)).toEqual(['pattern'])
     // 不主动补 `literal: false` 之类：Rust 侧容器上有 `#[serde(default)]`，
@@ -427,12 +434,33 @@ describe('前端 → Rust 的 command 名与参数名', () => {
   // 取消不在这个文件里：M2-D 之后搜索与替换共用 `cancel_task` 一个命令，
   // 它的参数名（`taskId`，本项目第二个多单词命令参数）由 `src/ipc/task.test.ts` 钉住
 
-  it('root 是绝对路径，前端不做任何路径拼接', async () => {
+  it('⚠️ roots 永远是数组，单根时也是长度为 1 的数组', async () => {
     tauriCore.invoke.mockResolvedValue('search-1')
-    await startSearch('/Users/xuanke/repo', { pattern: 'needle' })
-    expect(sentArgs().root).toBe('/Users/xuanke/repo')
-    // root 只可能来自 dialog（`directory: true`）。「不会逃出项目根」这条保证由
-    // Rust 侧一个人守着：相对路径会被 `preflight` 拒成 `bad_root`
+    await startSearch(['/Users/xuanke/repo'], { pattern: 'needle' })
+    expect(sentArgs().roots).toEqual(['/Users/xuanke/repo'])
+    // 参数名是**复数**的 `roots`，M2-F 起改的。写成 `root` 的失败方式是一句
+    // Tauri 的「invalid args」，还算好查；而递一个字符串过去（`roots: '/repo'`）
+    // 在 Rust 侧是 `Vec<String>` 反序列化失败，也是一句报错——两条都不安静，
+    // 所以这里钉的是**前端封装自己不把数组降级成字符串**这一条
+  })
+
+  it('多个根按传进去的顺序发出去，顺序就是 rootIndex 的语义', async () => {
+    tauriCore.invoke.mockResolvedValue('search-1')
+    await startSearch(['/repo/a', '/repo/b'], { pattern: 'needle' })
+    expect(sentArgs().roots).toEqual(['/repo/a', '/repo/b'])
+    // ⚠️ 顺序不是无关紧要的：Rust 侧 `search_roots` 按下标给 `SearchFile.root_index`
+    // 盖章，而前端拿 `roots[rootIndex]` 去显示「这一条来自哪个文件夹」。
+    // 前端要是在发之前排个序（或去重时打乱了顺序），面板上写着 A 根、
+    // 而结果其实来自 B 根——两边各自都「看起来对」
+  })
+
+  it('⚠️ 空数组照样发出去，不拦也不补默认值', async () => {
+    tauriCore.invoke.mockResolvedValue('search-1')
+    await startSearch([], { pattern: 'needle' })
+    expect(sentArgs().roots).toEqual([])
+    // Rust 侧把 `roots: []` 当**合法**输入，回的是一份全零的 summary 而不是错误
+    // （少一个错误变体，前端的分支表就少一行）。「没有打开文件夹」这句话
+    // 由 UI 自己说：`src/search/store.ts` 的 `search()` 在发之前就拦掉了
   })
 })
 

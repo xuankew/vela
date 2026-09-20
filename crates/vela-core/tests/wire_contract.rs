@@ -16,17 +16,23 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use vela_core::fs::{
-    read_text, write_text_atomic, Encoding, FileFormat, LineEnding, ReadError, TextFile, WriteReport, MAX_INLINE_BYTES,
+    open_shard, read_text, store_image, write_text_atomic, AssetError, Encoding, FileFormat, LineEnding, ReadError,
+    TextFile, WriteReport, MAX_IMAGE_BYTES, MAX_INLINE_BYTES, MAX_SHARD_BYTES,
 };
-use vela_core::project::{create_entry, list_dir, rename_entry, DirEntry, DirListing, EntryKind, TreeError};
+use vela_core::project::{
+    create_entry, list_dir, merge_stats, query_many, rename_entry, DirEntry, DirListing, EntryKind, FileIndex,
+    FileMatch, FileQuery, IndexStats, TreeError,
+};
 use vela_core::search::{
-    apply, preflight_apply, search, MatchRange, ReplaceProgress, ReplaceRequest, ReplaceSummary, SearchBatch,
-    SearchError, SearchFile, SearchHit, SearchQuery, SearchSummary,
+    apply, apply_roots, preflight_apply, preflight_apply_roots, preflight_roots, search, search_roots, MatchRange,
+    ReplaceProgress, ReplaceRequest, ReplaceSummary, SearchBatch, SearchError, SearchFile, SearchHit, SearchQuery,
+    SearchSummary,
 };
 use vela_core::session::{
-    load_session, save_session, PaneDirection, Session, SessionError, SessionProject, SessionReport, SessionTab,
-    MAX_SESSION_BYTES, SESSION_FILE_NAME, SESSION_VERSION,
+    load_session, save_session, PaneDirection, Session, SessionError, SessionProject, SessionReport, SessionRoot,
+    SessionTab, MAX_SESSION_BYTES, SESSION_FILE_NAME, SESSION_VERSION,
 };
+use vela_core::watcher::FileChange;
 
 #[test]
 fn file_format_的字段名与枚举值() {
@@ -144,6 +150,78 @@ fn write_error_用_kind_标签区分变体() {
     assert!(io.starts_with(r#"{"kind":"io","reason":"NotFound","message":""#), "{io}");
 }
 
+// ─────────────────────────── M3-A-7 图片粘贴落地 ───────────────────────────
+//
+// 前端那一份在 `src/ipc/asset.ts` + `src/ipc/asset.test.ts`。
+//
+// ⚠️ 这一组契约里**最容易漂移的是 `rel`**：它是唯一一个前端会拿去**拼进文档正文**的字段
+// （`![](assets/pasted-xxx.png)`）。别的字段读错了顶多是提示语不对，`rel` 读错了
+// 就是正文里躺着一个坏链接——而且它当时看着是对的，要等预览或 GitHub 渲染出破图才发现。
+
+/// 一张 1×1 的透明 PNG，与 `src/fs/asset.rs` 单测里那一份是同一串字节
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49,
+    0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00,
+    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn stored_image_的字段名是_camel_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let stored = store_image(&dir.path().join("note.md"), TINY_PNG).unwrap();
+    let json = serde_json::to_string(&stored).unwrap();
+
+    // 四个字段一个都不能少、一个都不能改名。`path` 含临时目录所以只钉前缀与后缀
+    assert!(json.starts_with(r#"{"rel":"assets/pasted-"#), "{json}");
+    assert!(json.contains(r#".png","path":"/"#), "{json}");
+    assert!(json.contains(&format!(r#""bytes":{},"reused":false}}"#, TINY_PNG.len())), "{json}");
+
+    // rel 里的分隔符**写死是正斜杠**：它是 Markdown 链接，不是文件系统路径。
+    // 这一条在 macOS 上与 `Path::display()` 恰好一样，所以只有显式钉住才不会在
+    // 将来移植到 Windows 时静默变成反斜杠
+    assert!(stored.rel.starts_with("assets/") && !stored.rel.contains('\\'), "{}", stored.rel);
+
+    // 再存一次同一份字节：reused 翻成 true，rel 不变
+    let again = store_image(&dir.path().join("note.md"), TINY_PNG).unwrap();
+    assert_eq!(again.rel, stored.rel);
+    let again_json = serde_json::to_string(&again).unwrap();
+    assert!(again_json.ends_with(r#""reused":true}"#), "{again_json}");
+}
+
+#[test]
+fn asset_error_用_kind_标签区分变体() {
+    assert_eq!(serde_json::to_string(&AssetError::Empty).unwrap(), r#"{"kind":"empty"}"#);
+    assert_eq!(
+        serde_json::to_string(&AssetError::Unsupported { reason: "x".into() }).unwrap(),
+        r#"{"kind":"unsupported","reason":"x"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&AssetError::BadData { reason: "y".into() }).unwrap(),
+        r#"{"kind":"bad_data","reason":"y"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&AssetError::NoParent { path: "note.md".into() }).unwrap(),
+        r#"{"kind":"no_parent","path":"note.md"}"#
+    );
+    // 这两个数字前端要拿去拼「这张图有多大 / 上限多大」，写死了才好对照
+    assert_eq!(
+        serde_json::to_string(&AssetError::TooBig { bytes: 5, limit: MAX_IMAGE_BYTES as u64 }).unwrap(),
+        r#"{"kind":"too_big","bytes":5,"limit":33554432}"#
+    );
+
+    // `io` 与 `WriteError` 同形状。用「`assets` 是个文件」这一条真实路径来取样本：
+    // reason 是稳定的字面量，message 含临时目录所以只钉前缀
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("assets"), b"not a directory").unwrap();
+    let io = serde_json::to_string(&match store_image(&dir.path().join("a.md"), TINY_PNG) {
+        Err(e) => e,
+        Ok(_) => panic!("期望落地失败"),
+    })
+    .unwrap();
+    assert!(io.starts_with(r#"{"kind":"io","reason":"NotADirectory","message":""#), "{io}");
+}
+
 // ────────────────────────────── M1-F 会话存档 ──────────────────────────────
 //
 // 前端那一份在 `src/ipc/session.ts` + `src/ipc/session.test.ts`。会话比 fs 更容易漂移：
@@ -190,10 +268,27 @@ fn sample_session() -> Session {
         // 空字符串是**根**那一层的 rel，不是「没有值」。它必须在契约里出现：
         // 前端 `src/project/store.ts` 用它索引缓存与展开集合，两边对「根怎么表示」
         // 的理解一旦分叉，恢复出来的树就是收起的，而且不报错
+        //
+        // 两个根：M2-F 起这是数组，而**顺序就是 `rootIndex`**（侧边栏里第几个项目，
+        // 也是行的身份 `RowKey` 的前一半）。只放一个根的话「顺序被排了」这种错
+        // 在契约里根本看不出来
         project: Some(SessionProject {
-            root: "/Users/me/code/vela".into(),
-            expanded: vec!["".into(), "src/doc".into()],
+            roots: vec![
+                SessionRoot { root: "/Users/me/code/vela".into(), expanded: vec!["".into(), "src/doc".into()] },
+                SessionRoot { root: "/Users/me/notes".into(), expanded: vec!["".into()] },
+            ],
         }),
+        // MRU：最新的在最前面。顺序**就是**这份清单的全部信息量——`Cmd+P` 按位置给
+        // 前几名加分（`FileIndex::recent_bonus` 的 `RECENT_TOP - rank`），一次排序失误
+        // 的后果是「上周那个文件顶在刚才那个上面」，而这同样不报错。
+        // 这里刻意放两条：一条是标签页里的（`/tmp/a.txt`），一条不是——最近打开过又
+        // 关掉的才是这份清单的主要价值，只存开着的标签它就没意义了
+        recent: vec!["/tmp/a.txt".into(), "/Users/me/code/vela/src/doc/tab.ts".into()],
+        // 最近项目（M2-F-6）。一条是**一个根清单**而不是一个路径：多根工作区是用户
+        // 一个个「添加文件夹」攒出来的，只记单个文件夹的话切回来就少两个根，
+        // 而那件事没有任何提示。两条刻意一条单根、一条多根——嵌套层级写错（少一层数组）
+        // 在只放单根时是看不出来的，而它的失败方式同样是静默的
+        recent_projects: vec![vec!["/Users/me/code/vela".into(), "/Users/me/notes".into()], vec!["/tmp/a.txt".into()]],
     }
 }
 
@@ -204,38 +299,46 @@ fn session_的线上形状() {
     // 字段顺序 = 结构体声明顺序（serde 的默认行为，前端不依赖它，但钉住能发现重排）；
     // direction 是 snake_case 枚举；selection 的 (usize, usize) 元组落成嵌套数组；
     // f64 永远带小数点（serde_json 的行为，前端 `number` 无所谓，但 0 与 0.0 要一致）；
-    // `project` **永远出现**（刻意不用 `skip_serializing_if`，理由见字段文档），
-    // 没开文件夹时是 `"project":null`
+    // `project`、`recent` 与 `recentProjects` **永远出现**（刻意不用 `skip_serializing_if`，
+    // 理由见字段文档），空的时候分别是 `"project":null`、`"recent":[]`、`"recentProjects":[]`
     assert_eq!(
         json,
-        r#"{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"root":"/Users/me/code/vela","expanded":["","src/doc"]}}"#
+        r#"{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}"#
     );
 }
 
 /// `SessionProject` 单独钉一份：它是**唯一一个两边都可能写错、而错法又完全静默**的
 /// 嵌套结构。`expanded` 里那个空字符串尤其要命——它表示「根那一层摊开着」，
 /// 名字或位置写错的后果是重启后树整个收起，用户只会觉得「上次点开的都没了」。
+///
+/// ⚠️ 这一条**只钉新形状**。旧形状（`{root, expanded}`）能不能读回来钉在
+/// `crates/vela-core/src/session/mod.rs` 的 `单根形状的旧_project_读成一个元素的数组` 里：
+/// 那是「上一版的格式」，不属于线上契约——线上契约只有当前版本会写的这一种。
 #[test]
 fn session_project_的线上形状() {
-    let json = serde_json::to_string(&SessionProject {
-        root: "/Users/me/code/vela".into(),
-        expanded: vec!["".into(), "src".into(), "src/doc".into()],
-    })
-    .unwrap();
-    assert_eq!(json, r#"{"root":"/Users/me/code/vela","expanded":["","src","src/doc"]}"#);
+    let sample = SessionProject {
+        roots: vec![
+            SessionRoot {
+                root: "/Users/me/code/vela".into(),
+                expanded: vec!["".into(), "src".into(), "src/doc".into()],
+            },
+            SessionRoot { root: "/Users/me/notes".into(), expanded: vec![] },
+        ],
+    };
+    let json = serde_json::to_string(&sample).unwrap();
     assert_eq!(
-        serde_json::from_str::<SessionProject>(&json).unwrap(),
-        SessionProject {
-            root: "/Users/me/code/vela".into(),
-            expanded: vec!["".into(), "src".into(), "src/doc".into()]
-        }
+        json,
+        r#"{"roots":[{"root":"/Users/me/code/vela","expanded":["","src","src/doc"]},{"root":"/Users/me/notes","expanded":[]}]}"#
     );
+    assert_eq!(serde_json::from_str::<SessionProject>(&json).unwrap(), sample);
 
     // `expanded` 空数组是合法的：文件夹打开了但一层都没摊开（用户手动收起了根）。
-    // 这与「没打开文件夹」（`project: null`）是两种不同的现场，不能混为一谈
+    // 这与「没打开文件夹」（`project: null`）是两种不同的现场，不能混为一谈。
+    // ⚠️ 而 `roots` 空数组**不**合法：同一个事实只留一种写法，见 `validate`
     assert_eq!(
-        serde_json::to_string(&SessionProject { root: "/r".into(), expanded: vec![] }).unwrap(),
-        r#"{"root":"/r","expanded":[]}"#
+        serde_json::to_string(&SessionProject { roots: vec![SessionRoot { root: "/r".into(), expanded: vec![] }] })
+            .unwrap(),
+        r#"{"roots":[{"root":"/r","expanded":[]}]}"#
     );
 }
 
@@ -644,11 +747,12 @@ fn 搜索结果的线上形状() {
         serde_json::to_string(&SearchFile {
             rel: "src/main.rs".to_owned(),
             path: "/repo/src/main.rs".to_owned(),
+            root_index: 0,
             hits: vec![],
             truncated: true,
         })
         .unwrap(),
-        r#"{"rel":"src/main.rs","path":"/repo/src/main.rs","hits":[],"truncated":true}"#
+        r#"{"rel":"src/main.rs","path":"/repo/src/main.rs","rootIndex":0,"hits":[],"truncated":true}"#
     );
     // ⚠️ 两种形状都钉：`files` 为空的那一个不是「没有结果」，是一次**心跳**
     // （理由与前端该怎么处理它，写在 `SearchBatch` 的文档里）。
@@ -663,6 +767,7 @@ fn 搜索结果的线上形状() {
             files: vec![SearchFile {
                 rel: "b.md".to_owned(),
                 path: "/repo/b.md".to_owned(),
+                root_index: 0,
                 hits: vec![SearchHit {
                     line: 1,
                     text: "needle".to_owned(),
@@ -675,7 +780,7 @@ fn 搜索结果的线上形状() {
             files_scanned: 3,
         })
         .unwrap(),
-        r#"{"files":[{"rel":"b.md","path":"/repo/b.md","hits":[{"line":1,"text":"needle","ranges":[{"start":0,"end":6}],"truncated":false}],"truncated":false}],"filesScanned":3}"#
+        r#"{"files":[{"rel":"b.md","path":"/repo/b.md","rootIndex":0,"hits":[{"line":1,"text":"needle","ranges":[{"start":0,"end":6}],"truncated":false}],"truncated":false}],"filesScanned":3}"#
     );
     assert_eq!(
         serde_json::to_string(&SearchSummary {
@@ -961,4 +1066,353 @@ fn 起飞前检查在线上给出可分支的拒绝理由() {
     // ⚠️ 三种都被拒了，而那个文件必须还是原样。这条断言是「检查发生在写盘之前」
     // 唯一的证据——没有它，一个「先改完再报错」的实现同样能让上面三条通过
     assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "needle\n");
+}
+
+/// `Cmd+P` 那两个命令的线上形状（M2-E）。另一半在 `src/ipc/project.test.ts`。
+///
+/// 与 `dir_listing_的线上形状` 同一个手法：手搓而不是序列化真实输出，因为 `path` 是
+/// 落在 `tempfile` 每次都不一样的随机目录里的绝对路径。真实输出对不对由下面
+/// `索引查询的_path_就是_root_拼上_rel` 负责
+#[test]
+fn 文件查询结果的线上形状() {
+    let query = FileQuery {
+        matches: vec![
+            FileMatch {
+                rel: "src/store.ts".to_owned(),
+                path: "/repo/src/store.ts".to_owned(),
+                score: 35,
+                root_index: 0,
+            },
+            FileMatch {
+                rel: "docs/about/store-history.md".to_owned(),
+                path: "/repo/docs/about/store-history.md".to_owned(),
+                score: 23,
+                root_index: 1,
+            },
+        ],
+        total: 17,
+    };
+    // ⚠️ M2-F 之前那五个字段名（rel / path / score / matches / total）没有一个双词的，
+    // 所以 `rename_all = "camelCase"` 在这个类型上是恒等的，这一条钉不住大小写漂移。
+    // 加进 `root_index` 之后**它能钉住了**：`rootIndex` 写成 `root_index` 的话前端读到
+    // `undefined`，浮层里那一行「来自哪个根」就变成空白，而控制台一行错都没有。
+    //
+    // 两条 `root_index` 刻意写成 0 与 1：字面量里全是 0 的话，看不出这个字段是**每条各自带**
+    // 而不是整份查询带一个
+    //
+    // `total` 刻意写成 17 而不是 2：它与 `matches.len()` **可以不相等**，
+    // 那个差值就是前端「还有更多没显示，把词写窄一点」那句话的依据。
+    // 字面量里两者相等的话这条契约就看不出形状允许不等了
+    assert_eq!(
+        serde_json::to_string(&query).unwrap(),
+        r#"{"matches":[{"rel":"src/store.ts","path":"/repo/src/store.ts","score":35,"rootIndex":0},{"rel":"docs/about/store-history.md","path":"/repo/docs/about/store-history.md","score":23,"rootIndex":1}],"total":17}"#
+    );
+}
+
+/// ⚠️ M2-F 之前 `IndexStats` 是这三个类型里**唯一**一个 camelCase 改名真的会生效的：
+/// `elapsed_ms` → `elapsedMs`。前端读成 `elapsed_ms` 拿到的是 `undefined`，
+/// 而 `undefined` 参与算术是 `NaN`、参与比较是 `false`，两种都不报错。
+/// 现在 `FileMatch::root_index` 也成了一个双词字段，于是这一类漂移有了两个可能的落点
+/// ——两边各有一条断言，见上面 `文件查询结果的线上形状`
+#[test]
+fn 索引统计的线上形状() {
+    let stats = IndexStats { files: 1234, unreadable: 2, truncated: true, elapsed_ms: 40 };
+    assert_eq!(
+        serde_json::to_string(&stats).unwrap(),
+        r#"{"files":1234,"unreadable":2,"truncated":true,"elapsedMs":40}"#
+    );
+}
+
+/// 真实索引在线上给出的东西**自洽**：`path` 就是 `root` 拼上 `rel`，
+/// `matches` 已经按 `score` 降序排好了。
+///
+/// 第二条是前端能不能直接画的关键：浮层拿到就渲染，**不再排一次**。
+/// 排序规则住在 vela-core 里（那套权重是产品决定，见 `project/index.rs` 的模块文档），
+/// 前端要是自己再排一遍就等于把那个决定抄了一份到 TypeScript 里
+#[test]
+fn 索引查询的_path_就是_root_拼上_rel() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("docs/about")).unwrap();
+    fs::write(root.join("docs/about/store-history.md"), "x\n").unwrap();
+    fs::write(root.join("store.ts"), "x\n").unwrap();
+
+    let index = FileIndex::build(root).unwrap();
+    let got = index.query("store", &[], 10);
+    assert_eq!(got.total, 2);
+    assert_eq!(got.matches.len(), 2);
+    for hit in &got.matches {
+        assert_eq!(Path::new(&hit.path), root.join(&hit.rel), "{hit:?}");
+        // 单份索引不知道自己是工作区里的第几个，所以恒为 0（多根由 `query_many` 重盖）
+        assert_eq!(hit.root_index, 0, "{hit:?}");
+    }
+
+    let scores: Vec<u32> = got.matches.iter().map(|hit| hit.score).collect();
+    let mut sorted = scores.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(scores, sorted, "线上顺序不是降序，前端就得自己再排一次");
+
+    // ⚠️ 第一条**不是**遍历顺序里的那一条：`docs/` 排在 `store.ts` 前面，
+    // 而 `BASENAME` 那条权重把 basename 里命中的这一个顶到了第一位。
+    // 这一条断言同时证明「打分在线上也是生效的」，不只是内部测试里的数字
+    assert_eq!(got.matches[0].rel, "store.ts");
+    assert_eq!(got.matches[1].rel, "docs/about/store-history.md");
+    assert!(got.matches[0].score > got.matches[1].score);
+}
+
+// ── M2-F 多根工作区 ────────────────────────────────────────────────────────
+
+/// 多根索引：合并出来的那一份在线上仍然满足前端依赖的两条规矩
+/// （**降序**、`path` 就是那一个根拼上 `rel`），并且每条都带对根序号。
+///
+/// ⚠️ 两个根里刻意各放一个同名的 `store.ts`：多根之下 `rel` 不再唯一，
+/// 这正是 `rootIndex` 存在的全部理由
+#[test]
+fn 多根索引合并后仍按分降序且带对根序号() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    fs::write(first.path().join("store.ts"), "x\n").unwrap();
+    fs::create_dir_all(second.path().join("docs/about")).unwrap();
+    fs::write(second.path().join("docs/about/store-history.md"), "x\n").unwrap();
+    fs::write(second.path().join("store.ts"), "x\n").unwrap();
+
+    let index_first = FileIndex::build(first.path()).unwrap();
+    let index_second = FileIndex::build(second.path()).unwrap();
+    let got = query_many(&[(0, &index_first), (1, &index_second)], "store", &[], 10);
+
+    // `total` 是各根之和（1 + 2），前端「还有更多，把词写窄一点」那句话在多根下照样成立
+    assert_eq!(got.total, 3);
+    assert_eq!(got.matches.len(), 3);
+
+    let scores: Vec<u32> = got.matches.iter().map(|m| m.score).collect();
+    let mut sorted = scores.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(scores, sorted, "合并之后不是降序，前端就得自己再排一次");
+
+    for m in &got.matches {
+        // ⚠️ 用**它自己报的那个**根去拼，而不是挨个试哪个能拼上：
+        // 「root_index 与 path 对不上」是最难查的一种漂移——浮层上写着 A 根，
+        // 回车打开的却是 B 根里的同名文件，而两边都「看起来对」
+        let root = if m.root_index == 0 { first.path() } else { second.path() };
+        assert_eq!(Path::new(&m.path), root.join(&m.rel), "{m:?}");
+    }
+
+    // 同分时按根的顺序。这一条钉的是**稳定**排序：换成 `sort_unstable_by` 的话
+    // 两次按键之间同分的两条会互换位置，而浮层里「上一条候选变了」是看得见的抖动
+    let ties: Vec<&FileMatch> = got.matches.iter().filter(|m| m.rel == "store.ts").collect();
+    assert_eq!(ties.len(), 2);
+    assert_eq!(ties[0].score, ties[1].score, "分数不相等的话下面那条断言什么也没钉住");
+    assert_eq!((ties[0].root_index, ties[1].root_index), (0, 1));
+}
+
+/// `merge_stats`：三个数相加、`truncated` 取**或**。
+///
+/// ⚠️ 取或是这一条的全部意义：`truncated` 的用途是让 UI 说一句「索引不全，
+/// 找不到的文件可能其实存在」。写成「取最后一个」的话，一个走完的根会把
+/// 一个没走完的根的那句话**盖掉**，而用户看到的就是一次安静的漏报
+#[test]
+fn 索引统计合并时_truncated_取或() {
+    let merged = merge_stats(&[
+        IndexStats { files: 10, unreadable: 1, truncated: false, elapsed_ms: 5 },
+        IndexStats { files: 20, unreadable: 0, truncated: true, elapsed_ms: 7 },
+    ]);
+    assert_eq!(merged, IndexStats { files: 30, unreadable: 1, truncated: true, elapsed_ms: 12 });
+    // 反过来的顺序也要给出同一份：合并不能依赖根的排列
+    let backwards = merge_stats(&[
+        IndexStats { files: 20, unreadable: 0, truncated: true, elapsed_ms: 7 },
+        IndexStats { files: 10, unreadable: 1, truncated: false, elapsed_ms: 5 },
+    ]);
+    assert_eq!(backwards, merged);
+    // 空的那一份是全零，而 `truncated` **不是**真：一个根都没有不等于「没走完」
+    assert_eq!(merge_stats(&[]), IndexStats { files: 0, unreadable: 0, truncated: false, elapsed_ms: 0 });
+}
+
+/// 多根搜索：`rootIndex` 一路传到线上，而 `filesScanned` 是**跨根累计**的。
+///
+/// 第二条钉的是共用一本账：每个根各记各的话，进度条会在根之间**倒退**，
+/// 而倒退的进度条比没有进度条更让人以为卡住了
+#[test]
+fn 多根搜索的批次里根序号对而扫描数是跨根累计的() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    fs::write(first.path().join("a.txt"), "needle\n").unwrap();
+    // 一个没有命中的文件：它必须照样计入 `files_scanned`，否则那个数就不是「扫过多少」
+    fs::write(first.path().join("filler.txt"), "nothing\n").unwrap();
+    fs::write(second.path().join("a.txt"), "needle\n").unwrap();
+
+    let mut batches = Vec::new();
+    let summary = search_roots(
+        &[first.path(), second.path()],
+        &SearchQuery { pattern: "needle".to_owned(), ..SearchQuery::default() },
+        &AtomicBool::new(false),
+        |b| batches.push(b),
+    )
+    .unwrap();
+
+    let files: Vec<&SearchFile> = batches.iter().flat_map(|b| b.files.iter()).collect();
+    assert_eq!(files.len(), 2);
+    // ⚠️ 两条的 `rel` **完全相同**，靠 `root_index` 才分得开
+    assert!(files.iter().all(|f| f.rel == "a.txt"), "{files:?}");
+    assert_eq!((files[0].root_index, files[1].root_index), (0, 1), "{files:?}");
+    assert_eq!(Path::new(&files[0].path), first.path().join("a.txt"));
+    assert_eq!(Path::new(&files[1].path), second.path().join("a.txt"));
+
+    assert_eq!(summary.files_scanned, 3, "两个根加起来");
+    assert_eq!(summary.files_with_hits, 2);
+    let scanned: Vec<u32> = batches.iter().map(|b| b.files_scanned).collect();
+    assert!(scanned.windows(2).all(|w| w[0] <= w[1]), "{scanned:?} 该单调不减");
+    assert_eq!(*scanned.last().unwrap(), summary.files_scanned, "最后一个批次的累计数就是总账上那个数");
+}
+
+/// 多根替换：两个根都被改到，而总账只有**一份**（`MAX_HITS` 是整次替换的预算，
+/// 不是每个根一份——两个根各换两万处等于换掉四万处，而用户批准的是两万）
+#[test]
+fn 多根替换把两个根都改了而总账是一份() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    fs::write(first.path().join("a.txt"), "needle one\n").unwrap();
+    fs::write(second.path().join("b.txt"), "needle two\nneedle three\n").unwrap();
+    // 一个读不动的二进制文件：它要被计入 `skipped_binary`，而不是让整次替换失败
+    fs::write(second.path().join("c.bin"), b"\x00needle").unwrap();
+
+    let request = ReplaceRequest {
+        query: SearchQuery { pattern: "needle".to_owned(), replace: Some("haystack".to_owned()), ..Default::default() },
+        skip: Vec::new(),
+    };
+    preflight_apply_roots(&[first.path(), second.path()], &request).unwrap();
+
+    let mut last = ReplaceProgress { files_scanned: 0, files_changed: 0, replacements: 0 };
+    let summary: ReplaceSummary = apply_roots(&[first.path(), second.path()], &request, &AtomicBool::new(false), |p| {
+        // 进度也是跨根累计的，理由与搜索那条相同
+        assert!(p.files_scanned >= last.files_scanned, "{p:?} 退回了 {last:?}");
+        last = p;
+    })
+    .unwrap();
+
+    assert_eq!(fs::read_to_string(first.path().join("a.txt")).unwrap(), "haystack one\n");
+    assert_eq!(fs::read_to_string(second.path().join("b.txt")).unwrap(), "haystack two\nhaystack three\n");
+    assert_eq!(summary.files_changed, 2);
+    assert_eq!(summary.replacements, 3);
+    assert_eq!(summary.skipped_binary, 1);
+    assert!(!summary.truncated && !summary.cancelled);
+}
+
+/// ⚠️ 所有根**一起查完**才开工。这一条是多根之下「reject = 什么都没发生」唯一的证据。
+///
+/// 「边查边走」的实现能让单根的所有测试照样通过，而它会在第二个根不合法时留下
+/// 「第一个根已经被改过了」这个中间状态——那个状态既没有 UI 也没有别的测试，
+/// 而它是**不可撤销**的（Vela 没有跨文件撤销）
+#[test]
+fn 第二个根不合法时第一个根一个文件都没被改() {
+    let good = tempfile::tempdir().unwrap();
+    fs::write(good.path().join("a.txt"), "needle\n").unwrap();
+    let missing = good.path().join("不存在的根");
+    let request = ReplaceRequest {
+        query: SearchQuery { pattern: "needle".to_owned(), replace: Some("haystack".to_owned()), ..Default::default() },
+        skip: Vec::new(),
+    };
+
+    let err = preflight_apply_roots(&[good.path(), &missing], &request).unwrap_err();
+    assert!(matches!(err, SearchError::NotFound { .. }), "{err}");
+    // `apply_roots` 自己**也**查，不依赖调用方先跑一遍 preflight
+    let err = apply_roots(&[good.path(), &missing], &request, &AtomicBool::new(false), |_| unreachable!()).unwrap_err();
+    assert!(matches!(err, SearchError::NotFound { .. }), "{err}");
+    assert_eq!(fs::read_to_string(good.path().join("a.txt")).unwrap(), "needle\n");
+
+    // 搜索侧同一条规矩：出错时**一个批次都没推出去**
+    let query = SearchQuery { pattern: "needle".to_owned(), ..Default::default() };
+    assert!(matches!(preflight_roots(&[good.path(), &missing], &query), Err(SearchError::NotFound { .. })));
+    let mut batches = 0;
+    let err = search_roots(&[good.path(), &missing], &query, &AtomicBool::new(false), |_| batches += 1).unwrap_err();
+    assert_eq!(batches, 0, "{err}");
+}
+
+/// `vela://file-changed` 载荷里那个 `kind` 的两个取值（M2-G）。
+///
+/// ⚠️ 这一条钉的是**全 Vela 最安静的失败方式**：`FileChange` 是个无字段枚举，
+/// serde 对它的默认写法是 `"Changed"`，而前端那份 `FileChangeKind` 写的是 `"changed"`。
+/// 对不上的话事件照样送到、`listen` 照样回调，只是前端 `switch` 走完 default 分支——
+/// 于是「外部改了文件而 Vela 一声不吭」，界面上没有任何东西可看，日志里也没有一行。
+/// 对照的另一半在 `src/ipc/watch.test.ts`。
+#[test]
+fn file_change_是两个小写单词() {
+    assert_eq!(serde_json::to_string(&FileChange::Changed).unwrap(), r#""changed""#);
+    assert_eq!(serde_json::to_string(&FileChange::Removed).unwrap(), r#""removed""#);
+}
+
+// ────────────────────────────── M2-H 大文件只读分片 ──────────────────────────────
+//
+// 前端那一份在 `src/ipc/shard.ts` + `src/ipc/shard.test.ts`，而 src-tauri 那一层
+// （`open_large` 的 `{ handle, header }` 信封、以及 `read_lines` 的 `Option` → `null`）
+// 的黄金 JSON 在 `src-tauri/src/shard.rs` 的 `线上形状`。
+//
+// ⚠️ 这一节与本文件其余各节有一处不同：它**跑真的 `open_shard`**，不手搓结构体。
+// 理由是这一层的公开边界比别处窄——`Shard` 里的 fd 是私有的，正文只能靠
+// `Shard::read_page` 拿到（见 `fs::shard::Shard` 的文档：那是「索引与内容必须来自
+// 同一个 inode」这条不变量的**结构性**保证）。手搓一个 `ShardPage` 断言它的字段名
+// 压根证明不了「外面的人能不能读到一页」，而那正是这个类型存在的全部理由。
+//
+// ⚠️ 于是下面两个字面量的**值**与前端那份不同（这里是真文件算出来的），
+// 但**字段名与顺序必须逐字相同**。
+
+/// 「第一行\r\nsecond\r\n」：9 + 2 + 6 + 2 = 19 字节、2 行、CRLF、无 BOM、纯 UTF-8。
+///
+/// ⚠️ 刻意混中文与 ASCII：字节数（19）与字符数（12）不同，于是 `bytes` 与
+/// `totalLines` 谁被写成谁的口径都会当场露出来。全 ASCII 的样本查不出这一类错
+const SHARD_SAMPLE: &str = "第一行\r\nsecond\r\n";
+
+#[test]
+fn 分片元信息与分页的线上形状() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.txt");
+    fs::write(&path, SHARD_SAMPLE).unwrap();
+    assert_eq!(SHARD_SAMPLE.len(), 19, "样本被改过了，下面那个 19 就不再是它算出来的");
+
+    let mut shard = open_shard(&path).unwrap();
+    assert_eq!(
+        serde_json::to_string(&shard.header).unwrap(),
+        r#"{"totalLines":2,"bytes":19,"encoding":"utf8","bom":false,"eol":"crlf","lossy":false}"#
+    );
+
+    // 🔴 CRLF 的那个 `\r` 必须在**线上**就没有：前端把 `lines` 一行一条直接画出来，
+    // 而行尾带一个 `\r` 的话每行末尾会多一个看不见的字符，
+    // 于是「这一行有多长」的列对齐会差一格——不报错，只是对不上
+    let page = shard.read_page(0, 2).unwrap();
+    assert_eq!(
+        serde_json::to_string(&page).unwrap(),
+        r#"{"start":0,"lines":["第一行","second"],"truncated":false,"lossy":false}"#
+    );
+}
+
+/// ⛔ UTF-16 在分片模式下打不开，理由见 `fs::shard` 模块文档最后一节。
+///
+/// ⚠️ 这条与 `read_error_用_kind_标签区分变体` 刻意分开：上面那个测的是**内联路径**
+/// 能产出的三种，而这一种**只有** `open_shard` 会产出。前端 `ReadError` 那个 union
+/// 少一个 arm 的话，`describeFsError` 的 `default` 分支会把它悄悄吞成 `[object Object]`
+#[test]
+fn 分片接不住的编码在契约上有其名() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("le.txt");
+    // BOM(2) + 一个 UTF-16LE 的 "a\n"(4) = 6 字节。`0A` 与 `00` 的相对位置随端序变，
+    // 于是「数 `0x0A` 的个数」在它上面压根不是行数
+    fs::write(&path, [0xFFu8, 0xFE, 0x61, 0x00, 0x0A, 0x00]).unwrap();
+
+    let err = match open_shard(&path) {
+        Err(err) => err,
+        Ok(_) => panic!("期望 UTF-16 被明确拒绝"),
+    };
+    assert_eq!(
+        serde_json::to_string(&err).unwrap(),
+        r#"{"kind":"unsupported_encoding","encoding":"utf16_le","bytes":6}"#
+    );
+
+    // 而 256 MiB 那一道闸报的是 `too_large`，与内联路径**同一个 kind**、只是 limit 不同。
+    // 前端靠 `limit` 那个数区分「4 MiB，该改走分片」与「256 MiB，真的打不开」，
+    // 所以这一条不许被换成一个新 kind
+    let huge = dir.path().join("huge.bin");
+    fs::File::create(&huge).unwrap().set_len(MAX_SHARD_BYTES + 1).unwrap();
+    match open_shard(&huge) {
+        Err(ReadError::TooLarge { limit, .. }) => assert_eq!(limit, MAX_SHARD_BYTES),
+        other => panic!("期望 TooLarge，实际 {other:?}"),
+    }
 }

@@ -47,6 +47,18 @@ impl Encoding {
         }
     }
 
+    /// 有 BOM 时它占几个字节。
+    ///
+    /// `fs::shard` 要这个数而不是 BOM 本身：稀疏行索引的第 0 个锚点必须落在 BOM **之后**，
+    /// 否则每一页的第一行都带着那两三个字节，而它们解码出来是 U+FEFF——
+    /// 一个看不见的字符，会让「第一行等于什么」这类断言莫名其妙地差一个位。
+    ///
+    /// ⚠️ 只开到 `pub(super)`：BOM 的**字节**（上面那个 `bom`）刻意不外泄，
+    /// 免得 `fs` 之外有人拿它去手工拼一个半截 BOM。
+    pub(super) fn bom_len(self) -> usize {
+        self.bom().len()
+    }
+
     fn codec(self) -> &'static encoding_rs::Encoding {
         match self {
             Encoding::Utf8 => encoding_rs::UTF_8,

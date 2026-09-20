@@ -30,10 +30,10 @@ import {
 /**
  * Rust 侧 `session_的线上形状` 断言的就是这个字面量，逐字符相同。
  * 样本刻意一次覆盖：带路径的干净标签、未命名的脏标签、**非默认编码 + lossy**、
- * 多光标、非零滚动、column 方向。
+ * 多光标、非零滚动、column 方向、非空的 MRU。
  */
 const GOLDEN_SESSION =
-  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"root":"/Users/me/code/vela","expanded":["","src/doc"]}}'
+  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}'
 
 /**
  * 同一份数据在 `JSON.stringify` 之后的样子。与上面**只差三处**：`0.0` 变成 `0`。
@@ -43,10 +43,10 @@ const GOLDEN_SESSION =
  * 把两个字面量并排放在这里，是为了让这点差异**看得见**，而不是让人对着两个文件犯嘀咕。
  */
 const GOLDEN_SESSION_JS =
-  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0}],"panes":[0,1],"project":{"root":"/Users/me/code/vela","expanded":["","src/doc"]}}'
+  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0}],"panes":[0,1],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}'
 
-/** 504 = GOLDEN_SESSION 的 UTF-8 字节数（不是字符数，中文占 3 字节），下面有用例钉住这条关系 */
-const GOLDEN_REPORT = '{"bytesWritten":504,"droppedDrafts":0}'
+/** 696 = GOLDEN_SESSION 的 UTF-8 字节数（不是字符数，中文占 3 字节），下面有用例钉住这条关系 */
+const GOLDEN_REPORT = '{"bytesWritten":696,"droppedDrafts":0}'
 
 /** 与 GOLDEN_SESSION 语义相同的对象字面量，用来做 deep-equal 与「前端能不能造出来」的检查 */
 function sampleSession(): Session {
@@ -84,8 +84,21 @@ function sampleSession(): Session {
     ],
     panes: [0, 1],
     // 空字符串是**根**那一层的 rel。它出现在契约里，是为了让「两边对根怎么表示」这件事
-    // 有个对照物——漂了的表现是重启后树整个收起，而不是一条报错
-    project: { root: '/Users/me/code/vela', expanded: ['', 'src/doc'] },
+    // 有个对照物——漂了的表现是重启后树整个收起，而不是一条报错。
+    // 两个根：`roots` 的顺序**就是** `rootIndex`，只放一个的话「顺序被排了」看不出来
+    project: {
+      roots: [
+        { root: '/Users/me/code/vela', expanded: ['', 'src/doc'] },
+        { root: '/Users/me/notes', expanded: [''] },
+      ],
+    },
+    // 最新的在最前面。刻意放一条不在 `tabs` 里的：最近打开过又关掉的才是这份清单的
+    // 主要价值，只存开着的标签它就没意义了
+    recent: ['/tmp/a.txt', '/Users/me/code/vela/src/doc/tab.ts'],
+    // 一条是一个**根清单**：多根工作区是用户一个个「添加文件夹」攒出来的，
+    // 只记单个路径的话切回来就少几个根，而那件事没有任何提示。
+    // 两条刻意一条多根、一条单根——嵌套层级少写一层数组在只放单根时看不出来
+    recentProjects: [['/Users/me/code/vela', '/Users/me/notes'], ['/tmp/a.txt']],
   }
 }
 
@@ -98,7 +111,16 @@ describe('Rust → 前端 的字段名', () => {
     const parsed = JSON.parse(GOLDEN_SESSION) as Session
     // 键顺序就是 JSON.parse 的插入顺序，所以 stringify 相等 == 字段集合与顺序都相等
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SESSION_JS)
-    expect(Object.keys(parsed)).toEqual(['version', 'direction', 'focused', 'tabs', 'panes', 'project'])
+    expect(Object.keys(parsed)).toEqual([
+      'version',
+      'direction',
+      'focused',
+      'tabs',
+      'panes',
+      'project',
+      'recent',
+      'recentProjects',
+    ])
     expect(Object.keys(parsed.tabs[0]!)).toEqual([
       'path',
       'format',
@@ -166,27 +188,39 @@ describe('Rust → 前端 的字段名', () => {
   })
 })
 
-describe('project 字段（M2-B-4）', () => {
-  it('SessionProject 的字段名与顺序与 Rust 侧一致', () => {
+describe('project 字段（M2-B-4；M2-F 起多根）', () => {
+  it('SessionProject 与 SessionRoot 的字段名与顺序与 Rust 侧一致', () => {
     const parsed = JSON.parse(GOLDEN_SESSION) as Session
     const project = parsed.project
     expect(project).not.toBeNull()
-    expect(Object.keys(project!)).toEqual(['root', 'expanded'])
-    expect(project!.root).toBe('/Users/me/code/vela')
+    // 外层只有一个键：`roots`。旧形状那两个键下移到了 `SessionRoot` 里
+    expect(Object.keys(project!)).toEqual(['roots'])
+    expect(Object.keys(project!.roots[0]!)).toEqual(['root', 'expanded'])
+    expect(project!.roots[0]!.root).toBe('/Users/me/code/vela')
 
-    const golden = '{"root":"/r","expanded":["","src","src/doc"]}'
-    const made: SessionProject = { root: '/r', expanded: ['', 'src', 'src/doc'] }
+    const golden = '{"roots":[{"root":"/r","expanded":["","src","src/doc"]}]}'
+    const made: SessionProject = { roots: [{ root: '/r', expanded: ['', 'src', 'src/doc'] }] }
     expect(JSON.stringify(made)).toBe(golden)
     expect(JSON.parse(golden)).toEqual(made)
   })
 
+  it('roots 的顺序就是 rootIndex，原样往返', () => {
+    // 行与选中的身份是「第几个根 + rel」（`src/project/tree.ts` 的 `RowKey`），
+    // 所以这个数组被排过一次的后果是两棵树立刻互换位置，而每一棵自己看起来都完好。
+    // 「原样往返」由上面那条 `JSON.stringify(parsed) === GOLDEN_SESSION_JS` 负责：
+    // 键顺序相等就意味着数组元素顺序相等，这里只把语义说出来
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    expect(parsed.project!.roots.map((r) => r.root)).toEqual(['/Users/me/code/vela', '/Users/me/notes'])
+  })
+
   it('expanded 里的空字符串就是根那一层，不是「没有值」', () => {
     const parsed = JSON.parse(GOLDEN_SESSION) as Session
-    expect(parsed.project!.expanded).toEqual(['', 'src/doc'])
+    const expanded = parsed.project!.roots[0]!.expanded
+    expect(expanded).toEqual(['', 'src/doc'])
     // 漂了的表现是重启后树整个收起：`''` 变成 `undefined` 或被过滤掉，
     // `flattenRows` 就只画出根那一行，而控制台一行错都没有
-    expect(parsed.project!.expanded[0]).toBe('')
-    expect(parsed.project!.expanded.filter((rel) => rel === '')).toHaveLength(1)
+    expect(expanded[0]).toBe('')
+    expect(expanded.filter((rel) => rel === '')).toHaveLength(1)
   })
 
   it('project 永远出现在序列化结果里，不会被 undefined 吃掉', () => {
@@ -211,6 +245,62 @@ describe('project 字段（M2-B-4）', () => {
     // 而不是 undefined——后者会被 JSON.stringify 整个删掉，落到线上就成了「缺键」，
     // 与「字段名拼错」长得一模一样
     expect(JSON.stringify(sent.session)).toContain('"project":null')
+  })
+})
+
+describe('recent 字段（M2-E）', () => {
+  it('顺序就是内容：最新的在最前面', () => {
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    expect(parsed.recent).toEqual(['/tmp/a.txt', '/Users/me/code/vela/src/doc/tab.ts'])
+    // `FileIndex::recent_bonus` 的加分是 `RECENT_TOP - rank`，于是这个数组的**下标**
+    // 是有语义的。它漂成「随便一个顺序」的后果是 `Cmd+P` 把上周的文件顶在刚才那个上面，
+    // 而不是一句报错——与 `expanded` 里那个空字符串同一类失败
+    expect(parsed.recent[0]).toBe('/tmp/a.txt')
+  })
+
+  it('每条都是绝对路径，与 SessionTab.path 同一种东西', () => {
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    for (const path of parsed.recent) {
+      expect(path.startsWith('/')).toBe(true)
+    }
+    // 存 rel 的话它就只对某一个 root 有意义，而 MRU 是要跨文件夹活着的：
+    // 关掉文件夹再开另一个，最近用过的东西不该跟着一起没了
+    expect(parsed.recent.some((p) => !p.startsWith('/'))).toBe(false)
+  })
+
+  it('⚠️ 刻意放一条不在 tabs 里的：这份清单不是标签清单', () => {
+    const parsed = JSON.parse(GOLDEN_SESSION) as Session
+    const tabPaths = parsed.tabs.map((t) => t.path).filter((p): p is string => p !== null)
+    const notOpen = parsed.recent.filter((p) => !tabPaths.includes(p))
+    expect(notOpen).toEqual(['/Users/me/code/vela/src/doc/tab.ts'])
+    // 只存开着的标签它就没有价值了——那种情况 `tabs` 已经全都知道
+  })
+
+  it('recent 永远出现在序列化结果里，空清单是 [] 不是缺键', () => {
+    expect(JSON.stringify(sampleSession())).toContain('"recent":[')
+    const empty: Session = { ...sampleSession(), recent: [] }
+    expect(JSON.stringify(empty)).toContain('"recent":[]')
+    expect(Object.keys(empty)).toContain('recent')
+    // `?:` 的写法在这里会退化成「拼错字段名」与「没有最近文件」在线上长得一样
+  })
+
+  it('发出去的 payload 永远带 recent 键，哪怕一条都没有', async () => {
+    invoke.mockResolvedValue(JSON.parse(GOLDEN_REPORT))
+    await saveSession({ ...sampleSession(), recent: [] })
+    const sent = invoke.mock.calls[0]![1] as { session: Session }
+    expect(Object.keys(sent.session)).toContain('recent')
+    expect(sent.session.recent).toEqual([])
+    expect(JSON.stringify(sent.session)).toContain('"recent":[]')
+  })
+
+  it('Rust 侧不截断，于是条数上限是前端的责任', () => {
+    // 与 `SessionRoot.expanded` 的 `MAX_RESTORED_EXPANDED` 同一套分工：
+    // 两边各截一次的结果是谁也说不清最终有多少条。
+    // 那条上限（`MAX_RECENT`）住在 `src/doc/workspace.ts`，由 `workspace.test.ts` 钉
+    const many = Array.from({ length: 500 }, (_, i) => `/tmp/f${i}.txt`)
+    const payload: Session = { ...sampleSession(), recent: many }
+    expect(payload.recent).toHaveLength(500)
+    expect((JSON.parse(JSON.stringify(payload)) as Session).recent).toHaveLength(500)
   })
 })
 

@@ -48,7 +48,7 @@
 //! ## ⚠️ 不走 `fs::read_text`，因为两条路的大小上限不一样
 //!
 //! `read_text` 的闸是 `MAX_INLINE_BYTES` = 4 MiB（那是单次 IPC payload 的限制），
-//! 遍历这一层的闸是 `MAX_FILE_BYTES` = 10 MiB。调它的话 4–10 MiB 的文件
+//! 遍历这一层的闸是 `MAX_FILE_BYTES` = 64 MiB。调它的话 4–64 MiB 的文件
 //! **在预览里出现、在落盘时被跳过**——正是上面那条「用户批准一份清单、改的是另一份」。
 //! 所以这里把七个公开原语自己摆一遍：`fs::read`、`decode`、`detect_eol`、
 //! `normalize_to_lf`、`apply_eol`、`encode`、`write_bytes_atomic`。摆两遍的代价是
@@ -65,7 +65,7 @@ use grep_regex::RegexMatcher;
 use serde::{Deserialize, Serialize};
 
 use super::query::{SearchError, SearchQuery, Template};
-use super::run::{prepare, walk_files, WalkOutcome, HEARTBEAT_FILES, HEARTBEAT_MS, MAX_HITS};
+use super::run::{check_root, compile, walk_files, WalkOutcome, HEARTBEAT_FILES, HEARTBEAT_MS, MAX_HITS};
 use crate::fs::{apply_eol, decode, detect_eol, encode, normalize_to_lf, write_bytes_atomic};
 
 /// 一次落盘替换的请求。
@@ -133,12 +133,22 @@ pub struct ReplaceSummary {
     pub elapsed_ms: u64,
 }
 
-/// 落盘替换的起飞前检查。规矩与 `search::preflight` 完全一致（共用 `prepare`），
+/// 落盘替换的起飞前检查。规矩与 `search::preflight` 完全一致（共用 `check_root` 与 `compile`），
 /// 只多一条：`replace` 必须是 `Some`，否则这就是一次搜索，走错门了。
 ///
 /// 前端因此保住同一条规则：**invoke reject = 一个文件都没被改**
 pub fn preflight_apply(root: &Path, request: &ReplaceRequest) -> Result<(), SearchError> {
-    prepare(root, &request.query).and_then(|prepared| need_template(&prepared.template))
+    preflight_apply_roots(&[root], request)
+}
+
+/// [`preflight_apply`] 的多根版。**所有**根一起查完才可能开工，与 `search::preflight_roots`
+/// 同一条理由：这一层唯一要保证的是「reject = 一个文件都没被改」，
+/// 而「改到第二个根时才发现它不合法」会让那句话变成假的
+pub fn preflight_apply_roots(roots: &[&Path], request: &ReplaceRequest) -> Result<(), SearchError> {
+    for root in roots {
+        check_root(root)?;
+    }
+    compile(&request.query).and_then(|prepared| need_template(&prepared.template))
 }
 
 /// `replace` 为 `None` 时那一句报错。两个入口共用，于是它们不可能说出两句话
@@ -165,7 +175,38 @@ pub fn apply<F>(
 where
     F: FnMut(ReplaceProgress),
 {
-    let prepared = prepare(root, &request.query)?;
+    apply_roots(&[root], request, cancel, on_progress)
+}
+
+/// [`apply`] 的多根版（M2-F 多根工作区）。
+///
+/// 三条与 `search_roots` 完全对应的性质，各自都是为了**保住一条已有的规矩**：
+///
+/// - **所有根一起查完才开工**：上面那句「reject = 一个文件都没被改」对多根同样成立。
+///   改成「边查边走」的话，第二个根不合法时第一个根已经被改过了，而这句话是这一层
+///   唯一对外承诺的东西
+/// - **一份 `Prepared`、一份 `Tally`**：匹配机与模板编一次（于是「预览与落盘用同一台
+///   匹配机」这句话仍然是同一个对象，不是 N 个相等的对象），`MAX_HITS` 仍然是**整次
+///   替换**的预算而不是每个根一份——两个根各换两万处等于换掉四万处，而用户批准的是两万
+/// - **收手就整个收手**：`cancelled || truncated` 直接跳出根循环。取消不该等走完一个根，
+///   截断更不该被理解成「每个根还能再换两万处」
+///
+/// ⚠️ `roots` 为空是合法的，得到一份全零的总账（`elapsed_ms` 除外）。与 `search_roots`
+/// 同一条理由：这个状态在 UI 上到不了（面板没有根就不让发起替换），为它另开一个
+/// `SearchError` 变体的代价是前端多一条翻译分支和契约测试多一个用例
+pub fn apply_roots<F>(
+    roots: &[&Path],
+    request: &ReplaceRequest,
+    cancel: &AtomicBool,
+    on_progress: F,
+) -> Result<ReplaceSummary, SearchError>
+where
+    F: FnMut(ReplaceProgress),
+{
+    for root in roots {
+        check_root(root)?;
+    }
+    let prepared = compile(&request.query)?;
     need_template(&prepared.template)?;
     // ⚠️ 上面已经判过一次，这里的 `expect` 因此不是「赌它不会失败」。
     // 而 release 档是 `panic = "abort"`——真走到这一支就是整个编辑器被带走，
@@ -181,9 +222,16 @@ where
         sink: Sink::new(on_progress),
         tally: Tally::default(),
     };
-    // 遍历与预览共用 `walk_files` 这一个实现，理由写在那个函数上
-    let outcome = walk_files(root, &prepared.filters, cancel, |path, _rel| run.visit(path));
-    run.tally.absorb(outcome);
+    for root in roots {
+        // 遍历与预览共用 `walk_files` 这一个实现，理由写在那个函数上。
+        // ⚠️ `prepared.filters` 刻意**留在局部**、每轮借出去：`run` 已经
+        // 拿走了 `matcher`，把 `filters` 也搬进去只是多一次移动
+        let outcome = walk_files(root, &prepared.filters, cancel, |path, _rel| run.visit(path));
+        run.tally.absorb(outcome);
+        if run.tally.cancelled || run.tally.truncated {
+            break;
+        }
+    }
     // 结尾刻意**不**补一次进度：下一行返回的 `ReplaceSummary` 才是终止信号，
     // 在它前面多推一个快照只是让前端在「最后一次进度」与「done」之间多插一帧
     Ok(run.tally.into_summary(started.elapsed().as_millis() as u64))
@@ -195,7 +243,7 @@ where
 /// 「一个文件」，与搜索侧完全相同。自己再存一份的话就有两处读同一个原子量，
 /// 而两处的检查时机不同会让「取消之后还改了几个」变成一个说不清的数
 struct Apply<F> {
-    /// ⚠️ 与下面那个 `template` 是 `prepare` 一起编出来的那一对，理由写在
+    /// ⚠️ 与下面那个 `template` 是 `compile` 一起编出来的那一对，理由写在
     /// `run::Prepared` 上：模板里的组号是拿**这台**匹配机的 `capture_count()` 校验过的
     matcher: RegexMatcher,
     template: Template,
@@ -318,7 +366,7 @@ impl<F: FnMut(ReplaceProgress)> Apply<F> {
 /// ⚠️ 这里刻意**没有**加一条 `matcher.is_match(line)` 的前置判断来跳过没命中的行。
 /// 看着像白捡的优化，其实不是：判断本身就要把整行扫一遍正则，省下的只是
 /// `expand_line` 里那次按行长度分配（`String::from_utf8` 会复用那块缓冲，所以是一次）。
-/// 真嫌慢要先量——而量出来的结论很可能是瓶颈在把 10 MiB 从盘上读进来（实测 6.9–8.5ms）。
+/// 真嫌慢要先量——而量出来的结论很可能是瓶颈在把文件从盘上读进来（实测 10MiB 6.9–8.5ms）。
 /// 更要紧的是：多一个判断就多一处「两个谓词对『有没有命中』不一致」的可能，
 /// 而这一层的失败方式是把用户的文件改坏
 fn expand_text<'t>(template: &Template, matcher: &RegexMatcher, text: &'t str) -> (Cow<'t, str>, u32) {
@@ -425,12 +473,17 @@ struct Tally {
 impl Tally {
     /// 把遍历那一层的账并进来。
     ///
-    /// ⚠️ `unreadable` 是**加**不是赋值，理由与搜索侧那条同名方法相同：
-    /// 它同时收遍历时读不动的目录与 `fs::read` 读不动的文件。
-    /// `skipped_too_large` 则是赋值——只有遍历那一层会记它
+    /// ⚠️ 三个都是**加**（`cancelled` 是取或），理由与搜索侧那条同名方法相同：
+    /// `unreadable` 同时收遍历时读不动的目录与 `fs::read` 读不动的文件，
+    /// 而多根之后 `absorb` 会被调 N 次，写成赋值的那一个会被后一个根安静地盖掉
     fn absorb(&mut self, out: WalkOutcome) {
         self.unreadable += out.unreadable;
-        self.skipped_too_large = out.skipped_too_large;
+        // ⚠️ **加**，不是赋值。这一行在 M2-F 之前写的是 `=`，而单根之下 `absorb`
+        // 只被调一次，赋值与加完全等价——于是它安安静静地错了整个 M2-D，
+        // 没有任何一条单根测试能看出来。多根之后第二个根会把第一个根的数**盖掉**，
+        // 用户在结果条上读到「跳过 1 个太大的文件」，而实际上是 2 个。
+        // 钉住它的是 `多根之下预览与落盘仍走过同一个文件集`（那条断言写的是 2）
+        self.skipped_too_large += out.skipped_too_large;
         self.cancelled |= out.cancelled;
     }
 
@@ -548,7 +601,7 @@ mod tests {
         assert_eq!(fs::read(&ignored).unwrap(), ignored_before);
         assert_eq!(summary.files_changed, 1);
         // `.gitignore` 自己也是一个普通文件，照样被读（点开头的文件不排除，
-        // 理由在 `run::walker` 那一行上）；被 gitignore 挡掉的只有 `build/out.txt`
+        // 理由在 `project::walk` 那个遍历器上）；被 gitignore 挡掉的只有 `build/out.txt`
         assert_eq!(summary.files_scanned, 3, "src/a.ts、src/b.ts 与 .gitignore");
         assert_eq!(summary.replacements, 3, "一行一个 + 一行两个");
     }
@@ -923,8 +976,10 @@ mod tests {
         fs::write(root.join("src/c.log"), "needle\n").unwrap();
         fs::write(root.join("build/out.txt"), "needle\n").unwrap();
         fs::write(root.join("big.dat"), "needle\n").unwrap();
-        // 一个超过 MAX_FILE_BYTES 的文件：遍历那一层就该把它挡掉，两边都不碰
-        fs::write(root.join("huge.bin"), vec![b'n'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
+        // 一个超过 MAX_FILE_BYTES 的文件：遍历那一层就该把它挡掉，两边都不碰。
+        // ⚠️ 用 `set_len` 撑稀疏文件而不是真写 64 MiB：它压根不会被读（大小闸排在读
+        // 之前），而 `metadata().len()` 报的是逻辑长度，闸照样看得见
+        fs::File::create(root.join("huge.bin")).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("src/a.ts"), root.join("link.ts")).unwrap();
 
@@ -1080,6 +1135,157 @@ mod tests {
         assert_eq!(last.files_scanned, 6, "最后一个快照该落后总账一个：{last:?}");
     }
 
+    // ───────────────────────── 多根工作区（M2-F） ─────────────────────────
+    //
+    // 这一节钉的是「共用一份 `Prepared`、一本 `Tally`」在**写盘**那一侧的后果。
+    // 线上形状（`rootIndex`、进度跨根累计）在 `tests/wire_contract.rs` 里。
+
+    /// 多根之下，预览与落盘仍然走过**同一个文件集**。
+    ///
+    /// ⚠️ 这一条是 `预览与落盘走过同一个文件集` 的多根版，而它钉的不是新规则：
+    /// 两个根各自的 gitignore、include、大小上限都必须照常生效。
+    /// 单根那条红不了而这条红的唯一情形，是有人给多根另写了一个遍历
+    #[test]
+    fn 多根之下预览与落盘仍走过同一个文件集() {
+        // 两个根刻意长得一模一样：多根之下 `rel` 不再唯一，
+        // 而「两边的 a.ts 是不同文件」这件事正是要钉的
+        let dirs: Vec<tempfile::TempDir> = (0..2)
+            .map(|_| {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path();
+                fs::create_dir_all(root.join("src")).unwrap();
+                fs::create_dir_all(root.join("build")).unwrap();
+                fs::write(root.join(".gitignore"), "build/\n*.log\n").unwrap();
+                fs::write(root.join("src/a.ts"), "needle\n").unwrap();
+                fs::write(root.join("src/c.log"), "needle\n").unwrap();
+                fs::write(root.join("build/out.txt"), "needle\n").unwrap();
+                // ⚠️ 稀疏文件，理由同单根那条：这一个文件不会被读，却要在每个根里各撑一次
+                fs::File::create(root.join("huge.bin")).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
+                dir
+            })
+            .collect();
+        let roots: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+        let query = SearchQuery {
+            pattern: "needle".to_owned(),
+            replace: Some("N".to_owned()),
+            include: vec!["*.ts".to_owned(), "*.log".to_owned(), "*.bin".to_owned(), "*.txt".to_owned()],
+            ..SearchQuery::default()
+        };
+
+        // 预览收成 `(第几个根, rel)`：多根之下 `rel` 自己不足以定位一个文件
+        let mut previewed: Vec<(u16, String)> = Vec::new();
+        crate::search::search_roots(&roots, &query, &AtomicBool::new(false), |b| {
+            for f in b.files {
+                previewed.push((f.root_index, f.rel));
+            }
+        })
+        .unwrap();
+        assert_eq!(previewed, vec![(0, "src/a.ts".to_owned()), (1, "src/a.ts".to_owned())]);
+
+        let request = ReplaceRequest { query, skip: Vec::new() };
+        let summary = apply_roots(&roots, &request, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(summary.files_changed, previewed.len() as u32);
+        assert_eq!(summary.skipped_too_large, 2, "每个根各有一个太大的文件，两边都要计数");
+
+        // ⚠️ 真正钉住这一条的是下面这两圈：把两个根里**每一个**文件都验一遍，
+        // 断言改了的正好是预览里那两个。少了它，「落盘多改了一个 gitignore 里的文件」
+        // 在 `files_changed` 上是看不出来的——那只是个数字，多一个少一个都「看起来合理」
+        for (index, root) in roots.iter().enumerate() {
+            for name in ["src/a.ts", "src/c.log", "build/out.txt"] {
+                let body = fs::read_to_string(root.join(name)).unwrap();
+                let changed = name == "src/a.ts";
+                assert_eq!(body.contains('N') && !body.contains("needle"), changed, "根 {index} 的 {name}");
+            }
+            // 太大的那个连读都没读，长度就是证据
+            assert_eq!(fs::metadata(root.join("huge.bin")).unwrap().len(), MAX_FILE_BYTES + 1, "根 {index}");
+        }
+    }
+
+    /// 多根之下 `MAX_HITS` 也是**整次替换**的预算，不是每个根一份。
+    ///
+    /// 每个根各两万处的话，用户批准的是两万而磁盘上被改了四万——
+    /// 而这一层没有撤销
+    #[test]
+    fn 多根替换的命中上限也是整次的预算() {
+        let body = "needle\n".repeat(MAX_HITS_PER_FILE as usize);
+        let replaced = "N\n".repeat(MAX_HITS_PER_FILE as usize);
+        let dirs: Vec<tempfile::TempDir> = (0..2)
+            .map(|_| {
+                let dir = tempfile::tempdir().unwrap();
+                // 每个根 25 个满文件 = 12500 处，两个根 25000 处，超过 MAX_HITS(20000)
+                for i in 0..25 {
+                    fs::write(dir.path().join(format!("f{i:02}.txt")), &body).unwrap();
+                }
+                dir
+            })
+            .collect();
+        let roots: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+
+        let summary = apply_roots(&roots, &request("needle", "N"), &AtomicBool::new(false), |_| {}).unwrap();
+
+        assert!(summary.truncated, "撞到上限却没有报截断");
+        assert_eq!(summary.replacements, MAX_HITS);
+        assert_eq!(summary.files_changed, MAX_HITS / MAX_HITS_PER_FILE);
+        // 撞线之后整个收手：第二个根只走到第 15 个文件，剩下的 10 个原样不动
+        let changed_second =
+            (0..25).filter(|i| fs::read_to_string(roots[1].join(format!("f{i:02}.txt"))).unwrap() == replaced).count();
+        assert_eq!(changed_second, 15, "第二个根被改的文件数不对：预算是整次的");
+        assert_eq!(fs::read_to_string(roots[0].join("f24.txt")).unwrap(), replaced, "第一个根该走完");
+    }
+
+    /// 取消在**根之间**也生效，而且是在**读第一个字节之前**就生效。
+    #[test]
+    fn 取消之后不再改下一个根的文件() {
+        let dirs: Vec<tempfile::TempDir> = (0..2)
+            .map(|_| {
+                let dir = tempfile::tempdir().unwrap();
+                fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+                dir
+            })
+            .collect();
+        let roots: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+
+        // ⚠️ 一开始就是取消状态：`walk_files` 逐个条目问，而问的时机在扫那个文件之前
+        let summary = apply_roots(&roots, &request("needle", "N"), &AtomicBool::new(true), |_| {}).unwrap();
+
+        assert!(summary.cancelled);
+        assert!(!summary.truncated, "取消不是截断，两个数在 UI 上是两句话");
+        assert_eq!((summary.files_scanned, summary.files_changed, summary.replacements), (0, 0, 0));
+        for root in &roots {
+            assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "needle\n");
+        }
+    }
+
+    /// `roots` 为空是**合法**的，得到一份全零总账（与 `search_roots` 同一条规矩）。
+    ///
+    /// ⚠️ 每个「没改成」的原因都摆出来，而不是只断言 `files_changed == 0`：
+    /// 全零与「有个数没归零」在 UI 上是两句话，而这一层的每一个计数器都会变成
+    /// 结果条上的一行字
+    #[test]
+    fn 空的根清单落盘得到一份全零总账() {
+        let summary = apply_roots(&[], &request("needle", "N"), &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(
+            (
+                summary.files_scanned,
+                summary.files_changed,
+                summary.replacements,
+                summary.skipped_binary,
+                summary.skipped_lossy,
+                summary.skipped_unmappable,
+                summary.skipped_too_large,
+                summary.skipped_open,
+                summary.unreadable,
+                summary.write_failed,
+                summary.truncated,
+                summary.cancelled
+            ),
+            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false)
+        );
+        // 起飞前检查也得放行：UI 那边自己拦着「没有根就不让替换」，
+        // 两处说法不一致的话前端就得为一条到不了的路径多写一个分支
+        assert!(preflight_apply_roots(&[], &request("needle", "N")).is_ok());
+    }
+
     // ───────────────────────── 起飞前检查 ─────────────────────────
 
     #[test]
@@ -1161,12 +1367,9 @@ mod tests {
     /// 出错时分不清是按行拼字符串错了还是编码错了
     #[test]
     fn 按行拼接的边界情况() {
-        let dir = tempfile::tempdir().unwrap();
-        let prepared = prepare(
-            dir.path(),
-            &SearchQuery { pattern: "a".to_owned(), replace: Some("Z".to_owned()), ..SearchQuery::default() },
-        )
-        .unwrap();
+        let prepared =
+            compile(&SearchQuery { pattern: "a".to_owned(), replace: Some("Z".to_owned()), ..SearchQuery::default() })
+                .unwrap();
         let matcher = &prepared.matcher;
         let template = prepared.template.as_ref().unwrap();
         let run =

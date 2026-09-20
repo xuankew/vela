@@ -6,7 +6,6 @@
  * 直接钉住，不必挂 jsdom、不必假装 `invoke`：
  *
  * - `flattenRows`：树的结构（哪些层摊开了、哪层还在读、哪层读失败了）
- * - `visibleWindow`：虚拟滚动的窗口算术
  * - `actionForKey`：方向键在一棵树上到底该干什么
  * - `displayName` / `childRel` / `parentRel`：rel 与显示名的拆与拼（M2-B-5）
  * - `containerRel` / `menuFor`：右键一行该给出哪些菜单项（M2-B-5）
@@ -20,6 +19,15 @@
  * 「这一层正在读 / 这一层读失败了」对所有层都是同一条规则（按 `row.rel` 去查），
  * 根层不必单独在标题上开一块地方显示错误。M2-F 的多根工作区也正好落在这个形状上——
  * 一个根一行。
+ *
+ * ## 多根之下「哪一行」怎么说（M2-F）
+ *
+ * 单根时代 `rel` 就是一行的身份。多根之后不成立了：两个根都有一条 `''`（各自的根行），
+ * 也可能都有一条 `src/a.ts`。于是身份变成**「第几个根 + 那个根里的 rel」**，即 `RowKey`。
+ *
+ * ⚠️ 只有「跨根」的那几件事需要它：选中、方向键的落点。根**内部**的一切（缓存、展开集合、
+ * loading、错误、`listDir` 的入参）照旧按裸 `rel` 索引——每个根有自己的一份状态，
+ * 见 `./store.ts`。把 `RowKey` 渗进那一层只会让每个 Map 的键都长一截而什么都没解决。
  */
 
 import type { DirEntry } from '../ipc/project'
@@ -27,15 +35,25 @@ import type { DirEntry } from '../ipc/project'
 /** 树里的一行。扁平化之后只有「第几行、缩进多深」，没有父子指针 */
 export interface TreeRow {
   /**
-   * 相对项目根的路径，与 `listDir` 的 `rel` 同一个口径：**根行是空字符串**。
+   * 这一行属于工作区里第几个根，从 0 起。
+   *
+   * ⚠️ 与 `SearchFile.rootIndex` / `FileMatch.rootIndex` 同一个口径，也同一条来源：
+   * 顺序就是那份根清单的顺序。前端**从不**用「把 `rel` 从 `path` 头上剥掉」来反推它
+   * ——那是路径算术，M2-A 就把它赶出前端了。
+   */
+  rootIndex: number
+  /**
+   * 相对**它那个根**的路径，与 `listDir` 的 `rel` 同一个口径：**根行是空字符串**。
    * 展开一行就是拿它的 `rel` 再调一次 `listDir`，前端从不自己拼路径。
+   *
+   * ⚠️ 多根之下它不再全局唯一（两个根都有一条 `''`）。要唯一就用 `keyOf(row)`
    */
   rel: string
   name: string
   /** 绝对路径。点文件时原样交给 `openFile` */
   path: string
   isDir: boolean
-  /** 缩进层级。根行 0，根的直接子项 1 */
+  /** 缩进层级。每个根的根行都是 0，根的直接子项 1 */
   depth: number
   /** 只对目录有意义。文件恒为 false，读它之前先看 `isDir` */
   expanded: boolean
@@ -43,6 +61,43 @@ export interface TreeRow {
   loading: boolean
   /** 这一层读失败的原因（已经落地成人话），null = 没出错 */
   error: string | null
+}
+
+/**
+ * 一行在**整份工作区**里的身份：第几个根 + 那个根里的 rel。
+ *
+ * 做成结构体而不是一条拼出来的字符串（`"0:src/a.ts"`），有两个理由：
+ *
+ * 1. **拿得出 `rootIndex`。** 方向键跨根之后，「摊开这一层」必须知道去哪个根上摊——
+ *    字符串形式就得在每个用到的地方再解析一遍，而解析函数是又一处会漂的约定。
+ * 2. **类型挡得住混淆。** `selected()` 是 `RowKey | null`，写成 `selected() === row.rel`
+ *    当场就是编译错误。若两边都是 `string`，那一行编译得过、跑起来永远不相等，
+ *    表现是「选中高亮没了、方向键每次都从第一行起步」——不报错，只是行为莫名其妙。
+ */
+export interface RowKey {
+  readonly rootIndex: number
+  readonly rel: string
+}
+
+/** `RowKey` 唯一的构造入口。字段是 `readonly`，所以拿到之后不会被就地改掉 */
+export function rowKey(rootIndex: number, rel: string): RowKey {
+  return { rootIndex, rel }
+}
+
+/** 一行的身份。`TreeRow` 上那两个字段就是它，这里只是免掉每次手写两遍 */
+export function keyOf(row: TreeRow): RowKey {
+  return { rootIndex: row.rootIndex, rel: row.rel }
+}
+
+/**
+ * 两个身份指的是不是同一行。
+ *
+ * 不能拿 `===` 比：`keyOf` 每次都新建一个对象，而 `rows()` 是 memo、一摊一收就整个重算，
+ * 引用相等永远为假。所有「这一行是不是选中的那一行」的判断都必须走这里
+ */
+export function sameRow(a: RowKey | null, b: RowKey | null): boolean {
+  if (a === null || b === null) return a === b
+  return a.rootIndex === b.rootIndex && a.rel === b.rel
 }
 
 /** `flattenRows` 要的全部输入。全是只读容器：store 每次改状态都换一个新引用 */
@@ -61,33 +116,46 @@ export interface TreeSnapshot {
   errors: ReadonlyMap<string, string>
 }
 
-/** 行高固定是这个值，虚拟滚动才有 O(1) 的窗口算术（见 `visibleWindow`） */
+/**
+ * 树的行高。
+ *
+ * 定高行是虚拟滚动那套 O(1) 窗口算术（`src/ui/virtual.ts` 的 `visibleWindow`）的前提，
+ * 而且**只有一个真相**：`Sidebar.tsx` 把它注入成 CSS 变量 `--vela-tree-row-height`，
+ * 样式表里不许出现第二个 `22px` 字面量——漂移的失败方式是「行与行之间露出一条缝」，
+ * 不报错，只是难看。
+ */
 export const ROW_HEIGHT = 22
 
 /**
- * 可视区上下各多渲染几行。
- *
- * 不设 overscan 的话，快速滚动时新行是「滚进来了才创建」，肉眼能看到一段空白跟着滚。
- * 6 行约 132px，比一次惯性滚动的位移小不了多少，而代价只是多 12 个 DOM 节点。
- */
-export const OVERSCAN = 6
-
-/**
- * 把树摊成扁平行数组。
+ * 把**一个根**的树摊成扁平行数组。
  *
  * 只走**摊开且已经取回来**的层：没摊开的目录不递归进去（那会逼着 Rust 建全量树），
  * 摊开了但条目还没回来的目录只产出它自己那一行 + `loading: true`。
  * 所以这个函数的成本只与「用户看得见多少行」有关，与仓库有多少文件无关——
  * PLAN §3.4 的验收判据（10 万+ 文件秒开）就是靠这条撑着的。
+ *
+ * `rootIndex` 是这一份快照在工作区里的位次，原样盖到它产出的**每一行**上。
+ * 多根时把 N 份结果按位次首尾相接就是整棵树，而接完仍然满足 `actionForKey` 要的两条：
+ * 同一根的行连续（所以「找父目录」只要不跨根就是对的），根行在每个根的开头（所以
+ * 上下键跨根时落到的正是另一个根的根行或其最后一个子项）。
  */
-export function flattenRows(snapshot: TreeSnapshot): TreeRow[] {
+export function flattenRows(snapshot: TreeSnapshot, rootIndex: number): TreeRow[] {
   const rows: TreeRow[] = []
-  appendDir(rows, snapshot, '', snapshot.rootName, snapshot.rootPath, 0)
+  appendDir(rows, snapshot, rootIndex, '', snapshot.rootName, snapshot.rootPath, 0)
   return rows
 }
 
-function appendDir(rows: TreeRow[], snapshot: TreeSnapshot, rel: string, name: string, path: string, depth: number) {
+function appendDir(
+  rows: TreeRow[],
+  snapshot: TreeSnapshot,
+  rootIndex: number,
+  rel: string,
+  name: string,
+  path: string,
+  depth: number,
+) {
   rows.push({
+    rootIndex,
     rel,
     name,
     path,
@@ -106,9 +174,10 @@ function appendDir(rows: TreeRow[], snapshot: TreeSnapshot, rel: string, name: s
     if (entry.isDir) {
       // 递归深度等于用户摊开的层数，而层数被真实目录深度挡着（本仓库最深 6 层）。
       // 没有「一键全部展开」，所以不存在被 node_modules 那种深度炸栈的路径
-      appendDir(rows, snapshot, entry.rel, entry.name, entry.path, depth + 1)
+      appendDir(rows, snapshot, rootIndex, entry.rel, entry.name, entry.path, depth + 1)
     } else {
       rows.push({
+        rootIndex,
         rel: entry.rel,
         name: entry.name,
         path: entry.path,
@@ -166,8 +235,8 @@ export function parentRel(rel: string): string {
   return at < 0 ? '' : rel.slice(0, at)
 }
 
-/** 右键菜单里的一项动作。六个都是 store 上已有的方法，一一对应 */
-export type TreeMenuAction = 'newFile' | 'newFolder' | 'rename' | 'trash' | 'reveal' | 'copyPath'
+/** 右键菜单里的一项动作。七个都是 store 上已有的方法，一一对应 */
+export type TreeMenuAction = 'newFile' | 'newFolder' | 'rename' | 'trash' | 'reveal' | 'copyPath' | 'removeRoot'
 
 export interface TreeMenuItem {
   action: TreeMenuAction
@@ -176,8 +245,11 @@ export interface TreeMenuItem {
    * 在这一项**上面**画一条分隔线。
    *
    * 分组按「会不会改磁盘」：新建是一组，改名与移到废纸篓是一组，
-   * 最后那两项压根不碰文件（只是把 Finder 推到前台 / 写剪贴板）。
+   * 「在 Finder 中显示」与「复制路径」压根不碰文件（只是把 Finder 推到前台 / 写剪贴板）。
    * 混在一起的话「复制路径」与「移到废纸篓」隔着一次误点，而前者是每天用几十次的动作。
+   *
+   * 「从工作区移除」自己一组、排在最后：它也不碰磁盘，但**整个根连同它下面所有行都会
+   * 从树上消失**，与「复制路径」之间必须隔着一次误点的距离。
    */
   separator?: boolean
 }
@@ -200,8 +272,16 @@ export function containerRel(row: TreeRow): string {
  * 这条规则放在纯函数层而不是渲染时写个 `Show when`，是因为它必须在测试里被钉住——
  * 「菜单里不显示这一项」是一条改渲染时就会被改坏的约定，而 `store.trash` 里那道
  * `rel === ''` 的拦截只是最后一道网，网住了也只来得及在用户点下去之后说一句不行。
+ *
+ * 判据是 `rel === ''` 而**不看 `rootIndex`**：多根之下每个根都有一条根行，
+ * 而那 N 条一条都不许改名或扔进废纸篓。所以「是不是根行」在每个根内部是同一个问题。
+ *
+ * @param rootCount 工作区里现在有几个根。只用来**给根行那一项挑措辞**：
+ *   一个根时说「关闭文件夹」（与头部那个 × 的 title 同一句话），多个根时说
+ *   「从工作区移除」。两句话背后是同一个动作，而说反了会让用户以为要丢东西——
+ *   只有一个根的时候「工作区」这个词在界面上压根没出现过
  */
-export function menuFor(row: TreeRow): TreeMenuItem[] {
+export function menuFor(row: TreeRow, rootCount: number): TreeMenuItem[] {
   const isRoot = row.rel === ''
   const items: TreeMenuItem[] = [
     { action: 'newFile', label: '新建文件' },
@@ -215,51 +295,26 @@ export function menuFor(row: TreeRow): TreeMenuItem[] {
   }
   items.push({ action: 'reveal', label: '在 Finder 中显示', separator: true })
   items.push({ action: 'copyPath', label: '复制路径' })
+  // 只在根行上出现，理由与「不给移到废纸篓」是同一条的两半：
+  // 根文件夹本身不许扔，但「我不再在这个项目里干活了」必须有个出口
+  if (isRoot) {
+    items.push({ action: 'removeRoot', label: rootCount > 1 ? '从工作区移除' : '关闭文件夹', separator: true })
+  }
   return items
 }
 
-/** `visibleWindow` 的结果：渲染 `[start, end)` 这几行，整列撑多高，往上偏多少 */
-export interface VirtualWindow {
-  start: number
-  /** 不含。等于 `start` 时一行都不渲染 */
-  end: number
-  /** 这一批行的顶边离列表顶边多少像素 */
-  offsetY: number
-  /** 滚动容器里那个占位元素的总高度 */
-  totalHeight: number
-}
-
 /**
- * 算出该渲染哪几行。
+ * 一次按键要做的动作。`none` = 这个键在这棵树此刻的状态下什么都不该干。
  *
- * 定高行 + 直接除法，没有累计高度的前缀和数组：一万行和十万行的成本都是 O(1)。
- *
- * ⚠️ `viewportHeight` 为 0 时返回 `overscan` 行而不是 0 行。这不是给 jsdom 开的后门
- * （虽然 jsdom 里 `clientHeight` 恒为 0，组件测试看到的正是头 6 行）：侧边栏被拖到
- * 看不见时多渲染 6 个节点没有任何代价，而返回 0 行会让「刚展开侧栏的那一帧」是空白的。
+ * ⚠️ 每个动作都带一份 `RowKey` 而不是裸 `rel`：多根之下「摊开 src」这句话是不完整的，
+ * 得说清是**哪个根**的 src。少带 `rootIndex` 的失败方式不是报错，而是操作落到
+ * 另一个根的同名目录上——两个根都有 `src` 是极常见的事。
  */
-export function visibleWindow(
-  scrollTop: number,
-  viewportHeight: number,
-  total: number,
-  rowHeight: number = ROW_HEIGHT,
-  overscan: number = OVERSCAN,
-): VirtualWindow {
-  if (total <= 0 || rowHeight <= 0) return { start: 0, end: 0, offsetY: 0, totalHeight: 0 }
-  const top = Math.max(0, scrollTop)
-  const first = Math.floor(top / rowHeight)
-  const start = Math.max(0, Math.min(first - overscan, total))
-  const shown = Math.ceil(Math.max(0, viewportHeight) / rowHeight)
-  const end = Math.max(start, Math.min(total, first + shown + overscan))
-  return { start, end, offsetY: start * rowHeight, totalHeight: total * rowHeight }
-}
-
-/** 一次按键要做的动作。`none` = 这个键在这棵树此刻的状态下什么都不该干 */
 export type TreeAction =
-  | { kind: 'select'; rel: string }
-  | { kind: 'expand'; rel: string }
-  | { kind: 'collapse'; rel: string }
-  | { kind: 'open'; rel: string }
+  | { kind: 'select'; key: RowKey }
+  | { kind: 'expand'; key: RowKey }
+  | { kind: 'collapse'; key: RowKey }
+  | { kind: 'open'; key: RowKey }
   | { kind: 'none' }
 
 /** `actionForKey` 认的键。用 `e.key` 的字面值，不经过命令中心的 keybinding 解析 */
@@ -298,11 +353,16 @@ const NONE: TreeAction = { kind: 'none' }
  * - Enter：文件 → 打开；目录 → 切换摊开
  *
  * 之所以做成纯函数而不是写在组件的 onKeyDown 里：这九条分支是整棵树里最容易写错、
- * 也最容易在改渲染时改坏的部分，而它对 DOM 的要求只是「给我一个 rel」。
+ * 也最容易在改渲染时改坏的部分，而它对 DOM 的要求只是「给我一个 RowKey」。
+ *
+ * ⚠️ `rows` 在多根之下是**所有根首尾相接**的那一份，所以上下键自然会跨根：
+ * 在根 A 的最后一行按下键就落到根 B 的根行。这正是 VS Code 的行为，也正是
+ * 「一份扁平数组 + ±1」这个实现能白拿到的东西——不需要为跨根写任何一条分支。
+ * 反过来说，左键**必须**拦住跨根，见 `parentOf`。
  */
-export function actionForKey(rows: readonly TreeRow[], current: string | null, key: TreeKey): TreeAction {
+export function actionForKey(rows: readonly TreeRow[], current: RowKey | null, key: TreeKey): TreeAction {
   if (rows.length === 0) return NONE
-  const at = current === null ? -1 : rows.findIndex((r) => r.rel === current)
+  const at = current === null ? -1 : rows.findIndex((r) => sameRow(keyOf(r), current))
   const row = at < 0 ? undefined : rows[at]
 
   switch (key) {
@@ -318,36 +378,46 @@ export function actionForKey(rows: readonly TreeRow[], current: string | null, k
     case 'ArrowRight': {
       if (!row) return select(rows[0]!)
       if (!row.isDir) return NONE
-      if (!row.expanded) return { kind: 'expand', rel: row.rel }
+      if (!row.expanded) return { kind: 'expand', key: keyOf(row) }
       const child = rows[at + 1]
       // 摊开了但没有下一行 = 空目录，无处可去
       return child ? select(child) : NONE
     }
     case 'ArrowLeft': {
       if (!row) return select(rows[0]!)
-      if (row.isDir && row.expanded) return { kind: 'collapse', rel: row.rel }
+      if (row.isDir && row.expanded) return { kind: 'collapse', key: keyOf(row) }
       const parent = parentOf(rows, at)
       return parent ? select(parent) : NONE
     }
     case 'Enter': {
       if (!row) return NONE
-      if (!row.isDir) return { kind: 'open', rel: row.rel }
-      return row.expanded ? { kind: 'collapse', rel: row.rel } : { kind: 'expand', rel: row.rel }
+      const target = keyOf(row)
+      if (!row.isDir) return { kind: 'open', key: target }
+      return row.expanded ? { kind: 'collapse', key: target } : { kind: 'expand', key: target }
     }
   }
 }
 
 function select(row: TreeRow): TreeAction {
-  return { kind: 'select', rel: row.rel }
+  return { kind: 'select', key: keyOf(row) }
 }
 
-/** 往上找第一个缩进比 `at` 浅的行。找不到（`at` 已经是根行）返回 undefined */
+/**
+ * 往上找**同一个根里**第一个缩进比 `at` 浅的行。找不到（`at` 已经是根行）返回 undefined。
+ *
+ * 父目录按定义就在同一个根里，所以那道 `rootIndex` 检查是这个函数**定义的一部分**，
+ * 不是一道兜底：它让「不跨根」这件事在本函数内成立，而不是依赖一条外部性质
+ * （`flattenRows` 每次都先产出一条 depth 0 的根行，所以往回扫总会先撞上它）。
+ * 少了这条检查，本函数在今天的调用方式下结果一样——但正确性就寄在了另一个函数
+ * 的实现细节上，而那个细节改起来不会有测试变红。
+ */
 function parentOf(rows: readonly TreeRow[], at: number): TreeRow | undefined {
-  const depth = rows[at]?.depth
-  if (depth === undefined) return undefined
+  const row = rows[at]
+  if (!row) return undefined
   for (let i = at - 1; i >= 0; i--) {
-    const row = rows[i]!
-    if (row.depth < depth) return row
+    const above = rows[i]!
+    if (above.rootIndex !== row.rootIndex) return undefined
+    if (above.depth < row.depth) return above
   }
   return undefined
 }

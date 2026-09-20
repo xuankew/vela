@@ -107,14 +107,13 @@ pub struct SessionTab {
     pub scroll_left: f64,
 }
 
-/// 项目树那一头的现场（M2-B-4）。
+/// 工作区里**一个根**的现场。
 ///
-/// 与标签页是**两套独立的状态**：树管「磁盘上有什么」，标签管「打开了哪些文档」。
-/// 关掉文件夹不动任何标签，反过来也一样。所以它在存档里也是一个独立的可选部分，
-/// 而不是塞进 `SessionTab` 里的某个字段。
+/// 它就是 M2-B-4 那个 `SessionProject` 的原样内容——多根工作区（M2-F）把「一份树的现场」
+/// 变成了「N 份」，于是把原来的两个字段整个下移一层，外层只留一个数组。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionProject {
+pub struct SessionRoot {
     /// 项目根的绝对路径。恢复时原样喂给 `list_dir`，前端不做任何路径算术
     pub root: String,
     /// 摊开着的层的 `rel`，含 `""`（根本身）。
@@ -127,6 +126,66 @@ pub struct SessionProject {
     /// Rust 这边管的是 4MiB 的 payload 预算，`MAX_SESSION_BYTES` 已经在管了。
     /// 两边各截一次的结果是「谁也说不清最终是多少条」，所以刻意只留一处。
     pub expanded: Vec<String>,
+}
+
+/// 项目树那一头的现场（M2-B-4；M2-F 起是**多根**）。
+///
+/// 与标签页是**两套独立的状态**：树管「磁盘上有什么」，标签管「打开了哪些文档」。
+/// 关掉文件夹不动任何标签，反过来也一样。所以它在存档里也是一个独立的可选部分，
+/// 而不是塞进 `SessionTab` 里的某个字段。
+///
+/// ## 顺序就是 `rootIndex`
+///
+/// `roots[i]` 恢复出来的树在侧边栏里排第 `i` 位，而行与选中的身份是
+/// 「第几个根 + 那个根里的 rel」（`src/project/tree.ts` 的 `RowKey`）。所以这个数组
+/// 的顺序是**契约的一部分**，不是随手排的：写的时候按侧边栏的顺序写，读的时候原样恢复。
+///
+/// ## 旧档（单个 `root` 键）照旧能读
+///
+/// `Deserialize` 是手写的，认两种形状：新形状 `{"roots":[…]}`，以及 M2-B-4 到 M2-E
+/// 写下的旧形状 `{"root":"…","expanded":[…]}`——后者被读成只有一个元素的数组。
+/// 用两个 `Option` 字段的影子结构而不是 `#[serde(untagged)]`：untagged 的错误信息是
+/// 「data did not match any variant」，而会话文件是系统边界，读不回来时必须能说出
+/// **少了哪个键**。影子结构也是本文件 `Session::deserialize` 已经在用的写法。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionProject {
+    /// 工作区里的根，顺序就是侧边栏里的顺序。
+    ///
+    /// ⚠️ **不允许为空**：「没打开任何文件夹」在存档里是 `project: null`，
+    /// 而不是 `roots: []`。一个事实只留一种写法，否则「上次到底开没开文件夹」
+    /// 就有了两个可能互相矛盾的答案。`validate` 会拒掉空数组。
+    pub roots: Vec<SessionRoot>,
+}
+
+impl<'de> Deserialize<'de> for SessionProject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Raw {
+            #[serde(default)]
+            roots: Option<Vec<SessionRoot>>,
+            #[serde(default)]
+            root: Option<String>,
+            #[serde(default)]
+            expanded: Option<Vec<String>>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        // 两个键都在时以 `roots` 为准：serde 本来就忽略未知字段，
+        // 这里只是把「谁是真相」写明白，而不是让字段声明的先后顺序替我们决定
+        if let Some(roots) = raw.roots {
+            return Ok(SessionProject { roots });
+        }
+        match (raw.root, raw.expanded) {
+            (Some(root), Some(expanded)) => Ok(SessionProject { roots: vec![SessionRoot { root, expanded }] }),
+            (Some(_), None) => Err(serde::de::Error::missing_field("project.expanded")),
+            (None, _) => Err(serde::de::Error::missing_field("project.roots")),
+        }
+    }
 }
 
 /// 一次完整的会话快照。
@@ -153,9 +212,7 @@ pub struct Session {
     ///
     /// 版本号的全部作用是「不认识就整份作废」，而这里**不存在读不懂的情形**：
     /// 读的方向上，`Raw::project` 带 `#[serde(default)]`，M1-F 时代写下的存档（没有这个
-    /// key）解析成 `None`，等价于「上次没打开文件夹」——正是当时的事实；
-    /// 写的方向上，serde 默认**忽略**未知字段，所以旧版 Vela 读到新存档只会当没看见。
-    /// 两个方向都优雅降级，没有哪一边会得到一个半对半错的现场，于是没有作废的必要。
+    /// key）解析成 `None`，等价于「上次没打开文件夹」——正是当时的事实。
     ///
     /// 反过来说， bump 版本号的代价是确定的：所有 M1-F 用户重启一次就丢光会话。
     /// 为一次纯增量的可选字段付这个代价不划算。
@@ -163,6 +220,23 @@ pub struct Session {
     /// ⚠️ 这条推理只对「**新增可选字段**」成立。哪天要改已有字段的含义、要删字段、
     /// 或者要收紧 `validate`（让原本合法的存档变非法），版本号就必须动——那时
     /// 「整份作废」比「解析成一半对一半错」好排查得多，见 `SESSION_VERSION` 的文档。
+    ///
+    /// ## ⚠️ M2-F 把它改成了多根，于是「写的方向」不再优雅降级
+    ///
+    /// `SessionProject` 从 `{root, expanded}` 变成了 `{roots:[{root, expanded}, …]}`：
+    /// 这不是新增可选字段，是改了已有字段的形状，所以上面那段推理的前提已经不成立了。
+    /// 两个方向分开看：
+    ///
+    /// - **新版读旧档**：`SessionProject::deserialize` 认旧形状，把它读成一个元素的数组。
+    ///   这一条必须做到——升级不该赔掉用户的会话。
+    /// - **旧版读新档**：M2-E 及以前的 `SessionProject` 要求 `root` 键，新档里没有，
+    ///   于是整份存档解析失败，旧版报一句「会话文件读不回来」然后空着启动。
+    ///
+    /// 明知如此还是**没有** bump `SESSION_VERSION`：bump 的代价是「新版读到旧档就整份作废」，
+    /// 那会让每个升级上来的用户都丢一次会话；而降级远比升级罕见，且它的失败方式是一句
+    /// 人话，不是半对半错的现场。也没有同时写两种形状（`{root, expanded, roots}`）：
+    /// 那样旧版能读到第一个根，代价是同一个事实有了两份写法，而「手改了 `root` 却不生效」
+    /// 这类问题查起来比丢一次会话更贵。
     ///
     /// ## 为什么刻意**不**用 `skip_serializing_if = "Option::is_none"`
     ///
@@ -172,6 +246,50 @@ pub struct Session {
     /// `SessionProject | null` 而不是 `?:`，符合 `src/ipc/session.ts` 那条「可空字段
     /// 一律显式 `null`」的规矩。
     pub project: Option<SessionProject>,
+    /// 最近打开过的文件的**绝对路径**，最新的在最前面（M2-E，`Cmd+P` 的 MRU 加分）。
+    ///
+    /// ## 为什么加了它 `SESSION_VERSION` 还是 1
+    ///
+    /// 与 `project` 完全同一条推理（见上面那一节）：读的方向上带 `#[serde(default)]`，
+    /// 旧存档缺这个 key 解析成一份空清单，而空清单在 `Cmd+P` 上的表现是「不加分，
+    /// 只按匹配分排」——那是一个合法的现场，不是一句错误。写的方向上 serde 忽略未知字段。
+    ///
+    /// ## ⚠️ 为什么**不**校验、也**不**在这里截断
+    ///
+    /// 一份手改过的存档能塞进来几万条。`validate` 拒掉它的代价是**整份会话作废**——
+    /// 为一个只影响排序的提示把用户所有标签连未保存的草稿一起赔进去，
+    /// 这笔交换比 `project.roots[i].root` 那条差远了（那条不拦会让 `list_dir` 收到一个相对路径）。
+    ///
+    /// 条数上限归**前端**（`src/doc/workspace.ts` 的 `MAX_RECENT`，与
+    /// `project::index::MAX_RECENT` 同值，两边各有一条测试钉住那个数字），恢复时夹一次。
+    /// 分工与 `SessionRoot::expanded` 的 `MAX_RESTORED_EXPANDED` 是同一套：
+    /// 两边各夹一次的结果是谁也说不清最终有多少条，所以只夹一次。
+    ///
+    /// 而一份**没被夹过**的超长清单在消费端也不造成任何损失：
+    /// `FileIndex::recent_bonus` 自己 `take(MAX_RECENT)`，多出来的部分压根不看。
+    ///
+    /// 同理不去重：重复条目只是让那个文件多拿一次加分，而排序本来就是近似的。
+    /// 「没有重复」是前端写入时维护的不变量，在这里再实现一遍就是第二份会漂的抄写。
+    pub recent: Vec<String>,
+    /// 最近打开过的**工作区**，最新的在最前面（M2-F-6，`Cmd+Shift+O` 的数据源）。
+    ///
+    /// ## 一条是一个**根清单**，不是一个路径
+    ///
+    /// 多根工作区（M2-F）是用户亲手攒出来的：一个个「添加文件夹到工作区」点出来的三个根，
+    /// 是他此刻干活的那个项目。只记单个文件夹的话，切回来就只剩一个根，而「我刚才那三个
+    /// 文件夹呢」这件事没有任何提示——它会看起来像是这个项目本来就这么大。
+    ///
+    /// 顺序同样是契约：它就是侧边栏从上到下的顺序，也就是 `RowKey.rootIndex`。
+    ///
+    /// ## 与 `recent` 同一条推理，所以同样不校验、不截断
+    ///
+    /// 读的方向上 `Raw` 带 `#[serde(default)]`，旧存档缺这个 key 解析成空清单——
+    /// 在 `Cmd+Shift+O` 上的表现是「还没有别的项目」，那是一个合法现场。
+    /// 写的方向上 serde 忽略未知字段，所以降级到 M2-E 也不会整份作废。
+    ///
+    /// 条数上限归**前端**（`src/project/store.ts` 的 `MAX_RECENT_PROJECTS`），恢复时夹一次。
+    /// 这里再夹一次的结果是「谁也说不清最终是多少条」，所以刻意只留一处。
+    pub recent_projects: Vec<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for Session {
@@ -192,11 +310,17 @@ impl<'de> Deserialize<'de> for Session {
             focused: usize,
             tabs: Vec<SessionTab>,
             panes: Vec<usize>,
-            /// 唯一一个带 `default` 的字段，也就是唯一一个**后加的**字段。
-            /// M1-F 的存档里没有它，缺 key 时解析成 `None`（= 上次没打开文件夹）。
+            /// 带 `default` 的三个字段，也就是**后加的**那三个（`project` 是 M2-B-4，
+            /// `recent` 是 M2-E，`recent_projects` 是 M2-F-6）。更早的存档里没有它们：
+            /// 缺 key 时 `project` 解析成 `None`（= 上次没打开文件夹）、两个清单解析成空
+            /// （= 还没攒出最近记录），三个都等价于当时的事实。
             /// 其余字段刻意不给默认值，理由见 `lossy_与_format_缺失时整份作废`。
             #[serde(default)]
             project: Option<SessionProject>,
+            #[serde(default)]
+            recent: Vec<String>,
+            #[serde(default)]
+            recent_projects: Vec<Vec<String>>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -207,6 +331,8 @@ impl<'de> Deserialize<'de> for Session {
             tabs: raw.tabs,
             panes: raw.panes,
             project: raw.project,
+            recent: raw.recent,
+            recent_projects: raw.recent_projects,
         };
         session.validate().map_err(serde::de::Error::custom)?;
         Ok(session)
@@ -246,11 +372,15 @@ impl Session {
                 return Err(format!("tabs[{i}].main={} 越界", tab.main));
             }
         }
-        // 项目这一部分**只**校验一件事：root 不能是空字符串。
+        // 项目这一部分**只**校验两件事：`roots` 不能为空、每个 root 不能是空字符串。
         //
         // 空 root 会让 `list_dir` 收到一个相对路径，那是 `bad_root`；虽然也能被兜住，
         // 但一个空的绝对路径不可能是任何一次 dialog 的返回值，它只可能来自手改或磁盘
         // 错误，属于「这份存档不可信」。
+        //
+        // 空 `roots` 同理：前端在「一个文件夹都没打开」时写的是 `project: null`，
+        // 所以 `roots: []` 也只可能来自手改。拦它是为了不让同一个事实有两种写法——
+        // 留着的话，「上次开没开文件夹」就有了 `null` 与 `[]` 两个可能互相矛盾的答案。
         //
         // 刻意**不**在这里检查路径形状（是不是绝对、存不存在、是不是目录）：那三种情况的
         // 正确反应是「树照常建起来，在那一行显示一句错误」，而不是「整份会话作废、
@@ -258,11 +388,19 @@ impl Session {
         // 为它赔上整个会话是把两种处境混成了一种。`project/tree.rs` 的 `bad_root` /
         // `not_found` 已经走在那条行内错误的通道上，这里再判一遍只会抢在它前面。
         //
-        // 同理不校验 `expanded`：里面的 `rel` 会逐条送去 `list_dir`，越界的、重复的、
-        // 指向文件的，都会在那一层自己变成一句错误，不影响别的层。
+        // 同理不校验 `expanded`，也不校验根的**个数**与**是否重复**：里面的每一条 `rel`
+        // 都会各自送去 `list_dir`，越界的、重复的、指向文件的，都会在那一层自己变成一句
+        // 错误，不影响别的层；个数与去重是前端的启动预算问题，由 `MAX_RESTORED_ROOTS` /
+        // `MAX_RESTORED_EXPANDED` 兜住。分工与 `Session::recent` 那条一样：两边各截一次
+        // 的结果是谁也说不清最终有多少条，所以只截一次。
         if let Some(project) = &self.project {
-            if project.root.is_empty() {
-                return Err("project.root 是空字符串".into());
+            if project.roots.is_empty() {
+                return Err("project.roots 是空数组（没打开文件夹时该写 null）".into());
+            }
+            for (i, entry) in project.roots.iter().enumerate() {
+                if entry.root.is_empty() {
+                    return Err(format!("project.roots[{i}].root 是空字符串"));
+                }
             }
         }
         Ok(())
@@ -459,12 +597,25 @@ mod tests {
             // 与项目树无关的用例占绝大多数，所以默认不开文件夹；
             // 要测项目的那几条自己覆写这个字段
             project: None,
+            // MRU 同理：它与「存档能不能原样往返」这件事无关，要测它的那几条自己覆写
+            recent: Vec::new(),
+            recent_projects: Vec::new(),
         }
     }
 
     /// 最小可用会话：一个标签、一块分屏。
     fn minimal() -> Session {
         session(vec![tab(Some("/tmp/a.txt"), None)])
+    }
+
+    /// 只有一个根的工作区现场。绝大多数与项目有关的用例只关心一个根
+    fn one_root(root: &str, expanded: &[&str]) -> SessionProject {
+        SessionProject {
+            roots: vec![SessionRoot {
+                root: root.into(),
+                expanded: expanded.iter().map(|s| (*s).to_owned()).collect(),
+            }],
+        }
     }
 
     fn path_in(dir: &Path) -> std::path::PathBuf {
@@ -500,10 +651,29 @@ mod tests {
             // 空字符串 `""` 是**根**那一层的 rel，不是「没有值」。它在 `expanded` 里
             // 必须能原样往返：丢了它，恢复出来的树是收起的，用户点开过的文件夹全缩回去了，
             // 而这件事没有任何报错——正是本模块最怕的那一类失败。
+            //
+            // 两个根而不是一根：`roots` 的**顺序就是 `rootIndex`**（侧边栏里第几个项目），
+            // 而行与选中的身份是「第几个根 + rel」。顺序被排过一次的话，恢复出来的两棵树
+            // 会互换位置，而每一棵自己看起来都完好无损
             project: Some(SessionProject {
-                root: "/Users/me/code/vela".into(),
-                expanded: vec!["".into(), "src".into(), "src/project".into()],
+                roots: vec![
+                    SessionRoot {
+                        root: "/Users/me/code/vela".into(),
+                        expanded: vec!["".into(), "src".into(), "src/project".into()],
+                    },
+                    SessionRoot { root: "/Users/me/notes".into(), expanded: vec!["".into()] },
+                ],
             }),
+            // 顺序就是契约：最新的在最前面。这一条用例顺手钉住「顺序能原样往返」，
+            // 因为 `recent_bonus` 的加分是按位置递减的，一次排序失误会让 `Cmd+P`
+            // 把上周开过的文件顶到最近的那个上面去
+            recent: vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()],
+            // 两条：一条是单根，一条是多根。「一条是一个根清单」这件事只有在两种
+            // 形状同时出现时才看得见——只放单根的话嵌套层级写错（少一层数组）也照样往返
+            recent_projects: vec![
+                vec!["/tmp/a.txt".into()],
+                vec!["/Users/me/code/vela".into(), "/Users/me/notes".into()],
+            ],
         };
 
         let report = save_session(&path, original.clone()).unwrap();
@@ -643,6 +813,8 @@ mod tests {
             tabs: vec![tab(Some("/a"), None)],
             panes: vec![0, 0],
             project: None,
+            recent: Vec::new(),
+            recent_projects: Vec::new(),
         };
 
         match save_session(&path, duplicated.clone()) {
@@ -691,10 +863,10 @@ mod tests {
         let path = path_in(dir.path());
 
         let mut with_project = minimal();
-        with_project.project = Some(SessionProject { root: "/repo".into(), expanded: vec!["".into()] });
+        with_project.project = Some(one_root("/repo", &[""]));
         let current = serde_json::to_string(&with_project).unwrap();
 
-        let legacy = current.replacen(r#","project":{"root":"/repo","expanded":[""]}"#, "", 1);
+        let legacy = current.replacen(r#","project":{"roots":[{"root":"/repo","expanded":[""]}]}"#, "", 1);
         assert_ne!(legacy, current, "没摘掉 project 键——上面的字面量与真实格式不一致了");
 
         fs::write(&path, &legacy).unwrap();
@@ -708,6 +880,51 @@ mod tests {
         assert_eq!(serde_json::from_str::<Session>(&legacy).unwrap().project, None);
     }
 
+    /// **M2-B-4 到 M2-E 时代写下的存档（`project` 里是单个 `root` 键）必须还能读回来。**
+    ///
+    /// 与上一条同一个理由，只是隔了一个里程碑：M2-F 把 `SessionProject` 从
+    /// `{root, expanded}` 改成了 `{roots:[…]}`，那是**改已有字段的形状**，不是新增可选
+    /// 字段，所以 serde 不会替我们降级——`Deserialize` 是手写的，认两种形状。
+    ///
+    /// 这条要是不成立，升级到多根版本的用户重启一次就丢光会话（包括未保存的草稿），
+    /// 而他只会认为「这功能坏了」。
+    #[test]
+    fn 单根形状的旧_project_读成一个元素的数组() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        // 字面量而不是「从当前格式改出来」：这一条要钉的正是**上一版的格式本身**，
+        // 而上一版的格式不会再变，所以写死是安全的，也是最不会自我欺骗的写法
+        let baseline = minimal();
+        let json = serde_json::to_string(&baseline).unwrap();
+        let json = json.replacen(r#""project":null"#, r#""project":{"root":"/repo","expanded":["","src"]}"#, 1);
+        assert_ne!(json, serde_json::to_string(&baseline).unwrap(), "没换上 project——minimal() 的形状变了");
+
+        fs::write(&path, json.as_bytes()).unwrap();
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(loaded.project, Some(one_root("/repo", &["", "src"])));
+        // 其余部分照旧一个字都没变
+        assert_eq!(loaded.tabs, baseline.tabs);
+        assert_eq!(loaded.panes, baseline.panes);
+
+        // 结构体形态同样认（前端 invoke 的 payload 也可能是旧形状）
+        assert_eq!(
+            serde_json::from_str::<SessionProject>(r#"{"root":"/r","expanded":[]}"#).unwrap(),
+            one_root("/r", &[])
+        );
+
+        // 反面：两个键都不在，说得出少了哪一个。会话文件是系统边界，
+        // 「data did not match any variant」那种话对用户没有意义
+        let err = serde_json::from_str::<SessionProject>(r#"{"expanded":[""]}"#).unwrap_err().to_string();
+        assert!(err.contains("project.roots"), "{err}");
+        let err = serde_json::from_str::<SessionProject>(r#"{"root":"/r"}"#).unwrap_err().to_string();
+        assert!(err.contains("project.expanded"), "{err}");
+
+        // 两个键都在时以 `roots` 为准，而不是看谁在 JSON 里写在前面
+        let both = r#"{"root":"/旧","expanded":[],"roots":[{"root":"/新","expanded":["a"]}]}"#;
+        assert_eq!(serde_json::from_str::<SessionProject>(both).unwrap(), one_root("/新", &["a"]));
+    }
+
     /// `"project": null` 与「没有这个键」必须是同一件事。
     ///
     /// 前端**总是**带上这个键（没开文件夹时传 `null`），所以这条路径才是常态；
@@ -718,10 +935,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(dir.path());
         // minimal() 的 project 就是 None，而序列化时**不**省略该键（见字段文档）
-        assert!(serde_json::to_string(&minimal()).unwrap().ends_with(r#","project":null}"#));
+        assert!(serde_json::to_string(&minimal())
+            .unwrap()
+            .ends_with(r#","project":null,"recent":[],"recentProjects":[]}"#));
 
         save_session(&path, minimal()).unwrap();
         assert_eq!(load_session(&path).unwrap().unwrap().project, None);
+    }
+
+    /// 缺 `recent` 键的旧存档解析成一份空清单，**不是**整份作废。
+    ///
+    /// 空清单在 `Cmd+P` 上的表现是「不加分，只按匹配分排」——一个合法的现场，
+    /// 不是一句错误。这正是 `SESSION_VERSION` 能停在 1 的理由（见字段文档）。
+    #[test]
+    fn 缺少_recent_键的旧存档照常解析() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        let mut with_recent = minimal();
+        with_recent.recent = vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()];
+        let current = serde_json::to_string(&with_recent).unwrap();
+
+        let legacy = current.replacen(r#","recent":["/tmp/a.txt","/tmp/b.txt"]"#, "", 1);
+        assert_ne!(legacy, current, "没摘掉 recent 键——上面的字面量与真实格式不一致了");
+
+        fs::write(&path, &legacy).unwrap();
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(loaded.recent, Vec::<String>::new(), "旧存档该解析成一份空的最近清单");
+        // 同样地：降级只能是「少了新功能」，旧功能一个字都不能变
+        assert_eq!(loaded.tabs, with_recent.tabs);
+        assert_eq!(loaded.panes, with_recent.panes);
+
+        // 结构体形态走同一条路（前端 invoke 的 payload 也可能不带这个键）
+        assert!(serde_json::from_str::<Session>(&legacy).unwrap().recent.is_empty());
+    }
+
+    /// 与上一条同一件事，换 M2-F-6 那个字段：缺 `recentProjects` 键的旧存档解析成空清单。
+    ///
+    /// 两条分开写而不是一条里摘两个键：一次只改一个变量，摘错键时
+    /// `assert_ne!` 那句会指出**哪一个**对不上，而不是让人去猜两个 replacen 里哪个失手了。
+    #[test]
+    fn 缺少_recent_projects_键的旧存档照常解析() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        let mut with_projects = minimal();
+        with_projects.recent_projects = vec![vec!["/Users/me/code/vela".into(), "/Users/me/notes".into()]];
+        let current = serde_json::to_string(&with_projects).unwrap();
+
+        let legacy = current.replacen(r#","recentProjects":[["/Users/me/code/vela","/Users/me/notes"]]"#, "", 1);
+        assert_ne!(legacy, current, "没摘掉 recentProjects 键——上面的字面量与真实格式不一致了");
+
+        fs::write(&path, &legacy).unwrap();
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(loaded.recent_projects, Vec::<Vec<String>>::new(), "旧存档该解析成一份空清单");
+        // 降级只能是「少了新功能」：`Cmd+P` 的 MRU 与标签页一个字都不能变
+        assert_eq!(loaded.tabs, with_projects.tabs);
+        assert_eq!(loaded.project, with_projects.project);
+
+        assert!(serde_json::from_str::<Session>(&legacy).unwrap().recent_projects.is_empty());
+    }
+
+    /// 超长清单**既不报错也不截断**：`validate` 里没有它的位置。
+    ///
+    /// 条数上限归前端（`src/doc/workspace.ts` 的 `MAX_RECENT`），与
+    /// `SessionRoot::expanded` 的 `MAX_RESTORED_EXPANDED` 同一套分工——
+    /// 两边各截一次的结果是谁也说不清最终有多少条。见字段文档。
+    #[test]
+    fn 超长的最近清单原样往返不在_rust_侧截断() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        let mut long = minimal();
+        // 5000 条，是前端 `MAX_RECENT` 的一百倍。它唯一的代价是这份 JSON 大一点，
+        // 而消费端 `FileIndex::recent_bonus` 自己 `take(MAX_RECENT)`，多出来的一条都不会看
+        long.recent = (0..5000).map(|i| format!("/tmp/f{i}.txt")).collect();
+        let expected = long.recent.clone();
+
+        save_session(&path, long).unwrap();
+        assert_eq!(load_session(&path).unwrap().unwrap().recent, expected);
     }
 
     /// 空 root 不可能是任何一次 dialog 的返回值，它只可能来自手改或磁盘错误。
@@ -734,10 +1026,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(dir.path());
         let mut s = minimal();
-        s.project = Some(SessionProject { root: String::new(), expanded: vec!["".into()] });
+        s.project = Some(one_root("", &[""]));
 
         match save_session(&path, s.clone()) {
-            Err(SessionError::Corrupt { message }) => assert!(message.contains("project.root"), "{message}"),
+            Err(SessionError::Corrupt { message }) => assert!(message.contains("project.roots[0].root"), "{message}"),
             other => panic!("期望 Corrupt，实际 {other:?}"),
         }
         assert!(!path.exists(), "被拒的保存不该留下文件");
@@ -745,31 +1037,63 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&s).unwrap()).unwrap();
         assert!(matches!(load_session(&path), Err(SessionError::Corrupt { .. })));
 
+        // 第二个根是空的也一样被拒，而且消息里说的是**第几个**：
+        // 多根之下「有一个坏了」必须指出是哪一个，否则用户只能挨个把文件夹关掉试
+        s.project = Some(SessionProject {
+            roots: vec![
+                SessionRoot { root: "/repo".into(), expanded: vec!["".into()] },
+                SessionRoot { root: String::new(), expanded: vec!["".into()] },
+            ],
+        });
+        match save_session(&path, s.clone()) {
+            Err(SessionError::Corrupt { message }) => assert!(message.contains("project.roots[1].root"), "{message}"),
+            other => panic!("期望 Corrupt，实际 {other:?}"),
+        }
+
+        // 空数组也拒：「没打开文件夹」在存档里只有一种写法，就是 `project: null`
+        s.project = Some(SessionProject { roots: Vec::new() });
+        match save_session(&path, s.clone()) {
+            Err(SessionError::Corrupt { message }) => assert!(message.contains("project.roots"), "{message}"),
+            other => panic!("期望 Corrupt，实际 {other:?}"),
+        }
+
         // 反面对照：一个**不存在**的路径必须被接受。它会在 `list_dir` 那里变成
         // `not_found`，显示在根行上——赔掉整个会话是错的
-        s.project = Some(SessionProject { root: "/这个文件夹已经不在了".into(), expanded: vec!["".into()] });
+        s.project = Some(one_root("/这个文件夹已经不在了", &[""]));
         save_session(&path, s).unwrap();
         assert!(load_session(&path).unwrap().unwrap().project.is_some());
     }
 
-    /// `expanded` 的上限**不在这里**。
+    /// `expanded` 与 `roots` 的上限**都不在这里**。
     ///
-    /// 前端 `src/project/store.ts` 的 `MAX_RESTORED_EXPANDED` 已经在截断了，Rust 再截一遍
-    /// 就有两个真相。它要限的成本（每条 `rel` 一次 `list_dir` 往返）是**前端**的成本，
-    /// 由前端自己兜住才对；Rust 这一侧管的是 4MiB 的 payload 预算，那已经有
-    /// `MAX_SESSION_BYTES` 在拦。这条用例钉住「Rust 不动 expanded」，免得将来有人
-    /// 出于「多一层保险」在这里加个截断，然后两边各截一次、谁也说不清最终是多少条。
+    /// 前端 `src/project/store.ts` 的 `MAX_RESTORED_EXPANDED` / `MAX_RESTORED_ROOTS` 已经
+    /// 在截断了，Rust 再截一遍就有两个真相。它们要限的成本（每条 `rel` 一次 `list_dir`
+    /// 往返、每个根一份索引与缓存）是**前端**的成本，由前端自己兜住才对；Rust 这一侧
+    /// 管的是 4MiB 的 payload 预算，那已经有 `MAX_SESSION_BYTES` 在拦。这条用例钉住
+    /// 「Rust 两样都不动」，免得将来有人出于「多一层保险」在这里加个截断，
+    /// 然后两边各截一次、谁也说不清最终是多少条。
     #[test]
-    fn 展开列表原样往返不在_rust_侧截断() {
+    fn 展开列表与根的个数原样往返不在_rust_侧截断() {
         let dir = tempfile::tempdir().unwrap();
         let path = path_in(dir.path());
         let mut s = minimal();
         let expanded: Vec<String> = (0..900).map(|i| format!("d{i}")).collect();
-        s.project = Some(SessionProject { root: "/repo".into(), expanded: expanded.clone() });
+        s.project =
+            Some(SessionProject { roots: vec![SessionRoot { root: "/repo".into(), expanded: expanded.clone() }] });
 
-        save_session(&path, s).unwrap();
+        save_session(&path, s.clone()).unwrap();
         let loaded = load_session(&path).unwrap().unwrap();
-        assert_eq!(loaded.project.unwrap().expanded, expanded, "Rust 侧不该动 expanded");
+        let roots = &loaded.project.clone().unwrap().roots;
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].expanded, expanded, "Rust 侧不该动 expanded");
+
+        // 60 个根，是前端 `MAX_RESTORED_ROOTS` 的好几倍。同一条分工：
+        // Rust 不数，前端在恢复时夹一次
+        s.project = Some(SessionProject {
+            roots: (0..60).map(|i| SessionRoot { root: format!("/repo{i}"), expanded: Vec::new() }).collect(),
+        });
+        save_session(&path, s).unwrap();
+        assert_eq!(load_session(&path).unwrap().unwrap().project.unwrap().roots.len(), 60, "Rust 侧不该动 roots");
     }
 
     #[test]

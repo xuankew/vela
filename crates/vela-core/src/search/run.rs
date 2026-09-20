@@ -13,8 +13,11 @@ use std::time::{Duration, Instant};
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::{sinks, BinaryDetection, Searcher, SearcherBuilder};
-use ignore::WalkBuilder;
 use serde::Serialize;
+
+// 遍历不住在本模块了：`Cmd+P` 的文件索引（`project::index`）是它的第三个消费者，
+// 而共用点必须是**同一个函数**，不能是抄的第二份。理由见 `project/walk.rs`
+use crate::project::walk::each_file;
 
 use super::query::{build_filters, build_matcher, build_template, Filters, SearchError, SearchQuery, Template};
 
@@ -32,9 +35,32 @@ pub const MAX_HITS_PER_FILE: u32 = 500;
 
 /// 超过这个大小的文件整个跳过，计入 `SearchSummary::skipped_too_large`。
 ///
-/// 与 `fs` 那边「打开文件」的 4MB 上限不是一回事：那边管的是 IPC payload，
-/// 这边管的是「别为一个 2GB 的日志把整次搜索卡住」。
-pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+/// 与 `fs` 那边两条「打开文件」的上限都不是一回事：`MAX_INLINE_BYTES`（4 MiB）管的是
+/// 单次 IPC payload，`MAX_SHARD_BYTES`（256 MiB）管的是「能不能以只读分片打开」。
+/// 这一条管的是「别为一个 2GB 的日志把整次搜索卡住」。
+///
+/// ## 🔴 为什么是 64 MiB：M2-H 之后它必须与分片对账
+///
+/// M2-H 之前这个数是 10 MiB，与分片毫无关系。之后它必须重新定，因为大文件里刻意
+/// **不做** ⌘F（分片是只读虚拟列表，压根没有 CM6 的搜索扩展），理由是「全局搜索已经
+/// 够了」——而那句话只在「打得开的都搜得到」的区间里成立。留着 10 MiB 的话，一个
+/// 100 MiB 的日志能打开成只读分片，却在自己的项目里搜不到：用户按 ⌘⇧F 找一句话
+/// 得到「0 个结果」，而那个文件就在眼前开着。
+///
+/// 不取 `MAX_SHARD_BYTES`（256 MiB）是因为搜索与替换**共用这一个闸**（理由见
+/// `replace.rs` 的「预览与落盘走过同一个文件集」），而两条路的成本结构完全不同：
+/// 搜索是流式的，文件多大都只花**时间**（实测 10 MiB 从头扫到尾 6.9–8.5ms，
+/// 线性外推 64 MiB ≈ 55ms、256 MiB ≈ 215ms）；替换要把整份读进内存、换完再原子写回，
+/// 峰值约两倍文件大小——256 MiB 就是 ~512 MiB 的瞬时占用，而 §2.9 那条预算是
+/// 「空转常驻 < 200MB」（实测均值 104MB）。64 MiB 把峰值压在 ~128 MiB，
+/// 而且它只在用户点过「替换全部」之后才发生。
+///
+/// ## ⚠️ 于是 64–256 MiB 这一段是「打得开、搜不到」
+///
+/// 这段缺口是**有意的**，而且不静默：跳过的文件计入 `skipped_too_large`，面板会把
+/// 「N 个太大的文件没搜」说出来。真要覆盖它，正确的做法是给分片视图加一个走行索引的
+/// 搜索（Rust 侧 `read_lines` 已经能按页取正文），而不是把替换的内存峰值再抬四倍。
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 一条命中行的预览最多留多少**字节**（不是字符）。
 ///
@@ -134,6 +160,16 @@ pub struct SearchFile {
     pub rel: String,
     /// 绝对路径，交给 `open_file` 用。与 `rel` 冗余是刻意买的：前端不做路径拼接
     pub path: String,
+    /// 这一条来自 `roots` 里的第几个根（M2-F 多根工作区）。单根时恒为 0。
+    ///
+    /// ⚠️ **为什么不让前端自己从 `path` 里剥出根来**：那样它就得拿 `path` 去掉
+    /// `/{rel}` 后缀反推，而「前端不做路径运算」是 M2-A 就定下的规矩
+    /// （`DirEntry` 同时带 `rel` 与 `path` 正是为此）。
+    ///
+    /// 多根之下 `rel` 不再唯一——两个根都可以有一个 `src/a.ts`——分组标题因此要么
+    /// 带上根名，要么在两个同名文件之间说不清是哪个。给一个序号，前端查一次
+    /// `roots[i]` 就拿到根名，一次拼接都不必做。
+    pub root_index: u16,
     pub hits: Vec<SearchHit>,
     /// 这个文件的命中被 `MAX_HITS_PER_FILE` 截断了
     pub truncated: bool,
@@ -214,7 +250,56 @@ pub fn search<F>(
 where
     F: FnMut(SearchBatch),
 {
-    let prepared = prepare(root, query)?;
+    search_roots(&[root], query, cancel, on_batch)
+}
+
+/// 在**好几个** root 下各搜一遍，结果仍然分批交给同一个 `on_batch`（M2-F 多根工作区）。
+///
+/// [`search`] 就是它的单根特例，两者不可能分岔——单根那条压根没有第二份实现。
+///
+/// ## 三样东西共用一份，两本账也共用一本
+///
+/// `matcher` / `filters` / `template` 由 [`compile`] 编出来，而它**只看 `query`、不看 root**
+/// （root 那两条检查是「是不是绝对路径」「是不是一个目录」，与编译无关）。所以多根之下：
+///
+/// - 编译只做一次。逐根重编是 N 倍的无用功，而更重要的是**它会让「预览与落盘用同一台
+///   匹配机」这条性质从「同一个对象」退化成「N 个内容相同的对象」**——那正是
+///   `mod.rs` 开头那张表要防的事。
+/// - `Tally` 只有一本，于是 `MAX_HITS` 是**整次搜索**的预算而不是每个根一份。
+///   逐根各给一份的话，挂五个根就能拿到五倍的命中，而那个上限本来是为
+///   「单次 IPC payload ≤ 4MB」与前端渲染量设的。
+/// - `Collector` 只有一个，于是 `files_scanned` 跨根**连续累计**，与它「累计值不是增量」
+///   的口径一致；批次也不会因为换根而多出一次无谓的冲批。
+///
+/// ## ⚠️ 收手就整个收手，不再走下一个根
+///
+/// `cancelled` 的意思是「别再碰文件了」，`truncated` 的意思是预算用完了，
+/// 两者都与「还有几个根没走」无关。接着走下一个根的话，取消要等一整个根走完才生效
+/// （十万文件的仓库上那是几秒），而截断会变成一个根一份的假上限。
+///
+/// ## `roots` 为空是合法的，得到一份全零的总账
+///
+/// 「在零个文件夹里搜」当然什么都搜不到，这不是一种失败。⚠️ 但 UI 因此必须自己挡住
+/// 「一个文件夹都没打开」这种处境并说一句话，否则用户看到的是「没有匹配」——
+/// 那是一句看起来很确定的错答案。前端今天挡在 `src/search/store.ts` 里
+/// （`roots().length === 0` 时压根不发命令），与 `goto/store.ts` 那句
+/// 「先打开一个文件夹，才能按名字找文件」是同一条规矩。
+pub fn search_roots<F>(
+    roots: &[&Path],
+    query: &SearchQuery,
+    cancel: &AtomicBool,
+    on_batch: F,
+) -> Result<SearchSummary, SearchError>
+where
+    F: FnMut(SearchBatch),
+{
+    // ⚠️ 所有根一起检查完才开始走第一个：「每一个 `SearchError` 都发生在第一批结果
+    // 之前」这条性质对多根同样成立（见 `mod.rs` 最后一条）。逐根「检查一个走一个」的话，
+    // 第二个根不合法就变成一个 done 事件之后的 failed 事件，而那条路径前端没有 UI 也没有测试
+    for root in roots {
+        check_root(root)?;
+    }
+    let prepared = compile(query)?;
 
     let started = Instant::now();
     let mut run = Run {
@@ -224,17 +309,24 @@ where
         searcher: searcher(),
         collector: Collector::new(on_batch),
         tally: Tally::default(),
+        root_index: 0,
     };
-    // ⚠️ `prepared.filters` 刻意**留在局部**、不搬进 `Run`：搬进去的话下面这个闭包
-    // 就没法整体可变借用 `run`（`&self.filters` 与 `&mut self` 打架）。
-    // 而「走哪些文件」这件事必须由 [`walk_files`] 这一个函数说了算——
-    // 预览走过一遍的文件集与落盘走过的不是同一个的话，用户批准的是一份清单、
-    // 改的是另一份。
-    //
-    // ⚠️ 分两句写：`run.tally.absorb(walk_files(..))` 编不过，
-    // 接收者 `run.tally` 与闭包捕获的 `&mut run` 会同时活着
-    let outcome = walk_files(root, &prepared.filters, cancel, |path, rel| run.visit(path, rel));
-    run.tally.absorb(outcome);
+    for (index, root) in roots.iter().enumerate() {
+        run.root_index = u16::try_from(index).unwrap_or(u16::MAX);
+        // ⚠️ `prepared.filters` 刻意**留在局部**、不搬进 `Run`：搬进去的话下面这个闭包
+        // 就没法整体可变借用 `run`（`&self.filters` 与 `&mut self` 打架）。
+        // 而「走哪些文件」这件事必须由 [`walk_files`] 这一个函数说了算——
+        // 预览走过一遍的文件集与落盘走过的不是同一个的话，用户批准的是一份清单、
+        // 改的是另一份。
+        //
+        // ⚠️ 分两句写：`run.tally.absorb(walk_files(..))` 编不过，
+        // 接收者 `run.tally` 与闭包捕获的 `&mut run` 会同时活着
+        let outcome = walk_files(root, &prepared.filters, cancel, |path, rel| run.visit(path, rel));
+        run.tally.absorb(outcome);
+        if run.tally.cancelled || run.tally.truncated {
+            break;
+        }
+    }
     // ⚠️ 结尾必须冲一次：最后一批几乎总是不满的。漏掉它的失败方式是
     // 「搜索结果少了最后几个文件」，而那恰好是最难发现的一种少——
     // 用户不会知道有几个文件本该出现在列表末尾。
@@ -251,32 +343,48 @@ where
 /// 前端因此保住了一条很简单的规则：**`start_search` reject = 这次搜索压根没开始**
 /// （见 `mod.rs` 最后一条）。代价是多编一次正则——微秒级。
 ///
-/// ⚠️ 它必须与 [`search`] 的检查**完全一致**，两者共用 [`prepare`] 这一个实现处。
+/// ⚠️ 它必须与 [`search`] 的检查**完全一致**，两者共用 [`check_root`] 与 [`compile`]
+/// 这两个实现处。
 /// 要是哪天有人只改一边，「preflight 过了而 search 报错」会让前端收到一个它以为
 /// 不可能出现的 event，而那条路径没有测试也没有 UI。一致性由
 /// `起飞前检查的两个入口结论一致` 钉住。
 pub fn preflight(root: &Path, query: &SearchQuery) -> Result<(), SearchError> {
-    prepare(root, query).map(|_| ())
+    preflight_roots(&[root], query)
 }
 
-/// 起飞前检查本体：root 与 query 有没有可能跑起来，跑起来的话用什么匹配机、
-/// 过滤器与替换模板。
+/// [`preflight`] 的多根版：**所有**根一起查，任何一个不合法就整次不开工。
 ///
-/// ⚠️ 三样收进 [`Prepared`] 一个结构体，而不是返回一个三元组：`matcher` 与 `template`
-/// **必须成对旅行**。模板里的组号是拿 `matcher.capture_count()` 校验过的（见
-/// `query::build_template`），把它们摊成两个自由变量的话，某天有人把模板交给另一个
-/// matcher，失败方式是 `caps.get(n)` 安静地返回 `None`——两万处各插进一个空串，
-/// 而这一步是直接改写磁盘的。
-pub(crate) fn prepare(root: &Path, query: &SearchQuery) -> Result<Prepared, SearchError> {
+/// ⚠️ 「全查完才开始」不是顺手写的。逐根「查一个走一个」的话，第二个根不合法会变成
+/// 「已经推出去几批结果、然后一个 failed 事件」——而前端那条简单规则
+/// （reject = 压根没开始 / 拿到 taskId = 一定等到 done 或 failed）正是靠
+/// 「失败只可能在开始之前」撑着的，`mod.rs` 最后那一节整节都在说这件事。
+pub fn preflight_roots(roots: &[&Path], query: &SearchQuery) -> Result<(), SearchError> {
+    for root in roots {
+        check_root(root)?;
+    }
+    compile(query).map(|_| ())
+}
+
+/// root 那两条检查：必须是绝对路径、必须确实是一个目录。
+///
+/// 与编译 query 分开成两个函数是 M2-F 逼出来的：多根之下「检查」要做 N 次而「编译」
+/// 只做一次，摊在一个函数里就只能逐根重编——N 倍无用功还是小事，
+/// 要紧的是那会让「预览与落盘用同一台匹配机」从「同一个对象」退化成
+/// 「N 个内容相同的对象」（见 [`search_roots`]）。
+pub(crate) fn check_root(root: &Path) -> Result<(), SearchError> {
     if !root.is_absolute() {
         return Err(SearchError::BadRoot { path: root.display().to_string() });
     }
     // 用 `metadata` 而不是 `Path::exists` + `is_dir` 两次 stat：一次就够，
     // 而且 `metadata` 跟着符号链接走——指向目录的链接是一个合法的 root
     match std::fs::metadata(root) {
-        Ok(meta) if meta.is_dir() => {}
-        _ => return Err(SearchError::NotFound { path: root.display().to_string() }),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        _ => Err(SearchError::NotFound { path: root.display().to_string() }),
     }
+}
+
+/// 编 query 那三样。**它不看 root**，所以一次搜索里无论挂了几个根都只编一次
+pub(crate) fn compile(query: &SearchQuery) -> Result<Prepared, SearchError> {
     let matcher = build_matcher(query)?;
     let filters = build_filters(query)?;
     // ⚠️ 模板也在这里编，于是 `$2` 配 `(a)` 这种错与「正则编不出来」一样当场 reject，
@@ -289,6 +397,11 @@ pub(crate) fn prepare(root: &Path, query: &SearchQuery) -> Result<Prepared, Sear
 /// 编好的三样东西。字段全是 `pub(crate)`：落盘那一层（M2-D-2）要用同一个
 /// `matcher` 与 `template` 去**改文件**，而「预览用的匹配机」与「落盘用的匹配机」
 /// 是同一个对象这件事，正是「所见即所做」的全部依据
+///
+/// ⚠️ **收进一个结构体而不是返回一个三元组**：`matcher` 与 `template` **必须成对旅行**。
+/// 模板里的组号是拿 `matcher.capture_count()` 校验过的（见 `query::build_template`），
+/// 把它们摊成两个自由变量的话，某天有人把模板交给另一个 matcher，失败方式是
+/// `caps.get(n)` 安静地返回 `None`——两万处各插进一个空串，而这一步是直接改写磁盘的。
 pub(crate) struct Prepared {
     pub(crate) matcher: RegexMatcher,
     pub(crate) filters: Filters,
@@ -328,44 +441,16 @@ pub(crate) struct WalkOutcome {
     pub(crate) cancelled: bool,
 }
 
-/// 配好五个设置的遍历器。
+/// 走一遍 root 下所有**该搜的**文件，对每一个调 `visit`。
 ///
-/// ⚠️ **搜索与替换必须共用这一个函数**，这是「所见即所做」在文件集合那一半的依据：
-/// 用户在预览里看到并批准的是**一份清单**，落盘时走的是另一份的话，
-/// 被改的文件里就有他从没见过的那几个。另一半依据（匹配机与模板成对旅行）
-/// 写在 [`Prepared`] 上。
+/// 规则分两半，各只写一次：
 ///
-/// 这五条设置各自的理由都记在对应那行上，它们不是可以「顺手统一一下」的东西
-pub(crate) fn walker(root: &Path) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(root);
-    builder
-        // 点开头的目录要搜：`.github/workflows/ci.yml`、`.vscode/settings.json`
-        // 都是用户真会去搜的东西。代价是 `.git` 不再被「隐藏文件」那条规则顺带挡掉，
-        // 所以下面显式挡一次
-        .hidden(false)
-        // 一个光秃秃的 `.gitignore`（没有 `.git` 目录）也算数。默认值是 true，
-        // 那意味着「不在 git 仓库里就完全不过滤」——而用户打开的文件夹是不是一个
-        // 仓库，与他要不要跳过 `build/` 里的产物没有任何关系
-        .require_git(false)
-        // ⚠️ 与文件树相反：**不跟随符号链接**。树放行链接是因为「展开一层」的成本有限，
-        // 而搜索要读正文——跟着 pnpm 的符号链接农场走会把同一个包读几十遍，
-        // 还可能成环。`follow_links(false)` 之下链接自己的 `file_type` 既不是 file
-        // 也不是 dir，于是下面那条 `is_file()` 把「目录」与「链接」一起挡掉了
-        .follow_links(false)
-        // `.git` 里面是几万条对象文件与 reflog，搜它们从来不是用户的意思
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
-        // 顺序确定，同一棵树搜两次长得一样。并行遍历做不到这一点，
-        // 而测试与 UI 都依赖顺序稳定（见 `mod.rs`「为什么是单线程遍历」）。
-        // 参数类型必须写出来：这里传的是 `impl Fn`，编译器没有位置可以反推
-        .sort_by_file_name(|a: &std::ffi::OsStr, b: &std::ffi::OsStr| a.cmp(b));
-    builder
-}
-
-/// 走一遍 root 下所有**该看的**文件，对每一个调 `visit`。
+/// 「是不是一个文件」那一半（不是 root 自己、是普通文件而不是目录或符号链接、
+/// 算得出 rel、读不动的目录记一笔继续）住在 [`each_file`] 里，与 `Cmd+P` 的索引共用——
+/// 那三条要是各写一份，两侧的测试还会全绿，而「跳得到的文件」与「搜得到的文件」就分岔了。
 ///
-/// 「该看」= 不是 root 自己、是普通文件（目录与符号链接都不算）、rel 通过了
-/// include/exclude、且不大于 `MAX_FILE_BYTES`。这四条规则只在这里写一次，
-/// 于是搜索侧与替换侧看到的文件集在结构上相同，而不是靠两边测试都过才相同。
+/// 「这个文件搜不搜」那一半住在这里，因为它们是**搜索专属**的：取消、include/exclude、
+/// `MAX_FILE_BYTES`。索引不需要其中任何一条，所以不能把它们塞进共用点。
 ///
 /// `visit` 返回 `Break` 就当场收手（`MAX_HITS` 到了）。取消是**每个条目问一次**，
 /// 粒度是「走到哪儿停到哪儿」——十万个文件的仓库上取消必须在一帧内生效
@@ -374,43 +459,23 @@ where
     V: FnMut(&Path, &str) -> ControlFlow<()>,
 {
     let mut out = WalkOutcome::default();
-    for item in walker(root).build() {
+    let tally = each_file(root, |entry, rel| {
         if cancel.load(Ordering::Relaxed) {
             out.cancelled = true;
-            break;
+            return ControlFlow::Break(());
         }
-        let entry = match item {
-            Ok(entry) => entry,
-            // 某个目录读不动（权限不够、遍历途中被删）：记一笔继续。
-            // 整次搜索失败比少搜一个目录糟得多，但**必须记下来**——
-            // 不记的话「没找到」就成了一个看起来很确定的错答案
-            Err(_) => {
-                out.unreadable += 1;
-                continue;
-            }
-        };
-        // depth 0 是 root 自己
-        if entry.depth() == 0 || !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        // `rel_of` 返回 None 只可能是路径没长在 root 下面——`WalkBuilder` 从 root
-        // 出发，正常走不到这一支。真走到了就跳过：一个算不出 rel 的命中
-        // 在 UI 上无处可挂
-        let Some(rel) = rel_of(root, path) else { continue };
-        if !filters.allows(&rel) {
-            continue;
+        if !filters.allows(rel) {
+            return ControlFlow::Continue(());
         }
         // `metadata()` 读不动就当它不大：宁可扫一个可能很大的文件，
         // 也不要因为一次 stat 失败就静默地少搜一个文件
         if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
             out.skipped_too_large += 1;
-            continue;
+            return ControlFlow::Continue(());
         }
-        if visit(path, &rel).is_break() {
-            break;
-        }
-    }
+        visit(entry.path(), rel)
+    });
+    out.unreadable = tally.unreadable;
     out
 }
 
@@ -426,13 +491,21 @@ struct Run<'a, F> {
     matcher: RegexMatcher,
     /// 替换模板（M2-D）。`None` = 纯搜索，`make_hit` 就不算 `replaced`。
     ///
-    /// ⚠️ 它必须与上面那个 `matcher` 是 `prepare` 一起编出来的那一对，
+    /// ⚠️ 它必须与上面那个 `matcher` 是 `compile` 一起编出来的那一对，
     /// 理由写在 [`Prepared`] 上
     template: Option<Template>,
     cancel: &'a AtomicBool,
     searcher: Searcher,
     collector: Collector<F>,
     tally: Tally,
+    /// 现在正在走的是 `roots` 里第几个（M2-F）。`search_roots` 每换一个根就改一次，
+    /// 于是盖到 `SearchFile` 上的序号天然与那一批命中的来源对得上。
+    ///
+    /// ⚠️ 它是 `Run` 里**唯一**一个在遍历途中被改的字段，其余五个都是开工前定死的。
+    /// 改成「每个根一个新 `Run`」看着更干净，代价是 `tally` 与 `collector` 也得跟着换——
+    /// 而那两样正是必须跨根共用的（`MAX_HITS` 的预算口径与 `files_scanned` 的累计口径，
+    /// 理由见 [`search_roots`]）
+    root_index: u16,
 }
 
 impl<F: FnMut(SearchBatch)> Run<'_, F> {
@@ -482,7 +555,13 @@ impl<F: FnMut(SearchBatch)> Run<'_, F> {
         if !hits.is_empty() {
             self.tally.files_with_hits += 1;
             self.tally.hits += hits.len() as u32;
-            let file = SearchFile { rel: rel.to_owned(), path: path.display().to_string(), hits, truncated };
+            let file = SearchFile {
+                rel: rel.to_owned(),
+                path: path.display().to_string(),
+                root_index: self.root_index,
+                hits,
+                truncated,
+            };
             self.collector.push(file, self.tally.files_scanned);
         }
         // 一个调用点，不管有没有命中都问一次。有结果压着的时候它自己什么也不做
@@ -571,8 +650,8 @@ fn make_hit(line_num: u64, line: &str, matcher: &RegexMatcher, template: Option<
     //    前端算预览、Rust 算落盘是另一种写法，它的失败方式是「预览说会改成 A、
     //    实际改成了 B」，而两边各有一套 `$` 语法解析，谁也测不出对方的偏差。
     //    代价是替换模式下这一行跑了**两遍**正则（`find_iter` 一遍、替换一遍）。
-    //    这个代价买得值：正则只跑在**命中的那些行**上，而遍历的主要成本是把
-    //    10MiB 的文件从盘上读进来（实测 6.9–8.5ms）；换成「预览可能说谎」是不可接受的。
+    //    这个代价买得值：正则只跑在**命中的那些行**上，而遍历的主要成本是把文件
+    //    从盘上读进来（实测 10MiB 是 6.9–8.5ms）；换成「预览可能说谎」是不可接受的。
     // 3. **换完再过一次 `preview`**，于是两边受同一个上限管，一行最多两个 1000 字节。
     let (replaced, truncated) = match template {
         None => (None, text_truncated),
@@ -622,14 +701,6 @@ fn utf16_at(text: &str, target: usize, cursor: &mut (usize, u32)) -> u32 {
     cursor.1
 }
 
-/// `path` 相对 `root` 的那条 rel，规矩与 `DirEntry.rel` 完全一致。
-pub(crate) fn rel_of(root: &Path, path: &Path) -> Option<String> {
-    let rel = path.strip_prefix(root).ok()?;
-    // 逐组件用 `/` 拼，而不是 `replace('\\', "/")`：后者是「假设分隔符是反斜杠」，
-    // 前者是「不假设任何平台的分隔符」
-    Some(rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))
-}
-
 /// 攒批次，兼管心跳。
 struct Collector<F> {
     files: Vec<SearchFile>,
@@ -664,10 +735,11 @@ impl<F: FnMut(SearchBatch)> Collector<F> {
     /// 那条测试就变成随机红的了。
     ///
     /// 代价是一个空洞：压着结果时撞上单个慢文件，那段时间没有信号。实测这个空洞有多小
-    /// （release，外部卷，连跑三次）：一个正好 `MAX_FILE_BYTES`（10MiB）的文本文件
-    /// 从头扫到尾是 **6.9–8.5ms**。而 `MAX_FILE_BYTES` 就是单文件的上限，
-    /// 所以空洞最长也就十几毫秒——比 `HEARTBEAT_MS` 小一个数量级，
-    /// 不值得为它另起一个计时线程。
+    /// （release，外部卷，连跑三次）：10MiB 的文本文件从头扫到尾是 **6.9–8.5ms**。
+    /// ⚠️ M2-H 把 `MAX_FILE_BYTES` 抬到 64 MiB 之后这个数**没有重量过**，只有线性
+    /// 外推：扫描吞吐与字节数成正比，于是单文件空洞的上界变成 **~55ms**。
+    /// 它仍然是「一个文件」的上限，而 `HEARTBEAT_MS` 是 250ms——余量从一个数量级
+    /// 掉到 ~4.5 倍，但还是不值得为它另起一个计时线程。真要把上限再抬，这一条得重量。
     ///
     /// ⚠️ 实测还有一件事：命中密度低时（十万个文件里 2000 个命中，约 2%），
     /// 相邻两次**结果批**之间会隔到 ~800 个文件——因为每攒够 16 个命中文件才冲一次批，
@@ -960,7 +1032,13 @@ mod tests {
             let mut collector = Collector::new(|b| batches.push(b));
             collector.flush(999);
             collector.push(
-                SearchFile { rel: "a.txt".into(), path: "/a.txt".into(), hits: Vec::new(), truncated: false },
+                SearchFile {
+                    rel: "a.txt".into(),
+                    path: "/a.txt".into(),
+                    root_index: 0,
+                    hits: Vec::new(),
+                    truncated: false,
+                },
                 999,
             );
             collector.flush(999);
@@ -1153,14 +1231,14 @@ mod tests {
     fn 太大的文件整个跳过_并且单独计数() {
         let dir = fixture();
         let root = dir.path();
-        // `edge.txt` 必须是真的写满 10MiB 的**文本**：`set_len` 撑出来的稀疏文件正文全是
+        // `edge.txt` 必须是真的写满 64MiB 的**文本**：`set_len` 撑出来的稀疏文件正文全是
         // NUL，会被二进制探测整个丢掉，那样「出现在结果里」就证不了「它被扫过」——
         // 而这条测试要钉的正是 `>` 与 `==` 的分界
         let mut body = "x".repeat(MAX_FILE_BYTES as usize - "needle\n".len());
         body.push_str("needle\n");
         assert_eq!(body.len() as u64, MAX_FILE_BYTES, "正好等于上限");
         fs::write(root.join("edge.txt"), &body).unwrap();
-        // `big.txt` 的内容无所谓——它压根不会被读，所以这里用 `set_len` 省掉 10MiB 的写入
+        // `big.txt` 的内容无所谓——它压根不会被读，所以这里用 `set_len` 省掉 64MiB 的写入
         let mut big = fs::File::create(root.join("big.txt")).unwrap();
         big.write_all(b"needle\n").unwrap();
         big.set_len(MAX_FILE_BYTES + 1).unwrap();
@@ -1171,7 +1249,7 @@ mod tests {
         assert!(!files.iter().any(|f| f.rel == "big.txt"), "超过上限的整个不扫");
 
         let edge = files.iter().find(|f| f.rel == "edge.txt").expect("正好等于上限的照常扫");
-        assert_eq!(edge.hits.len(), 1, "10MiB 的正文只有末尾一处命中");
+        assert_eq!(edge.hits.len(), 1, "64MiB 的正文只有末尾一处命中");
         assert!(!edge.truncated, "「命中数」没有截断；预览那一行的截断是另一回事");
     }
 
@@ -1439,7 +1517,7 @@ mod tests {
     fn 出错时一个批次都没推出去() {
         let dir = fixture();
         // 后两条是 M2-D 的替换模板：`mod.rs` 最后那条性质（每一个 `SearchError`
-        // 都发生在第一批结果之前）对模板也成立，靠的是 `prepare` 把模板一起编了
+        // 都发生在第一批结果之前）对模板也成立，靠的是 `compile` 把模板一起编了
         for q in [
             query(""),
             query("a\nb"),
@@ -1455,9 +1533,9 @@ mod tests {
 
     /// `preflight` 与 `search` 的结论**必须一致**。
     ///
-    /// 两者共用 `prepare` 这一个实现处，所以这条测试今天看来是同义反复。它防的是将来：
-    /// 有人在 `search()` 里多加一条检查（比如「root 必须是个 git 仓库」）而忘了同步
-    /// `prepare`，于是 `preflight` 说「可以搜」、Tauri 那边返回了 taskId、
+    /// 两者共用 `check_root` 与 `compile` 这两个实现处，所以这条测试今天看来是同义反复。
+    /// 它防的是将来：有人在 `search_roots()` 里多加一条检查（比如「root 必须是个 git
+    /// 仓库」）而忘了同步 `preflight_roots`，于是 `preflight` 说「可以搜」、Tauri 那边返回了 taskId、
     /// 后台线程里 `search()` 才报错——前端于是收到一个它按规则**不可能**收到的
     /// failed event，而那条路径既没有 UI 也没有别的测试。
     ///
@@ -1495,6 +1573,137 @@ mod tests {
                 (Ok(()), Ok(_)) => {}
                 (Err(a), Err(b)) => assert_eq!(a, b, "{case_root:?} {q:?}：两个入口报的不是同一个错"),
                 _ => panic!("{case_root:?} {q:?}：preflight 是 {before:?} 而 search 是 {:?}", during.is_ok()),
+            }
+        }
+    }
+
+    // ── 多根工作区（M2-F） ──────────────────────────────────────────────────
+    //
+    // 这一节钉的是**跨根共用的那三样**：一份 `Prepared`、一本 `Tally`、一个 `Collector`。
+    // 「每条结果带对根序号」「`filesScanned` 在线上跨根累计」那种**形状**的事在
+    // `tests/wire_contract.rs` 里，两边刻意不重复。
+
+    /// 三棵各自独立的小树，每棵里都有一个**同名**的 `a.txt`。
+    ///
+    /// 同名是刻意的：多根之下 `rel` 不再唯一，而 `SearchFile::root_index` 存在的
+    /// 全部理由就是这件事
+    fn three_roots() -> Vec<tempfile::TempDir> {
+        (0..3)
+            .map(|i| {
+                let dir = tempfile::tempdir().unwrap();
+                fs::write(dir.path().join("a.txt"), format!("needle {i}\n")).unwrap();
+                // 一个没有命中的文件：它照样计入 `files_scanned`，
+                // 否则那个数就不是「扫过多少」而是「命中过多少」
+                fs::write(dir.path().join("quiet.txt"), "nothing\n").unwrap();
+                dir
+            })
+            .collect()
+    }
+
+    /// 命中上限是**整次搜索**的预算，不是每个根一份。
+    ///
+    /// 每个根各记一本账的话，两个根就是四万条——而用户批准的预览里最多只有两万条。
+    /// 这是「共用一本 `Tally`」这件事唯一能被测出来的一面
+    #[test]
+    fn 命中上限是整次搜索的预算不是每个根一份() {
+        let body = "needle\n".repeat(MAX_HITS_PER_FILE as usize);
+        let dirs: Vec<tempfile::TempDir> = (0..2)
+            .map(|_| {
+                let dir = tempfile::tempdir().unwrap();
+                // 每个根 25 个满文件 = 12500 条，两个根 25000 条，超过 MAX_HITS(20000)
+                for i in 0..25 {
+                    fs::write(dir.path().join(format!("f{i:02}.txt")), &body).unwrap();
+                }
+                dir
+            })
+            .collect();
+        let roots: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+
+        let mut batches = Vec::new();
+        let summary = search_roots(&roots, &query("needle"), &AtomicBool::new(false), |b| batches.push(b)).unwrap();
+
+        assert!(summary.truncated);
+        assert_eq!(summary.hits, MAX_HITS);
+        assert_eq!(summary.files_scanned, MAX_HITS / MAX_HITS_PER_FILE);
+        // 撞线之后**整个**收手：第二个根剩下的 10 个文件一个都没碰
+        let files: Vec<&SearchFile> = batches.iter().flat_map(|b| b.files.iter()).collect();
+        let per_root: Vec<usize> = (0..2u16).map(|i| files.iter().filter(|f| f.root_index == i).count()).collect();
+        assert_eq!(per_root, [25, 15], "{per_root:?}：预算用完了还在走第二个根");
+    }
+
+    /// 取消在**根之间**也生效：`cancelled` 一到就整个收手，不把剩下的根走完。
+    ///
+    /// 「等走完当前这个根再看」在十万文件的仓库上是几秒到几十秒，而取消是用户
+    /// 觉得搜错了当场按下去的——那几秒里 UI 既不能说「已取消」也不能说「还在搜」
+    #[test]
+    fn 取消之后不再走下一个根() {
+        let dirs = three_roots();
+        let roots: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
+        // 一开始就是取消状态：`walk_files` 是**逐个条目**问的，
+        // 而问的时机在扫那个文件之前，所以一个字节都不该被读
+        let cancel = AtomicBool::new(true);
+
+        let mut batches = Vec::new();
+        let summary = search_roots(&roots, &query("needle"), &cancel, |b| batches.push(b)).unwrap();
+
+        assert!(summary.cancelled);
+        assert!(!summary.truncated, "取消不是截断，两个数在 UI 上是两句话");
+        assert_eq!(summary.files_scanned, 0);
+        // ⚠️ 连一个心跳都不该有：`Collector` 手上没有结果时 `flush` 什么也不推
+        assert!(batches.is_empty(), "{batches:?}");
+    }
+
+    /// `roots` 为空是**合法**的，得到一份全零的总账，而不是一个新的错误变体。
+    ///
+    /// 「没有根」这个状态在 UI 上到不了（面板与浮层都自己拦着，见 `search_roots` 的文档），
+    /// 为它加一个 `SearchError` 变体的代价是前端多一条翻译分支、契约测试多一个用例，
+    /// 而收益是零——它描述的是一个不可能发生的输入
+    #[test]
+    fn 空的根清单得到一份全零总账() {
+        let mut batches = 0;
+        let summary = search_roots(&[], &query("needle"), &AtomicBool::new(false), |_| batches += 1).unwrap();
+        assert_eq!(batches, 0, "一个文件都没扫，连心跳都不该有");
+        assert_eq!(
+            (
+                summary.files_scanned,
+                summary.files_with_hits,
+                summary.hits,
+                summary.skipped_too_large,
+                summary.unreadable,
+                summary.truncated,
+                summary.cancelled
+            ),
+            (0, 0, 0, 0, 0, false, false)
+        );
+        // 起飞前检查也得放行。两处要是说法不一致，前端就会在一条**到不了**的路径上
+        // 多一个分支，而那个分支永远测不到
+        assert!(preflight_roots(&[], &query("needle")).is_ok());
+    }
+
+    /// `preflight_roots` 与 `search_roots` 在多根下也必须给出**同一个错误值**。
+    ///
+    /// 与上面 `起飞前检查的两个入口结论一致` 同一条理由的延伸：多根之后
+    /// 「第几个根坏了」成了一个新自由度，两个入口要是各查各的，
+    /// 就会出现在「一个说不合法、另一个说合法」这种没法在前端表达的分岔。
+    ///
+    /// ⚠️ 四个用例里坏的根**位置不同**（第一个 / 第二个）、**坏法不同**
+    /// （不存在 / 是个文件 / 不是绝对路径），而且都夹着一个合法的根：
+    /// 只测「全坏」的话，一个「碰到第一个合法的就 return Ok」的实现照样能过
+    #[test]
+    fn 起飞前检查的两个入口在多根下也一致() {
+        let dirs = three_roots();
+        let good = dirs[0].path();
+        let missing = good.join("没有这个根");
+        let not_a_dir = good.join("a.txt");
+        let cases: Vec<Vec<&Path>> =
+            vec![vec![good, &missing], vec![&missing, good], vec![good, &not_a_dir], vec![Path::new("repo"), good]];
+
+        for roots in cases {
+            let before = preflight_roots(&roots, &query("needle"));
+            let during = search_roots(&roots, &query("needle"), &AtomicBool::new(false), |_| {});
+            match (&before, &during) {
+                (Err(a), Err(b)) => assert_eq!(a, b, "{roots:?}：两个入口报的不是同一个错"),
+                _ => panic!("{roots:?}：这一组该被拒，preflight 是 {before:?}、search 是 {}", during.is_ok()),
             }
         }
     }

@@ -112,6 +112,19 @@ export type ReadError =
   | { kind: 'io'; reason: string; message: string }
   | { kind: 'directory'; path: string }
   | { kind: 'too_large'; bytes: number; limit: number }
+  /**
+   * 只读分片模式接不住这个编码（M2-H）。
+   *
+   * ⚠️ **只有 `open_large` 会产出这一条**，`open_file` 永远不会：内联路径把整份字节
+   * 交给 `encoding_rs`，什么编码都能解；分片路径要按字节偏移跳来跳去，而 UTF-16 的
+   * `
+` 是 `0A 00` 或 `00 0A`，「数 `0x0A` 的个数」在它上面压根不是行数。
+   * 完整论证在 `crates/vela-core/src/fs/shard.rs` 的模块文档最后一节。
+   *
+   * ⚠️ 这不是一个退步：这类文件在 M2-H 之前**压根打不开**（4 MiB 就拒了），
+   * 现在只是从「打不开」变成「打不开，而且说得清是编码的问题、不是文件坏了」
+   */
+  | { kind: 'unsupported_encoding'; encoding: EncodingId; bytes: number }
 
 export type WriteError = { kind: 'io'; reason: string; message: string } | { kind: 'no_parent'; path: string }
 
@@ -126,7 +139,17 @@ export function describeFsError(err: unknown): string {
   if (!isFsError(err)) return err instanceof Error ? err.message : String(err)
   switch (err.kind) {
     case 'too_large':
-      return `文件 ${(err.bytes / 1048576).toFixed(1)} MB，超过单次传输上限 ${(err.limit / 1048576).toFixed(0)} MB（只读分片模式在 M2）`
+      // ⚠️ 这一条现在只有一个**用户看得见**的来源：`open_large` 撞了 256 MiB。
+      // `open_file` 撞 4 MiB 时前端会立刻改走 `open_large`（见 `src/doc/document.ts`
+      // 的 `openAt`：它把 `too_large` 当成「换一条路」而不是「失败」，一个字都不说），
+      // 那个 limit 到不了这里。原文案那句「只读分片模式在 M2」在 M2-H 之后是**错的**——
+      // 分片模式已经在了，而它自己也有上限，于是这句话改成了不指向任何里程碑
+      return `文件 ${(err.bytes / 1048576).toFixed(1)} MB，超过上限 ${(err.limit / 1048576).toFixed(0)} MB，Vela 打不开它`
+    case 'unsupported_encoding':
+      // 与 Rust 侧 `ReadError` 的 `Display` 同一句话。⛔ 不要在这里补 MB 数：
+      // 一个 5 MB 的 UTF-16 文件走到这里说明它已经**试过**内联路径并被拒了，
+      // 而把字节数再说一遍只会让人以为「小一点就能开」——不是大小的问题，是编码的问题
+      return `这个文件是 ${ENCODING_LABELS[err.encoding]}，太大以致只能按只读分片打开，而分片模式不支持这个编码`
     case 'directory':
       return `${err.path} 是目录，不是文件`
     case 'no_parent':

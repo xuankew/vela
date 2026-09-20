@@ -2,6 +2,7 @@ import { Compartment, type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import type { EditorSnapshot } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
+import type { PasteImageHook } from '../editor/paste'
 import { createEditorState, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
 import { createDocumentModel, type DocumentModel } from './document'
 
@@ -37,10 +38,27 @@ export interface ViewConfig {
    * 词补全只用当前文档自己那份词典。
    */
   readonly peerStates: () => Iterable<EditorState>
+  /**
+   * 粘贴图片的处理者，工作区内所有标签共用同一个（M3-A-7）。
+   *
+   * 与 `peerStates` 同一条理由放在这儿而不是每标签一个：「粘进来的图落到哪个目录」
+   * 由**收到事件的那个 view 正在显示的文档**决定，那是工作区的知识；一个标签自己
+   * 答不上来，而且每标签复制一份闭包只会让「谁说了算」这件事变模糊。
+   *
+   * 缺省 = 不接，粘贴走 CM6 的默认路径（`createEditorState` 被单独调用时，比如测试）。
+   */
+  readonly pasteImage?: PasteImageHook
 }
 
-export function createViewConfig(lineWrap = true, peerStates: () => Iterable<EditorState> = () => []): ViewConfig {
-  return { lineWrap, lineWrapSlot: new Compartment(), peerStates }
+export function createViewConfig(
+  lineWrap = true,
+  peerStates: () => Iterable<EditorState> = () => [],
+  pasteImage?: PasteImageHook,
+): ViewConfig {
+  // `pasteImage` 是可选的，所以只能条件展开：`exactOptionalPropertyTypes` 虽然没开，
+  // 但显式写一个 `pasteImage: undefined` 会让「缺省」与「传了个 undefined」在
+  // 序列化与 `in` 判断上分岔，而这一份 config 是要进 state 的
+  return { lineWrap, lineWrapSlot: new Compartment(), peerStates, ...(pasteImage ? { pasteImage } : {}) }
 }
 
 export interface Tab {
@@ -100,6 +118,7 @@ export function buildState(
     lineWrapSlot: config.lineWrapSlot,
     languageSlot,
     peerStates: config.peerStates,
+    ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
     onUpdate,
   })
 }

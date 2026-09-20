@@ -17,14 +17,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  *
  * ipc 只假掉两个读写函数，**标签表用真的**：`ENCODING_LABELS` / `LINE_ENDING_LABELS`
  * 正是要显示给用户看的东西，把它也 mock 掉等于自己给自己判卷。
+ *
+ * ⚠️ M2-H 之后最后那一组（只读分片）也在这儿：分片标签走的是**另一排格子**，
+ * 而「编码与换行符那两格压根不渲染」是 `document.ts` 里那两条写路径**唯一的守卫**
+ * （它们一被拨动就会标脏，而脏的分片标签关不掉）。守卫只有一条的时候，
+ * 就必须有一条测试钉住它。
  */
 
-const { ipc, dialog } = vi.hoisted(() => ({
+const { ipc, dialog, shardIpc, shardFactory } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn<typeof import('../ipc/fs').openFile>(),
     saveFile: vi.fn<typeof import('../ipc/fs').saveFile>(),
   },
   dialog: { open: vi.fn(), save: vi.fn() },
+  shardIpc: { openLarge: vi.fn(), closeLarge: vi.fn() },
+  // 🔴 `createShardView` 要 mock 掉：它建好就**立刻**要第一页，而上面那个 `shardIpc`
+  // 替身里没有 `readLines`，真跑起来是一条没人接的 rejection
+  shardFactory: { createShardView: vi.fn() },
 }))
 
 vi.mock('../ipc/fs', async (importOriginal) => ({
@@ -33,10 +42,13 @@ vi.mock('../ipc/fs', async (importOriginal) => ({
   saveFile: ipc.saveFile,
 }))
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
+vi.mock('../ipc/shard', () => shardIpc)
+vi.mock('./shardView', () => shardFactory)
 
 import { EditorSelection } from '@codemirror/state'
 import { EditorController } from '../editor/controller'
 import type { TextFile } from '../ipc/fs'
+import type { ShardHeader } from '../ipc/shard'
 import { StatusBar } from './StatusBar'
 import { createWorkspace, type Workspace } from './workspace'
 
@@ -120,6 +132,8 @@ beforeEach(() => {
   ipc.openFile.mockReset()
   ipc.saveFile.mockReset()
   dialog.save.mockReset()
+  shardIpc.openLarge.mockReset()
+  shardFactory.createShardView.mockReset()
   ipc.openFile.mockResolvedValue(textFile())
 })
 
@@ -380,5 +394,161 @@ describe('StatusBar：M1-E-2b 可写的两格', () => {
     release(textFile())
     await opening
     expect(selects.every((s) => !s.disabled)).toBe(true)
+  })
+})
+
+/* ---------- 只读分片那一排（M2-H）---------- */
+
+const SHARD_HEADER: ShardHeader = {
+  totalLines: 1_200_000,
+  bytes: 104_857_600,
+  encoding: 'gbk',
+  bom: true,
+  eol: 'crlf',
+  lossy: false,
+}
+
+/**
+ * 把当前标签换成一个只读分片标签。
+ *
+ * ⚠️ 走的是**真实那条路**（`openAt` 撞 `too_large` → `open_large`），不是直接塞一个 signal：
+ * 这一组要钉的是「分片标签在状态栏里长什么样」，而「它怎么变成一份分片」是
+ * `document.test.ts` 的事，那边已经钉过了。这里再抄一遍那条判断反而会把两份测试
+ * 绑在同一个假设上——真的漂了的时候两边一起绿
+ */
+async function makeShardTab(ws: Workspace, header: Partial<ShardHeader> = {}): Promise<void> {
+  const full: ShardHeader = { ...SHARD_HEADER, ...header }
+  ipc.openFile.mockRejectedValueOnce({ kind: 'too_large', bytes: full.bytes, limit: 4_194_304 })
+  shardIpc.openLarge.mockResolvedValueOnce({ handle: 3, header: full })
+  // 状态栏只读 `totalLines` 与 `header`，替身给这两样就够
+  shardFactory.createShardView.mockReturnValueOnce({
+    totalLines: full.totalLines,
+    header: full,
+  })
+  await ws.openAt('/var/log/huge.log')
+}
+
+describe('只读分片那一排（M2-H）', () => {
+  it('换成另一排：只读分片 · N 行 · X MB · 编码 · 换行符', async () => {
+    const ws = mount()
+
+    await makeShardTab(ws)
+    await flush()
+
+    // 整排逐个对，而不是挑几格看：这一排与内联那一排**没有一格是共用的**，
+    // 而 `cells()` 只收 `.status-cell`（`.status-spacer` 不算），
+    // 于是多一格少一格都会在这儿红
+    expect(cells()).toEqual(['huge.log', '只读分片', '1,200,000 行', '100.0 MB', 'GBK BOM', 'CRLF'])
+    expect(cell('这个文件太大，Vela 只读地按页取它：不能编辑，也不能保存')).toBe('只读分片')
+    expect(cell('全文行数（口径是 wc -l，与 CM6 差一行）')).toBe('1,200,000 行')
+    expect(cell('探测出来的编码。只读，不能改')).toBe('GBK BOM')
+    expect(cell('换行符，只从文件头部那一段判出来')).toBe('CRLF')
+  })
+
+  it('没有 BOM 时那一格不拖一个空的 BOM 后缀', async () => {
+    const ws = mount()
+
+    await makeShardTab(ws, { bom: false, encoding: 'utf8' })
+    await flush()
+
+    expect(cell('探测出来的编码。只读，不能改')).toBe('UTF-8')
+  })
+
+  it('🔴 编码与换行符压根不渲染成下拉——这是那两条写路径唯一的守卫', async () => {
+    const ws = mount()
+    expect(container.querySelectorAll('.statusbar select').length).toBe(2)
+
+    await makeShardTab(ws)
+    await flush()
+
+    expect(container.querySelectorAll('.statusbar select').length).toBe(0)
+    // 渲染出来就有人能拨它，而 `changeFormat` 会标脏。脏的分片标签**再也关不掉**：
+    // 关闭确认问「要不要保存」，而 `save` 在分片上一律拒绝（见 document.test.ts）
+    expect(ws.activeTab().doc.dirty()).toBe(false)
+  })
+
+  it('行/列、缩进、语言、字符数一律不报：一份没有光标的只读文本上它们没有意义', async () => {
+    const ws = mount()
+    // 先挂一个真编辑器：有了度量才看得出「那一排被换掉了」而不是「压根没渲染」
+    attachEditor(ws)
+    await flush()
+    expect(cell('主光标的行与列')).toBeDefined()
+    expect(cell('全文行数与字符数')).toBeDefined()
+
+    await makeShardTab(ws)
+    await flush()
+
+    expect(cell('主光标的行与列')).toBeUndefined()
+    expect(cell('缩进')).toBeUndefined()
+    expect(cell('语言')).toBeUndefined()
+    expect(cell('全文行数与字符数')).toBeUndefined()
+  })
+
+  it('🔴 不拿 ws.metrics() 凑数：它在分片标签上报的是那份**空占位 buffer**', async () => {
+    const ws = mount()
+
+    await makeShardTab(ws)
+    await flush()
+
+    // 正文压根不在 CM6 里（`openAsShard` 把它清成了空串），于是 metrics 说的是
+    // 「1 行 0 字符，光标在行 1 列 1」。照抄它的话状态栏会报出一个这个文件里
+    // 压根不存在的位置——而「行 1，列 1」读起来比留白更像真的
+    expect(ws.metrics().lines).toBe(1)
+    expect(ws.metrics().chars).toBe(0)
+    const shown = cells().join(' ')
+    expect(shown).not.toContain('行 1，列 1')
+    expect(shown).not.toContain('0 字符')
+    expect(shown).toContain('1,200,000 行')
+  })
+
+  it('路径那一格照旧：报文件名、title 给完整路径，而且永远不带那个未保存的圆点', async () => {
+    const ws = mount()
+
+    await makeShardTab(ws)
+    await flush()
+
+    const pathCell = container.querySelector('.status-path')!
+    expect(pathCell.textContent).toBe('huge.log')
+    expect(pathCell.getAttribute('title')).toBe('/var/log/huge.log')
+    expect(ws.activeTab().doc.dirty()).toBe(false)
+  })
+
+  it('切到内联标签，原来那一排回来（两个方向都要跟着 `doc.shard()` 走）', async () => {
+    const ws = mount()
+    await makeShardTab(ws)
+    await flush()
+    expect(container.querySelectorAll('.statusbar select').length).toBe(0)
+
+    await ws.openAt('/x/small.txt')
+    await flush()
+
+    expect(container.querySelectorAll('.statusbar select').length).toBe(2)
+    expect(cell('探测出来的编码。只读，不能改')).toBeUndefined()
+    expect(cell('编码')).toBe('UTF-8')
+    expect(cell('语言')).toBeDefined()
+  })
+
+  it('读写中那一格照旧：分片标签打开时 `open_large` 要整份扫一遍，可能很慢', async () => {
+    const ws = mount()
+    let release!: (opened: { handle: number; header: ShardHeader }) => void
+    ipc.openFile.mockRejectedValueOnce({ kind: 'too_large', bytes: 104_857_600, limit: 4_194_304 })
+    shardIpc.openLarge.mockReturnValue(new Promise((resolve) => (release = resolve)))
+
+    const opening = ws.openAt('/var/log/huge.log')
+    await flush()
+
+    // 建索引那几秒里用户得知道 Vela 没死。而那两个下拉在这儿压根不存在，
+    // 所以「禁用」这条退路也没有——只有路径格这一句
+    expect(container.querySelector('.status-path')?.textContent).toBe('读写中…')
+
+    release({ handle: 3, header: SHARD_HEADER })
+    shardFactory.createShardView.mockReturnValue({
+      totalLines: SHARD_HEADER.totalLines,
+      header: SHARD_HEADER,
+    })
+    await opening
+    await flush()
+
+    expect(cells()[0]).toBe('huge.log')
   })
 })

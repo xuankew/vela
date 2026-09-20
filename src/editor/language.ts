@@ -26,7 +26,14 @@ export interface LanguageChoice {
   readonly description: LanguageDescription | null
 }
 
-const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd)$/i
+/**
+ * 认作 Markdown 的那些扩展名。
+ *
+ * ⚠️ 导出成 HTML 时也要拿它算默认文件名（`src/md/export.ts` 的 `exportFileName`）：
+ * 那边自己再写一份 `.md|.markdown|…` 的话，将来加一个扩展名就会只加对一半——
+ * 症状是「`.mdx` 在编辑器里高亮成 Markdown，导出时却叫 `notes.mdx.html`」
+ */
+export const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd)$/i
 
 const MARKDOWN: LanguageChoice = { kind: 'markdown', label: 'Markdown', description: null }
 const PLAIN: LanguageChoice = { kind: 'plain', label: '纯文本', description: null }

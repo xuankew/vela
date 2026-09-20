@@ -1,4 +1,5 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { visibleWindow } from '../ui/virtual'
 import type { ProjectTree } from './store'
 import { NameDialog, type NameDialogProps } from './NameDialog'
 import { TreeMenu } from './TreeMenu'
@@ -7,9 +8,12 @@ import {
   containerRel,
   displayName,
   isTreeKey,
+  keyOf,
   menuFor,
   ROW_HEIGHT,
-  visibleWindow,
+  rowKey,
+  sameRow,
+  type RowKey,
   type TreeMenuAction,
   type TreeRow,
 } from './tree'
@@ -61,8 +65,8 @@ export interface SidebarProps {
  *
  * 这一层只做三件事：**弹在哪**（光标位置）、**弹什么**（`menuFor(row)`，纯函数，已单测）、
  * **选完之后调谁**（store 上那五个方法）。所有「行不行、成没成」的判断都在下游——
- * 根行不给「移到废纸篓」是 `menuFor` 的事，`trash('')` 再挡一道是 store 的事，
- * 名字合不合法是 Rust 侧的事。这一层不重复任何一条。
+ * 根行不给「移到废纸篓」是 `menuFor` 的事，`rootTree.trash` 里那道 `rel === ''` 的拦截
+ * 再挡一道，名字合不合法是 Rust 侧的事。这一层不重复任何一条。
  *
  * 结果一律走 `onNotice` 交到窗口顶部的提示条上，理由见 `TreeNotice`。
  */
@@ -103,8 +107,23 @@ export function Sidebar(props: SidebarProps) {
    */
   const [prompt, setPrompt] = createSignal<Omit<NameDialogProps, 'onCancel'> | null>(null)
 
-  const win = createMemo(() => visibleWindow(scrollTop(), viewportHeight(), tree.rows().length))
+  const win = createMemo(() => visibleWindow(scrollTop(), viewportHeight(), tree.rows().length, ROW_HEIGHT))
   const visible = createMemo(() => tree.rows().slice(win().start, win().end))
+
+  /**
+   * 头部那一格显示什么。
+   *
+   * ⚠️ 多根时**不能**只显示第 0 个根的名字：那一格是「我现在在哪个项目里」的唯一线索，
+   * 写着 `vela` 而工作区里还有 `notes` 的话，用户在 `notes` 里搜不到东西只会以为搜索坏了。
+   * 一个根就是它的名字，多个根就报个数——每个根自己的名字在它自己那条根行上，
+   * 头部这一格不重复。
+   */
+  const headLabel = createMemo(() => {
+    const list = tree.roots()
+    if (list.length === 0) return ''
+    if (list.length === 1) return tree.rootName(0)
+    return `${list.length} 个文件夹`
+  })
 
   function measure() {
     if (scrollEl) setViewportHeight(scrollEl.clientHeight)
@@ -119,10 +138,10 @@ export function Sidebar(props: SidebarProps) {
   onCleanup(() => window.removeEventListener('resize', measure))
 
   /** 把某一行滚进可视区。已经在里面时一动不动——「跳一下」比「不动」更让人失去方向 */
-  function scrollToRow(rel: string) {
+  function scrollToRow(key: RowKey) {
     const el = scrollEl
     if (!el) return
-    const index = tree.rows().findIndex((r) => r.rel === rel)
+    const index = tree.rows().findIndex((r) => sameRow(keyOf(r), key))
     if (index < 0) return
     const top = index * ROW_HEIGHT
     const bottom = top + ROW_HEIGHT
@@ -136,13 +155,14 @@ export function Sidebar(props: SidebarProps) {
     if (action.kind === 'none') return
     e.preventDefault()
     tree.run(action)
-    if (action.kind !== 'open') scrollToRow(action.rel)
+    if (action.kind !== 'open') scrollToRow(action.key)
   }
 
   function onRowClick(row: TreeRow) {
-    tree.select(row.rel)
-    if (row.isDir) void tree.toggle(row.rel)
-    else tree.run({ kind: 'open', rel: row.rel })
+    const key = keyOf(row)
+    tree.select(key)
+    if (row.isDir) void tree.toggle(key)
+    else tree.run({ kind: 'open', key })
   }
 
   function onRowContextMenu(e: MouseEvent, row: TreeRow) {
@@ -150,7 +170,7 @@ export function Sidebar(props: SidebarProps) {
     e.preventDefault()
     // 顺手选中：菜单弹出来时用户要能看清自己右键的是哪一行，
     // 尤其是名字被省略号截断的那些——菜单里不重复那一行的名字
-    tree.select(row.rel)
+    tree.select(keyOf(row))
     setMenu({ x: e.clientX, y: e.clientY, row })
   }
 
@@ -193,9 +213,12 @@ export function Sidebar(props: SidebarProps) {
     }
   }
 
-  /** 一层 rel 的显示名。根层用项目名——`displayName('')` 只会得到空字符串 */
-  function labelOf(rel: string): string {
-    return rel === '' ? tree.rootName() : displayName(rel)
+  /**
+   * 一层 rel 的显示名。根层用**那个根**的项目名——`displayName('')` 只会得到空字符串，
+   * 而多根之下「根层」有 N 个，得说清是哪一个。
+   */
+  function labelOf(rootIndex: number, rel: string): string {
+    return rel === '' ? tree.rootName(rootIndex) : displayName(rel)
   }
 
   /**
@@ -204,15 +227,18 @@ export function Sidebar(props: SidebarProps) {
    * `row` 是**参数**而不是从 `menu()` 里现读的：这个函数只会被 TreeMenu 的 onClick 调到，
    * 那一刻菜单马上就要关了，行也就定死了。写成 `menu()?.row` 的话下面每个闭包都会被
    * 当成「在追踪范围外面读响应式值」——而它们读的其实是一份快照。
+   *
+   * ⚠️ 递给 store 的一律是 `keyOf(row)` 而不是 `row.rel`：两个根都有一条 `src/a.ts`，
+   * 少了 `rootIndex` 的那一句会在**另一个根**里改名/删文件，而且不报错。
    */
   function pick(action: TreeMenuAction, row: TreeRow) {
     switch (action) {
       case 'newFile':
       case 'newFolder': {
         const kind = action === 'newFile' ? 'file' : 'dir'
-        const parent = containerRel(row)
+        const parent = rowKey(row.rootIndex, containerRel(row))
         setPrompt({
-          title: `在「${labelOf(parent)}」里新建${kind === 'file' ? '文件' : '文件夹'}`,
+          title: `在「${labelOf(parent.rootIndex, parent.rel)}」里新建${kind === 'file' ? '文件' : '文件夹'}`,
           initialValue: '',
           submitLabel: '新建',
           // 成了不用说话：新条目已经被选中，树上看得见
@@ -226,21 +252,28 @@ export function Sidebar(props: SidebarProps) {
           initialValue: row.name,
           selectBasename: !row.isDir,
           submitLabel: '改名',
-          onSubmit: closing((name) => tree.rename(row.rel, name)),
+          onSubmit: closing((name) => tree.rename(keyOf(row), name)),
         })
         return
       case 'trash':
         // ⚠️ 措辞必须是「移到废纸篓」，不能说「已删除」。说「已删除」，用户会去找那个
         // 不存在的撤销，或者反过来以为文件真没了、去翻 git
-        void runOp(() => tree.trash(row.rel), `已把「${row.name}」移到废纸篓，可以在 Finder 的废纸篓里找回`)
+        void runOp(() => tree.trash(keyOf(row)), `已把「${row.name}」移到废纸篓，可以在 Finder 的废纸篓里找回`)
         return
       case 'reveal':
         // 成了不说话：Finder 被推到前台本身就是回话，再说一句是重复
-        void runOp(() => tree.reveal(row.rel))
+        void runOp(() => tree.reveal(keyOf(row)))
         return
       case 'copyPath':
         // 成了要说：剪贴板没有任何可见变化，不说的话「复制成功了没有」无从判断
-        void runOp(() => tree.copyPath(row.rel), `已复制「${row.name}」的路径`)
+        void runOp(() => tree.copyPath(keyOf(row)), `已复制「${row.name}」的路径`)
+        return
+      case 'removeRoot':
+        // ⚠️ 这一句必须说清「磁盘上什么都没动」：整个根连同它下面所有行一起从树上消失，
+        // 看上去与「把那个文件夹删了」一模一样，而那正是用户此刻最怕的事。
+        // 它是同步的（不发 IPC），所以走不了 `runOp`——那条通道收的是 Promise
+        tree.removeRoot(row.rootIndex)
+        say('ok', `已把「${row.name}」移出工作区，磁盘上的文件一个都没动`)
         return
     }
   }
@@ -249,26 +282,33 @@ export function Sidebar(props: SidebarProps) {
     <aside class="sidebar" style={{ '--vela-tree-row-height': `${ROW_HEIGHT}px` }}>
       <div class="sidebar-head">
         <Show
-          when={tree.root()}
+          when={tree.roots().length > 0}
           fallback={
             <button class="sidebar-open" onClick={() => void tree.openViaDialog()}>
               打开文件夹…
             </button>
           }
         >
-          {(root) => (
-            <>
-              <span class="sidebar-title" title={root()}>
-                {tree.rootName()}
-              </span>
-              <button class="sidebar-act" title="重新读取所有摊开的层" onClick={() => void tree.refresh()}>
-                ↻
-              </button>
-              <button class="sidebar-act" title="关闭文件夹（不动已打开的标签）" onClick={() => tree.close()}>
-                ×
-              </button>
-            </>
-          )}
+          {/* title 挂**全部**根的路径（一行一个）：多根时头部那一格只剩「3 个文件夹」，
+              不挂 title 的话用户没有任何办法在界面上看清到底是哪三个 */}
+          <span class="sidebar-title" title={tree.roots().join('\n')}>
+            {headLabel()}
+          </span>
+          {/* 三个动作按「加 / 重读 / 全关」排：加是最常用的那个，全关排在最右边
+              与 macOS 的习惯一致，也离「＋」最远——一次误点不该直接把整个工作区关掉 */}
+          <button
+            class="sidebar-act"
+            title="添加文件夹到工作区…（可以一次多选）"
+            onClick={() => void tree.addViaDialog()}
+          >
+            +
+          </button>
+          <button class="sidebar-act" title="重新读取所有摊开的层" onClick={() => void tree.refresh()}>
+            ↻
+          </button>
+          <button class="sidebar-act" title="关闭所有文件夹（不动已打开的标签）" onClick={() => tree.close()}>
+            ×
+          </button>
         </Show>
       </div>
 
@@ -289,32 +329,38 @@ export function Sidebar(props: SidebarProps) {
         <div class="tree-spacer" style={{ height: `${win().totalHeight}px` }}>
           <div class="tree-window" style={{ transform: `translateY(${win().offsetY}px)` }}>
             <For each={visible()}>
-              {(row) => (
-                <div
-                  class="tree-row"
-                  classList={{
-                    selected: tree.selected() === row.rel,
-                    failed: row.error !== null,
-                  }}
-                  role="treeitem"
-                  aria-level={row.depth + 1}
-                  aria-expanded={row.isDir ? row.expanded : undefined}
-                  aria-selected={tree.selected() === row.rel}
-                  title={row.path}
-                  style={{ 'padding-left': `${row.depth * 12 + 6}px` }}
-                  onClick={() => onRowClick(row)}
-                  onContextMenu={(e) => onRowContextMenu(e, row)}
-                >
-                  <span class="tree-twisty">{row.isDir ? (row.expanded ? '▾' : '▸') : ''}</span>
-                  <span class="tree-name">{row.name}</span>
-                  {/* loading 与 error 都占同一行的剩余空间，不另起一行：
-                      多出一行会让这一行的高度不再是 ROW_HEIGHT，窗口算术立刻失准 */}
-                  <Show when={row.loading}>
-                    <span class="tree-note">读取中…</span>
-                  </Show>
-                  <Show when={row.error}>{(text) => <span class="tree-note bad">{text()}</span>}</Show>
-                </div>
-              )}
+              {(row) => {
+                // 一行里要读三次「是不是选中的那一行」，抽出来免得写三遍 `sameRow(…)`。
+                // ⚠️ 必须走 `sameRow`：`RowKey` 是结构体，`keyOf` 每次都新建对象，
+                // 而 `rows()` 一摊一收就整个重算，`===` 比引用永远是假
+                const selected = () => sameRow(tree.selected(), keyOf(row))
+                return (
+                  <div
+                    class="tree-row"
+                    classList={{
+                      selected: selected(),
+                      failed: row.error !== null,
+                    }}
+                    role="treeitem"
+                    aria-level={row.depth + 1}
+                    aria-expanded={row.isDir ? row.expanded : undefined}
+                    aria-selected={selected()}
+                    title={row.path}
+                    style={{ 'padding-left': `${row.depth * 12 + 6}px` }}
+                    onClick={() => onRowClick(row)}
+                    onContextMenu={(e) => onRowContextMenu(e, row)}
+                  >
+                    <span class="tree-twisty">{row.isDir ? (row.expanded ? '▾' : '▸') : ''}</span>
+                    <span class="tree-name">{row.name}</span>
+                    {/* loading 与 error 都占同一行的剩余空间，不另起一行：
+                        多出一行会让这一行的高度不再是 ROW_HEIGHT，窗口算术立刻失准 */}
+                    <Show when={row.loading}>
+                      <span class="tree-note">读取中…</span>
+                    </Show>
+                    <Show when={row.error}>{(text) => <span class="tree-note bad">{text()}</span>}</Show>
+                  </div>
+                )
+              }}
             </For>
           </div>
         </div>
@@ -328,7 +374,7 @@ export function Sidebar(props: SidebarProps) {
           <TreeMenu
             x={m().x}
             y={m().y}
-            items={menuFor(m().row)}
+            items={menuFor(m().row, tree.roots().length)}
             onPick={(action) => pick(action, m().row)}
             onClose={() => setMenu(null)}
           />

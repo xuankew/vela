@@ -1,10 +1,11 @@
 import { EditorSelection, type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { indentUnit, type LanguageSupport } from '@codemirror/language'
-import { createSignal, type Accessor, type Setter } from 'solid-js'
+import { batch, createSignal, type Accessor, type Setter } from 'solid-js'
 import { open as pickToOpen } from '@tauri-apps/plugin-dialog'
 import type { EditorController } from '../editor/controller'
 import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../editor/language'
+import type { PasteImageHook } from '../editor/paste'
 import { INDENT_UNIT, indentLabel, languageExtensions } from '../editor/setup'
 import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
 import {
@@ -91,6 +92,19 @@ export type SplitDirection = 'row' | 'column'
 export const MAX_PANES = 4
 
 /**
+ * MRU（最近打开过的文件）最多记多少条。与 `vela_core::project::index::MAX_RECENT`
+ * **同值**，两边各有一条测试钉住那个数字（那边是 `最近清单的长度上限与前端同值`）。
+ *
+ * 50 条的依据是 `Cmd+P` 一次只回 50 条（Rust 侧的 `QUERY_LIMIT`）：MRU 的用途就是在
+ * 空查询与短查询里把「刚才那几个」顶上来，超过一屏的部分永远排不进结果，记了也白带。
+ *
+ * ⚠️ 上限只归**这里**：Rust 侧的 `Session::validate` 不看 `recent`、也不截断它，
+ * 与 `SessionRoot.expanded` 的 `MAX_RESTORED_EXPANDED` 同一套分工——
+ * 两边各截一次的结果是谁也说不清最终有多少条。
+ */
+export const MAX_RECENT = 50
+
+/**
  * 一块可见编辑区。
  *
  * `tabId` 是 Accessor 而不是普通字段：标签条要拿它判断「哪个标签是活动的」，
@@ -120,8 +134,59 @@ export interface Workspace {
   readonly lineWrap: Accessor<boolean>
   /** 状态栏要的度量。只反映**聚焦分屏**显示的那个标签 */
   readonly metrics: Accessor<DocMetrics>
+  /**
+   * 正文改了几次。单调递增，只涨不落，数值本身没有意义——它是一个**变更信号**（M3-A）。
+   *
+   * 为什么不是复用 `metrics`：那个信号在**光标移动**时也会换引用（行列与选区在它上面），
+   * 而它的消费者是「正文变了就得重算」的那些东西——Markdown 预览、将来的字数统计。
+   * 拿 `metrics` 当触发器的后果是每按一下方向键就把整份文档重新解析渲染一遍，
+   * 而这类退化的表现是「打字还行，挪光标就卡」，很难往「触发条件太宽」上想。
+   *
+   * ⚠️ 口径是**任何标签**的正文变化都涨，不只是聚焦那个。多算的那几次由消费方自己挡：
+   * 正文没变时渲染结果逐字节相同，而预览那边有一道「HTML 一样就不碰 DOM」的闸
+   * （见 `src/md/MarkdownPreview.tsx`），代价只是一次解析。收窄成「只涨聚焦那个」的话，
+   * 外部改动静默重载了一个**没在看的**标签、用户随后切过去——那一路计数器一次都没动过，
+   * 而预览必须重算。少涨一次的失败方式是「切过去看到的还是上一份文档的渲染结果」，
+   * 而这恰好也是这个信号最难查的一种错：它不报错，只是旧
+   */
+  readonly revision: Accessor<number>
+  /**
+   * 最近打开过的文件的**绝对路径**，最新的在最前面，最多 `MAX_RECENT` 条（M2-E）。
+   *
+   * 给 `Cmd+P` 用：`query_project` 把它整份递给 Rust，那边按位置给前几名加分。
+   * 前端自己不拿它做任何过滤或排序。
+   *
+   * ⚠️ 记的是「成为用户正在看的那一个」，不是「还开着」——关掉的也算，
+   * 否则这份清单就退化成 `tabs` 的第二份抄写，而那种情况 `Cmd+P` 用不着它。
+   */
+  readonly recent: Accessor<string[]>
   /** 命令中心的 `ctx.editor` 就是这个。没有分屏挂着编辑器时是 null */
   focusedEditor: () => EditorController | null
+  /**
+   * 反查：这个编辑器实例此刻显示的是哪个标签（M3-A-7）。
+   *
+   * 存在的理由是「**谁收到事件，就改谁**」：CM6 的 paste 处理器递过来的是那个 view，
+   * 而粘贴落地要的是它正在显示的那份文档的路径。用 `activeTab()` 代替是一次
+   * 跨信号的间接推断，在分屏 + 焦点切换的时序下并不总与事件目标一致。
+   *
+   * 返回 `null` 表示这个实例已经不属于任何分屏（正在被 destroy），那时什么都不该做。
+   */
+  tabOfView: (view: EditorView) => Tab | null
+  /**
+   * `focusedEditor()` 的**响应式**孪生（M3-A-3）。
+   *
+   * 🔴 差别只有一件事：这一个额外读了 `attachedAt()` 与那块分屏的 `tabId()`，于是在
+   * `createEffect` / JSX 里读它**会订阅**「编辑器实例挂上来了／摘下去了」与
+   * 「这块分屏换了标签」两件事。`focusedEditor()` 两个都不读——`attach` 把实例写进的是
+   * `PaneRecord` 上一个普通可变字段，那一下不触发任何信号，所以在 effect 里读它
+   * 什么都等不到。`registry` 那条注释里「命令面板落地时要改成订阅」指的就是这件事。
+   *
+   * ⛔ 别把两个合并成一个。它们现在长得几乎一样，差别全在「读了哪些信号」上，
+   * 而合并之后命令中心每次 `execute` 都会顺手订阅一遍 `attachedAt`，
+   * 命令面板算 `enabled` 时也一样。多出来的重跑不报错、结果也对，只是白跑——
+   * 而「这个 effect 为什么又跑了一遍」是这类代码里最难查的一种问题。
+   */
+  readonly focusedView: Accessor<EditorController | null>
   /** 编辑器实例挂上来时由 `EditorPane` 的 onReady 调用 */
   attach: (paneId: number, controller: EditorController) => void
   detach: (paneId: number) => void
@@ -190,12 +255,21 @@ export interface WorkspaceOptions {
    * 宁可什么都别关，也不能让用户的一次点击把没存盘的稿子扔掉。
    */
   promptDiscard?: DiscardPrompt
+  /**
+   * 剪贴板里有一张图片时问谁（M3-A-7）。
+   *
+   * ⚠️ 钩子拿到的是**收到 paste 事件的那个 view**，而不是「当前活动标签」。
+   * 要把它换回文档请用 [`Workspace.tabOfView`]，⛔ 不要用 `activeTab()`：
+   * 后者读的是焦点跟踪的结果，两者在「焦点还没跟上」的时序下会不是同一个标签，
+   * 于是图片落到隔壁文档的目录里，而链接插在另一个文档里——两边都错，而且错得对不上。
+   */
+  pasteImage?: PasteImageHook
 }
 
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   // liveStates 声明在后面，但这里只是把引用存进 config，真正调用发生在补全请求时——
   // 那时 tabs 信号早就建好了，不会撞上 TDZ
-  const config: ViewConfig = createViewConfig(options.lineWrap ?? true, liveStates)
+  const config: ViewConfig = createViewConfig(options.lineWrap ?? true, liveStates, options.pasteImage)
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
   const [tabs, setTabs] = createSignal<Tab[]>([])
@@ -204,6 +278,14 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   const [direction, setDirection] = createSignal<SplitDirection>('row')
   const [wrap, setWrap] = createSignal(config.lineWrap)
   const [metrics, setMetrics] = createSignal<DocMetrics>(EMPTY_METRICS)
+  const [revision, setRevision] = createSignal(0)
+  /**
+   * 「某块分屏的编辑器实例挂上来了／摘下去了」的痕迹。值没有意义，只是一个订阅点，
+   * 存在的理由写在下面 `focusedView` 上。
+   */
+  const [attachedAt, setAttachedAt] = createSignal(0)
+  /** MRU。写入只走 `remember`，恢复时被 `restoreSession` 整个换掉 */
+  const [recent, setRecent] = createSignal<string[]>([])
 
   let nextTabId = 1
   let nextPaneId = 1
@@ -249,6 +331,14 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
    */
   function liveStates(): EditorState[] {
     return tabs().map((tab) => viewOf(tab)?.view.state ?? tab.snapshot.state)
+  }
+
+  /**
+   * 涨一次正文变更计数。两个调用点：CM6 的事务（`makeTab` 的 `onUpdate`）与
+   * 整个换掉正文的那一条（`host.setText`）。后者为什么必须单独涨，理由写在那里。
+   */
+  function bumpRevision() {
+    setRevision((n) => n + 1)
   }
 
   function syncMetrics(tab: Tab) {
@@ -314,6 +404,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       // 还是那个没装语言的 snapshot，语言会被整个冲掉
       syncLanguage(tab)
       if (tab.id === activeTab().id) syncMetrics(tab)
+      // 🔴 这一路**必须**手动涨一次。`replaceTabText` 之后走的是 `restore` → `view.setState`，
+      // 而 CM6 的 `setState` 不经过 dispatch，**不触发 updateListener**——下面 `makeTab`
+      // 里那一次自动涨不会发生。漏掉它的症状是「外部改了文件，编辑器里的正文换了，
+      // 旁边的预览还是旧的」，而那正是 M2-G 静默重载最常走的一条路
+      bumpRevision()
     },
     focus: (tab) => {
       viewOf(tab)?.focus()
@@ -330,8 +425,13 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       config,
       host,
       onUpdate: (info) => {
-        // 脏标记只认正文变化：光标移动不该让文件变成「未保存」
-        if (info.docChanged) tab.doc.markChanged()
+        if (info.docChanged) {
+          // 脏标记只认正文变化：光标移动不该让文件变成「未保存」
+          tab.doc.markChanged()
+          // 变更计数同一条口径。⚠️ 它必须只认 `docChanged`：跟着选区一起涨的话，
+          // 这个信号就退化成 `metrics` 了，而 M3-A 加它的全部理由就是不要那样
+          bumpRevision()
+        }
         // 只有正在显示的那个标签会收到事务（没显示在任何分屏里的标签没有 view，
         // 压根不产生 update），但度量属于状态栏，状态栏只跟着聚焦的分屏走，所以还是要判一次。
         // 走 syncMetrics 而不是直接用 info 带的那两个数：行列与选区只有 state 上有
@@ -359,13 +459,23 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
    *
    * `capture` 必须在 `restore` 之前——反过来就是拿目标标签的 state 覆盖掉当前标签
    * 还没存盘的最后一次编辑。
+   *
+   * 🔴 整段包在 `batch` 里，因为 `pane.setTabId` 是一次**信号写入**：不包的话它当场就把
+   * 订阅者刷一遍，而那时 `restore` 还没跑，订阅者看到的是「新标签 id + 上一份文档的正文」
+   * 这么一个撕裂的现场。预览面板正好踩在这一条上——它的 effect 读 `tabId()` 判定
+   * 「换标签了，立刻重渲染」，然后从 `view.state` 里读出**上一个**标签的正文渲染出来；
+   * 而 `restore` 走的是 `view.setState`，不触发 CM6 的 updateListener（同 `host.setText`
+   * 里那条注释），于是没有任何东西会再叫它一遍，预览就永远停在上一份文档上。
+   * 度量那一路看不见这个 bug：`syncMetrics(next)` 是把 `next` **显式**递进去的。
    */
   function showIn(pane: PaneRecord, next: Tab) {
     if (pane.tabId() === next.id) return
-    capture(pane)
-    pane.setTabId(next.id)
-    pane.controller?.restore(next.snapshot)
-    if (pane.id === focusedPaneId()) syncMetrics(next)
+    batch(() => {
+      capture(pane)
+      pane.setTabId(next.id)
+      pane.controller?.restore(next.snapshot)
+      if (pane.id === focusedPaneId()) syncMetrics(next)
+    })
   }
 
   function attach(paneId: number, controller: EditorController) {
@@ -383,6 +493,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       // 启动、恢复、新建分屏之后都得让用户先点一下编辑器才能开始打字
       controller.focus()
     }
+    // ⚠️ 放在最后：这一下会让所有订阅 `focusedView` 的东西同步重跑，而它们要读的是
+    // 一个**已经装好滚动位置、已经拿到焦点**的实例。放在赋值那一行后面的话，
+    // 预览会先按 `scrollTop = 0` 对齐一次，紧接着又被 applyScroll 触发的滚动事件拉回来
+    setAttachedAt((n) => n + 1)
   }
 
   function detach(paneId: number) {
@@ -391,6 +505,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     // 现场先存回标签：controller 马上就要被 destroy，之后 snapshot 是唯一的真相
     capture(pane)
     pane.controller = null
+    setAttachedAt((n) => n + 1)
   }
 
   function focusPane(paneId: number) {
@@ -442,9 +557,30 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return tab
   }
 
+  /**
+   * 记一笔 MRU。规矩是「**一个带路径的文档成为用户正在看的那一个**」，
+   * 于是四个地方调它：`openAt` 的两条真开分支、`activateTab`、`save` / `saveAs`。
+   *
+   * 收 `string | null` 而不是 `string`：调用点手上拿着的是 `doc.path()`，
+   * 而它**就是**「打开成功了没有」的判据——`document.ts` 的 `openAt` 失败时不抛，
+   * 只把错误挂在那个标签自己的 notice 上。让调用点先判一次 null 等于把这条判据
+   * 抄四份，哪天有一处忘了，MRU 里就会多出一个打不开的路径。
+   */
+  function remember(path: string | null) {
+    if (path === null) return
+    const list = recent()
+    // 已经排在第一就一个字都不写。⌘S 是个高频动作，而每次写 signal 都会捅一下
+    // 会话自动保存的节流器（`sessionSync`）——为一个没有变化的清单触发一轮序列化不值
+    if (list[0] === path) return
+    setRecent([path, ...list.filter((p) => p !== path)].slice(0, MAX_RECENT))
+  }
+
   function activateTab(id: number) {
     const tab = tabById(id)
     if (!tab) return
+    // 放在两条分支**之前**：「聚焦那个已经在显示它的分屏」与「把它装进聚焦的分屏」
+    // 在 MRU 看来是同一件事——用户现在看的是它
+    remember(tab.doc.path())
     // 已经在某个分屏里显示 → 聚焦那个分屏，而不是把它从那边搬过来：
     // 搬走会让那个分屏空掉，而「一个标签只能显示在一个分屏里」也不允许它同时留在两处
     const owner = paneOfTab(id)
@@ -479,54 +615,87 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return true
   }
 
+  /** 真正把标签摘掉：先从标签条上拿掉并给空出来的分屏换一个标签，最后还 fd */
+  function dropTab(id: number) {
+    const doomed = tabById(id)
+    if (!doomed) return
+    removeFromList(id)
+    // 🔴 分片的 fd 在这儿还回去，而顺序必须是**先从标签表里摘掉，再还**。反过来的话
+    // `releaseShard()` 把 `doc.shard()` 置回 null 的那一刻，这个标签**还在** `tabs()` 里，
+    // 于是 `fileWatch.currentPaths()` 会把它当成一个普通内联标签送进清单——
+    // Rust 侧白白订一次目录又立刻退订。更要紧的是同一段窗口里真来了一条外部改动事件的话，
+    // `onEvent` 看见的是「干净的内联标签」，于是 `reload` → 撞 too_large → **再开一个分片**，
+    // 而那个新 fd 挂在一个已经被摘掉的标签上，永远没人 dispose。
+    //
+    // 这个标签从此再没有任何引用，而 Rust 侧那个句柄不会因为没人再提它就自己关掉
+    // （见 `ipc/shard.ts` 的 `closeLarge`）。
+    // ⚠️ 刻意放在 `dropTab` 而不是 `ShardPane` 的 onCleanup：换标签也会卸载那个组件，
+    // 而分片必须活到标签真的关掉为止（理由写在 `ShardPane.tsx` 的模块文档里）
+    doomed.doc.releaseShard()
+  }
+
   /**
-   * 真正把标签摘掉，并给显示着它的那块分屏换一个标签显示。
+   * 把标签从标签条上摘掉，并给显示着它的那块分屏换一个标签显示。不碰任何 fd。
    *
    * 换谁：右邻居优先，但**只能挑一个没在别的分屏里显示着的**——否则两块分屏会显示同一个
    * 标签，正是文件头不变量 2 排除的情况（`snapshot` 不再是「没显示时的唯一真相」）。
    * 一个都挑不出来时就补一个空标签：宁可标签条上多一个「空文档」，也不能让现场分叉。
    */
-  function dropTab(id: number) {
-    const list = tabs()
-    const index = list.findIndex((t) => t.id === id)
-    if (index < 0) return
-    const rest = list.filter((t) => t.id !== id)
+  function removeFromList(id: number) {
+    // 🔴 整个函数体裹在 `batch` 里，因为中间那几步会短暂造出「某块分屏显示的标签不在
+    // `tabs()` 里」的状态：`setTabs` 已经把它摘掉了，而 `showIn` 还没给那块分屏换上新标签。
+    //
+    // 这个窗口从前没人看得见——`EditorPane` 只在 `onMount` 读一次 props，换标签不重挂。
+    // 但 M2-H 之后 `App.tsx` 在每块分屏外面套了一层 `<Show when={shardOf(pane)}>`：
+    // `shardOf` 查不到标签就返回 null，于是关掉一个**分片**标签的那一瞬间，那块分屏从
+    // 「只读分片」翻成 fallback，真的去挂一个新的 `EditorPane`，而 `paneState` 里那句
+    // `tabs().find(...)!` 当场炸——`!` 的前提是「分屏新建时它的标签一定已经在 `tabs()` 里」
+    // （见 workspace 的 `split`），中间态正好破坏这条前提。
+    //
+    // 而炸点在 `closeTab` 这个 async 函数体内，所以它变成一个没人接的 rejected promise：
+    // `dropTab` 后半句的 `releaseShard()` 再也跑不到，那个 fd 就这么漏了，一点声音都没有。
+    batch(() => {
+      const list = tabs()
+      const index = list.findIndex((t) => t.id === id)
+      if (index < 0) return
+      const rest = list.filter((t) => t.id !== id)
 
-    // 关掉最后一个 = 换一个空标签进来（见文件头的不变量）。
-    // 此时必然只剩一块分屏：分屏数永远 ≤ 标签数（split 一次同时加一个标签和一块分屏，
-    // closePane 只减分屏不减标签），所以标签只剩一个时分屏也只剩一块。
-    if (rest.length === 0) {
-      const fresh = makeTab()
-      setTabs([fresh])
-      const only = panes()[0]!
-      showIn(only, fresh)
-      focusPane(only.id)
-      return
-    }
+      // 关掉最后一个 = 换一个空标签进来（见文件头的不变量）。
+      // 此时必然只剩一块分屏：分屏数永远 ≤ 标签数（split 一次同时加一个标签和一块分屏，
+      // closePane 只减分屏不减标签），所以标签只剩一个时分屏也只剩一块。
+      if (rest.length === 0) {
+        const fresh = makeTab()
+        setTabs([fresh])
+        const only = panes()[0]!
+        showIn(only, fresh)
+        focusPane(only.id)
+        return
+      }
 
-    const victim = paneOfTab(id)
-    // 这个标签谁都没显示（比如它的分屏刚被合并掉），那就只是从标签条上摘掉
-    if (!victim) {
+      const victim = paneOfTab(id)
+      // 这个标签谁都没显示（比如它的分屏刚被合并掉），那就只是从标签条上摘掉
+      if (!victim) {
+        setTabs(rest)
+        return
+      }
+
+      const elsewhere = new Set(
+        panes()
+          .filter((p) => p.id !== victim.id)
+          .map((p) => p.tabId()),
+      )
+      const free = rest.filter((t) => !elsewhere.has(t.id))
+      if (free.length === 0) {
+        const fresh = makeTab()
+        setTabs([...rest, fresh])
+        showIn(victim, fresh)
+        return
+      }
       setTabs(rest)
-      return
-    }
-
-    const elsewhere = new Set(
-      panes()
-        .filter((p) => p.id !== victim.id)
-        .map((p) => p.tabId()),
-    )
-    const free = rest.filter((t) => !elsewhere.has(t.id))
-    if (free.length === 0) {
-      const fresh = makeTab()
-      setTabs([...rest, fresh])
-      showIn(victim, fresh)
-      return
-    }
-    setTabs(rest)
-    // 摘掉第 i 个之后，原来的第 i+1 个正好落到 `free` 的下标 i 上；
-    // 关掉的是最后一个（或右邻居都被别的分屏占着）时退回末尾
-    showIn(victim, free[Math.min(index, free.length - 1)]!)
+      // 摘掉第 i 个之后，原来的第 i+1 个正好落到 `free` 的下标 i 上；
+      // 关掉的是最后一个（或右邻居都被别的分屏占着）时退回末尾
+      showIn(victim, free[Math.min(index, free.length - 1)]!)
+    })
   }
 
   async function closeTab(id: number) {
@@ -565,10 +734,14 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     // 标签条很快全是没用的「空文档」
     if (active.doc.path() === null && !active.doc.dirty()) {
       await active.doc.openAt(path)
+      // 递 `doc.path()` 而不是形参 `path`：打开失败时前者是 null，`remember` 自己就不动。
+      // 这条分支不经过 `activateTab`（标签本来就是活动的那个），所以得自己记一笔
+      remember(active.doc.path())
       return
     }
     const tab = newTab()
     await tab.doc.openAt(path)
+    remember(tab.doc.path())
   }
 
   async function openViaDialog() {
@@ -617,6 +790,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     const { state } = live
     const path = tab.doc.path()
     const dirty = tab.doc.dirty()
+    // ⚠️ 只读分片标签**不需要任何特殊处理**，这是 M2-H 特意换来的：它干净、有路径、
+    // 正文是空的 → `draft` 落成 null → 恢复时走「干净又有路径就重新读盘」那一条 →
+    // `doc.openAt` 再撞一次 `too_large` → 自动改走分片。存档格式一个字都没改。
+    // 代价是滚动位置与选区恢复不回来（那份 `snapshot` 属于那个空 buffer，
+    // 而分片的滚动条压根不在 CM6 手里）——一个 100 MB 的日志重开在第 1 行是可以接受的
     return {
       path,
       format: tab.doc.format(),
@@ -660,6 +838,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       // `restoreSession(serializeSession())` 这条往返在测试里用了七次，
       // 缺一个字段就得处处补，换来的只是把一句注释换成一个类型体操。
       project: null,
+      // 与 `project` 相反，这一格**就是这里的真相**：MRU 记的是「看过哪些文档」，
+      // 与项目树无关（关掉文件夹它照样留着），所以 `sessionSync` 不会来覆盖它
+      recent: recent(),
+      // 这一格与 `project` 同属「项目树那一半」，永远是空数组，由 `sessionSync` 覆盖掉。
+      // 理由逐字同上：workspace 不知道文件夹的存在，而「最近项目」记的正是文件夹
+      recentProjects: [],
     }
   }
 
@@ -684,6 +868,18 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       scrollTop: saved.scrollTop,
       scrollLeft: saved.scrollLeft,
     }
+  }
+
+  /**
+   * 把所有还开着的分片关掉。两处调用：换掉整批标签之前（`restoreSession`），
+   * 以及确认可以关窗之后（`requestWindowClose`）。
+   *
+   * 关窗那一处是 `ipc/shard.ts` 的 `closeLarge` 点名要的三处之一（另两处是标签关闭
+   * 与「外部改了之后重开分片」，分别在 `dropTab` 与 `document.ts` 的 `reload`）。
+   * 进程退出时操作系统本来也会收走 fd，但那条兜底不该是代码依赖的东西
+   */
+  function releaseAllShards() {
+    for (const tab of tabs()) tab.doc.releaseShard()
   }
 
   async function restoreSession(session: Session): Promise<void> {
@@ -718,11 +914,33 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
     const freshPanes = session.panes.map((tabIndex) => makePane(fresh[tabIndex]!.id))
     setDirection(session.direction)
+    // 🔴 旧的那批标签整个被扔掉，它们身上的分片得还回去（理由见 `dropTab` 里那一段）。
+    //
+    // 位置是**紧贴着 `setTabs(fresh)`**，不是这个方法开头。放在开头的话，从这里到
+    // `setTabs` 之间隔着上面那一整段 `await Promise.all`——几十个文件的并行读盘，
+    // 几百毫秒起步。那段时间里旧标签还在 `tabs()` 上、而 `shard()` 已经是 null，
+    // 于是 `fileWatch` 会把它们当成普通内联标签送进清单；真来一条外部改动事件的话，
+    // `reload` → 撞 too_large → 再开一个分片，而那个 fd 挂在一个马上就要被扔掉的
+    // 标签上，`dispose` 永远不会被调到。
+    //
+    // 紧贴着就没有这个问题：两行之间没有 `await`，Solid 的 effect 要等到这一批更新
+    // 落地之后才跑，那时它看见的已经是 `fresh`。
+    //
+    // ⚠️ 这个方法只在启动时用一次，那时通常一个分片都没有——但「只用在启动时」
+    // 是文档里的一句话而不是类型系统里的一条约束，而漏一个 fd 是没有声音的
+    releaseAllShards()
     setTabs(fresh)
     // 旧的那批分屏由 Solid 卸载 EditorPane 时自己收尾：`detach` 在 panes() 里找不到
     // 旧记录会直接返回，controller 由 EditorPane 的 onCleanup 销毁，不会泄漏
     setPanes(freshPanes)
     setFocusedPaneId(freshPanes[session.focused]!.id)
+    // 只夹长度，**不去重也不校验路径**：
+    // - 夹是必须的，因为 Rust 侧刻意不截断（见 `Session::recent` 的文档），
+    //   一份手改过的存档能塞进来几万条，全背着就是白占内存；
+    // - 去重是 `remember` 在写入侧维护的不变量，在这里再实现一遍就是第二份会漂的抄写；
+    // - 路径存不存在更不该问：MRU 里的文件被删掉/移走是常态，`Cmd+P` 那边
+    //   索引里没有它就自然不会出现，多问一次磁盘只是拖慢启动
+    setRecent(session.recent.slice(0, MAX_RECENT))
     syncMetrics(activeTab())
   }
 
@@ -739,6 +957,32 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   // eslint-disable-next-line solid/reactivity
   syncMetrics(firstTab)
 
+  /**
+   * 见 `Workspace.focusedView` 上的说明。
+   *
+   * 🔴 刻意是普通箭头函数而不是 `createMemo`，两条理由，第二条是要紧的那条：
+   *
+   * 1. memo 在这里换不来任何东西。唯一的消费者（预览面板）自己就是防抖的，
+   *    而这一层做的事只有「查一个字段」，比 memo 的比较还便宜。
+   * 2. **memo 会把「同一块分屏换标签」整个吞掉。** `showIn` 走的是 `capture` + `restore`，
+   *    不重建 view，于是换标签前后 `controller` 是**同一个实例**——`===` 相等，memo 不通知，
+   *    订阅者收不到任何信号。少这一下的症状是「切了标签，旁边的预览还停在上一份文档」，
+   *    而它只在「换标签但没换分屏」这条路上发作，分屏之间切反倒是对的。
+   *
+   * 顺带省掉一条排序约束：`createMemo` 是**立刻**求值的，建在上面那批初始状态之前就会
+   * 因为 `panes()` 还是空数组而抛；普通箭头函数是被调用时才跑，没有这个坑。
+   */
+  const focusedView = (): EditorController | null => {
+    // `attachedAt()` 的返回值不用，读它就是**为了订阅**：`attach` / `detach` 改的是
+    // `PaneRecord` 上一个普通可变字段，那一下不触发任何信号，不留这个痕迹就没人知道
+    attachedAt()
+    const pane = focusedPane()
+    // `tabById(...)` 那一次读同样是为了订阅（理由见上面第 2 条）。
+    // 返回 `null` 而不是直接 `pane.controller`：一个标签都不在 `tabs()` 里的分屏
+    // 没有「当前文档」可言，那时说「没有可预览的正文」比递一个显示着幽灵文档的实例诚实
+    return tabById(pane.tabId()) === undefined ? null : pane.controller
+  }
+
   return {
     tabs,
     panes,
@@ -748,7 +992,16 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     activeIndex: () => tabs().findIndex((t) => t.id === activeTab().id),
     lineWrap: wrap,
     metrics,
+    revision,
+    recent,
     focusedEditor: () => focusedPane().controller,
+    tabOfView(view) {
+      const pane = panes().find((p) => p.controller?.view === view)
+      // `?? null` 那一半是「分屏还在、但它显示的标签已经被关掉了」：
+      // 与 `focusedView` 返回 null 的理由同一条——没有「当前文档」就别假装有
+      return pane === undefined ? null : (tabById(pane.tabId()) ?? null)
+    },
+    focusedView,
     attach,
     detach,
     focusPane,
@@ -761,8 +1014,19 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     closeTab,
     activateTab,
     reorder,
-    save: () => activeTab().doc.save(),
-    saveAs: () => activeTab().doc.saveAs(),
+    async save() {
+      const doc = activeTab().doc
+      await doc.save()
+      // 未命名文档的 `save` 会落到另存为，于是路径是在这一趟里**才出现的**。
+      // 那时标签早就是活动的那个，`activateTab` 不会再被调用——不在这里补一笔，
+      // 「新建 → ⌘S → 另存为」这个文件就永远进不了 MRU
+      remember(doc.path())
+    },
+    async saveAs() {
+      const doc = activeTab().doc
+      await doc.saveAs()
+      remember(doc.path())
+    },
     setLineWrap,
     toggleLineWrap: () => setLineWrap(!config.lineWrap),
     anyDirty: () => tabs().some((t) => t.doc.dirty()),
@@ -787,7 +1051,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       return changed
     },
     // 一次问完所有脏标签，而不是一个一个弹：关窗口时弹五次对话框没人受得了
-    requestWindowClose: () => settle(tabs().filter((t) => t.doc.dirty())),
+    requestWindowClose: async () => {
+      const ok = await settle(tabs().filter((t) => t.doc.dirty()))
+      // 只在真的要关的时候收：用户答了「取消」，那些分片还得继续用
+      if (ok) releaseAllShards()
+      return ok
+    },
     serializeSession,
     restoreSession,
   }

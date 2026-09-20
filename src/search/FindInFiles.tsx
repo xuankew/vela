@@ -370,6 +370,9 @@ export function FindInFiles(props: FindInFilesProps) {
                   >
                     {row.kind === 'file' ? (
                       <>
+                        {/* 只有多根工作区才画：单根时 `row.root` 恒为空串（见 `store.ts`
+                            的 `rootLabelOf`），那时每一行前面都挂同一个项目名，纯噪音 */}
+                        {row.root === '' ? null : <span class="find-root">{row.root}</span>}
                         <span class="find-rel">{row.rel}</span>
                         <span class="find-count">{count}</span>
                       </>

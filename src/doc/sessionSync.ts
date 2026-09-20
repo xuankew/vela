@@ -29,6 +29,15 @@ import type { Workspace } from './workspace'
  *
  * 这也让上面那条轮询策略**免费**覆盖了树：指纹是整份 `Session` 的 `JSON.stringify`，
  * 摊开/收起一层就是一次指纹变化，不需要在树那边另挂一套「改动时打个标记」。
+ *
+ * ⚠️ 「两半」说的是**需要拼接**的那两半。`Session.recent`（M2-E 的 MRU）整个住在
+ * workspace 那一半里，这一层什么都不用为它做——它记的是「看过哪些文档」，
+ * 与开没开文件夹无关。同理它也自动进了上面那个指纹：切一次标签就是一次指纹变化。
+ *
+ * 而 `Session.recentProjects`（M2-F 的最近项目）恰好相反：它记的是「换过哪些工作区」，
+ * 于是它住在**树那一半**，由这一层在拼接时盖上（`tree.serializeRecent()`），
+ * 启动时交回去（`tree.restoreRecent()`）。名字与 `recent` 只差一个词、归属却在另一边，
+ * 这是本文件最容易看错的一处——判据只有一条：它记的东西是文件夹还是文档。
  */
 
 /** 自动保存的最小间隔。5 秒是「崩了最多丢 5 秒」与「打字时别一直写盘」之间的取舍 */
@@ -48,7 +57,7 @@ export type Scheduler = (tick: () => void, intervalMs: number) => Unschedule
 export interface SessionSyncOptions {
   workspace: Workspace
   /**
-   * 项目树。没注入就只存标签页那一半（`project` 恒为 `null`）。
+   * 项目树。没注入就只存标签页那一半（`project` 恒为 `null`，`recentProjects` 恒为 `[]`）。
    *
    * 做成可选而不是必填：这一层的用例绝大多数与树无关，逼着它们都造一个
    * `createProjectTree` 只会把定时器测试拖进 IPC mock。
@@ -100,9 +109,14 @@ export function createSessionSync(options: SessionSyncOptions): SessionSync {
   let tail: Promise<void> = Promise.resolve()
 
   async function doWrite(): Promise<void> {
-    // 两半在这里拼成一份。`ws.serializeSession()` 的 `project` 恒为 null（workspace
-    // 不知道树存在），所以顺序是固定的：先摊开 workspace 那半，再盖上树这半。
-    const session: Session = { ...ws.serializeSession(), project: tree?.serializeState() ?? null }
+    // 两半在这里拼成一份。`ws.serializeSession()` 的 `project` 恒为 null、
+    // `recentProjects` 恒为空数组（workspace 不知道文件夹的存在），所以顺序是固定的：
+    // 先摊开 workspace 那半，再盖上树这两格。
+    const session: Session = {
+      ...ws.serializeSession(),
+      project: tree?.serializeState() ?? null,
+      recentProjects: tree?.serializeRecent() ?? [],
+    }
     // 指纹只用来跟自己做相等比较，不需要与线上的字节完全一致。
     // ⚠️ 必须在**拼接之后**算：算早了就只覆盖标签页那一半，摊开/收起文件夹永远不会触发写
     const fingerprint = JSON.stringify(session)
@@ -134,6 +148,9 @@ export function createSessionSync(options: SessionSyncOptions): SessionSync {
         // null = 第一次启动，还没有存档。静默地留着 workspace 自带的那个空标签、
         // 以及树自带的「打开文件夹…」空状态
         if (saved !== null) {
+          // 「最近项目」先装回去，而且是**同步**装：它只写一个信号，没有 IO，
+          // 于是即便下面那两半里有一半抛了，清单也已经在内存里了
+          tree?.restoreRecent(saved.recentProjects)
           // 两半**并行**装回去：它们之间没有任何依赖（workspace 读的是文件内容，
           // 树读的是目录列举），串起来等于把「几十个文件」与「几十层目录」两笔启动
           // 开销相加而不是取最大值。两边内部各自也已经是并行的。

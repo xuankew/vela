@@ -37,6 +37,7 @@ import { createFindReplacePanel, preserveCase } from './findReplace'
 import { indentGuides } from './indentGuides'
 import type { LanguageChoice } from './language'
 import { mouseGestures } from './multiCursor'
+import { imagePaste, type PasteImageHook } from './paste'
 import { coveredRange, escapesCoverage } from './viewport'
 import { wordCompletions, wordPeers } from './wordSource'
 
@@ -287,6 +288,13 @@ export interface EditorSetupOptions {
    * 而且注入之后「跨文档取词」能在 node 环境里拿两个裸 state 测出来。
    */
   peerStates?: () => Iterable<EditorState>
+  /**
+   * 剪贴板里有一张图片时问谁（M3-A-7）。缺省 = 不装这条扩展，粘贴走 CM6 的默认路径。
+   *
+   * 🔴 钩子必须**同步**回答接不接：paste 处理器的返回值决定 CM6 要不要 `preventDefault`
+   * 并跳过它自己那个默认粘贴。落地本身是异步的，那部分由钩子内部自己管（见 `src/md/paste.ts`）。
+   */
+  pasteImage?: PasteImageHook
 }
 
 /**
@@ -316,7 +324,7 @@ export function languageExtensions(choice: LanguageChoice, support: LanguageSupp
  * 部分（如 lint gutter）。
  */
 export function buildExtensions(options: EditorSetupOptions): Extension[] {
-  const { lineWrap = true, language, lineWrapSlot, languageSlot, peerStates } = options
+  const { lineWrap = true, language, lineWrapSlot, languageSlot, peerStates, pasteImage } = options
 
   const exts: Extension[] = [
     lineNumbers(),
@@ -383,6 +391,8 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   exts.push(lineWrapSlot.of(lineWrap ? [EditorView.lineWrapping] : []))
   // 词补全的「其他文档」。没传就不装：facet 缺省是空的，词典退化成只有当前文档那一份
   if (peerStates !== undefined) exts.push(wordPeers.of(peerStates))
+  // 粘贴图片。没传就不装：CM6 内置的 paste 处理器照旧跑，行为与 M3-A-7 之前一模一样
+  if (pasteImage !== undefined) exts.push(imagePaste(pasteImage))
 
   return exts
 }

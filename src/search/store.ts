@@ -48,6 +48,10 @@ import {
 import { startReplace, type ReplaceHandlers, type ReplaceProgress, type ReplaceSummary } from '../ipc/replace'
 // 取消走的是搜索与替换共用的那一个命令，所以它的封装不挂在 `ipc/search.ts` 上
 import { cancelTask } from '../ipc/task'
+// 只借这一个纯函数：根的显示名就是路径的最后一段，而「怎么从一条绝对路径里抠出最后一段」
+// 这件事在 `tree.ts` 里已经把末尾斜杠、根目录 `/` 这些边界都处理过了（见那边的注释）。
+// 自己再写一遍的失败方式是两处对 `/repo/` 这种路径给出不同的名字
+import { displayName } from '../project/tree'
 import {
   actionForKey,
   describeProgress,
@@ -67,8 +71,14 @@ import {
 /** 搜索词为空时前端自己说的那一句。与 Rust 侧 `build_matcher` 的 `bad_pattern` 文案相同 */
 const EMPTY_PATTERN = '搜索词不能为空'
 
-/** 预览与当前条件不一致时那一句。它是唯一会让「替换全部」灰掉而又看不出原因的情况 */
-const STALE_PREVIEW = '预览已过期：条件改过了，重新搜一遍再替换'
+/**
+ * 预览与当前条件不一致时那一句。它是唯一会让「替换全部」灰掉而又看不出原因的情况。
+ *
+ * ⚠️ 措辞里带「工作区」是 M2-F 加的：根清单也在预览指纹里，所以「搜完之后往工作区
+ * 添了一个文件夹」与「搜完之后改了搜索词」是同一件事——用户批准的那份清单
+ * 已经不是在说当前这些文件夹了
+ */
+const STALE_PREVIEW = '预览已过期：条件或工作区改过了，重新搜一遍再替换'
 
 /**
  * 「在飞的那一个任务」的认账逻辑，见模块文档那条竞态。
@@ -322,12 +332,16 @@ export interface SearchPanel {
 
 export interface SearchPanelOptions {
   /**
-   * 项目根从哪来。App 注入 `tree.root`。
+   * 工作区的根清单从哪来，顺序就是侧边栏从上到下的顺序。App 注入 `tree.roots`。
    *
    * 注入而不是让这一层 import `createProjectTree`：与 `project/store.ts` 的 `openFile`
    * 同一条道理——store 不该知道宿主长什么样，而且直接 import 会让两层互相引用成环。
+   *
+   * ⚠️ 空数组 = 没打开任何文件夹（「没打开」只有这一种写法，见 `project/store.ts` 文件头）。
+   * 这一层拿到空数组就报一句「还没打开文件夹」，绝不发一次 `start_search`——
+   * Rust 侧的 `validate` 也会拒掉空的 `roots`，两边各挡一次
    */
-  root: () => string | null
+  roots: () => readonly string[]
   /** 点一条命中时做什么。App 注入「打开这个文件并跳到那一行、选中那一段」 */
   openHit?: (hit: HitRow) => void | Promise<void>
   /**
@@ -347,7 +361,7 @@ export interface SearchPanelOptions {
    */
   skipPaths?: () => string[]
   /**
-   * 落盘真的改了东西之后做什么。App 注入「把 `root` 底下那些**干净的**标签重新读一遍」。
+   * 落盘真的改了东西之后做什么。App 注入「把工作区里那些**干净的**标签重新读一遍」。
    *
    * `filesChanged === 0` 时不调用：一个文件都没动，重新读盘是白跑，
    * 而且「读回来发现内容一样就什么都不做」那条判断（见 `DocumentModel.reload`）
@@ -379,16 +393,59 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
   const [selected, setSelected] = createSignal<number | null>(null)
   const [confirm, setConfirm] = createSignal<ConfirmApply | null>(null)
   /**
-   * 这一份预览是在什么条件下搜出来的（`query()` 的序列化）。null = 手上没有预览。
+   * 这一份预览是在什么条件下搜出来的（**根清单 + `query()`** 的序列化）。null = 手上没有预览。
    *
    * 存**序列化结果**而不是逐个比对六个字段：字段会加（`include`/`exclude` 哪天进 UI 就是两个），
    * 而漏比一个的失败方式是「用户批准了一份他没看到的清单」——那正是 `stale` 存在的理由。
-   * `JSON.stringify` 的键顺序由 `query()` 那个对象字面量的书写顺序决定，是稳定的
+   * `JSON.stringify` 的键顺序由对象字面量的书写顺序决定，是稳定的。
+   *
+   * ⚠️ 根清单也在里面（M2-F）。少了它的话「在文件夹 A 里预览、然后打开文件夹 B、
+   * 再点替换全部」会改掉 B——用户批准的清单在 A 里，而按钮是可点的。
+   * 单根时代这一条已经是个洞，多根之后「工作区变了」成了一个日常操作
+   * （添加/移除文件夹），于是它必须堵上
    */
   const [previewKey, setPreviewKey] = createSignal<string | null>(null)
 
+  /**
+   * 那一轮搜索**起飞时**的根清单。
+   *
+   * ⚠️ 结果行上的根名只能按这一份解释：Rust 推回来的 `rootIndex` 是它在
+   * `start_search` 收到的那个数组里的下标，而用户完全可能在结果还在飞的时候加一个根、
+   * 或者移掉一个。拿**当时现读**的 `options.roots()` 去解，第二个根里的命中就会被标成
+   * 第三个根的名字——不报错，只是每一行前面的那个名字都指错了地方，
+   * 而点下去打开的又确实是对的文件，所以用户连怀疑都不会怀疑。
+   * `stale()` 会同时亮起，但亮起之前那几批已经画出来了
+   */
+  const [sentRoots, setSentRoots] = createSignal<readonly string[]>([])
+
+  /**
+   * `SearchFile.rootIndex` → 画在 `rel` 前面的那个名字。
+   *
+   * 少于两个根一律给空串：单根时每一行前面都挂着同一个项目名，那是纯噪音，
+   * 而侧边栏与窗口标题已经说过一次「现在在哪个项目里」了。
+   * 越界也给空串（手改过的存档之外不会发生，但画一个 `undefined` 出来更糟）
+   */
+  const rootLabelOf = (rootIndex: number): string => {
+    const list = sentRoots()
+    if (list.length < 2) return ''
+    const at = list[rootIndex]
+    return at === undefined ? '' : displayName(at)
+  }
+
   const searchSlot = createTaskSlot()
   const applySlot = createTaskSlot()
+
+  /**
+   * 当前工作区的根清单。
+   *
+   * ⚠️ 每次都现读，不缓存：`stale()` 是一条 memo，它要靠读这个信号才能在
+   * 「用户换掉了工作区」时重新求值——缓存下来就等于告诉用户「这份预览还新鲜」，
+   * 而它其实是照着另一批文件夹搜出来的
+   */
+  const currentRoots = (): string[] => [...options.roots()]
+
+  /** 预览指纹：根清单与查询条件一起序列化，`stale()` 拿它与当前状态比 */
+  const fingerprint = (roots: readonly string[], sent: SearchQuery): string => JSON.stringify({ roots, query: sent })
 
   const query = (): SearchQuery => ({
     pattern: pattern(),
@@ -408,13 +465,13 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
     // 没有搜索总账 = 手上根本没有一份预览（没搜过，或那一轮起飞就失败了），
     // 那时说「预览已过期」是无中生有
     if (key === null || summary() === null) return false
-    return key !== JSON.stringify(query())
+    return key !== fingerprint(currentRoots(), query())
   })
 
   const canApply = createMemo(() => {
     if (!replaceMode() || running() || replacing() || stale()) return false
     // 没打开文件夹时连预览都搜不出来，这一条只是把「还没打开文件夹」那句留给 `search()` 说
-    if (options.root() === null) return false
+    if (options.roots().length === 0) return false
     const done = summary()
     return done !== null && done.hits > 0
   })
@@ -483,6 +540,7 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
     setReplaceSummary(null)
     setReplaceProgress(null)
     setPreviewKey(null)
+    setSentRoots([])
     setError(null)
     setFilesScanned(0)
     setSelected(null)
@@ -492,8 +550,8 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
     // 替换在飞时不接新的搜索：那一轮正在改磁盘，而搜完的结果会把它自己的进度挤掉
     // （两个 `running` 语义的信号同时为真，状态栏只能说一句）。UI 那边搜索键也是灰的
     if (replacing()) return
-    const at = options.root()
-    if (at === null) {
+    const roots = currentRoots()
+    if (roots.length === 0) {
       // 与 `project/store.ts` 的 `NO_FOLDER` 同一句话：没打开文件夹时所有项目级动作都说它
       setError('还没打开文件夹')
       setVisible(true)
@@ -518,17 +576,20 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
     const sent = query()
     // 在 await 之前就记下条件：done 可能比返回值先到（见模块文档），
     // 那时 `summary` 已经填上了，而 `stale` 得能立刻得出「一致」
-    setPreviewKey(JSON.stringify(sent))
+    setPreviewKey(fingerprint(roots, sent))
+    setSentRoots(roots)
     searchSlot.begin()
 
     try {
-      const taskId = await startSearch(at, sent)
+      const taskId = await startSearch(roots, sent)
       // 返回值是权威的：即使 `starting` 窗口里已经认下了同一个 id，这里也只是再写一遍。
       // 两个不同的 id 是不可能的——同一时刻只有一次 `start_search` 在飞
       searchSlot.settle(taskId)
     } catch (err) {
       // reject = 这次搜索压根没开始（起飞前检查没过），所以没有任何事件会来，
-      // 也不需要作废谁。这条规则由 `run.rs` 的 `preflight` 与 `search` 共用一份实现钉住
+      // 也不需要作废谁。这条规则由 `run.rs` 的 `preflight_roots` 与 `search_roots`
+      // 共用 `check_root` + `compile` 钉住——⚠️ 多根之下「所有根都查完了才开工」，
+      // 于是第二个根不合法时第一个根一个文件都不会被读
       searchSlot.settle(null)
       setRunning(false)
       setError(describeSearchError(err))
@@ -601,20 +662,28 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
 
   async function confirmApply(): Promise<void> {
     setConfirm(null)
-    const at = options.root()
-    if (at === null) {
+    const roots = currentRoots()
+    if (roots.length === 0) {
       setError('还没打开文件夹')
+      return
+    }
+    // ⚠️ 再查一次 `stale()`：确认对话框开着的那一会儿里，用户完全可能改了搜索词、
+    // 改了替换内容、或者动了工作区（`askApply` 那一次检查已经过去了）。
+    // 这一条挡的是「用户批准的清单与实际落盘的清单不是同一份」，
+    // 而它是全 Vela 唯一一处批量写盘，所以宁可多问一次也不要猜
+    if (stale()) {
+      setError(STALE_PREVIEW)
       return
     }
     setReplacing(true)
     setError(null)
     applySlot.begin()
     try {
-      // ⚠️ 这里递的是**当前**的 `query()`，与预览那一次是同一个函数产出的同一个形状。
-      // `stale()` 为假就是「当前条件 === 预览条件」的意思，所以用户批准的那份清单
-      // 与实际发生的条件逐字段相同——这正是 `previewKey` 存在的全部理由
+      // ⚠️ 这里递的是**当前**的 `query()` 与**当前**的根清单，与预览那一次是同一个函数
+      // 产出的同一个形状。上面那条 `stale()` 检查保证了两份指纹逐字段相同，
+      // 所以用户批准的那份清单与实际发生的条件一致——这正是 `previewKey` 存在的全部理由
       const skip = options.skipPaths?.() ?? []
-      const taskId = await startReplace(at, query(), skip)
+      const taskId = await startReplace(roots, query(), skip)
       applySlot.settle(taskId)
     } catch (err) {
       // 起飞前检查没过（`bad_replacement` 之类），磁盘上一个字节都没动
@@ -634,7 +703,7 @@ export function createSearchPanel(options: SearchPanelOptions): SearchPanel {
       // 增量拼接，理由见 `rows.ts` 的 `flattenFiles`
       const skip = new Set(options.skipPaths?.() ?? [])
       setRows((prev) => {
-        const next = flattenFiles(batch.files, (path) => skip.has(path))
+        const next = flattenFiles(batch.files, (path) => skip.has(path), rootLabelOf)
         return prev.length === 0 ? next : [...prev, ...next]
       })
     },

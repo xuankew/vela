@@ -35,14 +35,14 @@ import { createRoot, createSignal } from 'solid-js'
  */
 const { ipc, task, rep } = vi.hoisted(() => ({
   ipc: {
-    startSearch: vi.fn<(root: string, query: SearchQuery) => Promise<string>>(),
+    startSearch: vi.fn<(roots: string[], query: SearchQuery) => Promise<string>>(),
     describeSearchError: (err: unknown) => `模拟错误：${JSON.stringify(err)}`,
   },
   task: {
     cancelTask: vi.fn<(taskId: string) => Promise<void>>(),
   },
   rep: {
-    startReplace: vi.fn<(root: string, query: SearchQuery, skip: string[]) => Promise<string>>(),
+    startReplace: vi.fn<(roots: string[], query: SearchQuery, skip: string[]) => Promise<string>>(),
   },
 }))
 
@@ -87,8 +87,8 @@ function hitOf(line: number, text: string): SearchHit {
 }
 
 /** `texts` 的第 n 条就是第 n+1 行——行号 1 起算，与 `SearchHit.line` 同一套 */
-function fileOf(rel: string, texts: string[], truncated = false): SearchFile {
-  return { rel, path: `/repo/${rel}`, hits: texts.map((t, i) => hitOf(i + 1, t)), truncated }
+function fileOf(rel: string, texts: string[], truncated = false, rootIndex = 0): SearchFile {
+  return { rel, path: `/repo/${rel}`, rootIndex, hits: texts.map((t, i) => hitOf(i + 1, t)), truncated }
 }
 
 const GOLDEN_SUMMARY: SearchSummary = {
@@ -127,6 +127,7 @@ function previewFile(rel: string, pairs: [string, string][], truncated = false):
   return {
     rel,
     path: `/repo/${rel}`,
+    rootIndex: 0,
     truncated,
     hits: pairs.map(([text, replaced], i) => previewOf(i + 1, text, replaced)),
   }
@@ -158,8 +159,8 @@ function rsum(overrides: Partial<ReplaceSummary> = {}): ReplaceSummary {
 }
 
 let root: string | null
-/** 项目根那个 signal 的写入端，由 `mount` 赋值。用例一律走 `setRootAt`，不直接碰它 */
-let setRoot: (value: string | null) => void
+/** 根清单那个 signal 的写入端，由 `mount` 赋值。用例一律走 `setRootAt`，不直接碰它 */
+let setRoot: (value: readonly string[]) => void
 let opened: HitRow[]
 let panel: SearchPanel
 /** `skipPaths` 的返回值：正开着且有未保存改动的那些绝对路径。默认一个都没有 */
@@ -173,13 +174,13 @@ function mount(extra: Partial<SearchPanelOptions> = {}) {
   opened = []
   applied = []
   dispose = createRoot((teardown) => {
-    // ⚠️ 项目根走 signal 而不是直接读那个模块变量：`canApply` 是 `createMemo`，
-    // 而 memo 只在**响应式**依赖变化时重算。真实宿主注入的是 `tree.root`（signal），
-    // 脚手架里用普通变量的话「文件夹被关掉」这件事就测不出来
-    const [rootSignal, setRootSignal] = createSignal<string | null>(root)
-    setRoot = setRootSignal
+    // ⚠️ 根清单走 signal 而不是直接读那个模块变量：`canApply` 与 `stale` 都是 `createMemo`，
+    // 而 memo 只在**响应式**依赖变化时重算。真实宿主注入的是 `tree.roots`（memo），
+    // 脚手架里用普通变量的话「工作区被换掉」这件事就测不出来
+    const [rootsSignal, setRootsSignal] = createSignal<readonly string[]>(root === null ? [] : [root])
+    setRoot = setRootsSignal
     panel = createSearchPanel({
-      root: rootSignal,
+      roots: rootsSignal,
       openHit: async (hit) => void opened.push(hit),
       skipPaths: () => dirty,
       onApplied: async (s) => void applied.push(s),
@@ -189,10 +190,16 @@ function mount(extra: Partial<SearchPanelOptions> = {}) {
   })
 }
 
-/** 换项目根。⚠️ 一律走这个函数，别直接给 `root` 赋值——见 `mount` 里那条注释 */
-function setRootAt(value: string | null) {
-  root = value
-  setRoot(value)
+/**
+ * 换工作区。⚠️ 一律走这个函数，别直接给 `root` 赋值——见 `mount` 里那条注释。
+ *
+ * `null` = 一个文件夹都没打开（对应 `tree.roots()` 是空数组），字符串 = 就这一个根。
+ * 多根的那些用例直接给 `setRoot(['a','b'])`，这条签名两种都收
+ */
+function setRootAt(value: string | readonly string[] | null) {
+  const list = value === null ? [] : typeof value === 'string' ? [value] : value
+  root = typeof value === 'string' ? value : null
+  setRoot(list)
 }
 
 beforeEach(() => {
@@ -238,10 +245,10 @@ function cancelled(): string[] {
 }
 
 /** 第 n 次 `startReplace` 收到的三样东西。没发过就抛，不用非空断言 */
-function sentReplace(call = 0): { root: string; query: SearchQuery; skip: string[] } {
+function sentReplace(call = 0): { roots: string[]; query: SearchQuery; skip: string[] } {
   const args = rep.startReplace.mock.calls[call]
   if (!args) throw new Error(`第 ${call} 次 startReplace 没有发出去`)
-  return { root: args[0], query: args[1], skip: args[2] }
+  return { roots: args[0], query: args[1], skip: args[2] }
 }
 
 /** 搜一次并把 taskId 认下来，好让后面的事件有得可发 */
@@ -343,9 +350,11 @@ describe('起飞前的两道拦截', () => {
 })
 
 describe('发出去的查询条件', () => {
-  it('root 原样交给 Rust，前端不做任何路径算术', async () => {
+  it('⚠️ roots 就是注入进来的那份根清单，前端不做任何路径算术', async () => {
     await searchOnce()
-    expect(ipc.startSearch.mock.calls[0]?.[0]).toBe('/repo')
+    expect(ipc.startSearch.mock.calls[0]?.[0]).toEqual(['/repo'])
+    // M2-F 起 `start_search` 收的是 `roots`，store 原样把注入进来的那份清单递过去。
+    // ⚠️ 「原样」是这条用例的全部内容：前端一旦自己拼路径或剥前缀，两边就会各自漂移
   })
 
   it('四个字段，一个不多', async () => {
@@ -414,7 +423,7 @@ describe('批次与心跳', () => {
   it('命中行带着原文、偏移量与截断标记', async () => {
     await searchOnce()
     panel.handlers.onBatch('t1', {
-      files: [{ rel: 'a.ts', path: '/repo/a.ts', hits: [hitOf(7, 'let a = needle;')], truncated: true }],
+      files: [{ rel: 'a.ts', path: '/repo/a.ts', rootIndex: 0, hits: [hitOf(7, 'let a = needle;')], truncated: true }],
       filesScanned: 1,
     })
     const row = panel.rows()[1]
@@ -930,7 +939,49 @@ describe('stale：预览与当前条件是否还一致', () => {
     panel.setPattern('other')
     expect(panel.stale()).toBe(true)
     expect(panel.canApply()).toBe(false)
-    expect(panel.warnings()).toEqual(['预览已过期：条件改过了，重新搜一遍再替换'])
+    expect(panel.warnings()).toEqual(['预览已过期：条件或工作区改过了，重新搜一遍再替换'])
+  })
+
+  it('⚠️ 搜完之后换了工作区也过期——批准的那份清单已经不是在说这些文件夹了', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    expect(panel.canApply()).toBe(true)
+    setRootAt('/other')
+    expect(panel.stale()).toBe(true)
+    expect(panel.canApply()).toBe(false)
+    expect(panel.warnings()[0]).toContain('预览已过期')
+    // 这一条是 M2-F 补上的一个**单根时代就存在的洞**：根清单原来不在指纹里，
+    // 于是「在 A 里预览 → 打开 B → 点替换全部」会改掉 B，而按钮是可点的。
+    // 多根之后「往工作区加/减一个文件夹」成了一个日常操作，洞也就从一个边角变成了一条主路
+  })
+
+  it('工作区换回原来那一个又不算过期：指纹比的是内容，不是「动过没有」', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    setRootAt('/other')
+    expect(panel.stale()).toBe(true)
+    setRootAt('/repo')
+    expect(panel.stale()).toBe(false)
+    expect(panel.canApply()).toBe(true)
+    // 存一个「脏了没有」的布尔而不是比指纹的话，这一条就得额外写一句「什么时候清回来」，
+    // 而那句规则漏写的失败方式是**替换全部永久灰掉**——一个查不出原因的禁用按钮
+  })
+
+  it('⚠️ 往工作区里加一个文件夹也算换过：那份预览没搜过它', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    expect(panel.canApply()).toBe(true)
+    setRootAt(['/repo', '/extra'])
+    // 指纹比的是**整份清单的内容**，所以「多了一个根」与「换了一个根」同样算过期。
+    // 只比第 0 个根的话，用户往工作区里加了 B、点替换全部，而批准的那份清单里
+    // 压根没有 B 的命中——落下去的却是一次跨 A 与 B 的替换
+    expect(panel.stale()).toBe(true)
+    expect(panel.canApply()).toBe(false)
+    setRootAt(['/repo'])
+    expect(panel.stale()).toBe(false)
+  })
+
+  it('多根之下 roots 原样递过去，顺序就是侧边栏里的顺序', async () => {
+    setRootAt(['/repo', '/notes', '/docs'])
+    await searchOnce()
+    expect(ipc.startSearch.mock.calls[0]?.[0]).toEqual(['/repo', '/notes', '/docs'])
   })
 
   it('动了替换内容也过期——批准的与发生的必须是同一份条件', async () => {
@@ -1145,17 +1196,44 @@ describe('确认单', () => {
 })
 
 describe('落盘', () => {
-  it('confirmApply 递的是与预览同一份条件、同一个根、一份空 skip', async () => {
+  it('confirmApply 递的是与预览同一份条件、同一份根清单、一份空 skip', async () => {
     await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
     panel.askApply()
     await panel.confirmApply()
     expect(sentReplace()).toEqual({
-      root: '/repo',
+      roots: ['/repo'],
       query: { pattern: 'needle', literal: false, caseSensitive: false, wholeWord: false, replace: 'NEEDLE' },
       skip: [],
     })
     // 确认单收起来了，否则它会在落盘期间一直摊在屏幕上
     expect(panel.confirm()).toBeNull()
+  })
+
+  it('⚠️ 确认单摊开之后条件又变了：一个字节都不落盘，改说「预览已过期」', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    expect(panel.confirm()).not.toBeNull()
+    // `askApply` 那一次 `canApply()` 检查已经过去了。确认单虽然盖着面板，
+    // 但「变了」这件事不需要经过它：工作区可以在别处被换掉，
+    // 而这一条挡的是全 Vela 唯一一处批量写盘
+    panel.setReplacement('OTHER')
+    await panel.confirmApply()
+    expect(rep.startReplace).not.toHaveBeenCalled()
+    expect(panel.error()).toBe('预览已过期：条件或工作区改过了，重新搜一遍再替换')
+    expect(panel.replacing()).toBe(false)
+    expect(panel.confirm()).toBeNull()
+  })
+
+  it('⚠️ 确认单摊开之后换了工作区：同样不落盘', async () => {
+    await previewOnce([previewFile('a.ts', [['needle', 'NEEDLE']])])
+    panel.askApply()
+    setRootAt('/other')
+    await panel.confirmApply()
+    expect(rep.startReplace).not.toHaveBeenCalled()
+    expect(panel.error()).toContain('预览已过期')
+    // 落盘递的是**当前**的根清单，所以这一步不是「多查一次冗余的检查」：
+    // 少了它，用户批准的是 A 而写下去的是 B——两边各自的实现都是对的，
+    // 没有任何一边的测试能发现
   })
 
   it('⚠️ skip 是落盘那一刻求值的，不是预览那一刻', async () => {
@@ -1405,5 +1483,58 @@ describe('两个 slot 各认各的 taskId', () => {
     expect(panel.replaceProgress()).toBeNull()
     expect(panel.replaceSummary()).toBeNull()
     expect(applied).toEqual([])
+  })
+})
+
+describe('结果行上的根名（多根）', () => {
+  /** 摊好的那些文件行上的 `root` 字段，按顺序 */
+  function rootLabels(): string[] {
+    return panel
+      .rows()
+      .filter((r) => r.kind === 'file')
+      .map((r) => r.root)
+  }
+
+  it('单根时一律空串：那时每一行前面都挂着同一个项目名，纯噪音', async () => {
+    await searchOnce()
+    panel.handlers.onBatch('t1', { files: [fileOf('src/a.ts', ['needle'])], filesScanned: 1 })
+
+    expect(rootLabels()).toEqual([''])
+  })
+
+  it('多根时把 rootIndex 换成那个根的显示名', async () => {
+    setRootAt(['/repo', '/notes'])
+    await searchOnce()
+    panel.handlers.onBatch('t1', {
+      files: [fileOf('src/a.ts', ['needle']), fileOf('README.md', ['needle'], false, 1)],
+      filesScanned: 2,
+    })
+
+    expect(rootLabels()).toEqual(['repo', 'notes'])
+  })
+
+  it('⚠️ 按**起飞那一刻**的清单解释：结果还在飞的时候移掉一个根，已经摊出来的行不改口', async () => {
+    setRootAt(['/repo', '/notes'])
+    await searchOnce()
+    panel.handlers.onBatch('t1', { files: [fileOf('README.md', ['needle'], false, 1)], filesScanned: 1 })
+    // `stale()` 要求手上先有一份总账（没有总账 = 压根没有预览，说「过期」是无中生有），
+    // 所以这一轮要跑完
+    panel.handlers.onDone('t1', sum())
+
+    // 用户此刻把 `/notes` 移出了工作区。`rootIndex: 1` 在**新**清单里已经越界了，
+    // 现读的话这一行会被标成空串（或者更糟：标成后来加进来的那个根）
+    setRootAt(['/repo'])
+
+    expect(rootLabels()).toEqual(['notes'])
+    // 而「这份结果不是现在这个工作区的」这件事由 `stale()` 说，不是靠改前缀暗示
+    expect(panel.stale()).toBe(true)
+  })
+
+  it('越界的 rootIndex 给空串，而不是把 undefined 画到界面上', async () => {
+    setRootAt(['/repo', '/notes'])
+    await searchOnce()
+    panel.handlers.onBatch('t1', { files: [fileOf('a.ts', ['needle'], false, 7)], filesScanned: 1 })
+
+    expect(rootLabels()).toEqual([''])
   })
 })

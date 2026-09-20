@@ -1,4 +1,6 @@
 mod commands;
+mod shard;
+mod watcher;
 
 use tauri::{Emitter, RunEvent, WindowEvent};
 
@@ -42,6 +44,20 @@ const REPLACE_DONE: &str = "vela://replace-done";
 /// 与 `SEARCH_FAILED` 同一种罕见情形（root 在两步之间被删掉/被卸载）
 const REPLACE_FAILED: &str = "vela://replace-failed";
 
+/// 一个**被打开着的**文件在外部被改了或被删了（M2-G）。另一半在 `src/ipc/watch.ts`。
+///
+/// ⚠️ 与上面那六个不同，这一个**没有终止信号**，也没有 `taskId`：它是一条条独立的通知，
+/// 前端收到一条就处理一条（干净标签静默重载，脏标签进冲突队列）。
+///
+/// ⚠️ 载荷里的 `path` 是**前端自己递进来的那个原样字符串**，不是 canonical 形式。
+/// 前端要拿它与 `doc.path()` 比，而那一个从来没被规范化过。理由与静默失败的形状
+/// 写在 `src/watcher.rs` 里 `Filter` 那个类型别名的文档上。
+///
+/// ⚠️ 收不到这一条**不代表**文件没变：目录订不上（`WatchStats.failed`）、
+/// 目录数撞了上限（`truncated`）、路径压根没进计划（`skipped`）三种情况都是静默的。
+/// 所以 `set_watched` 的返回值里有那三个数字，前端该说的时候要说一句。
+const FILE_CHANGED: &str = "vela://file-changed";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -49,9 +65,20 @@ pub fn run() {
         // M2-C 起的 `taskId → 取消标志` 注册表，M2-D 的替换与搜索**共用这一份**。
         // 见 `commands::TaskRegistry`
         .manage(commands::TaskRegistry::default())
+        // M2-E 的第二份 managed state：`Cmd+P` 的文件索引缓存。
+        // 见 `commands::ProjectIndexCache`（那张实测表说明了为什么必须有缓存）
+        .manage(commands::ProjectIndexCache::default())
+        // M2-G 的第三份 managed state：外部改动监听。见 `watcher::WatcherState`
+        // （⚠️ 它是这三份里唯一一个会自己起线程、自己回调进来的）
+        .manage(watcher::WatcherState::default())
+        // M2-H 的第四份 managed state：大文件只读分片的句柄表。见 `shard::ShardRegistry`
+        // （⚠️ 它是这四份里唯一一个**必须有人来收尾**的：一个条目就是一个 fd，
+        // 而 fd 不会因为没人再提它就自己关掉）
+        .manage(shard::ShardRegistry::default())
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::save_file,
+            commands::store_image,
             commands::list_dir,
             commands::create_entry,
             commands::rename_entry,
@@ -63,7 +90,13 @@ pub fn run() {
             commands::save_session,
             commands::start_search,
             commands::start_replace,
-            commands::cancel_task
+            commands::cancel_task,
+            commands::index_project,
+            commands::query_project,
+            watcher::set_watched,
+            shard::open_large,
+            shard::read_lines,
+            shard::close_large
         ])
         // 未保存改动的关闭拦截（PLAN.md M1-D-4）。
         //
@@ -98,7 +131,7 @@ pub fn run() {
 mod tests {
     /// 与 `src/ipc/windowClose.ts` 的 `REQUEST_CLOSE_EVENT`、
     /// `src/ipc/search.ts` 的三个 `SEARCH_*_EVENT`、`src/ipc/replace.ts` 的三个
-    /// `REPLACE_*_EVENT` 对照。
+    /// `REPLACE_*_EVENT`、`src/ipc/watch.ts` 的 `FILE_CHANGED_EVENT` 对照。
     ///
     /// 这是个**契约快照**，和 `crates/vela-core/tests/wire_contract.rs` 同一套路数：
     /// 事件名在 Rust 与 TS 各手写一份，没有代码生成。名字对不上的失败方式很安静——
@@ -115,6 +148,15 @@ mod tests {
         assert_eq!(super::SEARCH_BATCH, "vela://search-batch");
         assert_eq!(super::SEARCH_DONE, "vela://search-done");
         assert_eq!(super::SEARCH_FAILED, "vela://search-failed");
+    }
+
+    /// ⚠️ `FILE_CHANGED` 拼错的失败方式与 `SEARCH_DONE` 那一档一样安静，
+    /// 但更难联想到是字符串的问题：外部改了文件、Vela 一声不吭，
+    /// 用户下一次 ⌘S 就把别人的改动盖掉了。而「Vela 没提醒我」这件事
+    /// 从来不会被报成 bug，只会被记成「这编辑器不太行」
+    #[test]
+    fn file_changed_event_matches_frontend() {
+        assert_eq!(super::FILE_CHANGED, "vela://file-changed");
     }
 
     /// ⚠️ 这一条的分量比上面那条重：`REPLACE_DONE` 拼错的后果不是「界面没反应」，

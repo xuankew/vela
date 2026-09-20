@@ -33,17 +33,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  * 于是每一处 `calls[0][1].pattern` 都是一次 unsafe member access，而 `pnpm lint` 是门禁。
  * 签名里直接用 `SearchQuery` 是安全的——类型在编译时被擦掉，`vi.hoisted` 的工厂搬到
  * import 之前也不会引用到任何运行时值。
+ *
+ * ⚠️ M2-F 起第一个入参是 `roots: string[]`（多根工作区）。桩的签名必须跟着改，
+ * 不然 `calls[0][0]` 的类型还是 `string`，一条 `toBe('/repo')` 就能编译过去——
+ * 而运行时收到的是数组，红的地方与真正错的地方隔了一层
  */
 const { ipc, task, rep } = vi.hoisted(() => ({
   ipc: {
-    startSearch: vi.fn<(root: string, query: SearchQuery) => Promise<string>>(),
+    startSearch: vi.fn<(roots: string[], query: SearchQuery) => Promise<string>>(),
     describeSearchError: (err: unknown) => `模拟错误：${JSON.stringify(err)}`,
   },
   task: {
     cancelTask: vi.fn<(taskId: string) => Promise<void>>(),
   },
   rep: {
-    startReplace: vi.fn<(root: string, query: SearchQuery, skip: string[]) => Promise<string>>(),
+    startReplace: vi.fn<(roots: string[], query: SearchQuery, skip: string[]) => Promise<string>>(),
   },
 }))
 
@@ -52,7 +56,7 @@ vi.mock('../ipc/task', () => task)
 vi.mock('../ipc/replace', () => rep)
 
 import type { MatchRange, SearchFile, SearchHit, SearchQuery, SearchSummary } from '../ipc/search'
-import { OVERSCAN } from '../project/tree'
+import { OVERSCAN } from '../ui/virtual'
 import { FindInFiles } from './FindInFiles'
 import { RESULT_ROW_HEIGHT, type HitRow } from './rows'
 import { createSearchPanel, type SearchPanel } from './store'
@@ -73,8 +77,8 @@ function hit(line: number, text: string, word = 'needle'): SearchHit {
   }
 }
 
-function file(rel: string, texts: string[], truncated = false): SearchFile {
-  return { rel, path: `/repo/${rel}`, hits: texts.map((t, i) => hit(i + 1, t)), truncated }
+function file(rel: string, texts: string[], truncated = false, rootIndex = 0): SearchFile {
+  return { rel, path: `/repo/${rel}`, rootIndex, hits: texts.map((t, i) => hit(i + 1, t)), truncated }
 }
 
 const TWO_FILES = [file('src/a.ts', ['let a = needle;', 'let b = needle;']), file('README.md', ['a needle here'])]
@@ -84,6 +88,7 @@ function previewFile(rel: string, pairs: [string, string][], truncated = false):
   return {
     rel,
     path: `/repo/${rel}`,
+    rootIndex: 0,
     truncated,
     hits: pairs.map(([text, replaced], i) => ({ ...hit(i + 1, text), replaced })),
   }
@@ -131,13 +136,13 @@ let taskId = 't1'
 let disposePanel: (() => void) | undefined
 let disposeRender: (() => void) | undefined
 
-function mount(): SearchPanel {
+function mount(roots: readonly string[] = ['/repo']): SearchPanel {
   opened = []
   disposePanel = createRoot((teardown) => {
     panel = createSearchPanel({
-      // root 是常量而不是 signal：这一组的用例里没有一条要改项目根，
-      // 而「root 变了 canApply 得跟着变」那条在 store.test.ts 里用真 signal 钉过了
-      root: () => '/repo',
+      // 根清单是常量而不是 signal：这一组的用例里没有一条要改工作区，
+      // 而「工作区变了 canApply 得跟着变」那条在 store.test.ts 里用真 signal 钉过了
+      roots: () => roots,
       openHit: async (h) => void opened.push(h),
       skipPaths: () => dirty,
     })
@@ -441,7 +446,7 @@ describe('面板头部', () => {
     expect(input().value).toBe('换一个字')
   })
 
-  it('「搜索」按钮起一次搜索，root 与四个开关原样交给 IPC', async () => {
+  it('「搜索」按钮起一次搜索，roots 与四个开关原样交给 IPC', async () => {
     const p = mount()
     type('needle')
     opts()[1]!.click() // 区分大小写
@@ -451,7 +456,8 @@ describe('面板头部', () => {
     await flush()
 
     expect(ipc.startSearch).toHaveBeenCalledTimes(1)
-    expect(ipc.startSearch.mock.calls[0]![0]).toBe('/repo')
+    // ⚠️ `toEqual` 而不是 `toBe`：roots 是一个数组，单根时是长度为 1 的数组
+    expect(ipc.startSearch.mock.calls[0]![0]).toEqual(['/repo'])
     expect(ipc.startSearch.mock.calls[0]![1]).toEqual({
       pattern: 'needle',
       literal: false,
@@ -772,6 +778,28 @@ describe('结果行', () => {
     // 绝对路径挂在 title 上：省略号截断之后这是唯一还能看清是哪一处地方
     expect(first.title).toBe('/repo/src/a.ts')
     expect(first.getAttribute('role')).toBe('option')
+  })
+
+  it('⚠️ 多根：文件行前面挂上它属于哪个根，命中行一个都不挂', async () => {
+    mount(['/repo', '/notes'])
+    await searchOnce()
+    await deliver([file('src/a.ts', ['let a = needle;']), file('README.md', ['a needle here'], false, 1)])
+
+    expect(rowEls()[0]!.querySelector('.find-root')?.textContent).toBe('repo')
+    expect(rowEls()[2]!.querySelector('.find-root')?.textContent).toBe('notes')
+    // 命中行上没有这个节点：它紧跟在自己的标题行下面，缩进已经说明了归属，
+    // 每行再挂一遍项目名会把两屏的命中挤成一屏
+    expect(rowEls()[1]!.querySelector('.find-root')).toBeNull()
+  })
+
+  it('单根时一个 .find-root 节点都不渲染——不是渲染成空的那一个', async () => {
+    mount()
+    await searchOnce()
+    await deliver()
+
+    // 空 span 也会占掉 `.find-row` 那 6px 的 gap，于是单根与多根的缩进对不齐。
+    // 判据是「节点不存在」而不是「文本是空的」
+    expect(container.querySelectorAll('.find-root')).toHaveLength(0)
   })
 
   it('命中行是行号 + 正文，缩进那一层由 CSS 表达（行对象里没有父子指针）', async () => {

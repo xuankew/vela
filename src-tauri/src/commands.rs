@@ -9,21 +9,41 @@
 //! 放进 vela-core 就意味着 `cargo test` 会把临时文件真的塞进开发机的废纸篓，
 //! 而 CI 的 ubuntu runner 上压根没有废纸篓可用。
 //!
-//! ## 接受路径的命令，按能力分组（M2-D 之后共十个）
+//! ## 接受路径的命令，按能力分组（M3-A-7 之后共十五个）
+//!
+//! ⚠️ 最后两个**不住在本文件里**：第十三个（`set_watched`）在 `src/watcher.rs`，
+//! 第十四个（`open_large`）在 `src/shard.rs`，理由各写在那儿开头。
+//! 它们照样列在下面这张表里：这张表是「谁能碰到磁盘」的账，按文件分家就漏了一笔。
+//! （`read_lines` / `close_large` 不在表里——它们收的是一个整数句柄，
+//! 而那个句柄只可能来自 `open_large` 的返回值。）
 //!
 //! | 能力 | 命令 | 参数形状 |
 //! |---|---|---|
 //! | 读文件内容 | `open_file` | 任意绝对路径 |
+//! | 读文件内容（**分片**） | `open_large` | 任意绝对路径 |
 //! | 写文件内容 | `save_file` | 任意绝对路径 |
+//! | **写图片字节**（粘贴落地） | `store_image` | 文档路径，目录由它推出 |
 //! | **枚举**目录 | `list_dir` | `(root, rel)` |
 //! | **创建** | `create_entry` | `(root, rel, kind)` |
 //! | **改名** | `rename_entry` | `(root, rel, new_name)` |
 //! | **删除**（移废纸篓） | `trash_entry` | `(root, rel)` |
 //! | 交给系统工具 | `reveal_entry` / `copy_entry_path` | `(root, rel)` |
-//! | **全文搜索**（读正文） | `start_search` | 任意绝对路径 `root` + 两个 glob 列表 |
+//! | **全文搜索**（读正文） | `start_search` | `roots` + 两个 glob 列表 |
 //! | **全局替换**（写正文） | `start_replace` | 同上，外加一份要跳过的绝对路径清单 |
+//! | **建文件索引**（只读名字） | `index_project` | `roots` |
+//! | **模糊匹配**（只读名字） | `query_project` | `roots` + needle + 一份最近清单 |
+//! | **订阅改动**（只读名字） | `set_watched` | 一组绝对路径（`doc.path()`） |
 //!
 //! 另存为没有自己的命令：它是前端先用 dialog 插件拿到新路径，再调同一个 `save_file`。
+//!
+//! ⚠️ **M2-F 起，中间那四个（`start_search` / `start_replace` / `index_project` /
+//! `query_project`）收的是 `roots: Vec<String>` 而不是一个 `root: String`**——
+//! 多根工作区里一次搜索、一次替换、一次 `Cmd+P` 都覆盖**全部**根。信任面没有变宽：
+//! 每一个 `root` 仍然只可能来自 dialog 插件（`directory: true`），
+//! 而 vela-core 那一侧对每一个根各查一次「是不是绝对路径、存不存在、是不是目录」。
+//! 变的是**取舍**：一个根不合法就整次 reject，坏根的路径写在错误里，而不是
+//! 「跳过它、搜剩下的」——跳过的话用户看到的是「找不到某个文件」，
+//! 而那与「这个文件不存在」在界面上长得一模一样。
 //!
 //! ⚠️ **前两个与后六个的信任面不是一类东西。** `open_file` / `save_file` 给的是
 //! 「读写一个**已知**路径的文件」；`list_dir` 给的是枚举——不知道路径也能一层层翻出来；
@@ -67,38 +87,90 @@
 //! 那几个脏标签不被落盘盖掉。递错了的后果是「少改一个文件，`skippedOpen` 加一」，
 //! 方向是安全的。
 //!
+//! ### `index_project` / `query_project` 是第十一、十二个，**都不打开任何文件**
+//!
+//! 信任面与 `start_search` 同侧（收一组任意绝对路径 `roots`）但更窄一档：这两个命令走的是
+//! `project::walk::each_file`，那一圈循环只看 `DirEntry::file_type()`，
+//! **从头到尾没有一次 `File::open`**。所以它们能泄露的最坏情况是「一棵目录树里有哪些
+//! 文件名」，读不到任何一个字节的内容。
+//!
+//! `query_project` 还收一份 `recent`——那是前端 MRU 里的**绝对路径清单**，
+//! ⚠️ 它唯一的用途是**排序加分**：`FileIndex::recent_bonus` 拿它去与索引里已有的 rel
+//! 做比对，比不上的（长在 root 外面的、已经不存在的）直接忽略，**不会因为它就去打开
+//! 或枚举那个路径**。递一份恶意 `recent` 的最坏结果是「排序乱了」，而不是「多读了一个文件」。
+//!
 //! 符号链接是**有意放行**的（pnpm 的 `node_modules` 就是符号链接搭的），
 //! 理由见 `vela-core/src/project/tree.rs` 的模块文档。⚠️ 注意这句话只适用于**文件树**：
-//! 搜索与替换恰恰相反（`follow_links(false)`），见 `vela-core/src/search/mod.rs` 开头那两节。
+//! 搜索、替换与文件索引恰恰相反（`follow_links(false)`，见 `project::walk`），
+//! 见 `vela-core/src/search/mod.rs` 开头那两节。
 //!
 //! 会话存档那两个命令也写文件，但**路径由 Rust 侧算出来**（`app_data_dir()/session.json`），
 //! 前端连传路径的入口都没有。所以它们没有把上面那条信任面扩大一分。
 //!
-//! ⚠️ 信任边界：这十个命令合起来等于给了 webview 一个「读、写、枚举、创建、改名、
+//! ### `set_watched` 是第十三个，**一个字节都不读也不写**
+//!
+//! 它收一组任意绝对路径，拿去做两件事：订阅它们的**父目录**、把它们记进一张过滤器表。
+//! 于是它扩大的是「哪些目录的文件名变动会被推给 webview」，而不是「能读到哪些内容」。
+//! 完整论证在 `src/watcher.rs` 开头那一节。
+//!
+//! ### `open_large` 是第十四个，与 `open_file` **完全同一档**
+//!
+//! 它收任意绝对路径，并且**真的读内容**——这一点与第十三个（`set_watched`，
+//! 一个字节都不读）不一样，所以它不是「信任面又宽了一点」，而是「同一个信任面上
+//! 多了一个入口」。三条命令里只有它收路径：`read_lines` 与 `close_large` 收的是
+//! 一个整数句柄，而句柄只可能来自 `open_large` 的返回值。
+//!
+//! ⚠️ 于是「句柄不可猜」在这里**买不到任何东西**：能调 `read_lines(3, …)` 的调用方
+//! 本来就能直接 `open_large` 那个路径。论证写在 `src/shard.rs` 开头，
+//! 而 M5 开放插件时它要跟着这张表一起重读。
+//!
+//! ### `store_image` 是第十五个，**收路径但不收「写哪」**
+//!
+//! 它是第二个会写盘的命令，也是这张表里唯一一个**路径参数不决定写到哪**的：
+//! `doc_path` 只用来推出 `<它所在目录>/assets/`，文件名由 Rust 按内容哈希生成。
+//! 命令签名里没有目标路径、没有目标目录、也没有文件名——三样都拿不到，
+//! 于是「往任意位置写任意名字」这个原语在这一条路上压根不存在。
+//!
+//! ⚠️ 它也不复用 `save_file`：那一个收的是 dialog 给出的绝对路径，而粘贴图片
+//! 没有「让用户选存哪」这一步，没有任何东西兜着。硬把目录名写死，
+//! 可写的范围就收敛成「用户已经打开的那个文档旁边」。
+//! 完整论证（含 `assets/` 不可配置这条明写的债）在 `vela-core/src/fs/asset.rs` 开头。
+//!
+//! ⚠️ 信任边界：这十五个命令合起来等于给了 webview 一个「读、写、枚举、创建、改名、
 //! 删除、以及**批量改写**本地文件」的原语。这在 Vela 里是可接受的，前提是 webview
 //! 只加载第一方打包产物：没有远程内容、没有 `withGlobalTauri`、没有开 remote 域名白名单。
 //! 注意 `tauri.conf.json` 目前的 `csp` 仍是 `null`，也就是说这条前提只靠
 //! 「我们不加载远程内容」这个约定撑着，没有第二道防线。**如果将来引入任何远程内容或
-//! 第三方插件 UI（M5），这十个命令必须改成只接受「用户显式授权过的路径」**——
+//! 第三方插件 UI（M5），这十五个命令必须改成只接受「用户显式授权过的路径」**——
 //! 具体做法是把 dialog 打开过的 root 记在 Tauri managed state 里，命令只收 `rootId`
 //! 而不收路径字符串。⚠️ 而 `start_replace` 是这件事变得**紧迫**的那一个：
 //! 在它之前，一次 XSS 最坏能改掉用户正在看的文件；在它之后，最坏能改掉整个文件夹。
-//! （M2-C 已经有了第一份 managed state，见 [`TaskRegistry`]，但那不是授权表。）
+//! ⚠️ `store_image` 不改变这个判断：它能写的只有 `assets/pasted-*.{png,jpg,gif,webp,bmp}`
+//! 这一种名字，写不进 `.md`、写不进 `.zshrc`，也覆盖不了任何已有文件（撞名就换后缀）。
+//! （M2-C 已经有了第一份 managed state，见 [`TaskRegistry`]；M2-E 又加了第二份，
+//! 见 [`ProjectIndexCache`]；M2-G 加了第三份，见 `watcher::WatcherState`；
+//! M2-H 加了第四份，见 `shard::ShardRegistry`。
+//! **四份都不是授权表**——没有一份记着「用户授权过哪些路径」，
+//! 它们记的分别是取消标志、索引、当前该盯哪些目录、与当前开着哪几个大文件分片。）
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use base64::Engine as _;
 use serde::Serialize;
 use tauri::{command, AppHandle, Emitter, Manager, State};
 use vela_core::fs::{
-    read_text, read_text_as, write_text_atomic, Encoding, FileFormat, ReadError, TextFile, WriteError, WriteReport,
+    read_text, read_text_as, store_image as store_image_bytes, write_text_atomic, AssetError, Encoding, FileFormat,
+    ReadError, StoredImage, TextFile, WriteError, WriteReport, MAX_IMAGE_BYTES,
 };
-use vela_core::project::{self, DirEntry, DirListing, EntryKind, TreeError};
+use vela_core::project::{
+    self, merge_stats, query_many, DirEntry, DirListing, EntryKind, FileIndex, FileQuery, IndexStats, TreeError,
+};
 use vela_core::search::{
-    apply, preflight, preflight_apply, search, ReplaceProgress, ReplaceRequest, ReplaceSummary, SearchBatch,
-    SearchError, SearchQuery, SearchSummary,
+    apply_roots, preflight_apply_roots, preflight_roots, search_roots, ReplaceProgress, ReplaceRequest, ReplaceSummary,
+    SearchBatch, SearchError, SearchQuery, SearchSummary,
 };
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
 
@@ -110,8 +182,8 @@ use vela_core::session::{self as session_store, Session, SessionError, SessionRe
 ///
 /// ⚠️ M2-C 的搜索落地之后这句话仍然成立，因为 `start_search` 走的是
 /// `spawn_blocking`（见下），它占的是 blocking 池而不是 async worker，
-/// 所以并没有给这里添并发负载。真要给 async worker 加压的是 M2-G 的文件监听，
-/// 到那时再把这里挪进 blocking 池。
+/// 所以并没有给这里添并发负载。M2-G 的文件监听同样走 blocking 池
+/// （理由见 `src/watcher.rs` 里 `WatcherState` 的文档），也没有给这里添负载。
 ///
 /// `encoding` 为 `None` 时走探测，`Some` 时**跳过探测**用它解——这是「以某编码重新
 /// 打开」。必须有这条路：探测会静默地错，一份 GBK 文件如果字节恰好是合法 UTF-8，
@@ -131,6 +203,42 @@ pub async fn open_file(path: String, encoding: Option<Encoding>) -> Result<TextF
 #[command]
 pub async fn save_file(path: String, text: String, format: FileFormat) -> Result<WriteReport, WriteError> {
     write_text_atomic(Path::new(&path), &text, format)
+}
+
+/// 把剪贴板里的一张图片落到 `<doc_path 所在目录>/assets/` 里（M3-A-7）。
+///
+/// 🔴 **签名里没有目标路径、没有目录名、也没有文件名。** `doc_path` 只用来推出落地目录，
+/// 名字由 `vela_core::fs::store_image` 按内容哈希生成。理由写在上面模块文档
+/// 「`store_image` 是第十五个」那一节，以及 `vela-core/src/fs/asset.rs` 开头。
+///
+/// ## ⚠️ 图片走 base64 字符串，不走数字数组
+///
+/// Tauri 的 invoke 载荷是 JSON。一张 1 MB 的截图若编码成 `[137,80,78,…]`，
+/// 就是 100 万个 JSON number token、约 4 MB 的文本，两头各解析一次要几百毫秒；
+/// 编成一个 base64 字符串只有 1 个 token、约 1.4 MB，几毫秒就过去了。
+/// 这不是「差不多」的差别，而是「粘完界面卡一下」与「粘完立刻出现链接」的差别。
+///
+/// 解码只认**标准字母表 + padding**（`general_purpose::STANDARD`），正是前端 `btoa`
+/// 的产物。刻意不放宽成「URL-safe 也收、没 padding 也收」：多认一种写法就多一种
+/// 「两边以为在说同一件事、其实在说两件事」的可能，而前端只有一个编码器。
+#[command]
+pub async fn store_image(doc_path: String, data_base64: String) -> Result<StoredImage, AssetError> {
+    // 先按长度挡一道再解码：`store_image_bytes` 的上限管的是**解出来**的字节数，
+    // 而解码本身要先把整份数据摊开。用户在 Finder 里复制一个 2 GB 的文件再粘进来
+    // 是**会发生**的，那时先吃掉 1.5 GB 内存、再被上限拒绝，界面已经卡过了。
+    // 4/3 是 base64 的膨胀率，多留 8 字节给 padding——这一道只防「离谱」，
+    // 精确判定在下面那一个里。报出去的 bytes 是按膨胀率估的，
+    // 但「已经超限」这件事是确定的，估个近似值比报 0 有用
+    const MAX_B64_LEN: usize = MAX_IMAGE_BYTES / 3 * 4 + 8;
+    if data_base64.len() > MAX_B64_LEN {
+        return Err(AssetError::TooBig { bytes: data_base64.len() as u64 * 3 / 4, limit: MAX_IMAGE_BYTES as u64 });
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| AssetError::BadData { reason: e.to_string() })?;
+    // 与 `save_file` 同一档：阻塞 IO 直接跑在异步运行时上。
+    // 一次哈希 + 一次原子写入，图片的现实中位数在几百 KB，毫秒量级
+    store_image_bytes(Path::new(&doc_path), &bytes)
 }
 
 /// 列出 `root` 下 `rel` 这一层的目录内容（**只有一层**，PLAN.md §3.4 M2-A）。
@@ -431,20 +539,35 @@ impl TaskRegistry {
 /// ⚠️ 起飞前检查在**这个**线程上做，不在后台线程里做。于是「搜索词编不出来」当场
 /// reject 掉 invoke，前端不需要先拿到 taskId、再等一个 failed event 绕回来，
 /// 规则就只剩一句：**reject = 这次搜索压根没开始；拿到了 taskId = 一定会等到
-/// done 或 failed**。代价是后台线程里 `search()` 会再编一次同样的正则——微秒级。
+/// done 或 failed**。代价是后台线程里 `search_roots()` 会再编一次同样的正则——微秒级。
 ///
-/// 同样声明成 `async fn`：预检要对 root 做一次 `metadata`，而 root 可能在网络卷上。
+/// 同样声明成 `async fn`：预检要对每个 root 做一次 `metadata`，而 root 可能在网络卷上。
+///
+/// ## ⚠️ 多根（M2-F）：一次搜索**一个** taskId、一个取消标志、一份总账
+///
+/// `roots` 是工作区里挂着的全部文件夹，顺序就是前端侧边栏里的顺序，而结果里每条
+/// `SearchFile::root_index` 是这个数组的下标。刻意不做成「每个根起一次搜索」：
+/// 那样前端要自己攒 N 份总账、自己判断 N 个 taskId 都到齐了没有、取消要发 N 次，
+/// 而 `MAX_HITS` 那本预算也会变成每个根一份（两个根就是四万条，用户批准的是两万）。
+///
+/// ⚠️ **有一个根不合法就整次 reject**，报的错里带着那一个根的路径。刻意不「跳过坏根、
+/// 搜剩下的」：跳过之后用户看到的是「找不到某个文件」，而那与「这个文件不存在」
+/// 在界面上长得一模一样——PLAN §3.4 里 `IndexStats::truncated` 那条讲的就是这个坑。
+/// 拔掉的移动硬盘该被说出来，不该被静默忽略。
+///
+/// `roots` 为空是合法的（得到一份全零总账），而 UI 到不了那个状态：
+/// 没有打开任何文件夹时前端压根不让发起搜索，见 `src/search/store.ts`。
 #[command]
 pub async fn start_search(
     app: AppHandle,
     tasks: State<'_, TaskRegistry>,
-    root: String,
+    roots: Vec<String>,
     query: SearchQuery,
 ) -> Result<String, SearchError> {
-    preflight(Path::new(&root), &query)?;
+    let roots = into_paths(&roots);
+    preflight_roots(&path_refs(&roots), &query)?;
 
     let (task_id, cancel) = tasks.register("search");
-    let root = PathBuf::from(root);
     // 三样东西都要在批次回调里用、也要在收尾时用，各克隆一份进闭包
     let emitter = app.clone();
     let batch_task_id = task_id.clone();
@@ -453,7 +576,7 @@ pub async fn start_search(
     // `spawn_blocking` 而不是 `std::thread::spawn`：搜索是分钟级的阻塞活，
     // 放进运行时的 blocking 池才不会「开十个搜索就起十个 OS 线程」
     tauri::async_runtime::spawn_blocking(move || {
-        let outcome = search(&root, &query, &cancel, |batch| {
+        let outcome = search_roots(&path_refs(&roots), &query, &cancel, |batch| {
             let _ = emitter.emit(crate::SEARCH_BATCH, BatchPayload { task_id: batch_task_id.clone(), batch });
         });
 
@@ -473,6 +596,24 @@ pub async fn start_search(
     });
 
     Ok(task_id)
+}
+
+/// 前端递来的 `roots` 落到 `PathBuf` 上。
+///
+/// ⚠️ 这里**不做任何规范化**（不 canonicalize、不去末尾斜杠）：四个命令收到的路径
+/// 与 `list_dir` / `start_search` 一直以来收到的是同一种东西，而 vela-core 那一侧
+/// 的相等比较用的是 `Path` 的逐组件语义，`/repo` 与 `/repo/` 本来就算同一个。
+/// 在这里多规范一次，反而会造出「同一个文件夹在两个地方是两个键」的第三种写法
+fn into_paths(roots: &[String]) -> Vec<PathBuf> {
+    roots.iter().map(PathBuf::from).collect()
+}
+
+/// `search_roots` / `apply_roots` / `preflight_*_roots` 要的是 `&[&Path]`。
+///
+/// ⚠️ 每次调用都新分配一个 `Vec`，而这个分配是**必要的**：闭包要 `move` 走 `roots`
+/// 本身（`Vec<PathBuf>`），借出来的 `&Path` 不能在闭包外面先算好
+fn path_refs(roots: &[PathBuf]) -> Vec<&Path> {
+    roots.iter().map(PathBuf::as_path).collect()
 }
 
 /// `vela://replace-progress` 的载荷。
@@ -527,23 +668,29 @@ struct ReplaceFailedPayload {
 /// 与 `start_search` 同一条规则：`preflight_apply` 在**这个**线程上做，
 /// reject = 一个文件都没动。这条对替换比对搜索重要得多——搜索 reject 了顶多没结果，
 /// 替换 reject 了要是已经改了一半，用户手上就是一个谁也不认识的仓库。
+///
+/// ⚠️ 多根之下这句话只有在**所有根一起查完才开工**时才成立，所以检查是
+/// `preflight_apply_roots`：第二个根不合法时，第一个根一个字节都不会被写。
+/// 钉住它的是 `vela-core/tests/wire_contract.rs` 里那条
+/// `第二个根不合法时第一个根一个文件都没被改`。其余的多根取舍（一个 taskId、
+/// 一份总账、坏根整次 reject）与 [`start_search`] 完全相同，不重复
 #[command]
 pub async fn start_replace(
     app: AppHandle,
     tasks: State<'_, TaskRegistry>,
-    root: String,
+    roots: Vec<String>,
     request: ReplaceRequest,
 ) -> Result<String, SearchError> {
-    preflight_apply(Path::new(&root), &request)?;
+    let roots = into_paths(&roots);
+    preflight_apply_roots(&path_refs(&roots), &request)?;
 
     let (task_id, cancel) = tasks.register("replace");
-    let root = PathBuf::from(root);
     let emitter = app.clone();
     let progress_task_id = task_id.clone();
     let final_task_id = task_id.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        let outcome = apply(&root, &request, &cancel, |progress| {
+        let outcome = apply_roots(&path_refs(&roots), &request, &cancel, |progress| {
             let _ = emitter
                 .emit(crate::REPLACE_PROGRESS, ReplaceProgressPayload { task_id: progress_task_id.clone(), progress });
         });
@@ -584,6 +731,222 @@ pub fn cancel_task(tasks: State<'_, TaskRegistry>, task_id: String) {
     tasks.cancel(&task_id);
 }
 
+/// `Cmd+P` 一次回多少条候选。
+///
+/// ⚠️ **刻意不做成命令参数。** 浮层只有一个，它要的条数永远是这一个数；做成参数的话
+/// Rust 侧就必须为「前端递来一个荒唐的 limit」兜底——二十万条 `FileMatch` 每条两个
+/// `String`，序列化出来远超 PLAN §2.6 那条「单次 payload ≤ 4MB」。
+/// 一个只能在 Rust 侧被夹紧的参数，前端拿到的那份自由是假的，不如压根不给。
+const QUERY_LIMIT: usize = 50;
+
+/// 当前建好的那几份文件索引，**一个根一份**。**M2 的第二份 managed state**（第一份是 [`TaskRegistry`]）。
+///
+/// ## 为什么要缓存：建一次不是免费的
+///
+/// 实测（合成的 `pkg{i}/src/feature{j}/module{k}.ts` 树，release，外接盘）：
+///
+/// | 文件数 | 建一次（热） | 查一次（最坏） |
+/// |---|---|---|
+/// | 2 万 | 40ms | 0.9ms |
+/// | 10 万 | 205ms | 12.7ms |
+///
+/// 于是「每个按键重建一遍」直接出局（12.7ms 能忍，205ms 不能），
+/// 而「每个按键查一次」完全站得住。**缓存要挡的是重建，不是查询。**
+///
+/// ## ⚠️ 什么时候重建：`index_project` 每次都建，`query_project` 只在缺的那一个根上才建
+///
+/// 这个不对称是全部的要点。浮层展开时调一次 [`index_project`]，于是「上一次开浮层之后
+/// 新建的文件」这一次一定找得到——用户在「Rust 建索引并缓存」那一条上原本接受了一项代价
+/// （M2-G 的文件监听落地之前，新文件要手动刷新才进得来），上面那两个数字说明
+/// **这项代价可以不付**：2 万文件的仓库重建 40ms，低于人能察觉的门槛；10 万文件 205ms，
+/// 而浮层展开那一刻前端本来就有 MRU 可以立刻画出来，用户看到的不是白屏。
+///
+/// 按键那一路则**绝不主动重建**：命中缓存就用。两条命令各自都能独立给出正确答案，
+/// 所以「浮层展开的请求还没回来、用户已经打了一个字」这个时序不会给出一个安静的错答案，
+/// 最多是那一次慢一点。
+///
+/// ## ⚠️ 多根（M2-F）：没有 LRU，`retain` 是唯一会拿掉东西的地方
+///
+/// 缓存从「一份」变成「每个根一份」之后，「换了项目旧的就够不着」这条不再自动成立，
+/// 于是 [`ProjectIndexCache::retain`] 在**两条命令的开头**各调一次：把不在当前工作区
+/// 里的那些扔掉。放在开头而不是结尾，是因为结尾的话一个刚被移出工作区的根会先被重建
+/// 一遍再被扔掉，白付两百毫秒。
+#[derive(Default)]
+pub struct ProjectIndexCache {
+    roots: Mutex<Vec<Arc<FileIndex>>>,
+}
+
+impl ProjectIndexCache {
+    /// 找 `root` 的那一份。找到就把 `Arc` 克隆出来，**锁立刻放掉**——
+    /// 后面那十几毫秒的打分不该占着一把别的查询也要拿的锁。
+    ///
+    /// ⚠️ 底下是 `Vec` 而不是 `HashMap<PathBuf, _>`：根的数量是个位数，线性扫比哈希快；
+    /// 而 `Path` 的相等比的是 components，`/repo` 与 `/repo/` 天然算同一个根，
+    /// 于是不需要先把 key 规范化（规范化本身是一次 `canonicalize`，即一次系统调用，
+    /// 而且在移动硬盘拔了的情况下会失败）。
+    fn get(&self, root: &Path) -> Option<Arc<FileIndex>> {
+        self.lock().iter().find(|index| index.root() == root).cloned()
+    }
+
+    fn put(&self, index: Arc<FileIndex>) {
+        let mut roots = self.lock();
+        // ⚠️ 同一个根建了两遍时**顶掉**旧的那一份，而不是在旁边多留一份。
+        // 建的时候不持锁（理由见 [`build_index`]），所以「两个请求同时重建同一个根」
+        // 是可能的时序；两份内容一样，留哪份都行，留两份则是白占内存
+        match roots.iter_mut().find(|old| old.root() == index.root()) {
+            Some(slot) => *slot = index,
+            None => roots.push(index),
+        }
+    }
+
+    /// 扔掉不在 `roots` 里的那些。理由与调用时机见 [`ProjectIndexCache`] 的模块文档。
+    fn retain(&self, roots: &[String]) {
+        self.lock().retain(|index| roots.iter().any(|root| Path::new(root) == index.root()));
+    }
+
+    /// ⚠️ `unwrap_or_else(into_inner)` 而不是 `expect`，理由与 [`TaskRegistry::lock`]
+    /// 一字不差：release 是 `panic = "abort"`，而中毒只意味着「有人持锁的时候 panic 了」，
+    /// 那个 `Vec<Arc<FileIndex>>` 本身还是完好的
+    fn lock(&self) -> MutexGuard<'_, Vec<Arc<FileIndex>>> {
+        self.roots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// 在 blocking 池里建一份索引，成功就写进缓存并把 `Arc` 交回来。
+///
+/// ⚠️ 走 `spawn_blocking` 而不是直接在 async command 里调：建索引是两百毫秒量级的
+/// **阻塞**活（表见 [`ProjectIndexCache`]），占着 async worker 就是占着
+/// `open_file` / `save_file` / `list_dir` 的执行位。这也是 [`start_search`] 的同一个理由。
+///
+/// 建的时候**不持锁**：两百毫秒的锁会把并发的查询全串起来，而两个请求同时重建同一个
+/// root 的最坏结果只是「后写完的那一份留下」，两份内容一样。
+async fn build_index(cache: &ProjectIndexCache, root: &Path) -> Result<Arc<FileIndex>, TreeError> {
+    let owned = root.to_path_buf();
+    let built = tauri::async_runtime::spawn_blocking(move || FileIndex::build(&owned).map(Arc::new))
+        .await
+        .map_err(join_failed)??;
+    cache.put(Arc::clone(&built));
+    Ok(built)
+}
+
+/// `spawn_blocking` 的 `JoinError` 翻成 `TreeError::Io`。
+///
+/// 它只有两个来源：任务被取消，或者任务 panic 了。panic 在 release 下是
+/// `panic = "abort"`，进程当场就没了、压根走不到这里，所以能收到这一条的实际只有取消。
+///
+/// ⚠️ `pub(crate)`：M2-G 的 `watcher::set_watched` 也走 `spawn_blocking`，
+/// 而这一条翻译与它要说的话一字不差，没必要写第二份
+pub(crate) fn join_failed(error: tauri::Error) -> TreeError {
+    TreeError::Io { reason: "Join".to_owned(), message: format!("建索引的任务没能跑完：{error}") }
+}
+
+/// 索引这两条命令的预检：**每一个根都合法**。
+///
+/// ⚠️ 与搜索、替换同一条规则：先把 N 个根全查一遍，再开始干活。于是
+/// 「第二个根是拔掉的移动硬盘」不会先在第一个根上白建一份两百毫秒的索引，
+/// 也不会把一份没人要的索引留在缓存里；规则也只需要说一次：**reject = 什么都没发生**。
+///
+/// 放在 `retain` 前面，是为了让上面那句话在缓存这一侧也字面成立。
+/// 名字里没有「project」是为了不与 `vela_core::search::preflight_roots` 撞车——
+/// 两个函数查的是同一件事，报的是两套错误枚举
+fn preflight_index_roots(roots: &[String]) -> Result<(), TreeError> {
+    roots.iter().map(Path::new).try_for_each(project::check_root)
+}
+
+/// 建**工作区里每一个根**的文件索引（**每次都重建**），回报合并成一份的账（M2-E，PLAN.md §3.4）。
+///
+/// 前端在 `Cmd+P` 浮层**展开的那一刻**调它，两个用途：① 让第一次按键落在一份热缓存上；
+/// ② 拿到 `IndexStats::truncated` ——为真时索引不全，而「找不到某个文件」在界面上与
+/// 「这个文件不存在」长得一模一样，不说一句用户无从分辨。
+///
+/// ⚠️ 报 `TreeError` 而不是造第四个错误枚举：索引的预检与文件树的是同一套
+/// （不是绝对路径 / 不存在 / 不是目录 / IO），前端那份 `describeTreeError` 直接就能用。
+/// 多一个枚举就多一份要两边同步的分支表，而它一条新信息也带不来。
+///
+/// ⚠️ 多根之下回来的 `IndexStats` 是 [`merge_stats`] 合出来的：文件数、读不动的个数、
+/// 耗时三个都是**加**，而 `truncated` 是**取或**——三个根里有一个撞了 `MAX_INDEX_FILES`
+/// 就必须报出来，不能被另外两个「走完了」的根静默掉。
+/// 坏根的取舍见 [`preflight_index_roots`]，与 [`start_search`] 那节完全相同
+#[command]
+pub async fn index_project(cache: State<'_, ProjectIndexCache>, roots: Vec<String>) -> Result<IndexStats, TreeError> {
+    rebuild_indexes(&cache, &roots).await
+}
+
+/// [`index_project`] 的本体：**逐个无条件重建**，合并成一份账回来。
+///
+/// 拆出来只有一个理由——`State<'_, T>` 没有公开的构造器，裹着它的命令在单测里
+/// 压根调不到，而「每次都建」正是这一层唯一一条需要被钉住的策略。
+/// 这也是本文件开头那句「这一层刻意薄到只有签名转换」的延伸：真正的实现能下沉就下沉到
+/// vela-core，下不去的（「什么时候该重建」是一个应用级决定）至少退到 `State` 外面来。
+async fn rebuild_indexes(cache: &ProjectIndexCache, roots: &[String]) -> Result<IndexStats, TreeError> {
+    preflight_index_roots(roots)?;
+    cache.retain(roots);
+    let mut stats = Vec::with_capacity(roots.len());
+    for root in roots {
+        // ⚠️ 逐个 `await` 而不是并发建：三个大仓库同时重建会把 blocking 池占满，
+        // 而 `open_file` / `save_file` / `list_dir` 也在上面。多花的是「三个 200ms
+        // 还是一个 600ms」，而浮层此刻画的是 MRU，用户看不见差别；
+        // 抢占编辑器的 IO 则是能看见的
+        stats.push(build_index(cache, Path::new(root)).await?.stats());
+    }
+    Ok(merge_stats(&stats))
+}
+
+/// 在**当前工作区的每一个根**上做模糊匹配，合并后只回**前 [`QUERY_LIMIT`] 条**（M2-E）。
+///
+/// `needle` 为空是**合法的**，意思是「随便给我一批」——浮层刚展开、用户一个字都还没打时
+/// 要的就是这个，而 MRU 加分会让最近打开过的那几个排在最前面。
+///
+/// `recent` 是前端 MRU 里的绝对路径清单，⚠️ **只用来加分**：比不上的（长在 root 外面的、
+/// 已经不存在的）直接忽略，不会因为它去打开或枚举任何路径。上限 `MAX_RECENT` 夹在
+/// vela-core 那一侧，前端递多少都不会让这边建一张大哈希表。
+#[command]
+pub async fn query_project(
+    cache: State<'_, ProjectIndexCache>,
+    roots: Vec<String>,
+    needle: String,
+    recent: Vec<String>,
+) -> Result<FileQuery, TreeError> {
+    query_cached(&cache, &roots, needle, recent).await
+}
+
+/// [`query_project`] 的本体：**每个根命中缓存就用，缺谁建谁**，最后在结果那一层合并。
+///
+/// ⚠️ 合并刻意**不**做成「先并成一份大索引再查」：那意味着每加一个根都要把已有的根
+/// 全部重走一遍，缓存就白做了。`query_many` 只碰 N × 50 行，理由写在它的文档里。
+async fn query_cached(
+    cache: &ProjectIndexCache,
+    roots: &[String],
+    needle: String,
+    recent: Vec<String>,
+) -> Result<FileQuery, TreeError> {
+    preflight_index_roots(roots)?;
+    cache.retain(roots);
+    let mut indexes: Vec<Arc<FileIndex>> = Vec::with_capacity(roots.len());
+    for root in roots {
+        let path = Path::new(root);
+        // 正常时序下浮层展开时 `index_project` 已经建好了，能走到重建的只有
+        // 「换了项目」与「按键比展开的响应先到」两种，两种都该建
+        indexes.push(match cache.get(path) {
+            Some(index) => index,
+            None => build_index(cache, path).await?,
+        });
+    }
+    // 打分是纯 CPU，10 万文件最坏 12.7ms，多根就是各份之和。这个量级按 `open_file`
+    // 的先例本来可以留在 async worker 上，但按键是一串连发的，排队会直接变成手感
+    tauri::async_runtime::spawn_blocking(move || {
+        // ⚠️ 这一行必须在闭包**里面**：它借 `indexes`，而 `indexes` 是被 move 进来的
+        let pairs: Vec<(u16, &FileIndex)> = indexes
+            .iter()
+            .enumerate()
+            .map(|(slot, index)| (u16::try_from(slot).unwrap_or(u16::MAX), index.as_ref()))
+            .collect();
+        query_many(&pairs, &needle, &recent, QUERY_LIMIT)
+    })
+    .await
+    .map_err(join_failed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,12 +962,17 @@ mod tests {
     ///
     /// 心跳批（`files` 为空）单独钉一遍：那是前端最容易漏处理的一种，
     /// 漏了的表现是「进度条不动」，而不是报错。
+    ///
+    /// ⚠️ M2-F 起 `rootIndex` **总是出现**（没挂 `skip_serializing_if`）：它写错名字的
+    /// 失败方式与上面两条一样安静——前端读到 `undefined`，于是每一行都被算成第 0 个根，
+    /// 多根工作区里点第二条结果会打开第一个根里的同名文件（如果那里面正好有的话）。
     #[test]
     fn 三个搜索事件载荷的线上形状() {
         let batch = SearchBatch {
             files: vec![SearchFile {
                 rel: "src/a.ts".to_owned(),
                 path: "/repo/src/a.ts".to_owned(),
+                root_index: 0,
                 hits: vec![SearchHit {
                     line: 3,
                     text: "let a = needle;".to_owned(),
@@ -618,7 +986,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&BatchPayload { task_id: "search-7".to_owned(), batch }).unwrap(),
-            r#"{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}}"#
+            r#"{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","rootIndex":0,"hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"truncated":false}],"truncated":false}],"filesScanned":3}}"#
         );
 
         // M2-D 替换模式下多出来的那一个字段。⚠️ 上面那条期望字符串**一个字都没改**——
@@ -630,6 +998,7 @@ mod tests {
             files: vec![SearchFile {
                 rel: "src/a.ts".to_owned(),
                 path: "/repo/src/a.ts".to_owned(),
+                root_index: 0,
                 hits: vec![SearchHit {
                     line: 3,
                     text: "let a = needle;".to_owned(),
@@ -643,7 +1012,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&BatchPayload { task_id: "search-7".to_owned(), batch: preview }).unwrap(),
-            r#"{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"replaced":"let a = N;","truncated":false}],"truncated":false}],"filesScanned":3}}"#
+            r#"{"taskId":"search-7","batch":{"files":[{"rel":"src/a.ts","path":"/repo/src/a.ts","rootIndex":0,"hits":[{"line":3,"text":"let a = needle;","ranges":[{"start":8,"end":14}],"replaced":"let a = N;","truncated":false}],"truncated":false}],"filesScanned":3}}"#
         );
 
         // 心跳：`files` 为空，只有累计的扫描数
@@ -724,8 +1093,8 @@ mod tests {
             r#"{"taskId":"replace-7","summary":{"filesScanned":120,"filesChanged":3,"replacements":7,"skippedBinary":1,"skippedLossy":2,"skippedUnmappable":0,"skippedTooLarge":4,"skippedOpen":1,"unreadable":2,"writeFailed":0,"truncated":false,"cancelled":true,"elapsedMs":45}}"#
         );
 
-        // 错误变体复用搜索那一个 `SearchError`——两边共享 `prepare`，所以坏正则、
-        // 坏 glob、坏 root 三种拒法在两个命令上是同一套。多出来的只有 `bad_replacement`
+        // 错误变体复用搜索那一个 `SearchError`——两边共享 `check_root` + `compile`，
+        // 所以坏正则、坏 glob、坏 root 三种拒法在两个命令上是同一套。多出来的只有 `bad_replacement`
         assert_eq!(
             serde_json::to_string(&ReplaceFailedPayload {
                 task_id: "replace-7".to_owned(),
@@ -815,5 +1184,256 @@ mod tests {
         tasks.cancel("replace-9999");
         tasks.forget("search-9999");
         assert!(tasks.lock().is_empty());
+    }
+
+    /// 一棵两文件的小树。⚠️ 刻意**不放** `.gitignore`、不放符号链接、不放读不动的目录：
+    /// 那些是遍历规则，由 `vela_core::project::index` 自己那一批测试负责
+    /// （其中两条还直接拿搜索对账）。这里只测缓存策略与参数是不是接对了，
+    /// 把遍历规则再抄一遍只是多一处会漂的地方
+    fn index_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/alpha.ts"), "a\n").unwrap();
+        std::fs::write(dir.path().join("src/beta.ts"), "b\n").unwrap();
+        dir
+    }
+
+    fn root_of(dir: &tempfile::TempDir) -> String {
+        dir.path().to_str().expect("tempdir 的路径不是合法 UTF-8").to_owned()
+    }
+
+    /// 只有一个根的工作区。
+    ///
+    /// 写成函数而不是就地 `&[root.clone()]`：那个写法 clippy 会挑
+    /// （`cloned_ref_to_slice_refs`），而它挑得对——`from_ref` 之外的克隆在这儿没有意义
+    fn one_root(root: &str) -> Vec<String> {
+        vec![root.to_owned()]
+    }
+
+    /// ⚠️ 这一条钉的是本层唯一一条**策略**：浮层每展开一次就重建一次。
+    ///
+    /// 它买来的东西很具体——「上一次开浮层之后新建的文件，这一次一定找得到」。
+    /// 要是哪天有人把它改成「命中缓存就复用」（看着很合理，还能省掉两百毫秒），
+    /// 失败方式是「刚建的文件 `Cmd+P` 找不到，重启 Vela 才有」，而 M2-G 的文件监听
+    /// 落地之前压根没有别的东西会去动这份缓存。数字依据见 [`ProjectIndexCache`] 那张表。
+    ///
+    /// 顺带钉住多根那一半：**两个根都重建**，不是一个建了一个复用
+    #[test]
+    fn 每次_index_project_都重建() {
+        let (dir, other) = (index_fixture(), index_fixture());
+        let roots = vec![root_of(&dir), root_of(&other)];
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            rebuild_indexes(&cache, &roots).await.unwrap();
+            let before: Vec<_> = roots.iter().map(|root| cache.get(Path::new(root)).unwrap()).collect();
+            rebuild_indexes(&cache, &roots).await.unwrap();
+            for (slot, root) in roots.iter().enumerate() {
+                let after = cache.get(Path::new(root)).unwrap();
+                assert!(!Arc::ptr_eq(&before[slot], &after), "第 {slot} 个根复用了缓存，新文件就再也进不来了");
+            }
+        });
+    }
+
+    /// 反过来：按键那一路**绝不主动重建**。
+    ///
+    /// 与上一条合起来才是完整的策略，少任何一条都会退化成另一种错——
+    /// 两条都「每次都建」的话第一个按键就要等两百毫秒，两条都「命中就用」的话
+    /// 新建的文件永远找不到
+    #[test]
+    fn 查询复用缓存里的那一份() {
+        let (dir, other) = (index_fixture(), index_fixture());
+        let roots = vec![root_of(&dir), root_of(&other)];
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            rebuild_indexes(&cache, &roots).await.unwrap();
+            let before: Vec<_> = roots.iter().map(|root| cache.get(Path::new(root)).unwrap()).collect();
+            let got = query_cached(&cache, &roots, "alpha".to_owned(), Vec::new()).await.unwrap();
+            for (slot, root) in roots.iter().enumerate() {
+                let after = cache.get(Path::new(root)).unwrap();
+                assert!(Arc::ptr_eq(&before[slot], &after), "根没变却重建了，那两百毫秒就落在第一个按键上");
+            }
+            // 两个根里各有一个 `src/alpha.ts`，于是两条都在，`root_index` 把它们分开
+            assert_eq!(got.total, 2);
+            assert_eq!(got.matches.len(), 2);
+            let indexes: Vec<u16> = got.matches.iter().map(|hit| hit.root_index).collect();
+            assert_eq!(indexes, vec![0, 1], "{got:?}");
+        });
+    }
+
+    /// 缓存里**只有当前工作区挂着的那几个根**。
+    ///
+    /// 这一条在单根时代是自动成立的（同时只有一份，换了就被顶掉），多根之后不再成立：
+    /// 往工作区里加了两个文件夹又移掉，`put` 只会往里加，谁都不会往外拿。
+    /// 留下来的就是内存里两棵没人看的十万条路径的 `Vec`
+    #[test]
+    fn 移出工作区的根会被淘汰() {
+        let (dir, other, gone) = (index_fixture(), index_fixture(), index_fixture());
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            rebuild_indexes(&cache, &[root_of(&dir), root_of(&other), root_of(&gone)]).await.unwrap();
+            assert_eq!(cache.lock().len(), 3);
+
+            rebuild_indexes(&cache, &[root_of(&dir), root_of(&other)]).await.unwrap();
+            assert!(cache.get(gone.path()).is_none(), "被移出工作区的根还挂在缓存里");
+            assert!(cache.get(dir.path()).is_some() && cache.get(other.path()).is_some());
+            assert_eq!(cache.lock().len(), 2);
+
+            // ⚠️ 查询那一路也淘汰。少了这一半的话，用户移出文件夹之后只要不再打开
+            // `Cmd+P` 浮层，那几份索引就一直在——而「不再打开浮层」正是最常见的情形
+            rebuild_indexes(&cache, &[root_of(&other)]).await.unwrap();
+            query_cached(&cache, &[root_of(&other)], String::new(), Vec::new()).await.unwrap();
+            assert!(cache.get(dir.path()).is_none(), "查询没有淘汰掉已经不在工作区里的根");
+            assert_eq!(cache.lock().len(), 1);
+        });
+    }
+
+    /// `Path` 的相等比的是 components，所以 `/repo` 与 `/repo/` 是同一个 root。
+    ///
+    /// 值得单钉一条：前端拿到 root 的两个来源（dialog 的返回值、会话存档里读回来的）
+    /// 不保证末尾斜杠一致，而比不上的后果是**每次按键都重建一次索引**——
+    /// 界面还是对的，只是慢两百毫秒，属于最难被当成 bug 报上来的那一类
+    #[test]
+    fn 末尾多一个斜杠算同一个_root() {
+        let dir = index_fixture();
+        let root = root_of(&dir);
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            rebuild_indexes(&cache, &one_root(&root)).await.unwrap();
+            let before = cache.get(Path::new(&root)).unwrap();
+            // ⚠️ 两种写法混着用：建的时候不带斜杠，查的时候带。要是被当成两个根，
+            // 缓存里会多出一份，而 `retain` 也认不出它们该合并
+            let slashed = format!("{root}/");
+            query_cached(&cache, &one_root(&slashed), String::new(), Vec::new()).await.unwrap();
+            let after = cache.get(Path::new(&slashed)).unwrap();
+            assert!(Arc::ptr_eq(&before, &after), "`{slashed}` 没被认成 `{root}`");
+            assert_eq!(cache.lock().len(), 1, "同一个文件夹在缓存里成了两个键");
+        });
+    }
+
+    /// 兜底那一条：缓存空着的时候查询自己会建。
+    ///
+    /// 正常时序走不到这里（浮层展开时 `index_project` 先建好了），能走到的只有
+    /// 「按键比展开的响应先到」。⚠️ 没有这一条的话那种时序会**安静地**回一个空列表，
+    /// 而空列表在界面上与「一个都没匹配上」长得一模一样。
+    ///
+    /// 多根版本钉的是**缺谁建谁**：只有一个根缺的时候，另一个必须复用
+    #[test]
+    fn 没有缓存时查询自己会建一份() {
+        let (dir, other) = (index_fixture(), index_fixture());
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            let roots = [root_of(&dir), root_of(&other)];
+            assert!(cache.get(Path::new(&roots[0])).is_none());
+            rebuild_indexes(&cache, &roots[..1]).await.unwrap();
+            let warm = cache.get(Path::new(&roots[0])).unwrap();
+
+            let got = query_cached(&cache, &roots, "beta".to_owned(), Vec::new()).await.unwrap();
+            assert_eq!(got.total, 2, "{got:?}");
+            let still_warm = cache.get(Path::new(&roots[0])).unwrap();
+            assert!(Arc::ptr_eq(&warm, &still_warm), "已经热着的那个根被重建了");
+            assert!(cache.get(Path::new(&roots[1])).is_some(), "建完没写进缓存，下一个按键还得再建一次");
+        });
+    }
+
+    /// 报 `TreeError`，而不是「一个空结果」。
+    ///
+    /// 与 [`index_project`] 的文档呼应：复用文件树那一个错误枚举，前端那份
+    /// `describeTreeError` 直接就能把它说成人话
+    #[test]
+    fn root_不存在时报错而不是一个空结果() {
+        let dir = index_fixture();
+        let missing = dir.path().join("nope").to_string_lossy().into_owned();
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            let err = rebuild_indexes(&cache, &one_root(&missing)).await.unwrap_err();
+            assert_eq!(err, TreeError::NotFound { path: missing.clone() });
+            // 查询那一路也一样：预检就把它挡下来了，不拿一个空索引糊过去
+            let err = query_cached(&cache, &one_root(&missing), String::new(), Vec::new()).await.unwrap_err();
+            assert_eq!(err, TreeError::NotFound { path: missing });
+        });
+    }
+
+    /// ⚠️ 与搜索、替换同一条取舍：**第二个根不合法时，第一个根一份索引都不建**。
+    ///
+    /// 钉的是「不静默跳过」这件事。跳过的话浮层照样出来一批文件、少一个根的那批，
+    /// 用户看到的就是「找不到某个文件」——拔掉的移动硬盘该被说出来
+    #[test]
+    fn 第二个根不合法时整次报错() {
+        let dir = index_fixture();
+        let missing = dir.path().join("nope").to_string_lossy().into_owned();
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            let roots = [root_of(&dir), missing.clone()];
+            let err = rebuild_indexes(&cache, &roots).await.unwrap_err();
+            assert_eq!(err, TreeError::NotFound { path: missing.clone() });
+            assert!(cache.lock().is_empty(), "第一个根已经建进缓存了，于是它下一次会命中一份没人淘汰的索引");
+
+            let err = query_cached(&cache, &roots, String::new(), Vec::new()).await.unwrap_err();
+            assert_eq!(err, TreeError::NotFound { path: missing });
+            assert!(cache.lock().is_empty());
+        });
+    }
+
+    /// 两个参数**没接反**。
+    ///
+    /// `needle` 与 `recent` 都是 `Vec<String>` / `String` 这类形状很宽的东西，
+    /// 接反了编译器一句话都不说：空 needle 命中全部，于是界面照样出来一批文件，
+    /// 只是顺序不对、打字不过滤——用户看到的是「这个搜索坏了」。
+    ///
+    /// ⚠️ 多根之后 `roots` 也是 `Vec<String>`，于是「`roots` 与 `recent` 接反」成了
+    /// 第三种同样静默的错法。这一条顺手把它钉住：`recent` 里放的是**绝对路径**，
+    /// 拿它当根去建索引会直接 `NotFound`，而下面第三条断言要求的是「建得出来且顺序对」
+    #[test]
+    fn 空_needle_合法_而_recent_真的能改变顺序() {
+        let (dir, other) = (index_fixture(), index_fixture());
+        let roots = vec![root_of(&dir), root_of(&other)];
+        let cache = ProjectIndexCache::default();
+        let beta = dir.path().join("src/beta.ts").to_string_lossy().into_owned();
+        tauri::async_runtime::block_on(async {
+            // 不带 recent：两个根各自按遍历顺序（每层按文件名排），再按根的序号拼接
+            let plain = query_cached(&cache, &roots, String::new(), Vec::new()).await.unwrap();
+            assert_eq!(plain.total, 4);
+            assert_eq!(plain.matches[0].rel, "src/alpha.ts");
+            assert_eq!(plain.matches[0].root_index, 0);
+
+            let mru = query_cached(&cache, &roots, String::new(), vec![beta.clone()]).await.unwrap();
+            assert_eq!(mru.matches[0].rel, "src/beta.ts", "recent 没被用上");
+            assert_eq!(mru.matches[0].root_index, 0, "加分加到了另一个根的同名文件上");
+
+            // needle 还在过滤：recent 只是加分，不是「无视搜索词」
+            let filtered = query_cached(&cache, &roots, "alpha".to_owned(), vec![beta]).await.unwrap();
+            assert_eq!(filtered.total, 2);
+            assert_eq!(filtered.matches[0].rel, "src/alpha.ts");
+        });
+    }
+
+    /// `QUERY_LIMIT` 在 IPC 这一侧真的生效，而 `total` 报的是**命中总数**不是回来的条数。
+    ///
+    /// 前端靠这两个数的差说「还有更多，把词写窄一点」。⚠️ 也顺便钉住了 §2.6 那条
+    /// 「单次 payload ≤ 4MB」：limit 不做成参数就是为了这里没有一个能被前端撑大的口子。
+    ///
+    /// ⚠️ 多根之下这一条更重要一档：每个根各回 `QUERY_LIMIT` 条再合并截断，
+    /// 于是「三个根」最坏是 150 条进来、50 条出去。要是合并那一步忘了截断，
+    /// payload 就随根的个数线性涨，而 §2.6 那条预算是死的
+    #[test]
+    fn 一次最多回_query_limit_条_但_total_报的是命中总数() {
+        let total = QUERY_LIMIT + 10;
+        // ⚠️ `TempDir` 必须收着：它一落地就把目录删了，而建索引是异步的
+        let mut dirs = Vec::new();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            let dir = tempfile::tempdir().unwrap();
+            for index in 0..total {
+                std::fs::write(dir.path().join(format!("f{index:03}.ts")), "x\n").unwrap();
+            }
+            roots.push(root_of(&dir));
+            dirs.push(dir);
+        }
+        let cache = ProjectIndexCache::default();
+        tauri::async_runtime::block_on(async {
+            let got = query_cached(&cache, &roots, String::new(), Vec::new()).await.unwrap();
+            assert_eq!(got.matches.len(), QUERY_LIMIT, "两个根各回 50 条，合并之后没有截断");
+            assert_eq!(got.total as usize, total * 2, "total 报的是回来的条数，前端就没法说「还有更多」了");
+        });
     }
 }

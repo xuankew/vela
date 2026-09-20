@@ -4,8 +4,13 @@
 //! CLI 工具没法复用、将来加个 headless 的批量转换工具就得重写一遍。Tauri command 只是
 //! 它外面薄薄一层适配器，住在 `src-tauri/` 里。
 //!
-//! 模块划分见 PLAN.md §2.5。已落地：`fs`（M1-B）、`session`（M1-F）、`project`（M2-A/M2-B）、
-//! `search`（M2-C）。其余模块等真正用到时再加，不预先建一堆空目录当装饰。
+//! 模块划分见 PLAN.md §2.5。已落地：`fs`（M1-B）、`session`（M1-F）、`project`（M2-A/M2-B/M2-E）、
+//! `search`（M2-C/M2-D）、`watcher`（M2-G）。其余模块等真正用到时再加，
+//! 不预先建一堆空目录当装饰。
+//!
+//! ⚠️ `watcher` 是个**例外**：它名字底下那件事（起一个 `notify` 的 watcher）压根不在这里，
+//! 在 `src-tauri` 里。这一层只留「该盯哪些目录」、「两份计划之间要动哪些订阅」与
+//! 「一条事件算哪一种变化」三件能同步跑完的事，理由写在 `watcher/mod.rs` 开头。
 //!
 //! ## 测试名是一句中文，而且**不能含大写 ASCII**
 //!
@@ -19,3 +24,4 @@ pub mod fs;
 pub mod project;
 pub mod search;
 pub mod session;
+pub mod watcher;

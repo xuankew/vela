@@ -210,8 +210,8 @@ describe('Rust → 前端 的字段名', () => {
   it('替换与搜索共用同一个 SearchError，bad_replacement 是替换独有的那一个', async () => {
     const { describeSearchError } = await import('./search')
     const failed = JSON.parse(GOLDEN_ENVELOPE_FAILED) as ReplaceFailedPayload
-    // 没有 `describeReplaceError`：两边共用 `prepare`，坏正则/坏 glob/坏 root 三种拒法
-    // 是同一套，多写一份等于多一处会分岔的地方
+    // 没有 `describeReplaceError`：两边共用同一份编译（Rust 侧的 `check_root` + `compile`），
+    // 坏正则/坏 glob/坏 root 三种拒法是同一套，多写一份等于多一处会分岔的地方
     expect(describeSearchError(failed.error)).toBe('缺少替换内容：replace 不能为 null')
   })
 })
@@ -243,23 +243,33 @@ describe('事件分发：信封拆开来交给对应的那个 handler', () => {
 })
 
 describe('前端 → Rust 的 command 名与参数名', () => {
-  it('start_replace 的参数是 root 加一整个 request 对象', async () => {
+  it('start_replace 的参数是 roots 加一整个 request 对象', async () => {
     tauriCore.invoke.mockResolvedValue('replace-7')
     const query = { pattern: 'needle', replace: 'N' }
-    const taskId = await startReplace('/repo', query, ['/repo/src/dirty.ts'])
+    const taskId = await startReplace(['/repo'], query, ['/repo/src/dirty.ts'])
     expect(taskId).toBe('replace-7')
     expect(tauriCore.invoke).toHaveBeenCalledWith('start_replace', {
-      root: '/repo',
+      roots: ['/repo'],
       request: { query, skip: ['/repo/src/dirty.ts'] },
     })
-    // ⚠️ `request` 是**内嵌**的，不是摊平成 `{ root, query, skip }`。
+    // ⚠️ `request` 是**内嵌**的，不是摊平成 `{ roots, query, skip }`。
     // 摊平的话 Rust 侧那句「invalid args `request` for command `start_replace`」
     // 至少还会报错；反过来要是 Rust 摊平而前端内嵌，前端拿到的是 undefined
   })
 
+  it('⚠️ 多个根按传进去的顺序发出去，那一份顺序就是用户批准的那一份', async () => {
+    tauriCore.invoke.mockResolvedValue('replace-1')
+    await startReplace(['/repo/a', '/repo/b'], { pattern: 'needle', replace: 'N' })
+    expect(sentArgs().roots).toEqual(['/repo/a', '/repo/b'])
+    // 替换这一侧的顺序比搜索更要紧一档：`rootIndex` 只影响显示，而这里的顺序
+    // 决定**哪些文件夹会被写**。落盘递的必须与预览那一次内容相同——
+    // 保证它的是 `src/search/store.ts` 的 `previewKey` 指纹（根清单也在里面），
+    // 工作区一变「替换全部」就灰掉。见 `replace.ts` 文件头最后那条 ⚠️
+  })
+
   it('⚠️ 没有脏标签时 skip 这个 key 整个不发', async () => {
     tauriCore.invoke.mockResolvedValue('replace-1')
-    await startReplace('/repo', { pattern: 'needle', replace: 'N' })
+    await startReplace(['/repo'], { pattern: 'needle', replace: 'N' })
     const sent = sentArgs().request as Record<string, unknown>
     expect(Object.keys(sent)).toEqual(['query'])
     // 不主动补 `skip: []`：Rust 侧 `#[serde(default)]` 会落到「一个都不跳过」，
@@ -269,13 +279,13 @@ describe('前端 → Rust 的 command 名与参数名', () => {
 
   it('空数组也不发 skip，与不传等价', async () => {
     tauriCore.invoke.mockResolvedValue('replace-1')
-    await startReplace('/repo', { pattern: 'needle', replace: 'N' }, [])
+    await startReplace(['/repo'], { pattern: 'needle', replace: 'N' }, [])
     expect(Object.keys(sentArgs().request as Record<string, unknown>)).toEqual(['query'])
   })
 
   it('⚠️ replace 为空字符串时照样发出去，那是「删掉」', async () => {
     tauriCore.invoke.mockResolvedValue('replace-1')
-    await startReplace('/repo', { pattern: 'needle', replace: '' })
+    await startReplace(['/repo'], { pattern: 'needle', replace: '' })
     const sent = (sentArgs().request as { query: Record<string, unknown> }).query
     expect(sent.replace).toBe('')
     // 真值判断（`if (query.replace)`）会把「删掉」悄悄变成「不替换」，
@@ -286,7 +296,7 @@ describe('前端 → Rust 的 command 名与参数名', () => {
 
   it('query 原样递过去，前端不补任何默认值', async () => {
     tauriCore.invoke.mockResolvedValue('replace-1')
-    await startReplace('/repo', { pattern: 'needle', replace: 'N' })
+    await startReplace(['/repo'], { pattern: 'needle', replace: 'N' })
     const sent = sentArgs().request as { query: Record<string, unknown> }
     expect(Object.keys(sent.query)).toEqual(['pattern', 'replace'])
   })

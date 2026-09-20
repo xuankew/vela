@@ -45,7 +45,8 @@ vi.mock('@tauri-apps/plugin-dialog', () => dialog)
 import type { DirEntry, DirListing, EntryKind } from '../ipc/project'
 import { Sidebar, type TreeNotice } from './Sidebar'
 import { createProjectTree, type ProjectTree } from './store'
-import { childRel, OVERSCAN, parentRel, ROW_HEIGHT } from './tree'
+import { OVERSCAN } from '../ui/virtual'
+import { childRel, parentRel, ROW_HEIGHT, rowKey, type RowKey } from './tree'
 
 /**
  * ⚠️ 与 `store.test.ts` 同一条豁免、同一个理由：Tauri 的 `invoke` 在 Rust 侧返回 `Err` 时，
@@ -95,7 +96,10 @@ function installFs(fs: Record<string, DirEntry[]> = FS) {
     calls.push([root, rel])
     const entries = fs[rel]
     if (!entries) return rejected<DirListing>({ kind: 'not_found', path: `${root}/${rel}` })
-    return Promise.resolve({ rel, entries })
+    // path 一律按**当前这个 root** 现算，与 Rust 侧 `list_dir` 的行为一致（`DirEntry.path`
+    // 恒为 `root/rel`）。多根时两个根共用同一张假表，写死 `/repo/…` 的话第二个根的行
+    // 会挂上第一个根的路径——而 `rowByRel` 正是按 title 找行的
+    return Promise.resolve({ rel, entries: entries.map((e) => ({ ...e, path: `${root}/${e.rel}` })) })
   })
 }
 
@@ -169,6 +173,15 @@ function stubOps(): void {
 /** 点击与 `run(expand)` 都是**故意**不等异步的，要断言后果得先让微任务与宏任务各跑一轮 */
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
+/**
+ * 第 0 个根里的一行。
+ *
+ * ⚠️ M2-F 起 store 上所有方法收的都是 `RowKey`（第几个根 + rel）而不是裸 rel：
+ * 两个根都有一条 `src/a.ts`，少了 `rootIndex` 的那一句会在**另一个根**里操作，而且不报错。
+ * 单根那几组用例一律走这个助手（位次恒为 0），下面「多根（M2-F）」那一组则显式写位次
+ */
+const k = (rel: string): RowKey => rowKey(0, rel)
+
 let container: HTMLDivElement
 let tree: ProjectTree
 let opened: string[]
@@ -177,7 +190,12 @@ let opened: string[]
  * 真机上它们落在窗口顶部的提示条里，见 `App.tsx` 的 `treeNotice`
  */
 let notices: TreeNotice[]
-/** `createProjectTree` 里有两个 `createMemo`；不在 root 里建，它们永远不会被释放 */
+/**
+ * `createProjectTree` 建了 memo，每个根实例还各建一个；不在 root 里建，它们永远不会被释放。
+ *
+ * ⚠️ M2-F 起这一句是**两层**的：协调层一个所有者，每个根一个所有者（`store.ts` 的 `spawn`
+ * 用 `createRoot` 单独开），移除一个根时它那份 memo 才真的能被回收
+ */
 let disposeTree: (() => void) | undefined
 let disposeRender: (() => void) | undefined
 
@@ -197,6 +215,20 @@ function mount(fs: Record<string, DirEntry[]> = FS): ProjectTree {
 async function openRepo(t = tree): Promise<void> {
   await t.openAt('/repo')
   await flush()
+}
+
+/**
+ * 选中那一行的 rel。
+ *
+ * ⚠️ 只给**单根**那几组用例用：它顺手把根序号钉在 0 上，所以「rootIndex 盖错了」这种
+ * 回归会当场红，而不是悄悄地让高亮落到另一个项目里（那种表现是「选中没了、方向键每次
+ * 都从第一行起步」，不报错）。多根那一组直接断言整个 `RowKey`
+ */
+function selectedRel(): string | null {
+  const key = tree.selected()
+  if (key === null) return null
+  expect(key.rootIndex).toBe(0)
+  return key.rel
 }
 
 function aside(): HTMLElement {
@@ -242,9 +274,9 @@ function names(): string[] {
 }
 
 /** 按 rel 找那一行的 DOM。只找渲染出来的（虚拟滚动下没渲染的就该是 undefined） */
-function rowByRel(rel: string): HTMLElement | undefined {
+function rowByRel(rel: string, root = '/repo'): HTMLElement | undefined {
   // 根行的 rel 是空字符串，而它的 path 就是 rootPath 本身——拼上斜杠会得到 `/repo/`
-  const path = rel === '' ? '/repo' : `/repo/${rel}`
+  const path = rel === '' ? root : `${root}/${rel}`
   return rowEls().find((el) => el.title === path)
 }
 
@@ -291,12 +323,17 @@ function menuItem(label: string): HTMLButtonElement {
  * 不 cancelable 的话 `preventDefault()` 是空操作，断言不出「原生菜单被拦掉了」。
  * `clientX/clientY` 是菜单的定位来源——不给的话就断不出「弹在光标那儿」。
  */
-function rightClick(rel: string, x = 40, y = 60): MouseEvent {
-  const row = rowByRel(rel)
-  if (!row) throw new Error(`找不到 rel='${rel}' 的那一行（虚拟滚动下它可能没被渲染）`)
+function rightClickOn(row: HTMLElement, x = 40, y = 60): MouseEvent {
   const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: x, clientY: y })
   row.dispatchEvent(e)
   return e
+}
+
+/** ⚠️ 只给**单根**那几组用例用：它按 `/repo` 找行，多根时两个根有同一条 rel */
+function rightClick(rel: string, x = 40, y = 60): MouseEvent {
+  const row = rowByRel(rel)
+  if (!row) throw new Error(`找不到 rel='${rel}' 的那一行（虚拟滚动下它可能没被渲染）`)
+  return rightClickOn(row, x, y)
 }
 
 /** 在某个元素上按下鼠标。`TreeMenu` 的「点外面就关」监听在 document 的**捕获**阶段 */
@@ -503,7 +540,7 @@ describe('渲染', () => {
   it('缩进按 depth 递进，padding-left 写在行内样式上', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
     // depth * 12 + 6：根行 6px，它的孩子 18px，孙辈 30px
     expect(rowByRel('')!.style.paddingLeft).toBe('6px')
@@ -522,7 +559,7 @@ describe('渲染', () => {
   it('摊开一层之后箭头翻向，孩子出现', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
     expect(rowByRel('src')!.querySelector('.tree-twisty')!.textContent).toBe('▾')
     expect(rowNames()).toEqual(['repo', 'src', 'a.ts', 'b.ts', 'README.md', 'docs'])
@@ -531,7 +568,7 @@ describe('渲染', () => {
   it('aria：树容器 role=tree，每行 role=treeitem 并带层级与展开态', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
     expect(scrollEl().getAttribute('role')).toBe('tree')
@@ -559,10 +596,10 @@ describe('渲染', () => {
     mount()
     await openRepo()
     expect(rowByRel('src/a.ts')).toBeUndefined() // 还没摊开
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
-    tree.select('src/a.ts')
+    tree.select(k('src/a.ts'))
     expect(rowByRel('src/a.ts')!.title).toBe('/repo/src/a.ts')
     expect(rowByRel('src/a.ts')!.classList.contains('selected')).toBe(true)
     expect(rowByRel('src/a.ts')!.getAttribute('aria-selected')).toBe('true')
@@ -574,7 +611,7 @@ describe('渲染', () => {
     mount({ '': [f('locked', true)] })
     await openRepo()
     // `locked` 不在假文件系统里，listDir 会以 not_found 拒绝
-    await tree.toggle('locked')
+    await tree.toggle(k('locked'))
     await flush()
 
     const row = rowByRel('locked')!
@@ -597,13 +634,13 @@ describe('交互', () => {
 
     expect(calls.map((c) => c[1])).toEqual(['', 'src'])
     expect(rowNames()).toEqual(['repo', 'src', 'a.ts', 'b.ts', 'README.md', 'docs'])
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
   })
 
   it('再点一次收起，且不重读——缓存命中', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
     rowByRel('src')!.click()
@@ -616,7 +653,7 @@ describe('交互', () => {
   it('点文件行把它打开，传的是 path 不是 rel', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
     rowByRel('src/a.ts')!.click()
@@ -625,19 +662,46 @@ describe('交互', () => {
     expect(opened).toEqual(['/repo/src/a.ts'])
     // 点文件不该触发任何读盘
     expect(calls.map((c) => c[1])).toEqual(['', 'src'])
-    expect(tree.selected()).toBe('src/a.ts')
+    expect(selectedRel()).toBe('src/a.ts')
   })
 
   it('点 ↻ 重读所有摊开的层', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
     headButton('↻').click()
     await flush()
 
     expect(calls.map((c) => c[1])).toEqual(['', 'src', '', 'src'])
+  })
+
+  it('点 + 弹目录对话框（可多选），挑中的按顺序追加到工作区后面', async () => {
+    mount()
+    await openRepo()
+    dialog.open.mockResolvedValue(['/notes', '/docs'])
+
+    headButton('+').click()
+    await flush()
+
+    // `multiple: true` 是这一项与「打开文件夹…」唯一的区别：加进来的是**第二个**项目，
+    // 用户一次挑两三个是常态，而单选的话他要重复三遍「点 + → 挑一个 → 确定」
+    expect(dialog.open).toHaveBeenCalledWith({ multiple: true, directory: true })
+    expect(tree.roots()).toEqual(['/repo', '/notes', '/docs'])
+    // 原来的根一个都没动：＋ 是追加，「打开文件夹…」才是替换
+    expect(names().slice(0, 4)).toEqual(['repo', 'src', 'README.md', 'docs'])
+  })
+
+  it('点 + 之后取消对话框：工作区一动不动，不凭空多出一个根', async () => {
+    mount()
+    await openRepo()
+    dialog.open.mockResolvedValue(null)
+
+    headButton('+').click()
+    await flush()
+
+    expect(tree.roots()).toEqual(['/repo'])
   })
 
   it('点 × 关掉根，回到空状态', async () => {
@@ -648,7 +712,101 @@ describe('交互', () => {
 
     expect(rowEls()).toHaveLength(0)
     expect(container.querySelector('.sidebar-open')).not.toBeNull()
-    expect(tree.root()).toBeNull()
+    expect(tree.roots()).toEqual([])
+  })
+})
+
+describe('多根（M2-F）', () => {
+  /**
+   * 装两个根：`/repo` 与 `/notes`。
+   *
+   * ⚠️ 两个根共用同一张假文件系统，所以它们的条目一模一样——这正好是最坏情况：
+   * 同一条 `rel`（`src/a.ts`）在两个根里都存在，任何「少了 rootIndex」的写法都会
+   * 在这一组用例里露出来，而它露出来的方式不是报错，是操作落到了另一个根上。
+   */
+  async function mountTwo(): Promise<void> {
+    mount(copyFs())
+    await tree.restoreState({
+      roots: [
+        { root: '/repo', expanded: [''] },
+        { root: '/notes', expanded: [''] },
+      ],
+    })
+    await flush()
+  }
+
+  it('⚠️ 头部不撒谎：两个根时报个数，title 里列出全部路径', async () => {
+    await mountTwo()
+
+    const title = container.querySelector<HTMLElement>('.sidebar-title')!
+    // 只显示第 0 个根的名字的话，用户在 `/notes` 里搜不到东西只会以为搜索坏了
+    expect(title.textContent).toBe('2 个文件夹')
+    expect(title.title).toBe('/repo\n/notes')
+  })
+
+  it('行是两个根首尾相接，每个根都以自己的根行开头', async () => {
+    await mountTwo()
+
+    expect(names()).toEqual(['repo', 'src', 'README.md', 'docs', 'notes', 'src', 'README.md', 'docs'])
+    expect(tree.rows().map((r) => r.rootIndex)).toEqual([0, 0, 0, 0, 1, 1, 1, 1])
+    expect(calls).toEqual([
+      ['/repo', ''],
+      ['/notes', ''],
+    ])
+  })
+
+  it('每个根的根行都是 depth 0，aria-level 各自从 1 重新开始', async () => {
+    await mountTwo()
+    await fakeViewport(ROW_HEIGHT * 8)
+
+    // 「一个 tree 容器里有两条 depth 0 的行」在 ARIA 里是合法的：一棵树可以有多个根节点。
+    // 层级**不**跨根累加（那样第二个根的子项会报 level 5，读屏的人会以为它嵌在第一个根里面）
+    expect(rowByRel('', '/repo')!.getAttribute('aria-level')).toBe('1')
+    expect(rowByRel('', '/notes')!.getAttribute('aria-level')).toBe('1')
+    expect(rowByRel('src', '/notes')!.getAttribute('aria-level')).toBe('2')
+  })
+
+  it('↓ 从第一个根的最后一行跨到第二个根的根行——不需要为跨根写任何一条分支', async () => {
+    await mountTwo()
+
+    tree.select(rowKey(0, 'docs'))
+    key('ArrowDown')
+    expect(tree.selected()).toEqual(rowKey(1, ''))
+
+    // ← 在第二个根的根行上收起它，再按一次无处可去（不许跨回第一个根）
+    key('ArrowLeft')
+    expect(names().slice(4)).toEqual(['notes'])
+    expect(key('ArrowLeft').defaultPrevented).toBe(false)
+    expect(tree.selected()).toEqual(rowKey(1, ''))
+  })
+
+  it('← 不许跨根找父目录：第二个根的行往上是它自己的根行，不是第一个根的东西', async () => {
+    await mountTwo()
+
+    tree.select(rowKey(1, 'src'))
+    key('ArrowLeft')
+    expect(tree.selected()).toEqual(rowKey(1, ''))
+  })
+
+  it('⚠️ 两个根时根行那一项改口说「从工作区移除」，点它只摘掉那一个根', async () => {
+    await mountTwo()
+    await fakeViewport(ROW_HEIGHT * 8)
+
+    rightClickOn(rowByRel('', '/notes')!)
+    await flush()
+    expect(menuLabels()).toEqual(['新建文件', '新建文件夹', '在 Finder 中显示', '复制路径', '从工作区移除'])
+
+    calls.length = 0
+    await pickItem('从工作区移除')
+
+    expect(tree.roots()).toEqual(['/repo'])
+    expect(names()).toEqual(['repo', 'src', 'README.md', 'docs'])
+    // ⚠️ 移除一个根**一次盘都不读**：那个根下面的层早就在缓存里，摘掉的是整份缓存；
+    // 剩下那个根的行对象引用不变（协调层用 `setIndex` 而不是重算，见 store.ts）
+    expect(calls).toEqual([])
+    // 这句话必须说清「磁盘上什么都没动」：整个根连同它下面所有行一起从树上消失，
+    // 看上去与「把那个文件夹删了」一模一样
+    expect(notices).toEqual([{ level: 'ok', text: '已把「notes」移出工作区，磁盘上的文件一个都没动' }])
   })
 })
 
@@ -656,62 +814,62 @@ describe('键盘', () => {
   it('↓ / ↑ 移动选中，并且拦掉浏览器自己的滚动', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
     // 没有选中时 ↓ 落到第一行
     expect(key('ArrowDown').defaultPrevented).toBe(true)
-    expect(tree.selected()).toBe('')
+    expect(selectedRel()).toBe('')
     expect(key('ArrowDown').defaultPrevented).toBe(true)
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
     expect(key('ArrowDown').defaultPrevented).toBe(true)
-    expect(tree.selected()).toBe('src/a.ts')
+    expect(selectedRel()).toBe('src/a.ts')
     expect(key('ArrowUp').defaultPrevented).toBe(true)
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
   })
 
   it('→ 在收起的目录上摊开它，在摊开的目录上移到第一个孩子', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
-    tree.select('docs')
+    tree.select(k('docs'))
     key('ArrowRight')
     await flush()
-    expect(tree.selected()).toBe('docs')
+    expect(selectedRel()).toBe('docs')
     expect(names()).toContain('intro.md')
 
-    tree.select('src')
+    tree.select(k('src'))
     key('ArrowRight')
     // 已经摊开了：这一次是「进到第一个孩子」，不该再读盘
-    expect(tree.selected()).toBe('src/a.ts')
+    expect(selectedRel()).toBe('src/a.ts')
     expect(calls.map((c) => c[1])).toEqual(['', 'src', 'docs'])
   })
 
   it('← 在摊开的目录上收起它，在文件上移到父目录', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
-    tree.select('src')
+    tree.select(k('src'))
     key('ArrowLeft')
     expect(names()).toEqual(['repo', 'src', 'README.md', 'docs'])
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
 
     key('ArrowRight') // 重新摊开
     await flush()
-    tree.select('src/b.ts')
+    tree.select(k('src/b.ts'))
     key('ArrowLeft')
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
   })
 
   it('← 在根行上把它收起，再按一次无处可去（none 不 preventDefault）', async () => {
     mount()
     await openRepo()
 
-    tree.select('')
+    tree.select(k(''))
     expect(key('ArrowLeft').defaultPrevented).toBe(true)
     expect(names()).toEqual(['repo'])
     expect(key('ArrowLeft').defaultPrevented).toBe(false)
@@ -720,15 +878,15 @@ describe('键盘', () => {
   it('Enter 在文件上打开它，在目录上切换摊开', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
-    tree.select('src/a.ts')
+    tree.select(k('src/a.ts'))
     key('Enter')
     await flush()
     expect(opened).toEqual(['/repo/src/a.ts'])
 
-    tree.select('docs')
+    tree.select(k('docs'))
     key('Enter')
     await flush()
     expect(names()).toContain('intro.md')
@@ -739,30 +897,30 @@ describe('键盘', () => {
   it('Home / End 跳到首末行', async () => {
     mount()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
 
     key('End')
-    expect(tree.selected()).toBe('docs')
+    expect(selectedRel()).toBe('docs')
     key('Home')
-    expect(tree.selected()).toBe('')
+    expect(selectedRel()).toBe('')
   })
 
   it('不是那七个键的一律放过：不 preventDefault，也不动选中', async () => {
     mount()
     await openRepo()
-    tree.select('src')
+    tree.select(k('src'))
 
-    for (const k of ['a', 'Escape', 'Tab', 'PageDown', 'Backspace']) {
-      expect(key(k).defaultPrevented, k).toBe(false)
+    for (const other of ['a', 'Escape', 'Tab', 'PageDown', 'Backspace']) {
+      expect(key(other).defaultPrevented, other).toBe(false)
     }
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
   })
 
   it('树是空的时候按键什么都不做（没有根，连第一行都没有）', () => {
     mount()
     expect(key('ArrowDown').defaultPrevented).toBe(false)
-    expect(tree.selected()).toBeNull()
+    expect(selectedRel()).toBeNull()
   })
 })
 
@@ -771,7 +929,7 @@ describe('虚拟滚动', () => {
   async function mountBig(): Promise<void> {
     mount(bigFs())
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
     expect(tree.rows()).toHaveLength(44)
   }
@@ -849,7 +1007,7 @@ describe('虚拟滚动', () => {
     await mountBig()
     await fakeViewport(ROW_HEIGHT * 5)
 
-    tree.select('')
+    tree.select(k(''))
     key('End') // 跳到最后一行（index 43）
 
     // bottom = 44 * 22 = 968，视口高 110，所以 scrollTop 落到 858
@@ -860,12 +1018,12 @@ describe('虚拟滚动', () => {
     await mountBig()
     await fakeViewport(ROW_HEIGHT * 5)
 
-    tree.select('src/f02.ts') // index 4
+    tree.select(k('src/f02.ts')) // index 4
     scrollTo(ROW_HEIGHT * 2) // 视口 = [44, 154)，index 4 的 [88,110) 在里面
 
     key('ArrowDown') // → index 5，[110,132) 仍然在视口里
 
-    expect(tree.selected()).toBe('src/f03.ts')
+    expect(selectedRel()).toBe('src/f03.ts')
     expect(scrollEl().scrollTop).toBe(ROW_HEIGHT * 2)
   })
 
@@ -873,12 +1031,12 @@ describe('虚拟滚动', () => {
     await mountBig()
     await fakeViewport(ROW_HEIGHT * 5)
 
-    tree.select('src/f02.ts') // index 4
+    tree.select(k('src/f02.ts')) // index 4
     scrollTo(ROW_HEIGHT * 4) // 视口 = [88, 198)，index 4 的 [88,110) 刚好贴着上沿
 
     key('ArrowUp') // → index 3（src/f01.ts），它的 [66,88) 在视口上面
 
-    expect(tree.selected()).toBe('src/f01.ts')
+    expect(selectedRel()).toBe('src/f01.ts')
     expect(scrollEl().scrollTop).toBe(ROW_HEIGHT * 3)
   })
 })
@@ -889,7 +1047,7 @@ describe('右键菜单', () => {
     mount(copyFs())
     stubOps()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
   }
 
@@ -902,7 +1060,7 @@ describe('右键菜单', () => {
     expect(e.defaultPrevented).toBe(true)
     // 选中是顺手的：菜单弹出来时用户要能看清自己右键的是哪一行，
     // 尤其是名字被省略号截断的那些——菜单里不重复那一行的名字
-    expect(tree.selected()).toBe('src/a.ts')
+    expect(selectedRel()).toBe('src/a.ts')
     expect(menuEl().style.left).toBe('120px')
     expect(menuEl().style.top).toBe('300px')
     expect(menuEl().getAttribute('role')).toBe('menu')
@@ -927,7 +1085,10 @@ describe('右键菜单', () => {
 
     // 那两项落在根行上的含义是「把用户整个项目文件夹改名」与「把整个项目文件夹扔进废纸篓」。
     // 规则本身在 `menuFor` 里（已单测），这里钉的是**渲染没有把它改掉**
-    expect(menuLabels()).toEqual(['新建文件', '新建文件夹', '在 Finder 中显示', '复制路径'])
+    expect(menuLabels()).toEqual(['新建文件', '新建文件夹', '在 Finder 中显示', '复制路径', '关闭文件夹'])
+    // ⚠️ 措辞是「关闭文件夹」而不是「从工作区移除」：只有一个根的时候「工作区」
+    // 这个词在界面上压根没出现过，而头部那个 × 说的正是同一句话
+    expect(menuLabels()).not.toContain('移到废纸篓')
   })
 
   it('选「移到废纸篓」调到 store，提示条那句话必须说「已移到废纸篓」', async () => {
@@ -946,7 +1107,7 @@ describe('右键菜单', () => {
     // 菜单选完就关；那一行没了，选中挪到父层
     expect(maybeMenu()).toBeNull()
     expect(names()).toEqual(['repo', 'src', 'b.ts', 'README.md', 'docs'])
-    expect(tree.selected()).toBe('src')
+    expect(selectedRel()).toBe('src')
   })
 
   it('⚠️ 移到废纸篓不问「确定吗」：点下去就做完了', async () => {
@@ -1025,7 +1186,7 @@ describe('右键菜单', () => {
     mouseDown(scrollEl())
 
     expect(maybeMenu()).toBeNull()
-    expect(tree.selected()).toBe('src/a.ts')
+    expect(selectedRel()).toBe('src/a.ts')
   })
 
   it('菜单**里面**按下不关：项是靠 click 触发的，先关掉那次 click 就永远等不到', async () => {
@@ -1048,7 +1209,7 @@ describe('右键菜单', () => {
     // Escape 在编辑器那边还有别的用处（关查找面板、退出多光标），谁在最上面谁说了算。
     // 与 DiscardDialog 同一条理由：绑 Escape 的命令一律不进命令中心
     expect(e.defaultPrevented).toBe(true)
-    expect(tree.selected()).toBe('src/a.ts')
+    expect(selectedRel()).toBe('src/a.ts')
   })
 
   it('⚠️ 右键另一行时菜单换过去，位置与选中都跟着换', async () => {
@@ -1065,14 +1226,14 @@ describe('右键菜单', () => {
     // 而 Ctrl+Click 那种只发 contextmenu 的路径上就会露出来
     expect(menuEl().style.left).toBe('55px')
     expect(menuEl().style.top).toBe('90px')
-    expect(tree.selected()).toBe('src/b.ts')
+    expect(selectedRel()).toBe('src/b.ts')
   })
 
   it('⚠️ 树滚动时把菜单关掉：菜单是 fixed，行滚走了它不会跟着走', async () => {
     mount(bigFs())
     stubOps()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
     await openMenu('src/f02.ts')
     expect(maybeMenu()).not.toBeNull()
@@ -1100,7 +1261,7 @@ describe('名称对话框', () => {
     mount(copyFs())
     stubOps()
     await openRepo()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await flush()
   }
 
@@ -1148,7 +1309,7 @@ describe('名称对话框', () => {
     expect(ipc.createEntry).toHaveBeenCalledWith('/repo', '新建.md', 'file')
     expect(maybeModal()).toBeNull()
     expect(names()).toContain('新建.md')
-    expect(tree.selected()).toBe('新建.md')
+    expect(selectedRel()).toBe('新建.md')
     // 成了不用说话：新条目已经被选中，树上看得见
     expect(notices).toHaveLength(0)
   })
@@ -1302,7 +1463,7 @@ describe('名称对话框', () => {
     await flush()
 
     expect(maybeModal()).toBeNull()
-    expect(tree.selected()).toBe('src/慢.md')
+    expect(selectedRel()).toBe('src/慢.md')
   })
 
   it('名字全是空格时「新建」是灰的，回车也不提交', async () => {
@@ -1349,7 +1510,7 @@ describe('名称对话框', () => {
     expect(ipc.renameEntry).toHaveBeenCalledWith('/repo', 'src/a.ts', 'c.ts')
     expect(maybeModal()).toBeNull()
     expect(names()).toEqual(['repo', 'src', 'c.ts', 'b.ts', 'README.md', 'docs'])
-    expect(tree.selected()).toBe('src/c.ts')
+    expect(selectedRel()).toBe('src/c.ts')
     expect(notices).toHaveLength(0)
   })
 

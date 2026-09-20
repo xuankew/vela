@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { ReplaceSummary } from '../ipc/replace'
 import type { SearchFile, SearchSummary } from '../ipc/search'
-import { OVERSCAN } from '../project/tree'
+import { OVERSCAN } from '../ui/virtual'
 import {
   actionForKey,
   describeProgress,
@@ -30,10 +30,13 @@ import {
 } from './rows'
 
 /** 与 `src/ipc/search.test.ts` 的黄金 listing 同一批假数据，省得两边各编一套 */
-function file(rel: string, lines: number[], truncated = false, replaced?: string): SearchFile {
+function file(rel: string, lines: number[], truncated = false, replaced?: string, rootIndex = 0): SearchFile {
   return {
     rel,
     path: `/repo/${rel}`,
+    // `rootIndex` 在契约上**不是**可选的（见 `ipc/search.ts`）。多根之下
+    // 「同一个 rel 来自两个根」全靠它才分得开，而这一层只负责把它交给 `rootOf` 换成名字
+    rootIndex,
     truncated,
     hits: lines.map((line) => ({
       line,
@@ -65,6 +68,7 @@ describe('flattenFiles', () => {
     expect(rows[0]).toEqual({
       kind: 'file',
       rel: 'src/a.ts',
+      root: '',
       path: '/repo/src/a.ts',
       hits: 2,
       truncated: false,
@@ -143,6 +147,24 @@ describe('flattenFiles', () => {
     expect(rows.map((r) => (r.kind === 'file' ? r.skipped : null))).toEqual([true, null, false, null])
     // 命中行刻意不带这个标志：一个文件的几十条命中共享同一个命运，
     // 在标题上说一次就够，逐行重复等于把「跳过」这件事淹没在噪音里
+  })
+
+  it('不传 rootOf 时根名是空串——单根工作区那一行前面什么都不画', () => {
+    const rows = flattenFiles([file('src/a.ts', [3])])
+    expect(rows[0]).toMatchObject({ kind: 'file', root: '' })
+  })
+
+  it('⚠️ rootOf 把 rootIndex 换成显示名，而且只落在标题行上', () => {
+    // 命中行上刻意**没有**这个字段：它紧跟在自己的标题行下面，缩进已经说明了归属，
+    // 每行再挂一遍项目名会把两屏的命中挤成一屏
+    const names = ['vela', 'notes']
+    const rows = flattenFiles(
+      [file('src/a.ts', [3], false, undefined, 1), file('README.md', [9], false, undefined, 0)],
+      undefined,
+      (i) => names[i] ?? '',
+    )
+    expect(rows.filter((r) => r.kind === 'file').map((r) => r.root)).toEqual(['notes', 'vela'])
+    expect(rows.filter((r) => r.kind === 'hit')).toHaveLength(2)
   })
 
   it('不传 isSkipped 时一个都不跳过（纯搜索那条路）', () => {

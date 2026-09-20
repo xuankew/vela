@@ -25,16 +25,49 @@ pub const MAX_INLINE_BYTES: u64 = 4 * 1024 * 1024;
 /// 用 `#[serde(tag = "kind")]` 而不是把错误压成一个字符串：前端要按类型分支
 /// （文件太大 → 提示等待 M2 的只读分片模式；权限不够 → 提示授权；不存在 → 从最近
 /// 列表里摘掉）。字符串匹配错误信息是最脆的一类代码。
+///
+/// ⚠️ 文档里那句「提示等待 M2 的只读分片模式」在 M2-H 之后**已经过期**：`TooLarge`
+/// 现在的意思是「大到连只读分片都接不住」，前端拿到它之前会先试一次 `open_large`。
+/// 4 MiB 与 `shard::MAX_SHARD_BYTES` 之间的那一段不再走到这里。
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReadError {
-    Io { reason: String, message: String },
-    Directory { path: String },
-    TooLarge { bytes: u64, limit: u64 },
+    Io {
+        reason: String,
+        message: String,
+    },
+    Directory {
+        path: String,
+    },
+    TooLarge {
+        bytes: u64,
+        limit: u64,
+    },
+    /// 只读分片模式接不住这个编码。
+    ///
+    /// ⚠️ **`read_text` 永远不会产出这一条**，它只由 `fs::shard::open_shard` 发出——
+    /// 内联路径把整份字节交给 `encoding_rs`，什么编码都能解；分片路径要按字节偏移
+    /// 跳来跳去，而 UTF-16 的一个字符占两个字节，`\n` 是 `0A 00` 或 `00 0A`，
+    /// 「数 `0x0A` 的个数」在它上面压根不是行数。
+    ///
+    /// 一个变体只有一个构造者，通常是个坏味道。这里的另一条路是再立一个平行的
+    /// `ShardError`，把 `Io` / `Directory` / `TooLarge` 三条抄一遍，前端也要多一个
+    /// `describe*Error`——为了不让一个枚举里有一条用不到的变体，代价是两份永远会漂的
+    /// 同构类型。两害相权，留在这儿并写清楚。
+    UnsupportedEncoding {
+        encoding: Encoding,
+        bytes: u64,
+    },
 }
 
 impl ReadError {
-    fn io(err: std::io::Error) -> Self {
+    /// 把 `io::Error` 包成线上形状。
+    ///
+    /// ⚠️ **开到 `pub` 而不是 `pub(super)`**：分片那一条路上有五次 IO（metadata、
+    /// open、读头部、seek、扫全文），而 M2-H-2 之后 src-tauri 的 `read_lines` 还有第六次
+    /// （seek + 读一页）。六处都得产出**同一个** `Io { reason, message }` 形状，
+    /// 否则前端就要为分片模式另写一套 `describe*Error`，而两套文案迟早会漂。
+    pub fn io(err: std::io::Error) -> Self {
         ReadError::Io { reason: format!("{:?}", err.kind()), message: err.to_string() }
     }
 }
@@ -44,8 +77,13 @@ impl std::fmt::Display for ReadError {
         match self {
             ReadError::Io { message, .. } => f.write_str(message),
             ReadError::Directory { path } => write!(f, "{path} 是目录，不是文件"),
-            ReadError::TooLarge { bytes, limit } => {
-                write!(f, "文件 {bytes} 字节，超过单次传输上限 {limit} 字节")
+            ReadError::TooLarge { bytes, limit } => write!(f, "文件 {bytes} 字节，超过上限 {limit} 字节"),
+            ReadError::UnsupportedEncoding { encoding, bytes } => {
+                write!(
+                    f,
+                    "文件 {bytes} 字节，是 {}，太大以致只能按只读分片打开，而分片模式不支持这个编码",
+                    encoding.label()
+                )
             }
         }
     }

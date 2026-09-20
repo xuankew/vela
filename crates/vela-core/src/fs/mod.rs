@@ -10,17 +10,40 @@
 //! ⚠️ 还原用的元信息（`FileFormat`）**不是可选装饰**：「打开 → 不改一个字 → 保存」
 //! 必须产出字节完全相同的文件。悄悄把用户的 CRLF 改成 LF、把 GBK 转成 UTF-8，
 //! 是编辑器最招骂的一类 bug，而且用户往往要到 git diff 炸开一片时才发现。
+//!
+//! ## `shard` 是这一层里唯一**只读**的一条路
+//!
+//! 上面那条「写出去时还原」的规矩在 `shard` 里压根用不上：超过 [`MAX_INLINE_BYTES`]
+//! 的文件不整份进内存，改成「文件留在磁盘上，前端按页要正文」。于是它交出去的
+//! `ShardHeader` 里**没有** `FileFormat`——只有一份用于**显示**的编码与行尾，
+//! 因为一个永远不写盘的模块拿着「怎么还原」的信息只会让人误以为它能写。
+//! 三条口径与内联路径不一样，逐条写在 `shard` 的模块文档里。
+//!
+//! ## `asset` 是这一层里唯一**不从用户给的正文写出去**的一条路
+//!
+//! 上面那几条路（`read` / `write` / `shard`）的输入输出都是**文本**，`asset` 的输入是
+//! 剪贴板里的二进制字节：
+//! 没有编码、没有行尾、没有 `FileFormat`，也不做归一化。它复用的是 `write_bytes_atomic`
+//! 那一份原子写入，但**目标路径由文档自己推出来**，命令层压根不收目录参数——
+//! 理由与它带来的那条限制（`assets/` 不可配置）都写在 `asset` 的模块文档里。
 
+mod asset;
 mod encoding;
 mod eol;
 mod read;
+mod shard;
 mod write;
 
 use serde::{Deserialize, Serialize};
 
+pub use asset::{store_image, AssetError, StoredImage, ASSET_DIR, MAX_IMAGE_BYTES};
 pub use encoding::{decode, decode_as, encode, Decoded, Encoding};
 pub use eol::{apply_eol, detect_eol, normalize_to_lf, LineEnding};
 pub use read::{read_text, read_text_as, ReadError, MAX_INLINE_BYTES};
+pub use shard::{
+    open_shard, LineIndex, Shard, ShardHeader, ShardPage, ANCHOR_STRIDE, MAX_PAGE_BYTES, MAX_PAGE_LINES,
+    MAX_SHARD_BYTES,
+};
 pub use write::{write_bytes_atomic, write_text_atomic, WriteError, WriteReport};
 
 /// 把一个文档还原成原样所需的全部格式信息。

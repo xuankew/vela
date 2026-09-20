@@ -5,8 +5,12 @@
  * （Rust 在 `crates/vela-core/tests/wire_contract.rs`，前端在 `./session.test.ts`），
  * 改一边必须改另一边。
  *
- * 会话比 fs 更需要这道保险：它有 14 个字段、一个枚举、一个嵌套元组数组，而任何一个
- * 名字写错的失败方式都是**「重启后什么都没恢复」**——不崩、不报错，用户只会觉得这功能没做。
+ * 会话比 fs 更需要这道保险：`Session` 与 `SessionTab` 加起来 16 个字段、一个枚举、
+ * 一个嵌套元组数组、一个嵌套结构，而任何一个名字写错的失败方式都是
+ * **「重启后什么都没恢复」**——不崩、不报错，用户只会觉得这功能没做。
+ *
+ * ⚠️ 那个数字是手工维护的，加字段时记得跟着改。它不是修辞：它说的是「这份契约里
+ * 有多少处能静默写错」。上一次加 `project` 时忘了改，于是它在 14 上停了两个里程碑。
  *
  * ⚠️ 注意 `path` 不是这两个 command 的参数。会话文件的位置由 Rust 侧从 `app_data_dir()`
  * 算出来（见 `src-tauri/src/commands.rs` 的 `session_path`）。让它变成参数等于给 webview
@@ -74,13 +78,8 @@ export interface SessionTab {
   scrollLeft: number
 }
 
-/**
- * 项目树那一头的现场。与 Rust `session::SessionProject` 一一对应。
- *
- * 与标签页是**两套独立的状态**：树管「磁盘上有什么」，标签管「打开了哪些文档」。
- * 关掉文件夹不动任何标签，反过来也一样，所以它在存档里也是一个独立的可选部分。
- */
-export interface SessionProject {
+/** 工作区里**一个根**的现场。就是 M2-B-4 那个 `SessionProject` 的原样内容下移一层 */
+export interface SessionRoot {
   /** 项目根的绝对路径。恢复时原样喂给 `listDir`，前端不做任何路径算术 */
   root: string
   /**
@@ -90,9 +89,42 @@ export interface SessionProject {
    * 文件夹全缩回去了，而这件事不报错，只会让人觉得「这功能没记住」。
    *
    * 条数上限由 `src/project/store.ts` 的 `MAX_RESTORED_EXPANDED` 负责，Rust 侧不截断
-   * （两边各截一次的结果是谁也说不清最终是多少条）。
+   * （两边各截一次的结果是谁也说不清最终是多少条）。⚠️ 那份预算是**每个根各一份**的：
+   * 多根之下 N 个根就是 N 份，管总盘子的另有 `MAX_RESTORED_ROOTS`。
    */
   expanded: string[]
+}
+
+/**
+ * 项目树那一头的现场。与 Rust `session::SessionProject` 一一对应。
+ *
+ * 与标签页是**两套独立的状态**：树管「磁盘上有什么」，标签管「打开了哪些文档」。
+ * 关掉文件夹不动任何标签，反过来也一样，所以它在存档里也是一个独立的可选部分。
+ *
+ * ## 顺序就是 `rootIndex`（M2-F）
+ *
+ * `roots[i]` 恢复出来排在侧边栏第 `i` 位，而行与选中的身份是「第几个根 + rel」
+ * （`src/project/tree.ts` 的 `RowKey`）。所以这个数组的顺序是契约的一部分：
+ * 写的时候按侧边栏的顺序写，读的时候原样恢复，中间不许排序、不许去重后再排。
+ *
+ * 根的去重与个数上限归前端（`MAX_RESTORED_ROOTS`），Rust 侧两样都不管，
+ * 分工与 `expanded` 完全一致。
+ *
+ * ## ⚠️ `roots` 不许为空
+ *
+ * 「一个文件夹都没打开」在存档里是 `project: null`，不是 `roots: []`。
+ * Rust 侧 `validate` 会拒掉空数组（整份会话作废），所以写入端必须在
+ * 「没有根」时返回 `null` 而不是一个空数组——见 `src/project/store.ts` 的 `serializeState`。
+ *
+ * ## 旧档
+ *
+ * M2-B-4 到 M2-E 写下的 `{"root":"…","expanded":[…]}` 由 Rust 侧读成只有一个元素的
+ * 数组，前端**永远只会看到新形状**：这一层是线上契约的镜像，而线上只有一种写法。
+ * 反过来（旧版 Vela 读新档）会整份解析失败，那个取舍记在 Rust 侧 `Session::project`
+ * 的字段文档里。
+ */
+export interface SessionProject {
+  roots: SessionRoot[]
 }
 
 /** 一次完整的会话快照 */
@@ -127,6 +159,50 @@ export interface Session {
    * 没有哪一边会得到半对半错的现场。完整推理见 Rust 侧同名字段的文档。
    */
   project: SessionProject | null
+  /**
+   * 最近打开过的文件的**绝对路径**，最新的在最前面（M2-E，`Cmd+P` 的 MRU 加分）。
+   *
+   * ## 它不是标签清单
+   *
+   * 存的是「打开过又关掉的也算」。只存开着的标签它就没有价值了——那种情况
+   * `tabs` 已经全都知道，`Cmd+P` 用不着第二份抄写。
+   *
+   * ## 条数上限归前端，Rust 侧既不校验也不截断
+   *
+   * `MAX_RECENT`（`src/doc/workspace.ts`）在写入与恢复两处各夹一次，与
+   * `SessionRoot.expanded` 的 `MAX_RESTORED_EXPANDED` 是同一套分工——
+   * 两边各截一次的结果是谁也说不清最终有多少条。
+   *
+   * Rust 侧连 `validate` 都没给它一条：一份手改过的存档能塞进来几万条，为它拒掉整份
+   * 会话等于拿用户所有标签连未保存的草稿去换一个**只影响排序**的提示。而超长清单在
+   * 消费端也不造成任何损失——`FileIndex::recent_bonus` 自己 `take(MAX_RECENT)`。
+   *
+   * 加了它 `SESSION_VERSION` 仍然是 1，理由与 `project` 逐字相同：旧存档缺这个 key
+   * 解析成一份空清单，空清单在 `Cmd+P` 上的表现是「不加分，只按匹配分排」——
+   * 一个合法的现场，不是一句错误。
+   */
+  recent: string[]
+  /**
+   * 最近打开过的**工作区**，最新的在最前面（M2-F-6，`Cmd+Shift+O` 的数据源）。
+   *
+   * ## 一条是一个根清单，不是一个路径
+   *
+   * 多根工作区是用户一个个「添加文件夹到工作区」攒出来的。只记单个文件夹的话，
+   * 切回来就只剩一个根，而「我刚才那三个文件夹呢」这件事没有任何提示——
+   * 它会看起来像是这个项目本来就这么大。
+   *
+   * 顺序也是契约：它就是侧边栏从上到下的顺序，也就是 `RowKey.rootIndex`。
+   *
+   * ## 与 `recent` 同一套分工
+   *
+   * 条数上限归前端（`src/project/store.ts` 的 `MAX_RECENT_PROJECTS`），Rust 侧既不校验
+   * 也不截断，理由与上面 `recent` 那一节逐字相同。加了它 `SESSION_VERSION` 仍然是 1：
+   * 旧存档缺这个 key 解析成空清单，在 `Cmd+Shift+O` 上的表现是「还没有别的项目」。
+   *
+   * ⚠️ 这一半**不住在 workspace 里**（那边只管标签与文档），而是住在项目树那一层，
+   * 由 `sessionSync` 在拼接时盖上去——与 `project` 同一个位置、同一条理由。
+   */
+  recentProjects: string[][]
 }
 
 /** Rust `session::SessionReport` */

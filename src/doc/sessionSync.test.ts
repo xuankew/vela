@@ -43,10 +43,12 @@ import {
   SESSION_VERSION,
   describeSessionError,
   type Session,
+  type SessionProject,
   type SessionReport,
   type SessionTab,
 } from '../ipc/session'
 import { createProjectTree, type ProjectTree } from '../project/store'
+import { rowKey } from '../project/tree'
 import { createSessionSync, SESSION_SYNC_INTERVAL_MS, type Scheduler, type SessionSync } from './sessionSync'
 import { createWorkspace, type Workspace } from './workspace'
 
@@ -79,9 +81,20 @@ function sessionTab(overrides: Partial<SessionTab> = {}): SessionTab {
 }
 
 function sessionOf(tabs: SessionTab[], overrides: Partial<Session> = {}): Session {
-  // `project: null` 属于基底：`Partial<Session>` 里它是可选的，不写死一个值，
-  // 展开之后类型就成了 `| undefined`，而线上的 `Session.project` 只能是值或 null
-  return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], project: null, ...overrides }
+  // `project: null` 与 `recent: []` 属于基底：`Partial<Session>` 里它们是可选的，
+  // 不写死一个值，展开之后类型就成了 `| undefined`，而线上的 `Session.project`
+  // 只能是值或 null、`Session.recent` 只能是数组
+  return {
+    version: SESSION_VERSION,
+    direction: 'row',
+    focused: 0,
+    tabs,
+    panes: [0],
+    project: null,
+    recent: [],
+    recentProjects: [],
+    ...overrides,
+  }
 }
 
 /**
@@ -177,21 +190,30 @@ function dirEntry(rel: string, isDir = false): DirEntry {
  * 而那条警告会把真正要看的东西淹掉。
  */
 function makeTree(fs: FakeFs = {}): ProjectTree {
-  project.listDir.mockImplementation(async (_root: string, rel: string) => {
+  project.listDir.mockImplementation(async (root: string, rel: string) => {
     const entries = fs[rel]
     if (!entries) {
       // Rust 的 Err 是被序列化后原样抛出的普通对象，包一层 Error 会让
       // describeTreeError 走到兜底分支上去（这里那个函数也是假的，但形状要保持一致）
       // eslint-disable-next-line @typescript-eslint/only-throw-error
-      throw { kind: 'not_found', path: `/repo/${rel}` }
+      throw { kind: 'not_found', path: `${root}/${rel}` }
     }
-    return { rel, entries }
+    // ⚠️ `path` 按**这次请求的那个根**重算，不用 `dirEntry` 里写死的那份：
+    // 多根的用例共用同一个 `fs`（按 rel 取），而 `DirEntry.path` 是绝对路径，
+    // Rust 的 `list_dir` 也是这么发的。写死的话第二个根里的条目会指着第一个根
+    return { rel, entries: entries.map((e) => ({ ...e, path: `${root}/${e.rel}` })) }
   })
   return createRoot((teardown) => {
     disposers.push(teardown)
     return createProjectTree({})
   })
 }
+
+/** 第 0 个根里的 `rel` 行键。这一层的用例都只有一个根 */
+const k = (rel: string) => rowKey(0, rel)
+
+/** 存档里 project 那一半的形状：M2-F 起是**根清单**，每个根自己带一份展开状态 */
+const archived = (root: string, expanded: string[]): SessionProject => ({ roots: [{ root, expanded }] })
 
 function harness(tree?: ProjectTree) {
   const ws = createWorkspace({ promptDiscard: async () => 'cancel' })
@@ -588,7 +610,7 @@ describe('项目树那一半（M2-B-4）', () => {
     await h.clock.fire()
 
     const saved = lastSaved()
-    expect(saved.project).toEqual({ root: '/repo', expanded: [''] })
+    expect(saved.project).toEqual(archived('/repo', ['']))
     // 拼的是**同一个对象**，不是把 workspace 那半覆盖掉：
     // `serializeSession` 返回的 project 恒为 null，展开顺序错了就会是这样
     expect(saved.tabs).toHaveLength(1)
@@ -606,10 +628,10 @@ describe('项目树那一半（M2-B-4）', () => {
     await h.clock.fire()
     expect(session.saveSession).toHaveBeenCalledTimes(1)
 
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await h.clock.fire()
     expect(session.saveSession).toHaveBeenCalledTimes(2)
-    expect(lastSaved().project).toEqual({ root: '/repo', expanded: ['', 'src'] })
+    expect(lastSaved().project).toEqual(archived('/repo', ['', 'src']))
   })
 
   it('收起之后要再写一次：比对的对象是「上次写出去的」，不是「以前写过没有」', async () => {
@@ -621,14 +643,14 @@ describe('项目树那一半（M2-B-4）', () => {
     await h.sync.start()
     await tree.openAt('/repo')
     await h.clock.fire()
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await h.clock.fire()
     expect(session.saveSession).toHaveBeenCalledTimes(2)
 
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
     await h.clock.fire()
     expect(session.saveSession).toHaveBeenCalledTimes(3)
-    expect(lastSaved().project).toEqual({ root: '/repo', expanded: [''] })
+    expect(lastSaved().project).toEqual(archived('/repo', ['']))
 
     // 现场没再动过，这一轮就该什么都不写
     await h.clock.fire()
@@ -639,18 +661,50 @@ describe('项目树那一半（M2-B-4）', () => {
     const tree = makeTree(FS)
     const h = harness(tree)
     session.loadSession.mockResolvedValue(
-      sessionOf([sessionTab({ path: '/a.txt' })], { project: { root: '/repo', expanded: ['', 'src'] } }),
+      sessionOf([sessionTab({ path: '/a.txt' })], { project: archived('/repo', ['', 'src']) }),
     )
 
     await h.sync.start()
 
-    expect(tree.root()).toBe('/repo')
+    expect(tree.roots()).toEqual(['/repo'])
     // 两层都读了，而且是并行发出的（顺序不保证，所以排序后比）
     expect(listed()).toEqual(['/repo|', '/repo|src'])
     // 标签那一半同时装好了：两半是并行的，不是「先标签，成了才轮到树」
     expect(h.ws.tabs()).toHaveLength(1)
     expect(h.ws.activeTab().doc.path()).toBe('/a.txt')
     expect(h.warnings).toEqual([])
+  })
+
+  it('存档里有多个根时逐个装回来，每个根读自己的展开清单', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    session.loadSession.mockResolvedValue(
+      sessionOf([sessionTab({ path: '/a.txt' })], {
+        project: {
+          roots: [
+            { root: '/repo', expanded: ['', 'src'] },
+            { root: '/notes', expanded: [''] },
+          ],
+        },
+      }),
+    )
+
+    await h.sync.start()
+
+    expect(tree.roots()).toEqual(['/repo', '/notes'])
+    // 两个根的层**一起**并行读出去，不是「读完第一个根再读第二个」
+    expect(listed()).toEqual(['/notes|', '/repo|', '/repo|src'])
+    expect(h.ws.tabs()).toHaveLength(1)
+    expect(h.warnings).toEqual([])
+
+    // 再写一轮，两个根都原样回到存档里
+    await h.clock.fire()
+    expect(lastSaved().project).toEqual({
+      roots: [
+        { root: '/repo', expanded: ['', 'src'] },
+        { root: '/notes', expanded: [''] },
+      ],
+    })
   })
 
   it('存档里 project 是 null 时树保持空，标签照常恢复', async () => {
@@ -660,7 +714,7 @@ describe('项目树那一半（M2-B-4）', () => {
 
     await h.sync.start()
 
-    expect(tree.root()).toBeNull()
+    expect(tree.roots()).toEqual([])
     expect(project.listDir).not.toHaveBeenCalled()
     expect(h.ws.tabs()).toHaveLength(1)
   })
@@ -675,12 +729,12 @@ describe('项目树那一半（M2-B-4）', () => {
     const tree = makeTree({ '': [dirEntry('src', true)] })
     const h = harness(tree)
     session.loadSession.mockResolvedValue(
-      sessionOf([sessionTab({ path: '/a.txt' })], { project: { root: '/repo', expanded: ['', '已经没了'] } }),
+      sessionOf([sessionTab({ path: '/a.txt' })], { project: archived('/repo', ['', '已经没了']) }),
     )
 
     await h.sync.start()
 
-    expect(tree.root()).toBe('/repo')
+    expect(tree.roots()).toEqual(['/repo'])
     expect(tree.rows().map((r) => r.name)).toEqual(['repo', 'src'])
     expect(h.ws.tabs()).toHaveLength(1)
     expect(h.warnings).toEqual([])
@@ -691,10 +745,89 @@ describe('项目树那一半（M2-B-4）', () => {
     const h = harness(tree)
     await h.sync.start()
     await tree.openAt('/repo')
-    await tree.toggle('src')
+    await tree.toggle(k('src'))
 
     await h.sync.saveNow()
 
-    expect(lastSaved().project).toEqual({ root: '/repo', expanded: ['', 'src'] })
+    expect(lastSaved().project).toEqual(archived('/repo', ['', 'src']))
+  })
+})
+
+describe('最近项目那一格（M2-F-6）', () => {
+  const FS: FakeFs = { '': [dirEntry('src', true)] }
+
+  it('键必须在，而且没打开过任何文件夹时它就是空数组', async () => {
+    const h = harness(makeTree(FS))
+    await h.sync.start()
+    await h.clock.fire()
+
+    // 与 `project: null` 同一条理由：`JSON.stringify` 会删掉 undefined 的键，
+    // 而「缺键」与「字段名拼错」在线上长得一模一样
+    expect(session.saveSession.mock.calls[0]![0] as Record<string, unknown>).toHaveProperty('recentProjects', [])
+  })
+
+  it('没注入树的老调用方照常工作，recentProjects 也是空数组', async () => {
+    const h = harness()
+    await h.sync.start()
+    await h.clock.fire()
+
+    expect(lastSaved().recentProjects).toEqual([])
+    expect(h.warnings).toEqual([])
+  })
+
+  it('换一次工作区，刚离开的那一个就进存档；当前这个也在最前面', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    await h.sync.start()
+
+    await tree.openAt('/repo')
+    await h.clock.fire()
+    // 只开过一个：没有「刚离开的」，于是清单里只有当前这一个
+    expect(lastSaved().recentProjects).toEqual([['/repo']])
+
+    await tree.openAt('/notes')
+    await h.clock.fire()
+    expect(lastSaved().recentProjects).toEqual([['/notes'], ['/repo']])
+  })
+
+  it('⚠️ 换工作区必须**当轮**就写下去：等下一轮的话「刚切过去又切回来」会丢一个', async () => {
+    // 这条钉的是「记录发生在替换的那一刻」而不是「轮询时才去看现在是什么」。
+    // 记晚了的失败方式是静默的：用户切到 B、五秒内切回 A，存档里从头到尾只有 A，
+    // 而 B 一次都没被记下来——他下次按 Cmd+Shift+O 找不到 B，也想不到为什么
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    await h.sync.start()
+    await tree.openAt('/repo')
+    await h.clock.fire()
+
+    await tree.openAt('/notes')
+    await tree.openAt('/repo')
+    await h.clock.fire()
+
+    expect(lastSaved().recentProjects).toEqual([['/repo'], ['/notes']])
+  })
+
+  it('start 把清单交回给树，而当前工作区不出现在候选里', async () => {
+    const tree = makeTree(FS)
+    const h = harness(tree)
+    session.loadSession.mockResolvedValue(
+      sessionOf([sessionTab({ path: '/a.txt' })], {
+        project: archived('/repo', ['']),
+        recentProjects: [['/repo'], ['/notes'], ['/scratch', '/docs']],
+      }),
+    )
+
+    await h.sync.start()
+
+    // `/repo` 是恢复出来的当前工作区，浮层里不该再列它一次（选了它等于把树重建一遍、
+    // 摊开着的层全缩回去，见 goto/store.ts）
+    expect(tree.recentProjects()).toEqual([['/notes'], ['/scratch', '/docs']])
+    expect(tree.roots()).toEqual(['/repo'])
+    expect(h.ws.tabs()).toHaveLength(1)
+    expect(h.warnings).toEqual([])
+
+    // 再写一轮，当前那个回到最前面，其余原样跟着
+    await h.clock.fire()
+    expect(lastSaved().recentProjects).toEqual([['/repo'], ['/notes'], ['/scratch', '/docs']])
   })
 })

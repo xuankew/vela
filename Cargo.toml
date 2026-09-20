@@ -15,11 +15,14 @@ publish = false
 #   serde / tempfile = MIT OR Apache-2.0
 #   ignore / globset / grep-searcher / grep-regex / grep-matcher = Unlicense OR MIT
 #     （都是 ripgrep 那一套的库化产物，`cargo info` 逐个核过 license 字段）
+#   memchr = Unlicense OR MIT（M2-H 起是 vela-core 的直接依赖；此前它已经作为
+#     grep-searcher / regex 的传递依赖躺在 Cargo.lock 里，版本没变，所以没有新增下载）
 #
 # ⚠️ `ignore` 是个来回：M2-A 一度引入，因为「树不按 .gitignore 过滤」那个决定又摘掉了；
 # M2-C 把它加回到**搜索侧**——搜索要读每个文件的正文，不过滤就等于 grep 十万个依赖文件。
 # 两处的方向相反是权衡不同，不是写错了，两条测试也刻意方向相反。
 encoding_rs = "0.8"
+memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

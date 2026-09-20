@@ -15,17 +15,30 @@
  * ## 与预览的关系：预览走 `search.ts`，落盘走这里
  *
  * ```text
- * start_search(root, { ...query, replace })  ──► 预览：每条命中多一个 replaced
+ * start_search(roots, { ...query, replace })  ──► 预览：每条命中多一个 replaced
  *                    │  用户在面板里看到「a.ts:12  let a = needle;  →  let a = N;」
  *                    ▼  按下「替换全部」+ 确认
- * start_replace(root, { query, skip })       ──► 落盘，本文件
+ * start_replace(roots, { query, skip })       ──► 落盘，本文件
  * ```
  *
- * ⚠️ **两边必须是同一个 `query` 对象**。Rust 侧靠「共用同一个遍历函数、同一个匹配机、
- * 同一个模板展开」保证「所见即所做」（见 `vela-core/src/search/mod.rs`），
- * 但那条保证的前提是**前端递过去的是同一份条件**。前端要是在两步之间偷偷改了
- * `caseSensitive`，用户批准的就不是实际发生的那份了——而没有任何测试能发现，
- * 因为两边各自的实现都是对的。
+ * ⚠️ **两边必须是同一个 `query` 对象、同一个 `roots` 数组**。Rust 侧靠「共用同一个
+ * 遍历函数、同一个匹配机、同一个模板展开」保证「所见即所做」（见
+ * `vela-core/src/search/mod.rs`），但那条保证的前提是**前端递过去的是同一份条件**。
+ * 前端要是在两步之间偷偷改了 `caseSensitive`，用户批准的就不是实际发生的那份了——
+ * 而没有任何测试能发现，因为两边各自的实现都是对的。
+ *
+ * ⚠️ `roots` 同理，而且它更容易漂：预览与落盘之间用户可能刚好添加/移除了一个文件夹。
+ * 多一个根 = 改了一个用户没在预览里看见过的文件夹，少一个根 = 预览里明明有却没改，
+ * 两种都不是用户批准的那件事。
+ *
+ * 保证它的是**预览指纹**而不是「存一份快照再复用」：`src/search/store.ts` 把根清单
+ * 与查询条件一起序列化成 `previewKey`，`stale()` 拿它与当前状态比。于是工作区一变，
+ * 「替换全部」就地灰掉并给出「预览已过期」——用户必须重搜一遍，看到的就是新清单。
+ * 落盘时递的是**当前**的根清单，而 `stale()` 已经保证它与用户批准的那份逐字段相同。
+ * 选这条路而不是存快照，是因为一份「悄悄与界面不一致」的快照比一个灰掉的按钮难查得多。
+ *
+ * 预览里的一个根在两步之间被弹出了怎么办：指纹挡不住磁盘的变化，那就让 Rust 侧
+ * 报 `not_found` 整次拒掉（起飞前检查在所有根上做完才开始写）——比静默地少改一半要好
  */
 
 import { invoke } from '@tauri-apps/api/core'
@@ -107,7 +120,7 @@ export interface ReplaceSummary {
    * 这时文件还没写，拦住是零成本的
    */
   skippedUnmappable: number
-  /** 因为太大（> 10 MiB）被整个跳过的文件数。**我们主动决定不改** */
+  /** 因为太大（> 64 MiB）被整个跳过的文件数。**我们主动决定不改** */
   skippedTooLarge: number
   /** 因为在 `skip` 清单里而跳过的文件数——也就是用户自己开着、还没保存的那些 */
   skippedOpen: number
@@ -159,7 +172,7 @@ export interface ReplaceFailedPayload {
 /**
  * 起一次全局替换（**落盘**），**立刻**拿到 `taskId`。进度与终止信号走 event。
  *
- * @param root dialog（`directory: true`）给的绝对路径，与预览那次同一个
+ * @param roots 与预览那次**内容相同的**数组（由 `previewKey` 指纹保证，见文件头最后那条 ⚠️）
  * @param query 与预览那次**同一个对象**，`replace` 必须非 `undefined`
  * @param skip 用户正开着、还没保存的那些文件的绝对路径（原样递，见 `ReplaceRequest.skip`）
  *
@@ -167,13 +180,18 @@ export interface ReplaceFailedPayload {
  * 这条对替换比对搜索更要紧：`replace-done` 是唯一能让 UI 停止转圈的东西，
  * 而它到达时磁盘已经改完了——漏掉它的话用户面对的是一个
  * 「改完了却显示还在改」的仓库，很可能再按一次替换。
+ *
+ * ⚠️ 与搜索同一条规则：**所有根的起飞前检查在第一个字节落盘之前做完**，
+ * 所以 reject = 一个文件都没动。第二个根不合法时第一个根也不会被改——
+ * 钉住它的是 `crates/vela-core/tests/wire_contract.rs` 里那条
+ * `第二个根不合法时第一个根一个文件都没被改`
  */
-export function startReplace(root: string, query: SearchQuery, skip: string[] = []): Promise<string> {
+export function startReplace(roots: string[], query: SearchQuery, skip: string[] = []): Promise<string> {
   const request: ReplaceRequest = { query }
   // 空清单不发这个 key：Rust 侧 `#[serde(default)]` 会落到「一个都不跳过」，
   // 与 `[]` 完全等价。替它补默认值等于把默认值抄两份，哪天那边改了这边就悄悄分岔
   if (skip.length > 0) request.skip = skip
-  return invoke<string>('start_replace', { root, request })
+  return invoke<string>('start_replace', { roots, request })
 }
 
 export interface ReplaceHandlers {

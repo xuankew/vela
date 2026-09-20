@@ -17,6 +17,9 @@ grep-matcher.workspace = true
 grep-regex.workspace = true
 grep-searcher.workspace = true
 ignore.workspace = true
+# M2-H 大文件只读分片：建稀疏行索引要在几百 MB 的字节流里数 `\n`，
+# 手写循环与 SIMD 版差一个数量级。Unlicense OR MIT，此前已作为传递依赖在 Cargo.lock 里
+memchr.workspace = true
 serde.workspace = true
 # M1-F 起是运行时依赖：会话存档就是 Rust 侧自己序列化出来的 JSON。
 # 在那之前它只服务于「线上契约」黄金 JSON 测试

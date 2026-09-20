@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  * 真·端到端（前端 → IPC → vela-core → 磁盘）由 Rust 侧的测试覆盖。
  */
 
-const { ipc, dialog } = vi.hoisted(() => ({
+const { ipc, dialog, shardIpc, shardFactory } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn(),
     saveFile: vi.fn(),
@@ -17,13 +17,24 @@ const { ipc, dialog } = vi.hoisted(() => ({
     ENCODING_LABELS: { utf8: 'UTF-8', utf16_le: 'UTF-16 LE', utf16_be: 'UTF-16 BE', gbk: 'GBK' },
   },
   dialog: { open: vi.fn(), save: vi.fn() },
+  shardIpc: { openLarge: vi.fn(), closeLarge: vi.fn() },
+  // 🔴 `createShardView` 要 mock 掉，理由不是它「不纯」（它内部那个 memo 自己裹在
+  // `createRoot` 里，见 shardView.ts），而是它建好就**立刻**要第一页，而上面那个
+  // `shardIpc` 替身里没有 `readLines`——真跑起来是一条没人接的 rejection。
+  // 而 `document.ts` 对它的用法只有「存下来 + 调 dispose」，替身足够
+  shardFactory: { createShardView: vi.fn() },
 }))
 
 vi.mock('../ipc/fs', () => ipc)
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
+vi.mock('../ipc/shard', () => shardIpc)
+vi.mock('./shardView', () => shardFactory)
 
 import { createDocumentModel, DEFAULT_FORMAT, UNTITLED_LABEL, type DocumentHost, type DocumentModel } from './document'
 import type { TextFile, WriteReport } from '../ipc/fs'
+import type { ShardOpen } from '../ipc/shard'
+import type { ShardView } from './shardView'
+import type { Mock } from 'vitest'
 
 function textFile(overrides: Partial<TextFile> = {}): TextFile {
   return {
@@ -33,6 +44,41 @@ function textFile(overrides: Partial<TextFile> = {}): TextFile {
     bytes: 6,
     ...overrides,
   }
+}
+
+/** `open_file` 撞 4 MiB 时后端给的形状（见 `ipc/fs.ts` 的 `ReadError`） */
+const TOO_LARGE_INLINE = { kind: 'too_large', bytes: 5_000_000, limit: 4_194_304 }
+
+function shardOpen(overrides: Partial<ShardOpen['header']> = {}): ShardOpen {
+  return {
+    handle: 7,
+    header: {
+      totalLines: 1_200_000,
+      bytes: 104_857_600,
+      encoding: 'utf8',
+      bom: false,
+      eol: 'lf',
+      lossy: false,
+      ...overrides,
+    },
+  }
+}
+
+/**
+ * 假分片视图。`document.ts` 只碰它两个地方：`createShardView` 的返回值本身，
+ * 和它的 `dispose`——所以替身只需要把 `dispose` 交出来给断言用
+ */
+function fakeView(): { view: ShardView; dispose: Mock } {
+  const dispose = vi.fn()
+  return { view: { dispose } as unknown as ShardView, dispose }
+}
+
+/** 让下一次 `openLarge` 装出一个新分片，并把它交回来 */
+function nextShard(overrides: Partial<ShardOpen['header']> = {}) {
+  const fake = fakeView()
+  shardIpc.openLarge.mockResolvedValueOnce(shardOpen(overrides))
+  shardFactory.createShardView.mockReturnValueOnce(fake.view)
+  return fake
 }
 
 const OK_REPORT: WriteReport = { bytesWritten: 6, unmappable: false }
@@ -60,6 +106,9 @@ beforeEach(() => {
   ipc.saveFile.mockReset()
   dialog.open.mockReset()
   dialog.save.mockReset()
+  shardIpc.openLarge.mockReset()
+  shardIpc.closeLarge.mockReset()
+  shardFactory.createShardView.mockReset()
   ipc.saveFile.mockResolvedValue(OK_REPORT)
 })
 
@@ -73,6 +122,7 @@ describe('初始状态', () => {
     expect(doc.notice()).toBeNull()
     expect(doc.busy()).toBe(false)
     expect(doc.format()).toEqual(DEFAULT_FORMAT)
+    expect(doc.shard()).toBeNull()
   })
 })
 
@@ -139,12 +189,14 @@ describe('打开', () => {
   it('打开失败时报错，且不动当前文档', async () => {
     const { doc, state } = harness()
     state.text = '原内容'
-    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: 5_000_000, limit: 4_194_304 })
+    // ⚠️ 这里刻意**不用** `too_large`：那一条在 M2-H 之后不是失败，是「改走分片」，
+    // 一个字都不该说（用例在下面「只读分片」那一组里）
+    ipc.openFile.mockRejectedValue({ kind: 'io', reason: 'NotFound', message: '文件没了' })
 
     await doc.openAt('/huge.log')
 
     expect(doc.notice()?.level).toBe('error')
-    expect(doc.notice()?.text).toContain('too_large')
+    expect(doc.notice()?.text).toContain('文件没了')
     expect(doc.path()).toBeNull()
     expect(state.text).toBe('原内容')
     expect(doc.busy()).toBe(false)
@@ -735,5 +787,247 @@ describe('reload（M2-D 全局替换之后对账）', () => {
 
     // 留着的话用户会一直看着一句已经不成立的报错，而它没有任何可操作的动作
     expect(doc.notice()).toBeNull()
+  })
+})
+
+describe('只读分片（M2-H）', () => {
+  /*
+   * 这一组的全部要点是「换一条路」与「失败」必须分得开：`open_file` 撞 4 MiB 不是
+   * 错误，是路由信号。判错方向的两种症状都很难查——当成失败的话用户看到一句红字，
+   * 而那个文件明明打得开；当成成功的话文档会停在一个空 buffer 上，看起来像是文件是空的
+   */
+  it('open_file 撞 4 MiB 时改走 open_large，一个字都不说', async () => {
+    const { doc, state } = harness()
+    // 上一个文件留下的正文。🔴 分片落地时必须清掉：留着的话 `host.getText()`
+    // 会把它当成这个大文件的内容，而分片模式下唯一读正文的地方就是它
+    state.text = '上一个文件的正文'
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    const fake = nextShard({ totalLines: 900_000, bytes: 52_428_800, encoding: 'gbk', bom: true, eol: 'crlf' })
+
+    await doc.openAt('/var/log/huge.log')
+
+    expect(shardIpc.openLarge).toHaveBeenCalledWith('/var/log/huge.log')
+    expect(shardFactory.createShardView).toHaveBeenCalledTimes(1)
+    expect(doc.shard()).toBe(fake.view)
+    expect(doc.notice()).toBeNull()
+    expect(doc.path()).toBe('/var/log/huge.log')
+    expect(doc.name()).toBe('huge.log')
+    expect(state.text).toBe('')
+    // 头部那个 encoding/eol 只为状态栏那两格（它们在分片模式下不渲染成 <select>）
+    expect(doc.format()).toEqual({ encoding: 'gbk', bom: true, eol: 'crlf' })
+    expect(doc.dirty()).toBe(false)
+    expect(doc.busy()).toBe(false)
+    expect(state.focuses).toBe(1)
+    expect(state.pathChanges).toBe(1)
+  })
+
+  it('刻意不采纳 header.lossy：那条提示讲的是「原样保存会损坏它」，而分片压根不能保存', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    nextShard({ lossy: true })
+
+    await doc.openAt('/h.log')
+
+    expect(doc.lossy()).toBe(false)
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('open_large 也接不住时才报错，且不动当前文档', async () => {
+    const { doc, state } = harness()
+    state.text = '原内容'
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    shardIpc.openLarge.mockRejectedValue({ kind: 'unsupported_encoding', path: '/h.txt', encoding: 'utf16_le' })
+
+    await doc.openAt('/h.txt')
+
+    expect(doc.notice()?.level).toBe('error')
+    expect(doc.notice()?.text).toContain('unsupported_encoding')
+    expect(doc.shard()).toBeNull()
+    expect(doc.path()).toBeNull()
+    expect(state.text).toBe('原内容')
+    expect(state.focuses).toBe(0)
+    expect(doc.busy()).toBe(false)
+  })
+
+  /*
+   * 「先拿到新句柄再关旧的」那一行的用例。反过来的顺序下，一次失败的 open_large
+   * 会把好端端一个能看的分片拆掉，只留一个空 buffer 加一句红字
+   */
+  it('新分片打开失败时，旧的那个留着不动', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    const first = nextShard()
+    await doc.openAt('/a.log')
+
+    shardIpc.openLarge.mockRejectedValueOnce({ kind: 'too_large', bytes: 300_000_000, limit: 268_435_456 })
+    await doc.openAt('/b.log')
+
+    expect(doc.shard()).toBe(first.view)
+    expect(first.dispose).not.toHaveBeenCalled()
+    // 新视图压根没被造出来，所以也就没有第二个 fd 需要收
+    expect(shardFactory.createShardView).toHaveBeenCalledTimes(1)
+    expect(doc.notice()?.level).toBe('error')
+  })
+
+  it('从分片切回内联：旧 fd 还回去，正文换掉', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockRejectedValueOnce(TOO_LARGE_INLINE)
+    const fake = nextShard()
+    await doc.openAt('/huge.log')
+
+    ipc.openFile.mockResolvedValueOnce(textFile({ text: '小文件的正文' }))
+    await doc.openAt('/small.txt')
+
+    // fd 泄漏是这条路上唯一「不报错但资源没了」的失败方式（见 ipc/shard.ts 的 closeLarge）
+    expect(fake.dispose).toHaveBeenCalledTimes(1)
+    expect(doc.shard()).toBeNull()
+    expect(state.text).toBe('小文件的正文')
+    expect(doc.path()).toBe('/small.txt')
+    expect(doc.dirty()).toBe(false)
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('分片换分片：上一个照样收掉', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    const first = nextShard()
+    await doc.openAt('/a.log')
+    const second = nextShard()
+
+    await doc.openAt('/b.log')
+
+    expect(first.dispose).toHaveBeenCalledTimes(1)
+    expect(doc.shard()).toBe(second.view)
+    expect(doc.path()).toBe('/b.log')
+  })
+
+  /*
+   * 🔴 `saveAs` 这一条比 `save` 要紧：它不问后端、直接拿 `host.getText()` 去写盘，
+   * 而分片模式下那个 buffer 是**空的**。没有这道守卫的话，用户在一个 100 MB 的日志上
+   * 按一次 ⌘⇧S 就会在磁盘上留下一个 0 字节的同名文件
+   */
+  it('save 与 saveAs 一律拒绝：一次写盘都不发，也不弹对话框', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    nextShard()
+    await doc.openAt('/huge.log')
+
+    await doc.save()
+
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+    expect(dialog.save).not.toHaveBeenCalled()
+    expect(doc.notice()?.level).toBe('warning')
+    expect(doc.notice()?.text).toContain('不能保存')
+    expect(state.text).toBe('')
+
+    await doc.saveAs()
+
+    expect(dialog.save).not.toHaveBeenCalled()
+    expect(ipc.saveFile).not.toHaveBeenCalled()
+    expect(doc.notice()?.text).toContain('不能另存为')
+    // 永远不脏 → 关闭确认压根不会为它弹一次，也就不会出现「问你要不要保存一个
+    // 保存不了的文件」那个死循环
+    expect(doc.dirty()).toBe(false)
+  })
+
+  it('releaseShard 幂等：连调两次只 dispose 一次', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockRejectedValue(TOO_LARGE_INLINE)
+    const fake = nextShard()
+    await doc.openAt('/huge.log')
+
+    doc.releaseShard()
+    doc.releaseShard()
+
+    expect(fake.dispose).toHaveBeenCalledTimes(1)
+    expect(doc.shard()).toBeNull()
+    expect(doc.notice()).toBeNull()
+  })
+
+  it('内联文档上 releaseShard 是空操作', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+
+    doc.releaseShard()
+
+    expect(doc.shard()).toBeNull()
+    expect(state.text).toBe('正文')
+    expect(doc.path()).toBe('/a.txt')
+    expect(shardIpc.closeLarge).not.toHaveBeenCalled()
+  })
+
+  it('reload 在分片上是整个重开：新视图换上、旧的收掉、一律返回 true', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockRejectedValueOnce(TOO_LARGE_INLINE)
+    const first = nextShard()
+    await doc.openAt('/huge.log')
+
+    const second = nextShard()
+    await expect(doc.reload()).resolves.toBe(true)
+
+    expect(shardIpc.openLarge).toHaveBeenCalledTimes(2)
+    expect(first.dispose).toHaveBeenCalledTimes(1)
+    expect(doc.shard()).toBe(second.view)
+    expect(doc.notice()).toBeNull()
+    expect(doc.busy()).toBe(false)
+    // 这条路上压根不该碰内联那一套：正文、语言槽位、焦点都不动
+    expect(ipc.openFile).toHaveBeenCalledTimes(1) // 只有最初那次撞上限
+    expect(state.text).toBe('')
+    expect(state.pathChanges).toBe(1)
+    expect(state.focuses).toBe(1)
+  })
+
+  it('重开失败时旧视图留着，返回 false', async () => {
+    const { doc } = harness()
+    ipc.openFile.mockRejectedValueOnce(TOO_LARGE_INLINE)
+    const first = nextShard()
+    await doc.openAt('/huge.log')
+
+    shardIpc.openLarge.mockRejectedValueOnce({ kind: 'io', reason: 'NotFound', message: '文件没了' })
+    await expect(doc.reload()).resolves.toBe(false)
+
+    // 旧视图虽然是打开那一刻的内容，但至少还能看，比一个空面板加一句红字有用
+    expect(doc.shard()).toBe(first.view)
+    expect(first.dispose).not.toHaveBeenCalled()
+    expect(doc.notice()?.level).toBe('error')
+    expect(doc.busy()).toBe(false)
+  })
+
+  /*
+   * 同一个「正在被追加的日志」，从另一个方向来：打开时还不到 4 MiB，
+   * 在 Vela 开着的时候长过去了。少了这条分支的话 reload 会以一句红字收场，
+   * 而这个文件明明有办法打开
+   */
+  it('reload 撞上「文件长过了 4 MiB」：改走分片，返回 true', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/var/log/app.log')
+    expect(doc.shard()).toBeNull()
+
+    ipc.openFile.mockRejectedValueOnce(TOO_LARGE_INLINE)
+    const fake = nextShard()
+    await expect(doc.reload()).resolves.toBe(true)
+
+    expect(doc.shard()).toBe(fake.view)
+    expect(state.text).toBe('')
+    expect(doc.path()).toBe('/var/log/app.log')
+    expect(doc.notice()).toBeNull()
+    expect(doc.busy()).toBe(false)
+  })
+
+  it('长过 4 MiB 又撞了分片自己的上限：报错，而内联那份正文留着', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValueOnce(textFile())
+    await doc.openAt('/var/log/app.log')
+
+    ipc.openFile.mockRejectedValueOnce(TOO_LARGE_INLINE)
+    shardIpc.openLarge.mockRejectedValueOnce({ kind: 'too_large', bytes: 300_000_000, limit: 268_435_456 })
+    await expect(doc.reload()).resolves.toBe(false)
+
+    expect(doc.shard()).toBeNull()
+    expect(state.text).toBe('正文')
+    expect(doc.notice()?.level).toBe('error')
+    expect(doc.busy()).toBe(false)
   })
 })

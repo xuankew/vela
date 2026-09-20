@@ -27,7 +27,7 @@
 
 import type { MatchRange, SearchFile, SearchSummary } from '../ipc/search'
 import type { ReplaceProgress, ReplaceSummary } from '../ipc/replace'
-import { OVERSCAN, visibleWindow, type VirtualWindow } from '../project/tree'
+import { OVERSCAN, visibleWindow, type VirtualWindow } from '../ui/virtual'
 
 /** 结果列表里的一行。文件行是分组标题，命中行是真正能点着跳过去的那一条 */
 export type ResultRow = FileRow | HitRow
@@ -36,6 +36,16 @@ export interface FileRow {
   kind: 'file'
   /** 相对项目根的路径，与 `DirEntry.rel` 同一个口径 */
   rel: string
+  /**
+   * 这个文件属于**哪一个根**的显示名，画在 `rel` 前面。空串 = 不画。
+   *
+   * ⚠️ 它是摊那一刻就算好的一个字符串，**不是** `rootIndex`：多根工作区里用户随时
+   * 可以加一个根或移掉一个根，而那之后 `rootIndex` 指向的就是另一个文件夹了。
+   * 存序号、渲染时再去查名字的失败方式不是报错，是「vela 里的命中被标成了 notes」——
+   * 而用户点下去打开的是对的文件，所以他连怀疑都不会怀疑。
+   * 单根时一律是空串：那时每一行前面都挂同一个项目名，纯噪音
+   */
+  root: string
   path: string
   /** 这个文件里有多少处命中。分组标题上显示的就是它 */
   hits: number
@@ -102,12 +112,9 @@ export const RESULT_ROW_HEIGHT = 20
 /**
  * 结果列表的可视窗口。
  *
- * 直接复用 `project/tree.ts` 的 `visibleWindow`：它的算术只依赖「定高行 + 总行数」，
- * 与「行是树节点还是搜索结果」无关，`OVERSCAN` 那条理由（快速滚动时别露白）也一模一样。
- * 只有行高不同，所以显式传进去。
- *
- * 它现在住在 `project/` 下面是历史顺序，不是归属判断。M2-E 的 Goto Anything 会是第三个
- * 消费者，到那时再抽成共享模块——现在抽是给一个还不存在的第三方让路。
+ * 复用 `src/ui/virtual.ts` 的 `visibleWindow`：它的算术只依赖「定高行 + 总行数」，
+ * 与「行是树节点、搜索结果还是 `Cmd+P` 的候选」无关，`OVERSCAN` 那条理由
+ * （快速滚动时别露白）在三处也一模一样。只有行高不同，所以显式传进去。
  */
 export function resultWindow(scrollTop: number, viewportHeight: number, total: number): VirtualWindow {
   return visibleWindow(scrollTop, viewportHeight, total, RESULT_ROW_HEIGHT, OVERSCAN)
@@ -120,6 +127,9 @@ export function resultWindow(scrollTop: number, viewportHeight: number, total: n
  * Rust 侧不会推这种文件（`run.rs` 只在 `hits` 非空时才 push），但契约上没禁止，
  * 而漏掉它的话那个文件就在结果里彻底消失了，连「搜到了但没命中」都说不出来。
  *
+ * @param rootOf 把 `SearchFile.rootIndex` 换成显示名（见 `FileRow.root`）。
+ *   与 `isSkipped` 同理，是**摊的那一刻**求值的：调用方递进来的必须是那一轮搜索
+ *   起飞时的根清单，而不是渲染时现读的工作区
  * @param isSkipped 这个绝对路径在替换时会不会被跳过（见 `FileRow.skipped`）。
  *   ⚠️ 它是**摊的那一刻**求值的，所以用户在这批到达之后才把某个文件改脏，
  *   已经摊出来的那一行不会跟着变。这是接受的代价：换成「每次渲染都查一遍」的话
@@ -130,12 +140,14 @@ export function resultWindow(scrollTop: number, viewportHeight: number, total: n
 export function flattenFiles(
   files: readonly SearchFile[],
   isSkipped: (path: string) => boolean = () => false,
+  rootOf: (rootIndex: number) => string = () => '',
 ): ResultRow[] {
   const rows: ResultRow[] = []
   for (const file of files) {
     rows.push({
       kind: 'file',
       rel: file.rel,
+      root: rootOf(file.rootIndex),
       path: file.path,
       hits: file.hits.length,
       truncated: file.truncated,

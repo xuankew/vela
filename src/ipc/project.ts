@@ -167,3 +167,126 @@ export function revealEntry(root: string, rel: string): Promise<void> {
 export function copyEntryPath(root: string, rel: string): Promise<void> {
   return invoke<void>('copy_entry_path', { root, rel })
 }
+
+/**
+ * Rust `project::IndexStats`，`#[serde(rename_all = "camelCase")]`。
+ *
+ * ⚠️ 读成 `elapsed_ms` 拿到的是 `undefined`，而 `undefined` 参与算术是 `NaN`、参与比较是
+ * `false`，两种都不报错。两边各有一份对照的黄金 JSON：
+ * Rust 侧 `wire_contract.rs` 的 `索引统计的线上形状`，前端 `project.test.ts`
+ */
+export interface IndexStats {
+  /** 收进索引的文件数 */
+  files: number
+  /** 遍历途中读不动的目录数（权限不够、途中被删） */
+  unreadable: number
+  /**
+   * 撞到 Rust 侧那个二十万的上限停下了，⚠️ 这份索引**不是全的**。
+   *
+   * 这个标志必须显示出来：为真时「找不到某个文件」与「这个文件不存在」在界面上
+   * 长得一模一样，用户无从分辨，而他能做的两件事（换个词 / 去侧边栏翻）方向完全相反。
+   *
+   * ⚠️ 多根之下它是各根的**逻辑或**：三个根里有一个撞了上限，这一条就是真的。
+   * 前端说不出是哪一个（那需要每条根一份账，而用户能做的事与是哪个根无关：
+   * 都是「把词写窄一点，或者去侧边栏翻」）
+   */
+  truncated: boolean
+  /**
+   * 建索引花了多少毫秒。⚠️ 只在日志里有意义，别拿它当性能指标显示给用户。
+   * 多根之下是各根**之和**（Rust 侧逐个建，不并发），所以它比单根时大是正常的
+   */
+  elapsedMs: number
+}
+
+/** Rust `project::FileMatch` */
+export interface FileMatch {
+  /**
+   * 相对 root 的路径，规矩与 `DirEntry.rel` 完全一致。
+   * ⚠️ 多根之下**不再唯一**，行键要带上 `rootIndex`
+   */
+  rel: string
+  /** 绝对路径，直接交给 `openFile`。⚠️ 前端永远不需要拿 `rel` 自己拼 */
+  path: string
+  /**
+   * 模糊匹配分。⚠️ 只在**同一次查询内部**有意义：那套权重是相对值，
+   * 换一个搜索词就没有可比性。拿它排序可以，拿它做「够不够像」的阈值判断不行
+   */
+  score: number
+  /**
+   * 这一条属于 `roots` 里的第几个根（M2-F）。**总是存在**，单根时恒为 `0`，
+   * 所以浮层里可以无条件地在路径前面加上根的名字。
+   *
+   * ⚠️ 与 `SearchFile.rootIndex` 同一条理由不给 `?`，也**不要**拿 `path` 反推
+   */
+  rootIndex: number
+}
+
+/** Rust `project::FileQuery` */
+export interface FileQuery {
+  /**
+   * 排好序的前一小批。**Rust 侧已经按 `score` 降序排完了，前端不要再排一次**——
+   * 排序规则（连续命中 > 分散命中、basename 里的命中 > 路径中间的命中、短路径优先、
+   * 最近打开过的略微加分）住在 `vela-core/src/project/index.rs` 里，
+   * 前端抄一份到 TypeScript 就等于把一个产品决定分成两处维护。
+   *
+   * ⚠️ 多根之下这一条更要紧一档：那一批是**跨根合并**过的，同分时按根的顺序。
+   * 前端再排一次的话用的是 JS 的排序稳定性与自己的比较函数，
+   * 于是「同分的两条谁在前」会与 Rust 侧不一致，浮层里候选的顺序就会抖
+   */
+  matches: FileMatch[]
+  /**
+   * 命中总数，**可以大于** `matches.length`。差值就是「还有更多没显示，把词写窄一点」，
+   * 条数上限定在 Rust 侧的 `QUERY_LIMIT`，前端不对它做任何假设。
+   *
+   * ⚠️ 多根之下它是**各根之和**，而 `matches` 是合并后截断到 `QUERY_LIMIT` 条的：
+   * 三个大仓库一起搜的时候「共 4 万条、显示 50 条」是常态，不是 bug
+   */
+  total: number
+}
+
+/**
+ * 建**工作区里每一个根**的文件索引（**每次都重建**），回报合并成一份的账（M2-E）。
+ *
+ * 在 `Cmd+P` 浮层**展开的那一刻**调它，两个用途：① 让第一个按键落在一份热缓存上
+ * （建索引在两万文件的仓库上是 40ms、十万文件上 205ms，那个数字与「为什么不能
+ * 每个按键都建」的推理都写在 `src-tauri/src/commands.rs` 的 `ProjectIndexCache` 上）；
+ * ② 拿到 `truncated`。
+ *
+ * ⚠️ 「每次都重建」是**买来的**，不是懒得做失效：M2-G 的文件监听落地之前没有别的
+ * 东西会去动这份缓存，重建一次就等于「上一次开浮层之后新建的文件这一次一定找得到」。
+ * 那条测试在 `src-tauri/src/commands.rs` 的 `每次_index_project_都重建`。
+ *
+ * ⚠️ 多根之下 Rust 侧是**逐个**重建（不并发），所以三个大仓库的浮层展开要等三份之和。
+ * 这是刻意的：并发建会把 blocking 池占满，而 `open_file` / `list_dir` 也在上面，
+ * 抢占编辑器的 IO 是用户看得见的。等的那一会儿浮层画的是 MRU，不是白屏。
+ *
+ * 报 `TreeError`，前端已有的 `describeTreeError` 直接就能用。
+ * ⚠️ 有一个根不合法就**整次 reject**，`path` 是那一个根
+ */
+export function indexProject(roots: readonly string[]): Promise<IndexStats> {
+  return invoke<IndexStats>('index_project', { roots })
+}
+
+/**
+ * 在**当前工作区的每一个根**上做一次模糊匹配，合并后回一小批（M2-E）。
+ *
+ * @param roots 与 [`indexProject`] 那一次同一个数组。⚠️ 顺序就是浮层里同分候选的顺序
+ * @param needle 空字符串是**合法的**，意思是「随便给我一批」——浮层刚展开、
+ *   一个字都还没打时要的就是这个，而 `recent` 的加分会让最近打开过的排在最前面。
+ *   ⚠️ 不要 trim：`"  "` 是两个空格，那是用户真的打了两个空格，替他改掉等于
+ *   让输入框显示的东西与查询用的东西不是同一个
+ * @param recent 前端 MRU 里的绝对路径清单，最新的在前。⚠️ **只用来加分**：
+ *   Rust 侧拿它与索引里已有的 rel 比对，比不上的（长在 root 外面的、已经不存在的）
+ *   直接忽略，不会因为它去打开或枚举任何路径。超过 50 条的部分同样被忽略
+ *   （`vela_core::project::MAX_RECENT`），所以前端不需要先截一刀。
+ *   ⚠️ 多根之下它是**一份跨根的清单**，不是每个根一份：MRU 记的是用户打开过的文件，
+ *   那些文件可以分布在任何一个根里
+ */
+export function queryProject(
+  roots: readonly string[],
+  needle: string,
+  recent: readonly string[] = [],
+): Promise<FileQuery> {
+  // `recent` 不能省：Rust 侧是 `Vec<String>` 而不是 `Option<...>`，缺 key 会直接反序列化失败
+  return invoke<FileQuery>('query_project', { roots, needle, recent })
+}

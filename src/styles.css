@@ -552,6 +552,165 @@ select {
   transform: none;
 }
 
+/* ---------- 大纲面板（M3-A-4） ----------
+
+   与 `.sidebar` 同一侧、同一套「定高行 + 虚拟窗口」的做法，但**窄一档**：
+   树里一行是路径的一段，220px 是照着路径长度定的；大纲里一行是一个标题，而标题比路径短。
+   给 200px——够放两三级缩进加一个中等长度的标题，再宽就开始从编辑区抢地方，
+   而这一栏与预览**同时开着是常态**。
+
+   ⚠️ 头部照抄 `.sidebar-head`（26px + 一条下边框），而不是 `.md-preview-head`
+   （`padding: 3px 10px`，高度是内容撑出来的）：这两栏与侧边栏并排站着，
+   头部高度不一致的话那两条下边框会错开半格，看着像哪里没对齐——而它确实没对齐。
+
+   ⚠️ 行高只有一个真相：`OUTLINE_ROW_HEIGHT`（`md/outline.ts`）由组件注入成
+   `--vela-outline-row-height`，下面所有行高都引用那个变量。理由与 `.tree-row` 那条逐字相同。
+   ⚠️ 不给 border：`.body-row` 的分隔线是「gap 露出底色」，而 border 参与盒模型。 */
+
+.outline {
+  flex: 0 0 200px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--vela-bg-alt);
+  font-size: 12px;
+}
+
+.outline-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.outline-title {
+  flex: 0 0 auto;
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+}
+
+/* 「TypeScript 还没有符号表」「这份文档还没有标题」这类限定。与 `.md-preview-note`
+   同一个形状：能省就省，省不下就截断，绝不折行——折行会把这一条 26px 的头撑高 */
+.outline-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vela-warn);
+  font-size: 11px;
+}
+
+/* × ：与 `.md-preview-close` 同一条口径——「关掉一个面板」是反向操作，只给最小视觉重量 */
+.outline-close {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.outline-close:hover {
+  border: none;
+  color: var(--vela-fg);
+}
+
+.outline-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  position: relative;
+}
+
+.outline-spacer {
+  position: relative;
+}
+
+/* transform 而不是 top：改 top 会重排整棵子树（与 `.tree-window` 同一条理由） */
+.outline-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+.outline-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: var(--vela-outline-row-height);
+  white-space: nowrap;
+  user-select: none;
+  /* padding-left 是 OutlinePanel.tsx 按 `depth * 12 + 4` 写在行内样式上的，
+     所以这里刻意不设，免得两个地方各算一半 */
+}
+
+.outline-row:hover {
+  background: var(--vela-bg-panel);
+}
+
+/* 两个都是**真的按钮**：这一栏没有键盘导航状态机，Tab + Enter 全靠它们（见组件文件头）。
+   于是全局那条 `button` 规则的四样东西必须逐个退掉：边框、面板底色、3px 内边距、
+   以及 🔴 `:active` 那个 `translateY(1px)`——在定高行的虚拟列表里，一行按下去挪一个像素
+   看着像整个列表抖了一下 */
+.outline-twisty,
+.outline-name {
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+  cursor: default;
+}
+
+.outline-twisty:active,
+.outline-name:active {
+  transform: none;
+}
+
+.outline-twisty:hover,
+.outline-name:hover {
+  border: none;
+}
+
+/* 焦点环画在**行内**：默认的环有一半会被滚动容器裁掉，看着像渲染出错 */
+.outline-twisty:focus-visible,
+.outline-name:focus-visible {
+  outline: 1px solid var(--vela-accent);
+  outline-offset: -1px;
+}
+
+.outline-twisty {
+  flex: 0 0 12px;
+  width: 12px;
+  color: var(--vela-fg-dim);
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+}
+
+.outline-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--vela-fg);
+  /* 继承行的字体而不是走全局 `button` 那条 `--vela-font-ui`：两者此刻是同一个值，
+     但这一栏与 `.sidebar` 并排站着，字体该跟着**这一列**走，不该跟着「它是个按钮」走 */
+  font: inherit;
+  text-align: left;
+}
+
 /* ---------- 状态栏 ---------- */
 
 /* 放在 grid 最后一行（`.app` 的行数因此是 5）。用 --vela-bg-alt 而不是面板色：
@@ -972,6 +1131,21 @@ select {
   text-overflow: ellipsis;
 }
 
+/* 多根工作区里，文件行前面那一个「它属于哪个根」。单根时压根不渲染这个节点
+   （不是渲染成空的：一个空 span 会占掉 `.find-row` 那 6px 的 gap，缩进就对不齐了） */
+.find-root {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+/* 分隔符画在 ::after 里而不是写进文案：`textContent` 因此只有根名本身，
+   组件测试断言的是「这一行说的是哪个项目」，不必连排版符号一起抄一遍 */
+.find-root::after {
+  content: '/';
+  margin-left: 2px;
+}
+
 .find-count {
   flex: 0 0 auto;
   font-size: 11px;
@@ -1028,4 +1202,1035 @@ select {
 
 .find-row.skipped .find-count {
   color: var(--vela-warn);
+}
+
+/* ---------- 跳转浮层（M2-E，Cmd+P / Cmd+R）---------- */
+
+/* ⚠️ 这一整段的行高**只能**引用 `--vela-palette-row-height`。
+   那个变量由 src/goto/QuickOpen.tsx 从 `store.ts` 的 `QUICK_OPEN_ROW_HEIGHT` 注入，
+   是虚拟滚动窗口算术（`src/ui/virtual.ts` 的 `visibleWindow`）唯一的高度来源。
+   与侧边栏那段是同一条规矩，理由也逐字相同：再写一个 `20px` 字面量，两处就会各自悄悄漂移。 */
+
+/* 顶部浮层，不是底部面板：底部那一块已经被 `.find-panel` 占了 240px，
+   两个同时展开编辑区只剩一条缝，而 Cmd+P 的典型用法是「跳过去，浮层立刻消失」。
+   fixed 而不是 absolute，理由与 `.modal-backdrop` 相同——绝对定位的子元素不是 grid item，
+   遮罩因此不会给那个「行数必须固定」的 `.app` grid 多加出一行。 */
+.palette-backdrop {
+  /* 行高的**默认值**。QuickOpen 会在标签上把它覆盖成 `QUICK_OPEN_ROW_HEIGHT`，
+     因为在那边这个数是虚拟滚动窗口算术（`src/ui/virtual.ts` 的 `visibleWindow`）的输入，
+     必须与 JS 侧完全一致；命令面板不虚拟化（理由见 `src/commands/palette.ts` 文件头），
+     它只是要一个行高，于是吃这个默认值。⚠️ 两个浮层共用这一个类名，所以它写在这儿 */
+  --vela-palette-row-height: 20px;
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  /* 靠上但不贴边：贴到顶上的话它与标题栏/标签条连成一片，读起来像界面的一部分而不是
+     一层临时的东西。固定像素而不是百分比——窗口很高时 12vh 会把浮层推到屏幕中间，
+     而「跳过去」这个动作的落点在编辑区，浮层该待在上半部 */
+  padding-top: 72px;
+  /* 盖在 `.modal-backdrop`（10）上面。反过来放的话，一张确认单开着的时候按 Cmd+P
+     浮层会藏在遮罩后面，用户只看到「按了没反应」；盖在上面时他按 Escape 就回到那张单子 */
+  z-index: 20;
+  /* 刻意**不**压暗背景：挑标题时要的正是「一边看编辑区一边挑」，
+     压暗等于宣布后面那块现在与他无关。浮层自己靠阴影与边框与内容分开（见 `.palette`） */
+}
+
+.palette {
+  display: flex;
+  flex-direction: column;
+  /* 定宽而不是跟着窗口走：候选是一列路径，宽了每行都变短、一屏装不下几个字，
+     窄了长路径全靠省略号。520px 约等于 `.modal` 的上限再宽一点，够放一条常见的项目相对路径 */
+  width: 520px;
+  max-width: calc(100vw - 32px);
+  /* 列表高度定死，浮层整体高度就只跟着「有没有警告行」变一档。
+     让它跟着内容长的话，每敲一个字符浮层就跳一次高度，眼睛得反复找输入框 */
+  max-height: 420px;
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  /* 阴影是这一层唯一的立体线索（背景没压暗）。rgba 的理由与 `.modal-backdrop` 相同：
+     它不承载语义色，换主题时对比度不会失控 */
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+}
+
+/* 输入框做成浮层的第一行而不是一个带边框的控件：整个浮层就一个输入口，
+   再套一层边框会和 `.palette` 自己的边框叠成两道线。底边那条线是它与列表的分界 */
+.palette-input {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 7px 10px;
+  font-family: var(--vela-font-ui);
+  font-size: 13px;
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border: none;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.palette-input:focus {
+  outline: none;
+}
+
+/* 索引被截断那一句。与 `.find-warning` / `.modal-warn` 同一套视觉语言：
+   它说的正是同一类事——一个看起来很确定的答案其实是假的 */
+.palette-warn {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--vela-warn);
+  border-bottom: 1px solid var(--vela-border);
+  border-left: 3px solid var(--vela-warn);
+}
+
+/* 滚动容器。**不给 tabIndex**：焦点始终留在输入框上（与 `.find-scroll` 相反，
+   那边要 tabIndex 是因为「从输入框按 ArrowDown 走进结果」会把焦点交给列表）。
+   这里每敲一个字符都要重算列表，焦点一旦被挪走就再也打不了字 */
+.palette-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  position: relative;
+}
+
+.palette-spacer {
+  position: relative;
+}
+
+/* transform 而不是 top，与 `.find-window` 同一条理由 */
+.palette-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+/* 缩进不在这里给：标题行按级别缩进 1–6 档，那是行内联样式算出来的
+   （见 QuickOpen.tsx 的 `pad`），CSS 这边只负责行高与配色 */
+.palette-row {
+  display: flex;
+  align-items: center;
+  height: var(--vela-palette-row-height);
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+}
+
+.palette-row:hover {
+  background: var(--vela-bg-alt);
+}
+
+/* 与 `.find-row.selected` / `.tree-row.selected` 同一套：inset 阴影不参与布局，
+   换成 border-left 会把这一行的内容整体右推 2px，缩进就乱了 */
+.palette-row.selected {
+  background: var(--vela-bg-alt);
+  box-shadow: inset 2px 0 0 var(--vela-accent);
+}
+
+/* 多根工作区里，候选前面那一个「它属于哪个根」。单根时这个节点压根不渲染。
+   分隔符画在 ::after 里而不是写进文案，理由与 `.find-root` 逐字相同：
+   `textContent` 因此只有根名本身，组件测试不必连排版符号一起抄一遍 */
+.palette-root {
+  flex: 0 0 auto;
+  margin-right: 4px;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+.palette-root::after {
+  content: '/';
+  margin-left: 2px;
+}
+
+.palette-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 文件行是路径 → 代码字体，与 `.find-text` 同一条分派规则（D2「按内容分字体」） */
+  font-family: var(--vela-font-code);
+  font-size: 11px;
+}
+
+/* 标题行是散文 → UI 字体。两种字体在同一个列表里从不共存（模式要么文件要么标题），
+   所以这不会读成「同一个列表里有两种东西」，只会读成「这一列是标题不是路径」 */
+.palette-row.symbol .palette-text {
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+}
+
+.palette-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-top: 1px solid var(--vela-border);
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+/* 「正在建索引…」。用 accent 而不是警告色：那是一件每次都发生的正常事，
+   用警告色等于每开一次浮层都闪一下「出事了」 */
+.palette-foot.busy {
+  color: var(--vela-accent);
+}
+
+.palette-error {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vela-bad);
+}
+
+.palette-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 命令面板（M3-B，Mod+Shift+P）复用了上面这一整段 `.palette-*`，只加了下面这四个类。
+   两块浮层是同一件东西的两个数据源，看起来一样是刻意的：手势因此不必学两遍 */
+
+/* 一行命令要同时装下标题、分类与快捷键，520px 挤。
+   ⚠️ 只放宽宽度，不改结构：`.palette` 的 `max-height` 也跟着抬一档，
+   否则宽了之后一屏还是只能看见十来条，白宽 */
+.palette.wide {
+  width: 600px;
+  max-height: 460px;
+}
+
+/* 命令标题是散文（「切换自动换行」）而不是路径，于是走 UI 字体。
+   与 `.palette-row.symbol .palette-text` 同一条分派规则（D2「按内容分字体」）：
+   `.palette-text` 的默认值是代码字体，那是为文件路径准备的 */
+.palette-row.command .palette-text {
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+}
+
+/* 分类与快捷键都靠右。`.palette-text` 是 `flex: 1 1 auto`，于是它把这两格推到行尾，
+   不需要 `margin-left: auto`。分类在前、键在后：读的顺序是「这条命令是什么、属于哪一类、
+   怎么按」，而键是那一行里最不需要被读到的东西 */
+.palette-cat,
+.palette-keys {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+  white-space: nowrap;
+}
+
+/* 快捷键标签里的 ⇧⌘P 那一类符号是比例宽度的，用代码字体会让 `⌘` 与字母之间空出一大截 */
+.palette-keys {
+  font-family: var(--vela-font-ui);
+}
+
+/* `when` 不满足的那一条。⛔ 不用 `cursor: not-allowed`：这一行是可以点的，
+   点下去 `registry.execute` 会返回 false、什么也不发生——那个光标是在承诺一件假事。
+   透明度与全局 `button:disabled` 同取 0.45，于是「按不动」在整个应用里是一个样子 */
+.palette-row.disabled {
+  opacity: 0.45;
+}
+
+.palette-row.disabled:hover {
+  background: none;
+}
+
+/* ---------- 工具箱（M3-B，Mod+Shift+T）---------- */
+
+/* 居中的一大块，不是顶部浮层也不是底部面板。
+   与 `.palette-backdrop` 的分工是按「用多久」切的：Cmd+P 是「跳过去，浮层立刻消失」，
+   所以它靠上、不压暗、看得见后面的文档；工具箱是「在这儿待一会儿，改选项、看输出、再改」，
+   所以它居中、压暗背景——压暗正是在说「后面那块现在与你无关」。
+   z-index 与 `.palette-backdrop` 同取 20：一张确认单开着的时候按 Mod+Shift+T，
+   浮层该盖在上面，Escape 一下回到那张单子（理由与 `.palette-backdrop` 那条逐字相同） */
+.toolbox-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 20;
+}
+
+.toolbox {
+  display: flex;
+  flex-direction: column;
+  /* 两个方向都定死，浮层就不跟着内容长。跟着长的话每敲一个字整块都在跳，
+     而这一块里有两格 textarea——高度一跳，正在读的输出就换位置了。
+     `min()` 而不是 `calc(100vw - 48px)` 单独用：小窗口下要退让，大窗口下不该无限变宽 */
+  width: min(880px, calc(100vw - 48px));
+  height: min(560px, calc(100vh - 96px));
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+}
+
+.toolbox-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 6px 8px 6px 10px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.toolbox-title {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--vela-fg-dim);
+}
+
+/* 当前工作台上的那个工具名。放在头部而不是右栏单独占一行：右栏的竖向空间全给两格文本，
+   一行 20px 在 560px 里是 3.5%，而这一行只说了一件头部本来就能说的事 */
+.toolbox-current {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+/* × 是一个小图标动作，于是全局那条 `button` 规则的四样东西逐个退掉：
+   边框、面板底色、内边距、圆角（与 `.tree-menu` 里那一条同一个理由） */
+.toolbox-close {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  border-radius: 0;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--vela-fg-dim);
+}
+
+.toolbox-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* 左栏定宽：工具名都是短词，跟着窗口走只会让「JSON 格式化」与右边那格之间空出一片 */
+.toolbox-nav {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 190px;
+  min-width: 0;
+  background: var(--vela-bg);
+  border-right: 1px solid var(--vela-border);
+}
+
+.toolbox-filter {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  width: 100%;
+  padding: 6px 10px;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border: none;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.toolbox-filter:focus {
+  outline: none;
+}
+
+/* 滚动容器。⚠️ 这一栏**不**虚拟化：P0 是 17 个工具、连分类标题一起三十几行，
+   而 `src/ui/virtual.ts` 那套是为「十万个文件」写的。理由写在 ToolBox.tsx 的文件头 */
+.toolbox-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+/* 分类标题。⛔ 不参与选中态：它是分组线索，不是候选 */
+.toolbox-group {
+  padding: 7px 10px 2px;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+  user-select: none;
+}
+
+.toolbox-row {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+}
+
+.toolbox-row:hover {
+  background: var(--vela-bg-alt);
+}
+
+/* 与 `.palette-row.selected` / `.tree-row.selected` 同一套：inset 阴影不参与布局，
+   换成 border-left 会把这一行的文字整体右推 2px，与分类标题对不齐 */
+.toolbox-row.selected {
+  background: var(--vela-bg-alt);
+  box-shadow: inset 2px 0 0 var(--vela-accent);
+}
+
+.toolbox-empty {
+  padding: 10px;
+  line-height: 1.6;
+  color: var(--vela-fg-dim);
+}
+
+.toolbox-work {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 8px 10px;
+}
+
+/* 选项条。⚠️ wrap 而不是横向滚：选项是「一眼要全看见」的东西，
+   藏在一个横向滚动条后面的开关等于不存在 */
+.toolbox-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  flex: 0 0 auto;
+}
+
+.toolbox-option {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--vela-fg-dim);
+  cursor: default;
+  user-select: none;
+}
+
+/* 数字格只装得下一个两位数的档位（缩进 2…8、列宽到 200），给宽了就是白占地方 */
+.toolbox-option input[type='number'] {
+  width: 60px;
+}
+
+/* 文字格装的是一整个正则或一个替换模板，60px 那种宽度看不见自己在打什么。
+   ⚠️ 不设为 100%：选项条是 `flex-wrap`，一格撑满会把后面几格全挤到下一行 */
+.toolbox-option input[type='text'] {
+  width: 180px;
+}
+
+/* 输入格与输出格并排。这是「大浮层」这个选择唯一换回来的东西：
+   改一个选项，左右两格同时看得见，不必来回切 */
+.toolbox-io {
+  display: flex;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.toolbox-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.toolbox-pane-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+/* 两格都是代码 → 代码字体（D2「按内容分字体」，与 `.palette-text` / `.find-text` 同一条分派规则）。
+   `wrap="off"` 写在标签上而不是这里：换行是 textarea 的属性，CSS 的 white-space 改不动它 */
+.toolbox-text {
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  padding: 6px 8px;
+  resize: none;
+  font-family: var(--vela-font-code);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+.toolbox-text:focus {
+  outline: none;
+  border-color: var(--vela-accent);
+}
+
+/* 占位句用暗色：它是「这里还没有东西」，不是一份内容为空的结果。
+   ⛔ 不能与真结果同色，否则用户会以为工具把输入吃掉了 */
+.toolbox-text.placeholder {
+  color: var(--vela-fg-dim);
+}
+
+/* 错误也是**输出**，所以它落在输出格里而不是页脚上：JSON 的报错要说清是哪一行哪一列，
+   那是一段要读的文字，不是一句提示。页脚那一格只放面板自己的一句话 */
+.toolbox-text.error {
+  color: var(--vela-bad);
+}
+
+.toolbox-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.toolbox-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border-top: 1px solid var(--vela-border);
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+/* 「正在运行…」。用 accent 而不是警告色：跑一次工具是每次都发生的正常事，
+   用警告色等于每按一个键都闪一下「出事了」（与 `.palette-foot.busy` 同一条） */
+.toolbox-foot.busy {
+  color: var(--vela-accent);
+}
+
+.toolbox-bad {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vela-bad);
+}
+
+.toolbox-notice {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolbox-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+
+/* ---------- 只读分片视图（M2-H，超大文件）---------- */
+
+/* ⚠️ 这一整段的行高**只能**引用 `--vela-shard-row-height`。
+   那个变量由 src/doc/ShardPane.tsx 从 `shardView.ts` 的 `SHARD_ROW_HEIGHT` 注入，
+   是虚拟滚动窗口算术（`src/ui/virtual.ts` 的 `visibleWindow`）唯一的高度来源。
+   与侧边栏、搜索结果、跳转浮层那三段是同一条规矩。这里漂移的后果比那三处更隐蔽：
+   占位高度按 18px 算、实际行高是别的数，症状是「滚动条走到底了内容还没到底」，
+   而且越往下差得越多，看起来像是读盘读漏了 */
+
+.shard-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 头部只说「只读」这一件事与它的两条限定。行数 / 字节数 / 编码 / 换行符在状态栏那一排
+   （见 StatusBar.tsx 的「只读分片是另一排」）：这儿重复一遍就是两份会各自漂移的真相 */
+.shard-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--vela-border);
+  font-family: var(--vela-font-ui);
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* 描边小牌，不上底色不上强调色：它是一个状态说明，不是一个可点的东西，
+   也不该比正文抢眼（与「反向操作只给最小视觉重量」同一条口径） */
+.shard-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border: 1px solid var(--vela-border);
+  border-radius: 3px;
+  letter-spacing: 0.5px;
+}
+
+.shard-tail {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 与 `.palette-foot.busy` 同一个选择：正在读是每次都会发生的正常事，
+   用警告色等于每滚一页都闪一下「出事了」 */
+.shard-tail.busy {
+  color: var(--vela-accent);
+}
+
+.shard-error {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--vela-bad);
+}
+
+/* `overflow-x: hidden`：长行一律截断，不做横向滚动。
+   一行可以有 1 MiB（`MAX_PAGE_BYTES`），横向虚拟化等于把窗口算术从一维做成二维，
+   而读日志的人要的是「往下翻」。代价说在 `.shard-clip` 那个省略号上 */
+.shard-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  /* 与 `.find-scroll` / `.tree-scroll` 同理：默认焦点环有一半会被面板边框裁掉。
+     tabIndex=0 是为了点一下就能用方向键 / PageDown 滚——只读视图没有别的原因要收焦点 */
+  outline: none;
+  position: relative;
+}
+
+.shard-spacer {
+  position: relative;
+}
+
+.shard-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+/* ⚠️ 这里刻意**没有** `user-select: none`，与 `.find-row` / `.tree-row` 相反。
+   那两处点一行是要跳走的，选中只会碍事；这里点一行什么也不发生，
+   而「从一个 100 MB 的日志里拷三行出来」正是打开它的主要理由之一 */
+.shard-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--vela-shard-row-height);
+  padding: 0 8px;
+  white-space: nowrap;
+  cursor: text;
+}
+
+/* 行号槽用 `ch` 而不是 px：它要装得下 256 MiB / 1 字节一行 = 9 位数，
+   而在代码字体里 `ch` 就是「0」的宽度，配上 tabular-nums 每一位都等宽。
+   ⚠️ 位数跨过边界的那一行会比同窗其它行宽一点点——一个文件里只发生一次，
+   不值得为它去量全文最大行号（那要先把整份文件扫一遍） */
+.shard-lineno {
+  flex: 0 0 auto;
+  min-width: 7ch;
+  font-family: var(--vela-font-code);
+  font-size: 11px;
+  text-align: right;
+  color: var(--vela-fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 正文。字号比 `.find-text` / `.palette-text` 那两处的 11px 大一号：
+   那两块是辅助列表，这一块是**主阅读面**——用户可能在这儿连着读几百行日志。
+   但也只能到 13px：行高钉死在 `--vela-shard-row-height`（18px），再大就顶出去 */
+.shard-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--vela-font-code);
+  font-size: 13px;
+  line-height: var(--vela-shard-row-height);
+}
+
+.shard-clip {
+  color: var(--vela-fg-dim);
+}
+
+/* 这一页有字节没能解码。⚠️ 不是「文件坏了」的告警，而是「Vela 显示的不是原样」的
+   交代，所以用警告色而不用错误色，与状态栏那条 lossy 提示同一口径 */
+.shard-flag {
+  flex: 0 0 auto;
+  color: var(--vela-warn);
+}
+
+/* 「这一行太长，取不出来」（`GAP_TEXT`）。整行压成警告色：它是唯一一个
+   Vela 明知内容却没显示的场合，读起来必须与正常行不一样，否则会被当成空行 */
+.shard-row.gap {
+  color: var(--vela-warn);
+}
+
+/* 还没读回来的占位行。压暗即可——它几十毫秒后就会被真内容替换掉，
+   给它任何强调色都会让每次滚动看起来像在闪 */
+.shard-row.pending {
+  color: var(--vela-fg-dim);
+}
+
+/* ---------- Markdown 预览（M3-A-3）---------- */
+
+/* 这一栏是 `.body-row` 的第三个 flex 子项（侧边栏 / 编辑区 / 预览）。
+   `.body` 那边写的是 `flex: 1`，也就是 `1 1 0%`，这里给同一份——于是编辑区与预览
+   **等宽**。不给 `min-width: 0` 的话它拒绝收缩到内容宽以下，一份带长表格的文档
+   会把编辑区整块挤没（与 `.body` 那条注释同一条道理） */
+.md-preview {
+  flex: 1 1 0%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* 不透明：否则 `.body-row` 的分隔线底色会透过来 */
+  background: var(--vela-bg);
+}
+
+/* 头部形状照抄 `.shard-head`：它说的也是「这一栏是什么 + 一句限定」，
+   两处不一致的话用户会以为它们是两种东西 */
+.md-preview-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--vela-border);
+  font-family: var(--vela-font-ui);
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.md-preview-title {
+  flex: 0 0 auto;
+  letter-spacing: 0.5px;
+}
+
+/* 「文档太大，只预览了前面一部分」「X 还没有预览」这类限定。
+   与 `.shard-tail` 同一个形状：能省就省，省不下就截断，绝不折行——
+   折行会把头部撑高，而它的高度是编辑区可用高度的减数 */
+.md-preview-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--vela-warn);
+}
+
+/* 关闭按钮：`margin-left: auto` 把它推到最右（与 `.notice-close` 一致）。
+   ⚠️ 刻意不上底色、不上强调色、不描边——「关掉一个面板」是反向操作，
+   按项目那条口径只给最小视觉重量 */
+.md-preview-close {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 0 4px;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.md-preview-scroll {
+  flex: 1;
+  min-height: 0;
+  /* 横向也留一条：一张宽表格该让这一栏自己滚，而不是把整块预览撑破。
+     ⚠️ 滚动同步只写 `scrollTop`，横向滚不动它 */
+  overflow: auto;
+}
+
+/* ---------- 预览正文的排版 ----------
+
+   ⚠️ 这里**只**给 `.md-preview-body` 底下的标签定样式，一个选择器都不外泄：
+   `render.ts` 输出的每一个字节都进了 `innerHTML`，而 `innerHTML` 里的东西
+   对全局样式是完全敞开的。写成 `h1 { … }` 的话，工具栏、状态栏、命令面板里
+   将来任何一个 `<h1>` 都会被顺带改掉，而那看起来会像是「别的组件坏了」。
+
+   字体分两拨，与编辑器里那条「按内容分字体」（见上面 §代码区字体）完全对齐：
+   散文用 `--vela-font-editor`（文楷 Screen），代码块 / 行内代码 / 表格用
+   `--vela-font-code`（Maple Mono CN）。表格归到代码那一拨是**跟着编辑器走的**——
+   `editor/setup.ts` 的 `CODE_BLOCK_NODES` 里也含着 `Table`，两边不一致的话
+   同一张表在左右两栏里会长得不一样。⚠️ 那条归类本身还欠用户一个决定（#26），
+   改判的话两处要一起改 */
+.md-preview-body {
+  padding: 12px 18px;
+  font-family: var(--vela-font-editor);
+  font-size: var(--vela-font-size);
+  line-height: var(--vela-line-height);
+  color: var(--vela-fg);
+  /* 一条没有空格的超长 URL 不该把整栏撑宽 */
+  overflow-wrap: break-word;
+}
+
+/* 首尾各去掉一次外边距：否则顶上会多出一段空白，而那段空白会让
+   「编辑器第 1 行」与「预览第 1 个块」在同步滚动时永远差一截 */
+.md-preview-body > :first-child {
+  margin-top: 0;
+}
+
+.md-preview-body > :last-child {
+  margin-bottom: 0;
+}
+
+.md-preview-body p {
+  margin: 0 0 0.9em;
+}
+
+.md-preview-body h1,
+.md-preview-body h2,
+.md-preview-body h3,
+.md-preview-body h4,
+.md-preview-body h5,
+.md-preview-body h6 {
+  margin: 1.4em 0 0.6em;
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+/* 只给前两级画那条底线：三级往下再画就把一页纸切成一堆格子了 */
+.md-preview-body h1,
+.md-preview-body h2 {
+  padding-bottom: 0.25em;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.md-preview-body h1 {
+  font-size: 1.6em;
+}
+
+.md-preview-body h2 {
+  font-size: 1.35em;
+}
+
+.md-preview-body h3 {
+  font-size: 1.18em;
+}
+
+.md-preview-body h4 {
+  font-size: 1.06em;
+}
+
+/* 五、六级不再往小走：再小就比正文还难读，而那两级本来就靠上下文区分 */
+.md-preview-body h5,
+.md-preview-body h6 {
+  font-size: 1em;
+  color: var(--vela-fg-dim);
+}
+
+.md-preview-body ul,
+.md-preview-body ol {
+  margin: 0 0 0.9em;
+  padding-left: 1.6em;
+}
+
+.md-preview-body li {
+  margin: 0.2em 0;
+}
+
+/* 嵌套列表不额外加下外边距：三层嵌套下来每层多 0.9em 会散得看不出层级 */
+.md-preview-body li > ul,
+.md-preview-body li > ol {
+  margin-bottom: 0;
+}
+
+/* GFM 任务列表（M3-A-1 渲染，M3-A-5 起可点：点一下把 `[ ]` / `[x]` 写回源文档）。
+   `list-style: none` 是必要的：不写的话复选框前面还挂着一个圆点，
+   两个「状态标记」并排 */
+.md-preview-body li.md-task-item {
+  list-style: none;
+  margin-left: -1.2em;
+}
+
+.md-preview-body .md-task {
+  display: inline-block;
+  width: 0.95em;
+  height: 0.95em;
+  margin-right: 0.45em;
+  border: 1px solid var(--vela-border);
+  border-radius: 2px;
+  /* 与后面那个字的基线对齐；不调的话复选框会浮到行的上半截 */
+  vertical-align: -0.1em;
+  text-align: center;
+  line-height: 0.95em;
+  font-size: 0.85em;
+  /* 它是可点的（`render.ts` 给它的是 `role="checkbox"` + `tabindex="0"`，
+     ⛔ 不是 `<input type="checkbox">`，理由写在那个文件的 `taskMarker` 上）。
+     不给指针的话预览里唯一能点的东西看着像纯装饰 */
+  cursor: pointer;
+}
+
+/* 键盘走到这儿时得看得见。用 `:focus-visible` 而不是 `:focus`：鼠标点完那一下
+   焦点也在这个元素上，而那时再画一圈焦点环只是在告诉用户「你刚点了这里」 */
+.md-preview-body .md-task:focus-visible {
+  outline: 1px solid var(--vela-accent);
+  outline-offset: 1px;
+}
+
+.md-preview-body .md-task[data-checked='true'] {
+  background: var(--vela-accent);
+  border-color: var(--vela-accent);
+  /* 底色是强调色，勾就得用底色那一套的反色，用 --vela-fg 会糊在一起 */
+  color: var(--vela-bg);
+}
+
+.md-preview-body .md-task[data-checked='true']::after {
+  content: '✓';
+}
+
+.md-preview-body blockquote {
+  margin: 0 0 0.9em;
+  padding: 0.2em 0 0.2em 0.9em;
+  border-left: 3px solid var(--vela-border);
+  color: var(--vela-fg-dim);
+}
+
+/* 引用里最后一个块不再带下外边距：否则那条左边框会比文字长出一截，
+   看着像引用还没完 */
+.md-preview-body blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+.md-preview-body pre,
+.md-preview-body code,
+.md-preview-body table {
+  font-family: var(--vela-font-code);
+}
+
+.md-preview-body pre {
+  margin: 0 0 0.9em;
+  padding: 8px 10px;
+  background: var(--vela-bg-alt);
+  border-radius: 3px;
+  overflow-x: auto;
+  /* 代码按行读，行距要比散文紧一点；用编辑器的 1.75 会让十行代码占掉半屏 */
+  line-height: 1.5;
+  font-size: 0.92em;
+}
+
+.md-preview-body code {
+  padding: 0.1em 0.35em;
+  background: var(--vela-bg-alt);
+  border-radius: 3px;
+  font-size: 0.92em;
+}
+
+/* 代码块里的 `code` 不能再套一层底色：`pre` 已经有了，两层叠在一起
+   会在块内画出一个比块还小的方块 */
+.md-preview-body pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  font-size: inherit;
+}
+
+.md-preview-body hr {
+  margin: 1.4em 0;
+  border: none;
+  border-top: 1px solid var(--vela-border);
+}
+
+.md-preview-body a {
+  color: var(--vela-accent);
+  text-decoration: none;
+}
+
+.md-preview-body a:hover {
+  text-decoration: underline;
+}
+
+/* 协议不在白名单里、被 `safeUrl` 拦下来的那一条（render.ts）。
+   用 `--vela-bad` 而不是照常渲染成链接：它长得像链接但点不动，
+   不给标记的话用户会以为是自己点歪了。`cursor: not-allowed` 补上鼠标那一半的说明 */
+.md-preview-body .md-unsafe-link {
+  color: var(--vela-bad);
+  cursor: not-allowed;
+}
+
+/* 本地图片的占位（render.ts 刻意不把 `file:` / 相对路径交给 `<img>`）。
+   虚线下边框 + help 光标：`title` 里写着原始路径，那是它唯一的出口 */
+.md-preview-body .md-img-local {
+  color: var(--vela-fg-dim);
+  border-bottom: 1px dashed var(--vela-border);
+  cursor: help;
+}
+
+.md-preview-body img {
+  max-width: 100%;
+}
+
+.md-preview-body table {
+  margin: 0 0 0.9em;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.md-preview-body th,
+.md-preview-body td {
+  padding: 4px 10px;
+  border: 1px solid var(--vela-border);
+}
+
+.md-preview-body th {
+  background: var(--vela-bg-alt);
+  font-weight: 600;
+}
+
+/* 表格分隔行里那个 `:` 决定的对齐（render.ts 输出 `md-left` / `md-center` / `md-right`）。
+   `th` 与 `td` 都要覆盖：`text-align` 不继承到表格里已经设过值的单元格 */
+.md-preview-body .md-left {
+  text-align: left;
+}
+
+.md-preview-body .md-center {
+  text-align: center;
+}
+
+.md-preview-body .md-right {
+  text-align: right;
+}
+
+.md-preview-body sub,
+.md-preview-body sup {
+  font-size: 0.72em;
 }

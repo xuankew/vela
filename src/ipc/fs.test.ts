@@ -130,11 +130,34 @@ describe('状态栏下拉用的编码组合表', () => {
 })
 
 describe('错误落地成人能读的话', () => {
-  it('too_large 报出两个字节数并指向 M2', () => {
+  it('too_large 报出两个字节数', () => {
     const msg = describeFsError({ kind: 'too_large', bytes: 5_000_000, limit: 4_194_304 })
     expect(msg).toContain('4.8 MB')
     expect(msg).toContain('4 MB')
-    expect(msg).toContain('M2')
+  })
+
+  it('⚠️ too_large 的文案**不再指向任何里程碑**', () => {
+    // 原来那句是「（只读分片模式在 M2）」。M2-H 落地之后它是**错的**：分片模式在了，
+    // 而它自己有 256 MiB 的上限，于是这条错误恰恰是分片模式**也接不住**时才出现的。
+    // 用户看见这一条时唯一能做的事是换个工具，所以文案只说事实、不给一个假指望。
+    // 🔴 这一条钉的是「不要把它改回一个待办」——写成「M3 会支持」的话，
+    // 到了 M3 它就又是一句错话，而没有人会记得回来删
+    const msg = describeFsError({ kind: 'too_large', bytes: 300 * 1048576, limit: 256 * 1048576 })
+    expect(msg).toContain('300.0 MB')
+    expect(msg).toContain('256 MB')
+    expect(msg).not.toContain('M2')
+    expect(msg).not.toContain('M3')
+  })
+
+  it('⚠️ unsupported_encoding 说的是**编码**，不是大小', () => {
+    // 对照 Rust 侧 `ReadError` 的 `Display`（`crates/vela-core/src/fs/read.rs`）。
+    // 这一条只有 `open_large` 会产出，而它是「UTF-16 的大文件」唯一的出口：
+    // 文案要是让人以为是文件坏了或者太大了，用户会去试「换个更小的文件」，
+    // 而真正的原因是编码——一个 5 MB 的 UTF-16 文件同样打不开
+    const msg = describeFsError({ kind: 'unsupported_encoding', encoding: 'utf16_le', bytes: 5_000_000 })
+    expect(msg).toContain('UTF-16 LE')
+    expect(msg).toContain('分片模式不支持')
+    expect(msg).not.toContain('MB')
   })
 
   it('directory / no_parent 带上路径', () => {

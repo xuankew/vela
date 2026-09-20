@@ -12,7 +12,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
  * 晚到的结果什么时候落地由 import 决定，不闸住的话那条用例就是掷硬币——过与不过都说明不了什么。
  */
 
-const { ipc, dialog, lazyLoad } = vi.hoisted(() => ({
+const { ipc, dialog, lazyLoad, shardIpc, shardFactory } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn(),
     saveFile: vi.fn(),
@@ -21,10 +21,17 @@ const { ipc, dialog, lazyLoad } = vi.hoisted(() => ({
   },
   dialog: { open: vi.fn(), save: vi.fn() },
   lazyLoad: { held: false, parked: [] as (() => void)[], landings: [] as (LanguageSupport | null)[] },
+  shardIpc: { openLarge: vi.fn(), closeLarge: vi.fn() },
+  // 🔴 `createShardView` 要 mock 掉：它建好就**立刻**要第一页，而上面那个 `shardIpc`
+  // 替身里没有 `readLines`，真跑起来是一条没人接的 rejection。
+  // 这一层只关心「谁在什么时候调了 dispose」，替身足够
+  shardFactory: { createShardView: vi.fn() },
 }))
 
 vi.mock('../ipc/fs', () => ipc)
 vi.mock('@tauri-apps/plugin-dialog', () => dialog)
+vi.mock('../ipc/shard', () => shardIpc)
+vi.mock('./shardView', () => shardFactory)
 vi.mock('../editor/language', async (importOriginal) => {
   const real = await importOriginal<typeof import('../editor/language')>()
   return {
@@ -54,11 +61,14 @@ import type { LanguageChoice } from '../editor/language'
 import { codeFontBySyntax, indentLabel, lineWrapEnabled } from '../editor/setup'
 import { completeWords, wordPeers } from '../editor/wordSource'
 import type { TextFile, WriteReport } from '../ipc/fs'
+import type { ShardHeader } from '../ipc/shard'
 import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
+import type { ShardView } from './shardView'
 import { tabText } from './tab'
 import {
   createWorkspace,
   MAX_PANES,
+  MAX_RECENT,
   type DiscardDecision,
   type DiscardPrompt,
   type SplitDirection,
@@ -204,6 +214,8 @@ beforeEach(() => {
   dialog.save.mockReset()
   ipc.openFile.mockResolvedValue(textFile())
   ipc.saveFile.mockResolvedValue(OK_REPORT)
+  shardIpc.openLarge.mockReset()
+  shardFactory.createShardView.mockReset()
   // 闸门是模块级的，不复位的话某条用例闸住了会一路漏到后面的用例里
   lazyLoad.held = false
   lazyLoad.parked.length = 0
@@ -462,6 +474,225 @@ describe('openAt：文件落到哪个标签', () => {
     expect(pane.ws.activeTab().doc.notice()?.level).toBe('error')
     expect(pane.doc).toBe('')
     expect(tabText(pane.ws.tabs()[0]!)).toBe('手稿')
+  })
+})
+
+/**
+ * M2-E-3：MRU（最近打开过的文件）。
+ *
+ * 规矩是「**一个带路径的文档成为用户正在看的那一个**就记一笔」，于是有四个入口：
+ * `openAt` 的两条真开分支、`activateTab`、`save` / `saveAs`。这里逐个钉住——
+ * 漏掉任何一个的表现都是**静默的**：那个文件永远排不进 `Cmd+P` 的前排，
+ * 而没有任何一处会报错，用户只会觉得「这个编辑器记不住我用过什么」。
+ */
+describe('M2-E-3：MRU', () => {
+  it('上限与 Rust 侧 project::index::MAX_RECENT 同值', () => {
+    // 两边各钉一次这个数字（那边是 `最近清单的长度上限与前端同值`）：
+    // 前端按它裁清单，Rust 按它兜住「前端没裁」。改一边不改另一边就会有一侧变红
+    expect(MAX_RECENT).toBe(50)
+  })
+
+  it('起始是空的：一个未命名文档不算「打开过文件」', () => {
+    const pane = mounted()
+    expect(pane.ws.recent()).toEqual([])
+  })
+
+  it('openAt 成功之后记一笔', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    expect(pane.ws.recent()).toEqual(['/a.txt'])
+  })
+
+  it('活动标签脏时走「新建一个标签」那条路，同样记', async () => {
+    const pane = mounted()
+    pane.type('手稿')
+    await pane.ws.openAt('/a.txt')
+    expect(pane.ws.tabs()).toHaveLength(2)
+    expect(pane.ws.recent()).toEqual(['/a.txt'])
+  })
+
+  it('⚠️ openAt 失败时不记：判据是 doc.path()，不是那个形参', async () => {
+    const pane = mounted()
+    ipc.openFile.mockRejectedValue({ kind: 'not_found', path: '/gone.txt' })
+
+    await pane.ws.openAt('/gone.txt')
+
+    // 记了它的后果是 `Cmd+P` 的前排顶着一个打不开的路径，
+    // 用户回车之后只得到一条「找不到文件」
+    expect(pane.ws.recent()).toEqual([])
+    expect(pane.ws.activeTab().doc.notice()?.level).toBe('error')
+  })
+
+  it('切标签把切过去的那个顶到最前', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    await pane.ws.openAt('/b.txt')
+    expect(pane.ws.recent()).toEqual(['/b.txt', '/a.txt'])
+
+    pane.ws.activateTab(pane.ws.tabs()[0]!.id)
+
+    expect(pane.ws.recent()).toEqual(['/a.txt', '/b.txt'])
+  })
+
+  it('标签已经在另一块分屏里显示时，聚焦那块也算「切过去了」', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    const left = pane.ws.activeTab()
+    const leftPane = pane.ws.panes()[0]!.id
+    pane.splitPane()
+    await pane.ws.openAt('/b.txt')
+    expect(pane.ws.recent()).toEqual(['/b.txt', '/a.txt'])
+
+    pane.ws.activateTab(left.id)
+
+    expect(pane.ws.recent()).toEqual(['/a.txt', '/b.txt'])
+    // 而它没有被搬过来：仍然显示在左边那块分屏里（不变量 2）
+    expect(pane.ws.focusedPaneId()).toBe(leftPane)
+  })
+
+  it('同一个文件被看第二次时提到最前，不留两份', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    await pane.ws.openAt('/b.txt')
+    await pane.ws.openAt('/c.txt')
+
+    pane.ws.activateTab(pane.ws.tabs()[0]!.id)
+
+    expect(pane.ws.recent()).toEqual(['/a.txt', '/c.txt', '/b.txt'])
+    expect(new Set(pane.ws.recent()).size).toBe(3)
+  })
+
+  it('未命名文档不进 MRU：它没有路径可记', () => {
+    const pane = mounted()
+    pane.type('手稿')
+    const unnamed = pane.ws.activeTab()
+    pane.ws.newTab()
+
+    pane.ws.activateTab(unnamed.id)
+
+    expect(pane.ws.recent()).toEqual([])
+  })
+
+  it('已经排在第一时一个字节都不写', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    const before = pane.ws.recent()
+
+    pane.ws.activateTab(pane.ws.activeTab().id)
+
+    // 比的是**同一个数组对象**：`remember` 每次写都造一个新数组，所以引用没变
+    // == signal 没被写过 == 会话自动保存的节流器没被白捅一下。
+    // ⌘S 与切标签都是高频动作，这条不是洁癖
+    expect(pane.ws.recent()).toBe(before)
+  })
+
+  it('⌘S 一个已经排在第一的文档也不写', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    pane.type('改')
+    const before = pane.ws.recent()
+
+    await pane.ws.save()
+
+    expect(pane.ws.recent()).toBe(before)
+  })
+
+  it('新建 → 另存为：路径是在这一趟里才出现的，也要记', async () => {
+    const pane = mounted()
+    pane.type('手稿')
+    dialog.save.mockResolvedValue('/out/notes.md')
+
+    await pane.ws.saveAs()
+
+    // 这个文件从来没有被 openAt 过，而标签早就是活动的那个（`activateTab` 不会再来一次）。
+    // 不在 saveAs 里补一笔，它就永远进不了 MRU
+    expect(pane.ws.recent()).toEqual(['/out/notes.md'])
+  })
+
+  it('未命名文档的 save 落到另存为，同样记', async () => {
+    const pane = mounted()
+    pane.type('手稿')
+    dialog.save.mockResolvedValue('/out/notes.md')
+
+    await pane.ws.save()
+
+    expect(pane.ws.recent()).toEqual(['/out/notes.md'])
+  })
+
+  it('另存为被取消时不记', async () => {
+    const pane = mounted()
+    pane.type('手稿')
+    dialog.save.mockResolvedValue(null)
+
+    await pane.ws.saveAs()
+
+    expect(pane.ws.recent()).toEqual([])
+    expect(pane.ws.activeTab().doc.path()).toBeNull()
+  })
+
+  it('已有路径的文档另存为到新位置：记的是新路径', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    dialog.save.mockResolvedValue('/copy.txt')
+
+    await pane.ws.saveAs()
+
+    expect(pane.ws.activeTab().doc.path()).toBe('/copy.txt')
+    expect(pane.ws.recent()).toEqual(['/copy.txt', '/a.txt'])
+  })
+
+  it('超出上限时最老的那个被挤掉', async () => {
+    const pane = mounted()
+    for (let i = 0; i < MAX_RECENT + 5; i += 1) {
+      await pane.ws.openAt(`/f${i}.txt`)
+    }
+
+    const list = pane.ws.recent()
+    expect(list).toHaveLength(MAX_RECENT)
+    expect(list[0]).toBe(`/f${MAX_RECENT + 4}.txt`)
+    expect(list[MAX_RECENT - 1]).toBe('/f5.txt')
+    // 最老的五条被挤出去了，而它们的标签还在标签条上——MRU 不是标签清单
+    expect(list).not.toContain('/f0.txt')
+    expect(pane.ws.tabs()).toHaveLength(MAX_RECENT + 5)
+  })
+
+  it('serializeSession 把整份清单带上', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    await pane.ws.openAt('/b.txt')
+
+    expect(pane.ws.serializeSession().recent).toEqual(['/b.txt', '/a.txt'])
+  })
+
+  it('restoreSession 装回来，顺序一字不动', async () => {
+    const source = mounted()
+    await source.ws.openAt('/a.txt')
+    await source.ws.openAt('/b.txt')
+    const saved = source.ws.serializeSession()
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    // 恢复走的是 `doc.openAt` 而不是 `ws.openAt`，所以它不会顺手记 MRU——
+    // 要是记了，「上次最后在看的」会被恢复过程自己顶成「最先恢复的那个」
+    expect(fresh.ws.recent()).toEqual(saved.recent)
+    expect(fresh.ws.recent()).toEqual(['/b.txt', '/a.txt'])
+  })
+
+  it('恢复时只夹长度，不去重也不校验路径存不存在', async () => {
+    const source = mounted()
+    const filler = Array.from({ length: MAX_RECENT }, (_, i) => `/tmp/f${i}.txt`)
+    // 52 条、带一对重复、全是磁盘上根本不存在的路径
+    const handMade = { ...source.ws.serializeSession(), recent: ['/dup.txt', '/dup.txt', ...filler] }
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(handMade)
+
+    expect(fresh.ws.recent()).toHaveLength(MAX_RECENT)
+    expect(fresh.ws.recent()[0]).toBe('/dup.txt')
+    // 重复的那一对原样留着：去重是 `remember` 在写入侧维护的不变量，
+    // 恢复时再实现一遍就是第二份会漂的抄写
+    expect(fresh.ws.recent().filter((p) => p === '/dup.txt')).toHaveLength(2)
   })
 })
 
@@ -1342,9 +1573,19 @@ describe('M1-F-4：会话序列化与恢复', () => {
   }
 
   function sessionOf(tabs: SessionTab[], overrides: Partial<Session> = {}): Session {
-    // `project: null` 是基底的一部分：这些用例都只关心标签页那一半，
-    // 而 `Partial<Session>` 里它是可选的——不写死一个值，展开之后类型就成了 `| undefined`
-    return { version: SESSION_VERSION, direction: 'row', focused: 0, tabs, panes: [0], project: null, ...overrides }
+    // `project: null` 与 `recent: []` 是基底的一部分：这些用例大多只关心标签页那一半，
+    // 而 `Partial<Session>` 里它们是可选的——不写死一个值，展开之后类型就成了 `| undefined`
+    return {
+      version: SESSION_VERSION,
+      direction: 'row',
+      focused: 0,
+      tabs,
+      panes: [0],
+      project: null,
+      recent: [],
+      recentProjects: [],
+      ...overrides,
+    }
   }
 
   /**
@@ -1743,5 +1984,212 @@ describe('M2-D-4c：全局替换之后的对账', () => {
     // 都会凭空变脏，关窗时的「有未保存的改动」就是这么来的
     expect(pane.ws.activeTab().doc.dirty()).toBe(false)
     expect(pane.ws.anyDirty()).toBe(false)
+  })
+})
+
+/**
+ * M2-H：只读分片标签在 workspace 这一层要做的四件事。
+ *
+ * 分片自己的状态机（窗口 → 请求哪几页、缓存、缺口）在 `shardView.test.ts` 里，
+ * 「什么时候该走分片」在 `document.test.ts` 里。这里只钉**生命周期**：
+ * 那个 fd 是 Vela 里唯一一个「不调 `dispose` 就会漏」的资源，而三处收尾
+ * （关标签、关窗、换掉整批标签）全在这一层。漏了不报错，只是每关一个大文件
+ * 就在 Rust 那边的句柄表上留一条永远不会被读也不会被关的记录。
+ *
+ * ⚠️ 存档那一半同样要紧，而且它的失败方式是**安静的**：分片标签的 CM6 buffer 是空的，
+ * 一旦被当成草稿存进去，恢复出来就是一个「正文为空」的内联标签——
+ * 用户看到的是一个 100 MB 的日志显示成空文件。
+ */
+describe('M2-H：只读分片标签', () => {
+  const SHARD_HEADER: ShardHeader = {
+    totalLines: 1_200_000,
+    bytes: 104_857_600,
+    encoding: 'utf8',
+    bom: false,
+    eol: 'lf',
+    lossy: false,
+  }
+
+  /**
+   * 让**指定路径**走分片那条路（`open_file` 撞 too_large → `open_large`），
+   * 其余路径照旧走内联——于是同一个用例里可以既有分片标签又有普通标签。
+   */
+  function shardPath(path: string, header: Partial<ShardHeader> = {}) {
+    const full: ShardHeader = { ...SHARD_HEADER, ...header }
+    const dispose = vi.fn()
+    const view = { dispose } as unknown as ShardView
+    ipc.openFile.mockImplementation(async (target: string) => {
+      // 抛的**就是**那个普通对象，不是 Error 实例：Tauri 的 invoke 在 Rust command
+      // 返回 Err 时拒绝的正是这个序列化结果，`document.ts` 也靠 `kind` 字面量认它
+      // （同一份理由在上面的『一个文件读不回来不影响其余标签』里写过一遍）
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      if (target === path) throw { kind: 'too_large', bytes: full.bytes, limit: 4_194_304 }
+      return textFile()
+    })
+    shardIpc.openLarge.mockResolvedValue({ handle: 3, header: full })
+    shardFactory.createShardView.mockReturnValue(view)
+    return { view, dispose }
+  }
+
+  it('关掉标签时把分片收掉', async () => {
+    const pane = mounted()
+    const fake = shardPath('/var/log/huge.log')
+    await pane.ws.openAt('/var/log/huge.log')
+    expect(pane.ws.activeTab().doc.shard()).toBe(fake.view)
+    const id = pane.ws.activeTab().id
+
+    // 得先有第二个标签：只剩一个时 closeTab 是空操作（编辑器至少要有一个标签）
+    pane.ws.newTab()
+    await pane.ws.closeTab(id)
+
+    expect(fake.dispose).toHaveBeenCalledTimes(1)
+    expect(pane.ws.tabs().some((t) => t.id === id)).toBe(false)
+  })
+
+  /*
+   * 🔴 `dropTab` 里那两步的**顺序**：先把标签从表里摘掉，再还 fd。
+   *
+   * 反过来（`releaseShard()` 在前）会在两步之间露出一段「`shard()` 已经是 null、
+   * 而标签还在 `tabs()` 里」的现场。两个后果，都是安静的：
+   *
+   * - `fileWatch.currentPaths()` 会把它当成一个普通内联标签，清单白白多出这条路径，
+   *   Rust 侧订一次目录又立刻退订（那半边在 `fileWatch.test.ts` 里钉着）
+   * - 更要紧的是同一段窗口里真来了一条外部改动事件：`onEvent` 看见的是「干净的内联标签」，
+   *   于是 `reload` → 撞 too_large → **再开一个分片**，而那个新 fd 挂在一个已经被摘掉的
+   *   标签上，`dispose` 永远不会被调到
+   */
+  it('还 fd 那一刻，标签已经不在表里、也不再被任何分屏显示', async () => {
+    const pane = mounted()
+    const fake = shardPath('/var/log/huge.log')
+    await pane.ws.openAt('/var/log/huge.log')
+    const id = pane.ws.activeTab().id
+    // 得先有第二个标签：只剩一个时 closeTab 是空操作
+    pane.ws.newTab()
+
+    let stillListed = true
+    let stillShown = true
+    fake.dispose.mockImplementation(() => {
+      stillListed = pane.ws.tabs().some((t) => t.id === id)
+      stillShown = pane.ws.panes().some((p) => p.tabId() === id)
+    })
+
+    await pane.ws.closeTab(id)
+
+    expect(fake.dispose).toHaveBeenCalledTimes(1)
+    expect(stillListed).toBe(false)
+    // 显示也先停：反过来就是那块分屏还在渲染一个 fd 已经关掉的视图，
+    // 而它的读页一律回 null——滚到哪儿都是「加载中」，并且不报错
+    expect(stillShown).toBe(false)
+  })
+
+  /*
+   * 这一条钉的是「不渲染那两格」之外的第二道防线：分片标签**永远不脏**，
+   * 于是关闭确认压根不会为它弹一次。反过来一旦有人给它加了一条会标脏的路径
+   * （最现成的就是状态栏那两个 <select>），用户会掉进一个出不来的循环：
+   * 问「要不要保存」→ save 在分片上一律拒绝 → 标签关不掉
+   */
+  it('永远不脏：关闭确认压根不会为它弹一次', async () => {
+    const asked: string[][] = []
+    const pane = mounted({
+      promptDiscard: async (names) => {
+        asked.push(names)
+        return 'discard'
+      },
+    })
+    shardPath('/var/log/huge.log')
+    await pane.ws.openAt('/var/log/huge.log')
+
+    expect(pane.ws.activeTab().doc.dirty()).toBe(false)
+    expect(pane.ws.anyDirty()).toBe(false)
+    expect(await pane.ws.requestWindowClose()).toBe(true)
+    expect(asked).toEqual([])
+  })
+
+  it('存档里只有路径、没有草稿：正文压根不在内存里，存下来的只会是那个空 buffer', async () => {
+    const pane = mounted()
+    shardPath('/var/log/huge.log')
+    await pane.ws.openAt('/var/log/huge.log')
+
+    const session = pane.ws.serializeSession()
+    const saved = session.tabs.find((t) => t.path === '/var/log/huge.log')!
+
+    // 🔴 draft 必须是 null。恢复时「干净 + 有路径」那一支会重新读盘，
+    // 于是又撞一次 too_large、又变回一个分片——存档格式一个字都不用改
+    expect(saved.draft).toBeNull()
+    expect(saved.dirty).toBe(false)
+    expect(saved.lossy).toBe(false)
+  })
+
+  it('从存档恢复：只有路径也够，恢复出来还是一个分片', async () => {
+    const pane = mounted()
+    shardPath('/var/log/huge.log')
+    await pane.ws.openAt('/var/log/huge.log')
+    const session = pane.ws.serializeSession()
+
+    const next = mounted()
+    const again = shardPath('/var/log/huge.log')
+    await next.ws.restoreSession(session)
+
+    expect(next.ws.activeTab().doc.path()).toBe('/var/log/huge.log')
+    expect(next.ws.activeTab().doc.shard()).toBe(again.view)
+    expect(next.ws.activeTab().doc.dirty()).toBe(false)
+  })
+
+  it('restoreSession 换掉整批标签之前，先把旧的分片收掉', async () => {
+    const pane = mounted()
+    const fake = shardPath('/var/log/huge.log')
+    await pane.ws.openAt('/var/log/huge.log')
+
+    // 换一份只含普通文件的存档：整批标签被换掉，那个 fd 不会自己消失
+    const other = mounted()
+    await other.ws.openAt('/x/a.txt')
+    await pane.ws.restoreSession(other.ws.serializeSession())
+
+    expect(fake.dispose).toHaveBeenCalledTimes(1)
+    expect(pane.ws.activeTab().doc.shard()).toBeNull()
+  })
+
+  it('requestWindowClose：答「可以关」才收，答「取消」时那些分片还得继续用', async () => {
+    // 得有一个脏标签，确认才会弹出来；分片标签自己永远不会是那个理由
+    const cancelled = mounted({ promptDiscard: async () => 'cancel' })
+    const first = shardPath('/var/log/huge.log')
+    await cancelled.ws.openAt('/var/log/huge.log')
+    cancelled.ws.newTab()
+    await cancelled.ws.openAt('/x/a.txt')
+    cancelled.type('改')
+
+    expect(await cancelled.ws.requestWindowClose()).toBe(false)
+    // 用户还要接着用这个窗口。收了的话面板会停在一个死视图上：
+    // fd 已经关了，读页一律回 null，滚到哪儿都是空的，而且不报错
+    expect(first.dispose).not.toHaveBeenCalled()
+    expect(cancelled.ws.tabs()[0]!.doc.shard()).toBe(first.view)
+
+    const going = mounted({ promptDiscard: async () => 'discard' })
+    const second = shardPath('/var/log/huge.log')
+    await going.ws.openAt('/var/log/huge.log')
+    going.ws.newTab()
+    await going.ws.openAt('/x/b.txt')
+    going.type('也改')
+
+    expect(await going.ws.requestWindowClose()).toBe(true)
+    expect(second.dispose).toHaveBeenCalledTimes(1)
+  })
+
+  it('两块分屏各显示一个分片：关掉其中一块只收那一个', async () => {
+    const pane = mounted()
+    const first = shardPath('/var/log/a.log')
+    await pane.ws.openAt('/var/log/a.log')
+    const firstId = pane.ws.activeTab().id
+
+    pane.ws.split('row')
+    const second = shardPath('/var/log/b.log')
+    await pane.ws.openAt('/var/log/b.log')
+
+    expect(pane.ws.tabs()).toHaveLength(2)
+    await pane.ws.closeTab(firstId)
+
+    expect(first.dispose).toHaveBeenCalledTimes(1)
+    expect(second.dispose).not.toHaveBeenCalled()
+    expect(pane.ws.activeTab().doc.shard()).toBe(second.view)
   })
 })

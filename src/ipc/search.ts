@@ -128,11 +128,26 @@ export interface SearchHit {
 export interface SearchFile {
   /**
    * 相对 root 的路径，与 `DirEntry.rel` 同一套规矩：`/` 分隔、不以 `/` 开头或结尾。
-   * 拿它去树上定位，也拿它当分组标题
+   * 拿它去树上定位，也拿它当分组标题。
+   *
+   * ⚠️ 多根之下 `rel` **不再唯一**：两个根里可以都有 `src/a.ts`。
+   * 分组、行键、去重都必须带上 `rootIndex`
    */
   rel: string
   /** 绝对路径，交给 `openFile` 用。⚠️ 不要自己用 root + rel 拼，这一份就是拼好的 */
   path: string
+  /**
+   * 这条命中属于 `roots` 里的第几个根（M2-F）。**总是存在**，单根时恒为 `0`。
+   *
+   * ⚠️ 刻意不给 `?`：可选的话前端每一处读它都得写 `?? 0`，而那条兜底规则一旦漏写，
+   * 失败方式是「多根工作区里点结果打开了另一个根里的同名文件」——安静得几乎查不到。
+   * 省下的那点 payload（每个命中文件约 12 字节）换不来这个。
+   *
+   * ⚠️ 也**不要**用 `path` 去掉末尾的 `rel` 反推出根：M2-A 定下的规矩是
+   * 「前端永远不需要做路径拼接」，反推是同一件事的镜像，同样会在大小写不敏感的
+   * 文件系统上、在符号链接上出错
+   */
+  rootIndex: number
   hits: SearchHit[]
   /** 这个文件的命中被单文件上限截断了：UI 要说「还有更多」 */
   truncated: boolean
@@ -195,11 +210,13 @@ export type SearchError =
   /**
    * `replace` 模板里的 `$` 用法不支持（M2-D）。
    *
-   * ⚠️ 替换与搜索**共用这一个错误类型**，因为两边共用同一份 `prepare`：
-   * 坏正则、坏 glob、坏 root 三种拒法在 `start_search` 与 `start_replace` 上是同一套，
-   * 只有 `bad_replacement` 是替换那边独有的（纯搜索压根不看 `replace`）
+   * ⚠️ 替换与搜索**共用这一个错误类型**，因为两边共用同一份编译（Rust 侧的
+   * `check_root` + `compile`）：坏正则、坏 glob、坏 root 三种拒法在 `start_search`
+   * 与 `start_replace` 上是同一套，只有 `bad_replacement` 是替换那边独有的
+   * （纯搜索压根不看 `replace`）
    */
   | { kind: 'bad_replacement'; message: string }
+  /** ⚠️ 多根之下 `path` 指的是**那一个**不合法的根，不是整个工作区 */
   | { kind: 'bad_root'; path: string }
   | { kind: 'not_found'; path: string }
 
@@ -262,14 +279,21 @@ export function describeSearchError(err: unknown): string {
 /**
  * 起一次全文搜索，**立刻**拿到 `taskId`。结果走 event，见文件头那张图。
  *
- * @param root dialog（`directory: true`）给的绝对路径
+ * @param roots 工作区里挂着的全部文件夹，都是 dialog（`directory: true`）给的绝对路径。
+ *   ⚠️ **一次搜索覆盖全部根**，回来的是一个 taskId、一份总账：每条命中的 `rootIndex`
+ *   是这个数组的下标。空数组是合法的（Rust 侧回一份全零总账），但 UI 不该走到那儿——
+ *   没有打开任何文件夹时搜索面板压根不给发起，见 `src/search/store.ts`
  * @param query 只有 `pattern` 是必填的，其余五个字段缺 key 时 Rust 侧落到默认值
  *   （那边有一条 `只发_pattern_的搜索条件也能解析` 钉住这份宽容）
  *
+ * ⚠️ **有一个根不合法就整次 reject**，`bad_root` / `not_found` 的 `path` 是那一个根。
+ * 拔掉的移动硬盘会被说出来，而不是被静默跳过——跳过的话用户看到的是「找不到某个文件」，
+ * 而那与「这个文件不存在」在界面上长得一模一样。
+ *
  * ⚠️ **调用之前必须先挂上监听器**，见 [`attachSearchListeners`]。
  */
-export function startSearch(root: string, query: SearchQuery): Promise<string> {
-  return invoke<string>('start_search', { root, query })
+export function startSearch(roots: string[], query: SearchQuery): Promise<string> {
+  return invoke<string>('start_search', { roots, query })
 }
 
 // 取消不在这个文件里：M2-D 之后搜索与替换共用同一个 `cancel_task` 命令，
@@ -295,8 +319,8 @@ export interface SearchHandlers {
  * 而 `listen` 本身是异步的。要是写成
  *
  * ```ts
- * const id = await startSearch(root, query)   // 事件从这一刻就开始发
- * await listen(SEARCH_BATCH_EVENT, …)         // 这中间到达的批次**永久丢失**
+ * const id = await startSearch(roots, query)   // 事件从这一刻就开始发
+ * await listen(SEARCH_BATCH_EVENT, …)          // 这中间到达的批次**永久丢失**
  * ```
  *
  * 丢掉的是**最前面**那几批，也就是用户最先看到的那些结果——表现是「搜索结果少了开头

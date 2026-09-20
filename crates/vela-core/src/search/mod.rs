@@ -11,8 +11,8 @@
 //!
 //! | 共用什么 | 在哪 | 不共用的话会怎样 |
 //! |---|---|---|
-//! | 走哪些文件 | `run::walk_files` | 用户批准的是一份清单，改的是另一份 |
-//! | 用哪台匹配机 + 哪份模板 | `run::prepare` 一次编出来，成对旅行 | 模板里的组号是按另一台匹配机校验的，`caps.get(n)` 安静地返回 `None`，两万处各插进一个空串 |
+//! | 走哪些文件 | `run::walk_files`（搜索专属的过滤器）＋ `project::walk::each_file`（遍历那一圈循环） | 用户批准的是一份清单，改的是另一份 |
+//! | 用哪台匹配机 + 哪份模板 | `run::compile` 一次编出来，成对旅行 | 模板里的组号是按另一台匹配机校验的，`caps.get(n)` 安静地返回 `None`，两万处各插进一个空串 |
 //! | 怎么展开一行 | `query::Template::expand_line` | 预览显示的和写进去的不是同一个字符串 |
 //!
 //! 三样都不是「靠约定保持一致」，而是**结构上只有一份实现**。而「只有一份」这件事本身
@@ -25,6 +25,11 @@
 //! `grep-searcher` 负责「按行扫正文」。本模块把它们接成一条**流式**的搜索。
 //!
 //! ## ⚠️ 这里按 .gitignore 过滤，而文件树不过滤——方向刻意相反
+//!
+//! 这一条与下面那条符号链接的规则都不写在本模块里，而是写在 `project::walk` 那一圈
+//! 共用的遍历上：M2-E 的 `Cmd+P` 文件索引是它的第三个消费者，共用同一个函数换来的是
+//! 「浮层里跳得到的文件」与「搜索搜得到的文件」结构上是同一批。
+//! **改那五条设置等于同时改这两个功能**，而它们各自的测试都不会告诉你另一边跟着变了。
 //!
 //! `project::tree` 的模块文档里写着「不按 .gitignore 过滤」，本模块恰恰相反，
 //! 而且两边各有一条钉住自己方向的测试（那边是 `gitignore_命中的条目照常列出`，
@@ -41,8 +46,8 @@
 //! 树放行链接是因为「展开一层」的成本有限，而 pnpm 的 `node_modules` 整个是符号链接搭的，
 //! 挡住它等于让本项目不能用。搜索要读正文，跟着链接走会把同一个包读几十遍，
 //! 还可能成环（`WalkBuilder` 有环检测，但代价是每次都要比 inode）。
-//! 所以这里 `follow_links(false)`，并且只搜 `file_type().is_file()` 的条目——
-//! 链接自己的 `file_type` 既不是 file 也不是 dir，于是被一并跳过。
+//! 所以 `project::walk` 里配的是 `follow_links(false)`，并且只搜 `file_type().is_file()`
+//! 的条目——链接自己的 `file_type` 既不是 file 也不是 dir，于是被一并跳过。
 //!
 //! ## 为什么是流式，以及批次多大
 //!
@@ -134,8 +139,10 @@ mod replace;
 mod run;
 
 pub use query::{SearchError, SearchQuery};
-pub use replace::{apply, preflight_apply, ReplaceProgress, ReplaceRequest, ReplaceSummary};
+pub use replace::{
+    apply, apply_roots, preflight_apply, preflight_apply_roots, ReplaceProgress, ReplaceRequest, ReplaceSummary,
+};
 pub use run::{
-    preflight, search, MatchRange, SearchBatch, SearchFile, SearchHit, SearchSummary, MAX_FILE_BYTES, MAX_HITS,
-    MAX_HITS_PER_FILE,
+    preflight, preflight_roots, search, search_roots, MatchRange, SearchBatch, SearchFile, SearchHit, SearchSummary,
+    MAX_FILE_BYTES, MAX_HITS, MAX_HITS_PER_FILE,
 };
