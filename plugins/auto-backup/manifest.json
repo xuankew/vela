@@ -1,0 +1,25 @@
+{
+  "name": "auto-backup",
+  "displayName": "自动备份",
+  "version": "1.0.0",
+  "description": "保存文件时自动创建备份到 ~/.vela/backups/",
+  "author": "Vela Team",
+  "minVelaVersion": "1.0.0",
+  "activationEvents": [
+    "onStartup"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "autoBackup.toggle",
+        "title": "切换自动备份开关",
+        "category": "工具"
+      },
+      {
+        "id": "autoBackup.list",
+        "title": "列出备份文件",
+        "category": "工具"
+      }
+    ]
+  }
+}

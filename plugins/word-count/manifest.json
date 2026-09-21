@@ -1,0 +1,20 @@
+{
+  "name": "word-count",
+  "displayName": "字数统计",
+  "version": "1.0.0",
+  "description": "统计当前文档的字数、字符数和行数，在状态栏显示",
+  "author": "Vela Team",
+  "minVelaVersion": "1.0.0",
+  "activationEvents": [
+    "onCommand:wordCount.show"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "id": "wordCount.show",
+        "title": "显示字数统计",
+        "category": "工具"
+      }
+    ]
+  }
+}
