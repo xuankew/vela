@@ -62,6 +62,7 @@ const FILE_CHANGED: &str = "vela://file-changed";
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::UpdaterBuilder::new().build())
         // M2-C 起的 `taskId → 取消标志` 注册表，M2-D 的替换与搜索**共用这一份**。
         // 见 `commands::TaskRegistry`
         .manage(commands::TaskRegistry::default())

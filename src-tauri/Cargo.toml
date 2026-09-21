@@ -28,6 +28,8 @@ base64 = "0.22"
 # 原生「打开 / 另存为」对话框。用 JS 侧的 plugin-dialog 调用（前端本来就需要拿到路径
 # 去做窗口标题、脏标记与后续保存），所以 Rust 侧只需要把插件注册进 Builder。
 tauri-plugin-dialog = "2"
+# M6 自动更新：Tauri updater 插件，用于检查/下载/安装新版本
+tauri-plugin-updater = "2"
 # 右键菜单的「删除」= 移到废纸篓（M2-B-5）。许可证已核实（闭源硬约束，见 PLAN.md）：
 # trash 5.2.9 = MIT。macOS 那一侧走 objc2/cocoa-foundation，Linux 走 D-Bus 或 CLI，
 # 而 CI 的 rust job 在 ubuntu 上只**编译**它——`trash::delete` 是系统调用，

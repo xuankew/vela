@@ -1,0 +1,8 @@
+name = "vela-updater"
+main = "index.ts"
+compatibility_date = "2024-01-01"
+
+# Cloudflare R2 bucket binding
+[[r2_buckets]]
+binding = "UPDATES"
+bucket_name = "vela-updates"
