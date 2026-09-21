@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  *
  * sanitize / 写穿队列 / CSS 变量那一半在 `./store.test.ts` 里钉过了。这里测五件事：
  * **打开与关闭**（按钮 toggle、Esc、点外面）、**画出来的读数对不对得上 store**、
- * **步进器与 select 落到对的 mutator 上**、**恢复默认把五项都打回内置默认**、
+ * **步进器与 select 落到对的 mutator 上**、**恢复默认把六项都打回内置默认**、
  * **a11y 属性**（aria-haspopup / aria-expanded / role=dialog）。
  *
  * ⚠️ 用**真的** store（只 mock IPC 与字体注入），不用手搓的假对象：这一层的全部职责就是
@@ -39,6 +39,7 @@ vi.mock('../fonts/loader', async (importOriginal) => ({
 import { DEFAULT_CODE_FONT, DEFAULT_VARIANT } from '../fonts/loader'
 import { AppearancePopover } from './AppearancePopover'
 import { createSettingsStore, DEFAULT_FONT_SIZE, type SettingsStore } from './store'
+import { DEFAULT_THEME } from './theme'
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -127,10 +128,10 @@ describe('打开与关闭', () => {
     expect(pop()).toBeNull()
   })
 
-  it('打开时焦点落到第一个控件（字号 select）', async () => {
+  it('打开时焦点落到第一个控件（主题 select）', async () => {
     click(toggle())
     await flush()
-    expect(document.activeElement).toBe(selectByTitle('字号'))
+    expect(document.activeElement).toBe(row('主题').querySelector('select'))
   })
 })
 
@@ -155,6 +156,13 @@ describe('读数对得上 store', () => {
     expect(selectByTitle('字号').value).toBe(String(DEFAULT_FONT_SIZE))
     expect(selectByTitle('正文与 UI 字体').value).toBe(DEFAULT_VARIANT)
     expect(selectByTitle('代码区字体').value).toBe(DEFAULT_CODE_FONT)
+  })
+
+  it('主题 select 的初值是内置默认，三个选项来自 THEME_LABELS', () => {
+    click(toggle())
+    const sel = row('主题').querySelector<HTMLSelectElement>('select')!
+    expect(sel.value).toBe(DEFAULT_THEME)
+    expect([...sel.options].map((o) => o.textContent)).toEqual(['亮色', '暗色', '跟随系统'])
   })
 })
 
@@ -195,11 +203,23 @@ describe('控件落到对的 mutator', () => {
     changeSelect(selectByTitle('代码区字体'), 'inherit')
     expect(store.codeFontKey()).toBe('inherit')
   })
+
+  it('主题 select 走 setTheme，data-theme 属性跟着写', () => {
+    click(toggle())
+    const sel = row('主题').querySelector<HTMLSelectElement>('select')!
+    changeSelect(sel, 'light')
+    expect(store.theme()).toBe('light')
+    expect(document.documentElement.dataset.theme).toBe('light')
+    changeSelect(sel, 'dark')
+    expect(store.theme()).toBe('dark')
+    expect(document.documentElement.dataset.theme).toBe('dark')
+  })
 })
 
 describe('恢复默认', () => {
-  it('把五项都打回内置默认', () => {
+  it('把六项都打回内置默认', () => {
     click(toggle())
+    store.setTheme('light')
     store.setFontSize(20)
     store.setFontVariant('screen-r')
     store.setCodeFont('inherit')
@@ -207,11 +227,13 @@ describe('恢复默认', () => {
     store.setLetterSpacing(0.3)
 
     click(container.querySelector('.appearance-reset')!)
+    expect(store.theme()).toBe(DEFAULT_THEME)
     expect(store.fontSize()).toBe(DEFAULT_FONT_SIZE)
     expect(store.fontKey()).toBe(DEFAULT_VARIANT)
     expect(store.codeFontKey()).toBe(DEFAULT_CODE_FONT)
     expect(store.lineHeight()).toBe(1.75)
     expect(store.letterSpacing()).toBe(0)
     expect(stepperValue('字间距')).toBe('正常')
+    expect(document.documentElement.dataset.theme).toBe('dark')
   })
 })

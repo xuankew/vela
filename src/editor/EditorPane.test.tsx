@@ -17,6 +17,7 @@ function stateFor(doc = '', onUpdate?: (info: EditorUpdateInfo) => void): Editor
     lineWrap: true,
     language: languageFor(null),
     lineWrapSlot: new Compartment(),
+    darkSlot: new Compartment(),
     languageSlot: new Compartment(),
     onUpdate,
   })

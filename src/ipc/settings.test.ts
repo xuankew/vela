@@ -36,11 +36,11 @@ import {
  * 于是 Rust 的黄金字面量写 `letterSpacing:0.0`，这里写 `letterSpacing:0`，各钉各那一侧的输出。
  */
 const GOLDEN_SETTINGS =
-  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0}'
+  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark"}'
 
 /** 非默认值的一份配置，用来钉「任何一档都走同一条反序列化路径」（字段是具体值不是 Option） */
 const GOLDEN_SETTINGS_CUSTOM =
-  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05}'
+  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light"}'
 
 /**
  * Rust 侧 `loaded_settings_的线上形状` 断言的就是这个字面量。
@@ -49,17 +49,24 @@ const GOLDEN_SETTINGS_CUSTOM =
  * 两件事一次钉住。
  */
 const GOLDEN_LOADED =
-  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
+  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
 
 /** Rust 侧 `空现场下_load_的线上形状`：两层都 absent、配置是内置默认、没有键被忽略 */
 const GOLDEN_LOADED_EMPTY =
-  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
+  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark"},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
 
 /** Rust 侧 `save_report_的线上形状` */
 const GOLDEN_SAVE_REPORT = '{"bytesWritten":42}'
 
 function sampleSettings(): Settings {
-  return { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn', lineHeight: 1.75, letterSpacing: 0 }
+  return {
+    fontSize: 14,
+    fontVariant: 'screen-gb',
+    codeFont: 'maple-cn',
+    lineHeight: 1.75,
+    letterSpacing: 0,
+    theme: 'dark',
+  }
 }
 
 beforeEach(() => {
@@ -71,7 +78,7 @@ describe('Rust → 前端 的字段名', () => {
     const parsed = JSON.parse(GOLDEN_SETTINGS) as Settings
     // 键顺序就是 JSON.parse 的插入顺序，所以 stringify 相等 == 字段集合与顺序都相等
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SETTINGS)
-    expect(Object.keys(parsed)).toEqual(['fontSize', 'fontVariant', 'codeFont', 'lineHeight', 'letterSpacing'])
+    expect(Object.keys(parsed)).toEqual(['fontSize', 'fontVariant', 'codeFont', 'lineHeight', 'letterSpacing', 'theme'])
   })
 
   it('解析出来的值与前端能造出来的对象完全相等', () => {
@@ -87,6 +94,7 @@ describe('Rust → 前端 的字段名', () => {
       codeFont: 'inherit',
       lineHeight: 2,
       letterSpacing: 0.05,
+      theme: 'light',
     })
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SETTINGS_CUSTOM)
   })
@@ -135,9 +143,10 @@ describe('Rust → 前端 的字段名', () => {
 })
 
 describe('内置默认值两边各钉一条', () => {
-  it('黄金字面量里的五个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
+  it('黄金字面量里的六个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
     // Rust 侧 `内置默认配置被钉住` 断言 DEFAULT_FONT_SIZE==14 / DEFAULT_FONT_VARIANT=="screen-gb"
-    // / DEFAULT_CODE_FONT=="maple-cn" / DEFAULT_LINE_HEIGHT==1.75 / DEFAULT_LETTER_SPACING==0.0。
+    // / DEFAULT_CODE_FONT=="maple-cn" / DEFAULT_LINE_HEIGHT==1.75 / DEFAULT_LETTER_SPACING==0.0
+    // / DEFAULT_THEME=="dark"。
     // 这里钉的是**同一个字面量**的前端那一半：改了任一边而没改另一边，两条测试会一起红。
     const parsed = JSON.parse(GOLDEN_SETTINGS) as Settings
     expect(parsed.fontSize).toBe(14)
@@ -145,6 +154,7 @@ describe('内置默认值两边各钉一条', () => {
     expect(parsed.codeFont).toBe('maple-cn')
     expect(parsed.lineHeight).toBe(1.75)
     expect(parsed.letterSpacing).toBe(0)
+    expect(parsed.theme).toBe('dark')
   })
 
   it('字体注册表的默认 ID 就是契约里的默认值', () => {
@@ -185,12 +195,19 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     expect(invoke).toHaveBeenCalledWith('save_settings', { settings })
   })
 
-  it('发出去的 settings payload 永远带齐五个键', async () => {
+  it('发出去的 settings payload 永远带齐六个键', async () => {
     invoke.mockResolvedValue(JSON.parse(GOLDEN_SAVE_REPORT))
     await saveSettings(sampleSettings())
     const sent = invoke.mock.calls[0]![1] as { settings: Settings }
-    expect(Object.keys(sent.settings)).toEqual(['fontSize', 'fontVariant', 'codeFont', 'lineHeight', 'letterSpacing'])
-    // 五个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
+    expect(Object.keys(sent.settings)).toEqual([
+      'fontSize',
+      'fontVariant',
+      'codeFont',
+      'lineHeight',
+      'letterSpacing',
+      'theme',
+    ])
+    // 六个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
     // 落到 Rust 侧就成了「缺键」，而 Settings 没有 #[serde(default)]，缺键直接拒）
     expect(JSON.stringify(sent.settings)).toBe(GOLDEN_SETTINGS)
   })

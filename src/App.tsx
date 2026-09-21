@@ -143,11 +143,17 @@ export default function App() {
   const [settingsNotice, setSettingsNotice] = createSignal<string | null>(null)
 
   /**
-   * 字体 / 字号的持久化状态（M4-A）。三个值跟着**人**走（用户全局层 `~/.vela/settings.json`），
-   * 换项目也在。sanitize（档外字号、不认识的字体 ID）与写穿都在这一层里，理由见
-   * `src/settings/store.ts` 的模块文档。
+   * 字体 / 字号 / 行高 / 字间距 / 主题的持久化状态（M4-A 起，M4-C 加进主题）。六个值都跟着
+   * **人**走（用户全局层 `~/.vela/settings.json`），换项目也在。sanitize（档外字号、不认识的
+   * 字体/主题 ID）与写穿都在这一层里，理由见 `src/settings/store.ts` 的模块文档。
+   *
+   * 🔴 `applyDark` 把「当前该是亮还是暗」接到 workspace 的 `setDarkTheme`（CM6 的 `darkSlot`）。
+   * store 自己只写 `<html data-theme>`（管 `--vela-*` 颜色），CM6 base theme 的 `&dark` facet
+   * 归 workspace——两件事必须一起做，少一件就会「颜色换了但光标/弹层底色还是旧的」。
+   * 闭包引用 `ws`（声明在后面）是安全的：它只在 `load`/`applyNow`/`setTheme` 时被调，
+   * 那都在组件体跑完之后，`ws` 早已初始化。
    */
-  const settings = createSettingsStore({ onWarn: setSettingsNotice })
+  const settings = createSettingsStore({ onWarn: setSettingsNotice, applyDark: (dark) => ws.setDarkTheme(dark) })
 
   /**
    * 会话这一层的提示：存档读不回来、写不下去、草稿超预算被丢。

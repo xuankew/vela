@@ -12,8 +12,10 @@
  * 下面的 --vela-font-* 只是注入完成前的兜底值，loader 会用真实字体栈覆盖它们。
  */
 
+/* 字体分区放在 `:root` 而不是 `[data-theme]` 里：它们不随主题变（M4-C 只接管**颜色**），
+   两套主题共用同一份字体 token，写两份就会各自漂移。 */
 :root {
-  /* 字体分区。M4 的主题系统会接管这几个变量。
+  /* 字体分区。
      editor = Markdown 正文；code = 代码块/表格（按语法节点分流，见 editor/setup.ts）；ui = 界面。
      正文与代码是两个正交维度，各自可切换，因此必须同时驻留。 */
   --vela-font-editor: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -26,8 +28,25 @@
      与「压根没声明 letter-spacing」是同一件事，`0em` 严格说是另一回事。
      与 `--vela-line-height` 一样被 CM6 与 `.md-preview-body` 同时消费。 */
   --vela-letter-spacing: normal;
+}
 
-  /* 临时暗色配色，正式主题系统在 M4 接管 */
+/* ───────────────────────── 主题：颜色 token（M4-C）─────────────────────────
+   11 个颜色 + `color-scheme`。默认（暗色）写在 `:root` 里当**兜底**：JS 还没跑、
+   或 `data-theme` 属性缺失时，落到这里就是暗色——与 M4-C 之前逐像素一致，
+   也不会闪一下亮色再变暗。`theme.ts` 随后把 `<html>` 的 `data-theme` 设成
+   'dark' 或 'system' 解析出的具体值；设成 'dark' 相对这份兜底是 no-op，
+   设成 'light' 则由下面那块 `:root[data-theme='light']` 覆盖。
+
+   ⚠️ 覆盖块用 `:root[data-theme='light']`（特异度 0,2,0）而不是裸 `[data-theme='light']`
+   （0,1,0）：后者与 `:root` 特异度相同，只能靠源码顺序取胜——一个改文件顺序的重构
+   就会让亮色悄悄失效。加上 `:root` 前缀把特异度抬高一档，顺序就不再是要紧事。
+
+   两套配色同源（Tokyo Night 暗 / Tokyo Night Day 亮），语义逐 token 对齐：
+   bg = 正文面；bg-alt = 界面壳（工具栏/侧栏/状态栏）与代码块底；bg-panel = 浮起/可交互面
+   （菜单/模态/浮层/按钮/hover 行）。暗色里亮度序是 alt < bg < panel，亮色里 alt < panel < bg，
+   但「hover 行(panel) 相对它所在的壳(alt) 更亮」这条关系两边一致，所以 hover 都看得见。 */
+:root {
+  /* 暗色（默认） */
   --vela-bg: #1a1b26;
   --vela-bg-alt: #16161e;
   --vela-bg-panel: #24283b;
@@ -44,6 +63,27 @@
   --vela-bad: #f7768e;
 
   color-scheme: dark;
+}
+
+:root[data-theme='light'] {
+  /* 亮色。文字与语义色都在 Day 配色基础上压深一档：正文要长时间读，
+     `--vela-fg` 用近黑的冷灰而不是 Day 那个偏蓝的 #3760bf；ok/warn/bad 也从
+     Day 的亮色压深，好让它们在浅底上作为**文字**（提示条、错误行）仍有足够对比度。
+     guide 反过来比 border 更**浅**：暗色里「更暗 = 更弱」，亮色里「更浅 = 更弱」，
+     两边都是让引导线退到纹理层。 */
+  --vela-bg: #f7f8fc;
+  --vela-bg-alt: #dfe3ee;
+  --vela-bg-panel: #eef1f8;
+  --vela-fg: #2f3549;
+  --vela-fg-dim: #7c849c;
+  --vela-border: #c5ccdd;
+  --vela-guide: #dbe0ea;
+  --vela-accent: #2e7de9;
+  --vela-ok: #4f7a28;
+  --vela-warn: #96691a;
+  --vela-bad: #d1415f;
+
+  color-scheme: light;
 }
 
 * {
@@ -217,7 +257,9 @@ button:active {
 
 button.primary {
   background: var(--vela-accent);
-  color: #1a1b26;
+  /* 强调底上的文字用 `--vela-bg`：暗色下它是深色（压在浅蓝 accent 上），
+     亮色下它是近白（压在深蓝 accent 上），两边都是「反色」，无需为每套主题各写一条 */
+  color: var(--vela-bg);
   border-color: var(--vela-accent);
   font-weight: 600;
 }
@@ -638,7 +680,8 @@ select {
 .tree-menu-item:hover {
   background: var(--vela-accent);
   border: none;
-  color: #1a1b26;
+  /* 与 `.button.primary` 同一条：accent 底上的文字用 `--vela-bg`，两套主题各自反色 */
+  color: var(--vela-bg);
 }
 
 .tree-menu-item:active {

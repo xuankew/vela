@@ -56,6 +56,7 @@ import {
   type Settings,
   type SettingsReport,
 } from '../ipc/settings'
+import { applyThemeAttr, DEFAULT_THEME, resolveTheme, sanitizeThemeId, watchSystemTheme, type ThemeId } from './theme'
 
 /**
  * 字号档位。工具栏的 select 直接列这些值，所以冒出一个档外值（17px）会让 select 变空白——
@@ -146,6 +147,18 @@ export interface SettingsStoreOptions {
    * 不值得为它拦下启动；但「我设的没记住」这件事该让用户知道一句，而不是静默回退。
    */
   onWarn?: (text: string) => void
+  /**
+   * 深/浅色生效时的回调（M4-C）。`App.tsx` 注入成 `(dark) => ws.setDarkTheme(dark)`。
+   *
+   * 🔴 为什么是注入而不是 store 直接 import workspace：与 `pasteImage` / `promptDiscard`
+   * 同一条理由——store 不该知道宿主长什么样，而且那样会成环。store 只负责「算出当前该是
+   * 亮还是暗」（`resolveTheme`）与「把 `data-theme` 写进 `<html>`」（管 `--vela-*` 那套颜色）；
+   * CM6 base theme 的 `&dark` facet 归 workspace 的 `setDarkTheme` 管。两件事必须一起做，
+   * 少一件就会「颜色换了但光标/选区/弹层底色还是旧的」或反过来。
+   *
+   * 没注入（测试、首屏还没接 workspace 时）就只写 `data-theme`，CM6 那边保持缺省的暗色。
+   */
+  applyDark?: (dark: boolean) => void
 }
 
 export interface SettingsStore {
@@ -159,6 +172,14 @@ export interface SettingsStore {
   readonly lineHeight: Accessor<number>
   /** 当前字间距（em，已夹到 `LETTER_SPACING_MIN..=LETTER_SPACING_MAX`；`0` = `normal`） */
   readonly letterSpacing: Accessor<number>
+  /**
+   * 当前主题选择（`'light'` / `'dark'` / `'system'`，已 sanitize）。
+   *
+   * ⚠️ 这是**用户选的那个 ID**，不是解析后的亮/暗。选 `'system'` 时它一直是 `'system'`，
+   * 实际生效的亮暗由 `resolveTheme` 现算（跟随 `prefers-color-scheme`）。外观浮层的下拉
+   * 要显示的是这个 ID（「跟随系统」），不是解析结果。
+   */
+  readonly theme: Accessor<ThemeId>
   /**
    * 最近一次 [`SettingsStore.load`] 的账单；`null` = 还没 load 过。
    * `report().ignoredProjectKeys` 非空表示当前仓库的 `.vela/settings.json` 试图改偏好键、
@@ -188,6 +209,8 @@ export interface SettingsStore {
   stepLetterSpacing: (delta: number) => void
   /** 回到默认字间距 */
   resetLetterSpacing: () => void
+  /** 用户选了主题（亮/暗/跟随系统）：更新 + 应用（`data-theme` + CM6 深浅色）+ 写穿 */
+  setTheme: (id: ThemeId) => void
 
   /**
    * 从 Rust 读回合并好的配置，sanitize 后灌进信号并应用。**不写穿**。
@@ -211,6 +234,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   const [fontSize, setFontSizeSignal] = createSignal(DEFAULT_FONT_SIZE)
   const [lineHeight, setLineHeightSignal] = createSignal(DEFAULT_LINE_HEIGHT)
   const [letterSpacing, setLetterSpacingSignal] = createSignal(DEFAULT_LETTER_SPACING)
+  const [theme, setThemeSignal] = createSignal<ThemeId>(DEFAULT_THEME)
   const [report, setReport] = createSignal<SettingsReport | null>(null)
 
   /** 写队列的尾巴。所有写挂在它后面，于是任意时刻最多一个写在飞（见文件头） */
@@ -219,6 +243,13 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   let lastSent: string | null = null
   /** load 的代号：每次 load 自增，回来时只有「还是最新那次」才允许灌信号 */
   let loadGen = 0
+  /**
+   * 「跟随系统」时挂着的那个 matchMedia 订阅；`null` = 当前不是 system、没订阅。
+   *
+   * 只在 `theme() === 'system'` 时存在：OS 切换深浅色要实时反映到应用上。选死亮/暗时
+   * 必须退订，否则一次系统主题变化会把用户**明确选的**那一档盖掉。
+   */
+  let unsubscribeSystem: (() => void) | null = null
 
   function applyFontSizeVar(n: number): void {
     document.documentElement.style.setProperty('--vela-font-size', `${n}px`)
@@ -237,6 +268,36 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     document.documentElement.style.setProperty('--vela-letter-spacing', n === 0 ? 'normal' : `${n}em`)
   }
 
+  /**
+   * 把当前主题选择解析成亮/暗，写到两处：`<html data-theme>`（管 `--vela-*` 那套颜色）
+   * 与 CM6 的 `darkSlot`（管 base theme 的 `&dark` 规则，经注入的 `applyDark` 回调）。
+   *
+   * 两处必须一起更新，少一处就会「颜色换了但光标/选区/弹层底色还是旧的」或反过来。
+   */
+  function applyResolvedTheme(): void {
+    const resolved = resolveTheme(theme())
+    applyThemeAttr(resolved)
+    options.applyDark?.(resolved === 'dark')
+  }
+
+  /**
+   * 让 matchMedia 订阅与当前选择对齐：选 `system` 才订阅，选死亮/暗就退订。
+   * 幂等——`applyNow` 与 `setTheme` 都会调它，重复调不会重复订阅。
+   */
+  function syncSystemWatch(): void {
+    const want = theme() === 'system'
+    if (want && unsubscribeSystem === null) {
+      // OS 切换深浅色时重算并重应用。只动 DOM 与 CM6，不写穿——这不是用户改动。
+      // 这个回调是 matchMedia 的 change 事件处理器（不是响应式追踪范围）：事件触发时现读
+      // 一次 theme() 的当前值正是我们要的，不需要它随信号自动重跑
+      // eslint-disable-next-line solid/reactivity
+      unsubscribeSystem = watchSystemTheme(() => applyResolvedTheme())
+    } else if (!want && unsubscribeSystem !== null) {
+      unsubscribeSystem()
+      unsubscribeSystem = null
+    }
+  }
+
   function currentSettings(): Settings {
     return {
       fontSize: fontSize(),
@@ -244,6 +305,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
       codeFont: codeFontKey(),
       lineHeight: lineHeight(),
       letterSpacing: letterSpacing(),
+      theme: theme(),
     }
   }
 
@@ -269,6 +331,9 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     applyFontSizeVar(fontSize())
     applyLineHeightVar(lineHeight())
     applyLetterSpacingVar(letterSpacing())
+    applyResolvedTheme()
+    // 「跟随系统」要把 matchMedia 订阅挂上；选死亮/暗时这一步是 no-op（幂等）
+    syncSystemWatch()
     // 字体是动态 import，注入有真实异步成本；`void` 掉——首屏不等它，到达后浏览器自己
     // 用 font-display: swap 重排。两个 family 同时驻留（正文 + 代码区），互不干扰
     void applyFontVariant(fontKey())
@@ -296,6 +361,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setCodeFontKey(sanitizeCodeFont(s.codeFont))
     setLineHeightSignal(sanitizeLineHeight(s.lineHeight))
     setLetterSpacingSignal(sanitizeLetterSpacing(s.letterSpacing))
+    setThemeSignal(sanitizeThemeId(s.theme))
     setReport(loaded.report)
     applyNow()
   }
@@ -366,12 +432,22 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setLetterSpacing(DEFAULT_LETTER_SPACING)
   }
 
+  function setTheme(id: ThemeId): void {
+    const next = sanitizeThemeId(id)
+    setThemeSignal(next)
+    applyResolvedTheme()
+    // 选死亮/暗要退订 matchMedia，选 system 要挂上：否则系统主题变化会盖掉用户明确选的那一档
+    syncSystemWatch()
+    persist()
+  }
+
   return {
     fontKey,
     codeFontKey,
     fontSize,
     lineHeight,
     letterSpacing,
+    theme,
     report,
     setFontVariant,
     setCodeFont,
@@ -384,6 +460,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setLetterSpacing,
     stepLetterSpacing,
     resetLetterSpacing,
+    setTheme,
     load,
     applyNow,
   }

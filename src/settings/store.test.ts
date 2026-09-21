@@ -33,6 +33,7 @@ vi.mock('../fonts/loader', async (importOriginal) => ({
 
 import { DEFAULT_CODE_FONT, DEFAULT_VARIANT } from '../fonts/loader'
 import type { LoadedSettings, Settings, SettingsReport } from '../ipc/settings'
+import { DEFAULT_THEME } from './theme'
 import {
   createSettingsStore,
   DEFAULT_FONT_SIZE,
@@ -58,6 +59,7 @@ function loaded(settings: Partial<Settings> = {}, report: Partial<SettingsReport
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
       ...settings,
     },
     report: {
@@ -82,9 +84,12 @@ function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: 
 const cssFontSize = (): string => document.documentElement.style.getPropertyValue('--vela-font-size')
 const cssLineHeight = (): string => document.documentElement.style.getPropertyValue('--vela-line-height')
 const cssLetterSpacing = (): string => document.documentElement.style.getPropertyValue('--vela-letter-spacing')
+const dataTheme = (): string | undefined => document.documentElement.dataset.theme
 
 let store: SettingsStore
 const warnings: string[] = []
+/** `applyDark` 回调收到的深浅色序列。App.tsx 里它接的是 `ws.setDarkTheme`，这里用数组盯着 */
+const darkCalls: boolean[] = []
 
 beforeEach(() => {
   settingsIpc.loadSettings.mockReset()
@@ -97,17 +102,20 @@ beforeEach(() => {
   document.documentElement.style.removeProperty('--vela-font-size')
   document.documentElement.style.removeProperty('--vela-line-height')
   document.documentElement.style.removeProperty('--vela-letter-spacing')
+  delete document.documentElement.dataset.theme
   warnings.length = 0
-  store = createSettingsStore({ onWarn: (text) => warnings.push(text) })
+  darkCalls.length = 0
+  store = createSettingsStore({ onWarn: (text) => warnings.push(text), applyDark: (dark) => darkCalls.push(dark) })
 })
 
 describe('初始状态', () => {
-  it('五个信号都停在内置默认，report 是 null', () => {
+  it('六个信号都停在内置默认，report 是 null', () => {
     expect(store.fontKey()).toBe(DEFAULT_VARIANT)
     expect(store.codeFontKey()).toBe(DEFAULT_CODE_FONT)
     expect(store.fontSize()).toBe(DEFAULT_FONT_SIZE)
     expect(store.lineHeight()).toBe(DEFAULT_LINE_HEIGHT)
     expect(store.letterSpacing()).toBe(DEFAULT_LETTER_SPACING)
+    expect(store.theme()).toBe(DEFAULT_THEME)
     expect(store.report()).toBeNull()
   })
 
@@ -253,6 +261,7 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -267,6 +276,7 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       codeFont: 'inherit',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -281,6 +291,7 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -425,6 +436,67 @@ describe('行高 / 字间距：连续量的夹取、归一化、CSS 变量与写
     await store.load([])
     expect(store.lineHeight()).toBe(1.76)
     expect(store.letterSpacing()).toBe(0.06)
+  })
+})
+
+describe('主题（M4-C）：data-theme 属性 + applyDark 回调 + 写穿', () => {
+  it('applyNow 把默认主题写进 data-theme 并回调 applyDark(true)', () => {
+    store.applyNow()
+    expect(dataTheme()).toBe('dark')
+    expect(darkCalls).toEqual([true])
+    expect(store.theme()).toBe(DEFAULT_THEME)
+  })
+
+  it('setTheme(light) 改信号、写 data-theme、回调 applyDark(false)、写穿', async () => {
+    store.setTheme('light')
+    expect(store.theme()).toBe('light')
+    expect(dataTheme()).toBe('light')
+    expect(darkCalls).toEqual([false])
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({ theme: 'light' })
+  })
+
+  it('setTheme 来回切：applyDark 跟着报 true/false，data-theme 同步', () => {
+    store.setTheme('light')
+    store.setTheme('dark')
+    expect(darkCalls).toEqual([false, true])
+    expect(dataTheme()).toBe('dark')
+    expect(store.theme()).toBe('dark')
+  })
+
+  it('不认识的 theme ID 打回默认（sanitize）', async () => {
+    store.setTheme('霓虹' as never)
+    expect(store.theme()).toBe(DEFAULT_THEME)
+    expect(dataTheme()).toBe('dark')
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({ theme: 'dark' })
+  })
+
+  it('load 装回 theme 并应用，但不写穿', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ theme: 'light' }))
+    await store.load([])
+    expect(store.theme()).toBe('light')
+    expect(dataTheme()).toBe('light')
+    expect(darkCalls).toEqual([false])
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('load 装回不认识的 theme：sanitize 成默认', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ theme: 'toString' }))
+    await store.load([])
+    expect(store.theme()).toBe(DEFAULT_THEME)
+    expect(dataTheme()).toBe('dark')
+  })
+
+  it('theme 进写穿指纹：只改 theme 也会触发一次写', async () => {
+    store.setTheme('light')
+    await flush()
+    expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
+    // 再设成同一个值：指纹相同，跳过
+    store.setTheme('light')
+    await flush()
+    expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
   })
 })
 

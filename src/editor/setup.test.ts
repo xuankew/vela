@@ -16,7 +16,12 @@ function stateFor(lineWrap = true) {
   return EditorState.create({
     doc: '',
     // 不传 language：槽位留空，与 tab.ts 建 state 时的做法一致（语言随后由 syncLanguage 装）
-    extensions: buildExtensions({ lineWrap, lineWrapSlot: new Compartment(), languageSlot: new Compartment() }),
+    extensions: buildExtensions({
+      lineWrap,
+      lineWrapSlot: new Compartment(),
+      darkSlot: new Compartment(),
+      languageSlot: new Compartment(),
+    }),
   })
 }
 
@@ -65,6 +70,7 @@ describe('M1-E-3：词补全的接线', () => {
       extensions: buildExtensions({
         lineWrap: true,
         lineWrapSlot: new Compartment(),
+        darkSlot: new Compartment(),
         languageSlot: new Compartment(),
         ...(peerStates === undefined ? {} : { peerStates }),
       }),
@@ -113,6 +119,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       doc: '正文',
       lineWrap: true,
       lineWrapSlot: slot,
+      darkSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
     expect(state.doc.toString()).toBe('正文')
@@ -125,7 +132,13 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
     // 这条是硬前提：标签没被任何分屏显示时，它的换行偏好也得能改，
     // 否则「关掉换行」只对当前看得见的那个标签生效，切过去才发现另一个还是开的。
     const slot = new Compartment()
-    const on = createEditorState({ doc: 'x', lineWrap: true, lineWrapSlot: slot, languageSlot: new Compartment() })
+    const on = createEditorState({
+      doc: 'x',
+      lineWrap: true,
+      lineWrapSlot: slot,
+      darkSlot: new Compartment(),
+      languageSlot: new Compartment(),
+    })
     expect(wrapEnabled(on)).toBe(true)
 
     const off = on.update({ effects: slot.reconfigure([]) }).state
@@ -137,11 +150,54 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
     expect(wrapEnabled(backOn)).toBe(true)
   })
 
+  it('调用方的 darkSlot 能在没有 view 的 state 上 reconfigure（M4-C）', () => {
+    // 与 lineWrapSlot 同一条硬前提：标签没被任何分屏显示时，它的深浅色也得能改，
+    // 否则「切主题」只对当前看得见的那个标签生效，切过去才发现另一个还是旧色。
+    const slot = new Compartment()
+    const dark = createEditorState({
+      doc: 'x',
+      darkSlot: slot,
+      lineWrapSlot: new Compartment(),
+      languageSlot: new Compartment(),
+    })
+    expect(dark.facet(EditorView.darkTheme)).toBe(true)
+
+    const light = dark.update({ effects: slot.reconfigure(EditorView.darkTheme.of(false)) }).state
+    expect(light.facet(EditorView.darkTheme)).toBe(false)
+    expect(light.doc.toString()).toBe('x')
+
+    const backDark = light.update({ effects: slot.reconfigure(EditorView.darkTheme.of(true)) }).state
+    expect(backDark.facet(EditorView.darkTheme)).toBe(true)
+  })
+
+  it('传 dark: false 建出来的 state 一开始就是亮色', () => {
+    const state = createEditorState({
+      doc: '',
+      dark: false,
+      darkSlot: new Compartment(),
+      lineWrapSlot: new Compartment(),
+      languageSlot: new Compartment(),
+    })
+    expect(state.facet(EditorView.darkTheme)).toBe(false)
+  })
+
   it('两个标签各持一个 Compartment 也不会串：槽位是自己的 StateField', () => {
     const slotA = new Compartment()
     const slotB = new Compartment()
-    const a = createEditorState({ doc: 'A', lineWrap: true, lineWrapSlot: slotA, languageSlot: new Compartment() })
-    const b = createEditorState({ doc: 'B', lineWrap: true, lineWrapSlot: slotB, languageSlot: new Compartment() })
+    const a = createEditorState({
+      doc: 'A',
+      lineWrap: true,
+      lineWrapSlot: slotA,
+      darkSlot: new Compartment(),
+      languageSlot: new Compartment(),
+    })
+    const b = createEditorState({
+      doc: 'B',
+      lineWrap: true,
+      lineWrapSlot: slotB,
+      darkSlot: new Compartment(),
+      languageSlot: new Compartment(),
+    })
 
     const aOff = a.update({ effects: slotA.reconfigure([]) }).state
     expect(wrapEnabled(aOff)).toBe(false)

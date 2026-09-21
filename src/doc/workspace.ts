@@ -132,6 +132,8 @@ export interface Workspace {
   readonly activeTab: Accessor<Tab>
   readonly activeIndex: Accessor<number>
   readonly lineWrap: Accessor<boolean>
+  /** 当前 CM6 是不是暗色（M4-C）。与 `lineWrap` 同为全局视图设置的响应式镜像 */
+  readonly dark: Accessor<boolean>
   /** 状态栏要的度量。只反映**聚焦分屏**显示的那个标签 */
   readonly metrics: Accessor<DocMetrics>
   /**
@@ -211,6 +213,8 @@ export interface Workspace {
   saveAs: () => Promise<void>
   setLineWrap: (on: boolean) => void
   toggleLineWrap: () => void
+  /** 切换 CM6 的深/浅色 facet（M4-C）。颜色的 `data-theme` 由 store 负责，两者要一起做 */
+  setDarkTheme: (on: boolean) => void
   /** 有没有任何标签还没落盘 */
   anyDirty: () => boolean
   /**
@@ -248,6 +252,8 @@ export interface Workspace {
 
 export interface WorkspaceOptions {
   lineWrap?: boolean
+  /** 初始是不是暗色（M4-C）。缺省 `true` = 与 M4-C 之前逐像素一致 */
+  dark?: boolean
   /**
    * 缺省时一律答「取消」。
    *
@@ -269,7 +275,12 @@ export interface WorkspaceOptions {
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   // liveStates 声明在后面，但这里只是把引用存进 config，真正调用发生在补全请求时——
   // 那时 tabs 信号早就建好了，不会撞上 TDZ
-  const config: ViewConfig = createViewConfig(options.lineWrap ?? true, liveStates, options.pasteImage)
+  const config: ViewConfig = createViewConfig(
+    options.lineWrap ?? true,
+    liveStates,
+    options.pasteImage,
+    options.dark ?? true,
+  )
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
   const [tabs, setTabs] = createSignal<Tab[]>([])
@@ -277,6 +288,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   const [focusedPaneId, setFocusedPaneId] = createSignal(-1)
   const [direction, setDirection] = createSignal<SplitDirection>('row')
   const [wrap, setWrap] = createSignal(config.lineWrap)
+  const [dark, setDark] = createSignal(config.dark)
   const [metrics, setMetrics] = createSignal<DocMetrics>(EMPTY_METRICS)
   const [revision, setRevision] = createSignal(0)
   /**
@@ -766,6 +778,26 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
+   * 切换 CM6 的深/浅色 facet（M4-C）。与 `setLineWrap` 是同一个模子：改 `config.dark`、
+   * 拨共享的 `darkSlot`、显示中的分屏走 dispatch、没在显示的标签就地 update。
+   *
+   * 🔴 这一条只管 CM6 base theme 里那些 `&dark` 规则（光标色、选区色、gutter 底、补全/查找
+   * 面板底）。`--vela-*` 那套颜色由 `settings/store.ts` 写 `<html data-theme>` 属性来切，
+   * 两件事**必须一起做**（见 `App.tsx` 的接线）：少了 `data-theme` 这一步，颜色还是旧的；
+   * 少了这一步，CM6 的内部件会用反。
+   */
+  function setDarkTheme(on: boolean) {
+    if (on === config.dark) return
+    config.dark = on
+    setDark(on)
+    const effects = config.darkSlot.reconfigure(EditorView.darkTheme.of(on))
+    for (const pane of panes()) pane.controller?.view.dispatch({ effects })
+    for (const tab of tabs()) {
+      if (!viewOf(tab)) applyViewConfig(tab, config)
+    }
+  }
+
+  /**
    * 要存进会话的标签。超出 `MAX_SESSION_TABS` 时从后面截断，但**正在显示的标签一个都不丢**。
    *
    * 丢一个显示中的标签会让 `panes` 里的一个下标悬空，而 Rust 侧的 `validate` 会因此
@@ -991,6 +1023,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     activeTab,
     activeIndex: () => tabs().findIndex((t) => t.id === activeTab().id),
     lineWrap: wrap,
+    dark,
     metrics,
     revision,
     recent,
@@ -1029,6 +1062,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     },
     setLineWrap,
     toggleLineWrap: () => setLineWrap(!config.lineWrap),
+    setDarkTheme,
     anyDirty: () => tabs().some((t) => t.doc.dirty()),
     dirtyPaths: () =>
       tabs().flatMap((t) => {

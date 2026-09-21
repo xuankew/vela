@@ -1,7 +1,7 @@
 import { EditorView } from '@codemirror/view'
 import { describe, expect, it, vi } from 'vitest'
 import type { EditorSnapshot } from '../editor/controller'
-import { lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
+import { darkThemeEnabled, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
 import {
   applyViewConfig,
   createTab,
@@ -182,5 +182,45 @@ describe('applyViewConfig（未显示的标签也要跟着全局设置走）', (
     applyViewConfig(tab, config)
 
     expect(lineWrapEnabled(tab.snapshot.state)).toBe(true)
+  })
+
+  it('把深浅色落到存着的 state 上（darkSlot 与 lineWrapSlot 互不干扰）', () => {
+    const config = createViewConfig(true)
+    const tab = makeTab('正文', config)
+    expect(darkThemeEnabled(tab.snapshot.state)).toBe(true)
+
+    config.dark = false
+    applyViewConfig(tab, config)
+
+    expect(darkThemeEnabled(tab.snapshot.state)).toBe(false)
+    // 深浅色这一改不该顺手把换行也动了
+    expect(lineWrapEnabled(tab.snapshot.state)).toBe(true)
+    expect(tabText(tab)).toBe('正文')
+  })
+
+  it('换行与深浅色同时不一致时，一趟 update 两个槽位都跟上', () => {
+    const config = createViewConfig(true)
+    const tab = makeTab('正文', config)
+
+    config.lineWrap = false
+    config.dark = false
+    applyViewConfig(tab, config)
+
+    expect(lineWrapEnabled(tab.snapshot.state)).toBe(false)
+    expect(darkThemeEnabled(tab.snapshot.state)).toBe(false)
+  })
+
+  it('只有深浅色一致、换行不一致时也要换 state（早退只看「全都一致」）', () => {
+    // 回归保护：applyViewConfig 一度只比对 lineWrap，加 dark 那一维后若沿用旧的单条早退，
+    // 「换行没变、只切主题」会被整个跳过，未显示的标签切回来还是旧色
+    const config = createViewConfig(true)
+    const tab = makeTab('正文', config)
+    const before = tab.snapshot.state
+
+    config.dark = false
+    applyViewConfig(tab, config)
+
+    expect(tab.snapshot.state).not.toBe(before)
+    expect(darkThemeEnabled(tab.snapshot.state)).toBe(false)
   })
 })

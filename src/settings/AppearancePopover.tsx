@@ -8,6 +8,7 @@ import {
   type FontVariantId,
 } from '../fonts/loader'
 import { DEFAULT_FONT_SIZE, DEFAULT_LETTER_SPACING, DEFAULT_LINE_HEIGHT, FONT_SIZES, type SettingsStore } from './store'
+import { DEFAULT_THEME, THEME_IDS, THEME_LABELS, type ThemeId } from './theme'
 
 /**
  * 「外观」浮层（M4-B，PLAN §3.6「字体管线产品化」）。
@@ -104,6 +105,7 @@ export function AppearancePopover(props: AppearancePopoverProps) {
   }
 
   function resetAll(): void {
+    settings.setTheme(DEFAULT_THEME)
     settings.setFontSize(DEFAULT_FONT_SIZE)
     settings.setFontVariant(DEFAULT_VARIANT)
     settings.setCodeFont(DEFAULT_CODE_FONT)
@@ -118,7 +120,7 @@ export function AppearancePopover(props: AppearancePopoverProps) {
         aria-haspopup="dialog"
         aria-expanded={open()}
         onClick={toggle}
-        title="字号 / 行高 / 字间距 / 字体"
+        title="主题 / 字号 / 行高 / 字间距 / 字体"
       >
         外观
       </button>
@@ -126,9 +128,22 @@ export function AppearancePopover(props: AppearancePopoverProps) {
       <Show when={open()}>
         <div class="appearance-pop" role="dialog" aria-label="外观" onKeyDown={onKeyDown}>
           <label class="appearance-row">
-            <span class="appearance-label">字号</span>
+            <span class="appearance-label">主题</span>
             <select
               ref={firstControlEl}
+              value={settings.theme()}
+              onChange={(e) => settings.setTheme(e.currentTarget.value as ThemeId)}
+              title="亮色 / 暗色 / 跟随系统"
+            >
+              {THEME_IDS.map((id) => (
+                <option value={id}>{THEME_LABELS[id]}</option>
+              ))}
+            </select>
+          </label>
+
+          <label class="appearance-row">
+            <span class="appearance-label">字号</span>
+            <select
               value={settings.fontSize()}
               onChange={(e) => settings.setFontSize(Number(e.currentTarget.value))}
               title="字号（也可用 Cmd/Ctrl + = / - / 0）"
@@ -196,7 +211,7 @@ export function AppearancePopover(props: AppearancePopoverProps) {
           </label>
 
           <div class="appearance-foot">
-            <button class="appearance-reset" onClick={resetAll} title="五项都回到内置默认">
+            <button class="appearance-reset" onClick={resetAll} title="六项都回到内置默认">
               恢复默认
             </button>
           </div>

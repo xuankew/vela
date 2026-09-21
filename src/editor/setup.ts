@@ -275,6 +275,21 @@ export interface EditorSetupOptions {
    */
   lineWrapSlot: Compartment
   /**
+   * 深/浅色的开关槽位（M4-C 主题系统），装的是 `EditorView.darkTheme` facet。
+   *
+   * 与 `lineWrapSlot` 是**同一类东西**：全局视图设置、共享一个实例、一次 reconfigure
+   * 拨动所有标签。理由是主题不由单个标签决定，而由「现在这套配色是亮还是暗」决定，
+   * 那是工作区的知识（与 `languageSlot` 每标签一个实例正好相反）。
+   *
+   * 🔴 必须是槽位而不是写死：M4-C 之前这里写的是 `EditorView.darkTheme.of(true)`（应用只有暗色）。
+   * 这个 facet 控制 CM6 base theme 里所有 `&dark` 规则——光标色、选区色、gutter 底、
+   * 自动补全 tooltip 与查找面板的底。亮色主题下还写死 true 的话，这些内部件会整个用反
+   * （浅底应用里弹出一个深灰 tooltip），而 `--vela-*` 那套 CSS 变量管不到 CM6 的 base theme。
+   */
+  darkSlot: Compartment
+  /** 初始是否暗色。缺省 `true` = 与 M4-C 之前逐像素一致（应用一直是暗色的） */
+  dark?: boolean
+  /**
    * 语言的开关槽位，**每标签一个实例**。
    *
    * 与 `lineWrapSlot` 正好相反：换行是全局视图设置，共享一个实例才能一次 reconfigure
@@ -332,7 +347,16 @@ export function languageExtensions(choice: LanguageChoice, support: LanguageSupp
  * 部分（如 lint gutter）。
  */
 export function buildExtensions(options: EditorSetupOptions): Extension[] {
-  const { lineWrap = true, language, lineWrapSlot, languageSlot, peerStates, pasteImage } = options
+  const {
+    lineWrap = true,
+    dark = true,
+    language,
+    lineWrapSlot,
+    darkSlot,
+    languageSlot,
+    peerStates,
+    pasteImage,
+  } = options
 
   const exts: Extension[] = [
     lineNumbers(),
@@ -373,11 +397,6 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     syntaxHighlighting(tokenHighlight),
     syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
     noLigatures,
-    // 整个应用是暗色的（styles.css：`color-scheme: dark`、`--vela-bg: #1a1b26`），
-    // 但从没人设过这个 facet，于是 CM6 base theme 的 `&dark` 规则一条都没生效：
-    // 光标是黑的、选区是亮色、gutters 是 #f5f5f5，自动补全 tooltip 与查找面板都是浅底。
-    // M4 做可切换主题时这一条要换成 Compartment（现在只有暗色，不值得先搭槽位）。
-    EditorView.darkTheme.of(true),
     scrollPastEnd(),
     keymap.of([
       ...closeBracketsKeymap,
@@ -397,6 +416,10 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   exts.push(languageSlot.of(language === undefined ? [] : languageExtensions(language, null)))
   // 换行槽位同理：关闭换行时塞空数组，否则之后 reconfigure 无处生效
   exts.push(lineWrapSlot.of(lineWrap ? [EditorView.lineWrapping] : []))
+  // 深浅色槽位（M4-C）：始终在扩展集里，装的恒是 `EditorView.darkTheme.of(dark)`。
+  // 与换行槽位同一条理由——槽位不存在就无处 reconfigure，切主题时对显示中的 view 那一下
+  // dispatch 会静默落空。切换由 workspace 的 `setDarkTheme` 拨动（见 `doc/workspace.ts`）
+  exts.push(darkSlot.of(EditorView.darkTheme.of(dark)))
   // 词补全的「其他文档」。没传就不装：facet 缺省是空的，词典退化成只有当前文档那一份
   if (peerStates !== undefined) exts.push(wordPeers.of(peerStates))
   // 粘贴图片。没传就不装：CM6 内置的 paste 处理器照旧跑，行为与 M3-A-7 之前一模一样
@@ -459,4 +482,15 @@ export function lineWrapEnabled(state: EditorState): boolean {
   return state
     .facet(EditorView.contentAttributes)
     .some((attrs) => typeof attrs !== 'function' && attrs.class === 'cm-lineWrapping')
+}
+
+/**
+ * 这套 state 当前是不是暗色（M4-C）。
+ *
+ * 与 `lineWrapEnabled` 同一个用途：`applyViewConfig` 靠它做「已经一致就什么都不做」的
+ * 早退，免得切一次换行顺手把所有标签的 state 对象都换掉（那些靠 `===` 判断 state 没动过
+ * 的地方会失准）。`EditorView.darkTheme` 是个布尔 facet，`state.facet` 直接给出合并后的值。
+ */
+export function darkThemeEnabled(state: EditorState): boolean {
+  return state.facet(EditorView.darkTheme)
 }

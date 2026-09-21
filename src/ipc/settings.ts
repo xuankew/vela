@@ -5,12 +5,12 @@
  * （Rust 在 `crates/vela-core/tests/wire_contract.rs`，前端在 `./settings.test.ts`），
  * 改一边必须改另一边。
  *
- * 配置比会话简单（三个具体键，没有嵌套元组），但失败方式一样安静：字段名写错的后果是
+ * 配置比会话简单（六个具体键，没有嵌套元组），但失败方式一样安静：字段名写错的后果是
  * **「重启后字号/字体回到默认」**——不崩、不报错，用户只会觉得「我设的没记住」。
  *
- * ## 🔴 五个键在 v1 全是偏好类，项目层写了也忽略
+ * ## 🔴 六个键在 v1 全是偏好类，项目层写了也忽略
  *
- * 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距是**个人偏好**，只认「内置默认 + 用户全局」两层。
+ * 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题是**个人偏好**，只认「内置默认 + 用户全局」两层。
  * 打开一个带 `.vela/settings.json` 的仓库**不会**改掉你的字号。于是项目层被读、被解析、
  * 但**不生效**：它试图写的偏好键落进 `SettingsReport.ignoredProjectKeys`，前端据此说一句
  * 「这个仓库想改你的 <键>，但 <键> 只认用户全局，已忽略」。完整推理见 Rust 侧模块文档
@@ -57,6 +57,14 @@ export interface Settings {
    * `normal` 而不是 `0em`，理由见 `store.ts`）。Rust 不夹范围，归 store。
    */
   letterSpacing: number
+  /**
+   * 主题选择（M4-C）：`'light'` / `'dark'` / `'system'`。偏好类。
+   *
+   * ⚠️ 线上是**不透明串**而不是 `ThemeId`：与 `fontVariant` 同一条理由——配置文件可能被
+   * 手改成任何串，Rust 只当它原样往返，合法 ID 清单（`THEME_IDS`）住在 `src/settings/theme.ts`，
+   * 校验/回退是 store 的职责（`sanitizeThemeId`），不是这一层的。
+   */
+  theme: string
 }
 
 /**
@@ -78,7 +86,7 @@ export interface SettingsReport {
   projectLayer: LayerStatus
   /**
    * 项目层试图写「仅全局」的偏好键、因而被忽略的键名（wire 名，可直接引用）。
-   * v1 里五个键全是偏好类，所以项目层写的任何键都会落在这里。
+   * v1 里六个键全是偏好类，所以项目层写的任何键都会落在这里。
    */
   ignoredProjectKeys: string[]
 }
@@ -141,7 +149,7 @@ export function loadSettings(roots: string[]): Promise<LoadedSettings> {
 /**
  * 把配置写进**用户全局层**（`~/.vela/settings.json`），原子。
  *
- * 🔴 v1 只写用户全局层：五个键都是偏好类、只认全局，没有需要落到项目层的键。
+ * 🔴 v1 只写用户全局层：六个键都是偏好类、只认全局，没有需要落到项目层的键。
  *
  * ⚠️ 参数名 `settings` 在契约里：Tauri 按名字去 payload 里取值，拼错的后果是 Rust 报
  * 「invalid args」——这一条**会**报错，不像字段名写错那样静默。

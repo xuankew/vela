@@ -165,7 +165,14 @@ const {
    */
   const settingsCmd: { loaded: unknown; loadError: unknown; saved: unknown[] } = {
     loaded: {
-      settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn', lineHeight: 1.75, letterSpacing: 0 },
+      settings: {
+        fontSize: 14,
+        fontVariant: 'screen-gb',
+        codeFont: 'maple-cn',
+        lineHeight: 1.75,
+        letterSpacing: 0,
+        theme: 'dark',
+      },
       report: {
         userLayer: { status: 'absent' },
         projectLayer: { status: 'absent' },
@@ -336,7 +343,14 @@ beforeEach(async () => {
   assetCmd.result = null
   assetCmd.error = null
   settingsCmd.loaded = {
-    settings: { fontSize: 14, fontVariant: 'screen-gb', codeFont: 'maple-cn', lineHeight: 1.75, letterSpacing: 0 },
+    settings: {
+      fontSize: 14,
+      fontVariant: 'screen-gb',
+      codeFont: 'maple-cn',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+      theme: 'dark',
+    },
     report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   }
   settingsCmd.loadError = null
@@ -4320,6 +4334,7 @@ describe('分层配置接线（M4-A）', () => {
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -4333,6 +4348,7 @@ describe('分层配置接线（M4-A）', () => {
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -4345,6 +4361,7 @@ describe('分层配置接线（M4-A）', () => {
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -4357,6 +4374,7 @@ describe('分层配置接线（M4-A）', () => {
       codeFont: 'inherit',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 
@@ -4383,7 +4401,7 @@ describe('分层配置接线（M4-A）', () => {
     expect(settingsCmd.saved.at(-1)).toMatchObject({ letterSpacing: 0.01 })
   })
 
-  it('「恢复默认」把五项一起打回内置默认并写穿', async () => {
+  it('「恢复默认」把六项一起打回内置默认并写穿', async () => {
     changeSelect(fontSizeSelect(), '20')
     stepperButtons('行高')[1]!.click()
     const reset = [...container.querySelectorAll<HTMLButtonElement>('.appearance-reset')][0]!
@@ -4398,6 +4416,7 @@ describe('分层配置接线（M4-A）', () => {
       codeFont: 'maple-cn',
       lineHeight: 1.75,
       letterSpacing: 0,
+      theme: 'dark',
     })
   })
 

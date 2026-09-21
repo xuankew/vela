@@ -9,9 +9,9 @@
 //!
 //! 合并顺序是「后一层盖前一层」，但 🔴 **不是每一层都能写每一个键**，见下面「可写层」。
 //!
-//! ## 🔴「哪一层能改哪些键」：v1 五个键都是偏好类，项目层写了也忽略
+//! ## 🔴「哪一层能改哪些键」：v1 六个键都是偏好类，项目层写了也忽略
 //!
-//! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距是**个人偏好**，只认「内置默认 + 用户全局」两层。
+//! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题是**个人偏好**，只认「内置默认 + 用户全局」两层。
 //! 打开一个带 `.vela/settings.json` 的仓库**不会**突然改掉你的字号——那样太突兀，
 //! 而且一个克隆来的仓库不该有这种权力（它连你的磁盘都能碰到，见 `commands.rs` 的信任面那张表）。
 //!
@@ -89,6 +89,17 @@ pub const DEFAULT_LINE_HEIGHT: f64 = 1.75;
 /// （`normal` 允许字体自带的字距调整）。区间与步进同样是 UI 概念，归前端夹。
 pub const DEFAULT_LETTER_SPACING: f64 = 0.0;
 
+/// 内置默认主题（M4-C）。与前端 `src/settings/theme.ts` 的 `DEFAULT_THEME` 同值，
+/// 两边各写一份、各钉一条（同 `DEFAULT_FONT_SIZE` 的做法）。
+///
+/// ⚠️ Rust 这边只当它是**不透明字符串**：合法 ID 清单（`'light' | 'dark' | 'system'`）
+/// 住在前端，Rust 不校验，前端读到不认识的串自己回退默认（`sanitizeThemeId`）。
+///
+/// 🔴 默认是 `'dark'` 而不是 `'system'`：M4-C 之前应用**只有暗色**，默认暗色保证老用户
+/// 升级后逐像素不变。选 `'system'` 会让「系统是亮色」的用户一升级就突然变亮——那是
+/// 一次没人要求的改动。想要跟随系统的用户自己选。
+pub const DEFAULT_THEME: &str = "dark";
+
 /// 合并之后的**最终配置**：每个键都是具体值，没有 `Option`。
 ///
 /// 这是 `load` 交出去、`save` 收进来的形状。前端拿到它直接往信号里灌，
@@ -113,6 +124,9 @@ pub struct Settings {
     pub line_height: f64,
     /// 字间距（em）。**偏好类**。`0.0` = `normal`。Rust 不夹范围，归前端。
     pub letter_spacing: f64,
+    /// 主题选择（`'light' | 'dark' | 'system'`，M4-C）。**偏好类**。
+    /// Rust 视为不透明字符串，前端校验（同 `font_variant`）。
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -124,6 +138,7 @@ impl Default for Settings {
             code_font: DEFAULT_CODE_FONT.to_owned(),
             line_height: DEFAULT_LINE_HEIGHT,
             letter_spacing: DEFAULT_LETTER_SPACING,
+            theme: DEFAULT_THEME.to_owned(),
         }
     }
 }
@@ -146,6 +161,7 @@ pub struct SettingsLayer {
     pub code_font: Option<String>,
     pub line_height: Option<f64>,
     pub letter_spacing: Option<f64>,
+    pub theme: Option<String>,
 }
 
 /// 一层配置文件在读取时的下场。
@@ -170,7 +186,7 @@ pub struct SettingsReport {
     pub project_layer: LayerStatus,
     /// 项目层试图写「仅全局」的偏好键、因而被忽略的键名（wire 名，前端可直接引用）。
     ///
-    /// v1 里五个键全是偏好类，所以项目层写的任何键都会落在这里。前端可以据此说一句
+    /// v1 里六个键全是偏好类，所以项目层写的任何键都会落在这里。前端可以据此说一句
     /// 「这个仓库的 `.vela/settings.json` 想改你的 <键>，但 <键> 只认用户全局，已忽略」。
     pub ignored_project_keys: Vec<String>,
 }
@@ -234,7 +250,7 @@ fn read_layer(path: &Path) -> (Option<SettingsLayer>, LayerStatus) {
 
 /// 把两层文件内容合并成最终配置，并记账项目层被忽略的键。
 ///
-/// 🔴 **可写层门在这里**：v1 五个键都是偏好类，只有 `user`（用户全局）能盖过内置默认；
+/// 🔴 **可写层门在这里**：v1 六个键都是偏好类，只有 `user`（用户全局）能盖过内置默认；
 /// `project`（项目级）里的同名键一律**丢弃并记账**。将来加 project-safe 键时，
 /// 就在这个函数里给那个键加一条「也接受 project」的分支——门已经在这儿了，不用临时搭。
 pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<String>) {
@@ -257,6 +273,9 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     if let Some(v) = user.letter_spacing {
         settings.letter_spacing = v;
     }
+    if let Some(v) = user.theme {
+        settings.theme = v;
+    }
 
     // 项目层：v1 没有 project-safe 键，偏好键写了也忽略，只记账给前端一句话
     let mut ignored_project_keys = Vec::new();
@@ -274,6 +293,9 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     }
     if project.letter_spacing.is_some() {
         ignored_project_keys.push("letterSpacing".to_owned());
+    }
+    if project.theme.is_some() {
+        ignored_project_keys.push("theme".to_owned());
     }
 
     (settings, ignored_project_keys)
@@ -435,12 +457,14 @@ mod tests {
 
     #[test]
     fn 未知键被忽略而不让整层作废() {
-        // forward-compat：新版本写下的 theme 键不该让只认五个键的这一版读不动
+        // forward-compat：将来才有的键不该让只认六个键的这一版读不动。
+        // theme 在 M4-C 之后已是**已知**键，正好顺带钉住「用户层写的 theme 生效」
         let home = tempfile::tempdir().unwrap();
-        write_user(home.path(), r#"{"fontSize":18,"theme":"dark","将来才有的键":123}"#);
+        write_user(home.path(), r#"{"fontSize":18,"theme":"light","将来才有的键":123}"#);
         let loaded = load(home.path(), None);
         assert_eq!(loaded.report.user_layer, LayerStatus::Present);
         assert_eq!(loaded.settings.font_size, 18);
+        assert_eq!(loaded.settings.theme, "light", "用户层写的 theme 是已知键，该生效");
     }
 
     #[test]
@@ -452,6 +476,7 @@ mod tests {
             code_font: "inherit".into(),
             line_height: 2.0,
             letter_spacing: 0.05,
+            theme: "light".into(),
         };
         let report = save(home.path(), &settings).unwrap();
         assert_eq!(report.bytes_written, fs::read(user_settings_path(home.path())).unwrap().len() as u64);
@@ -485,6 +510,28 @@ mod tests {
     }
 
     #[test]
+    fn 项目层写主题也被忽略并记账() {
+        // 主题是偏好类（M4-C）：一个克隆来的仓库不该有「把你整个应用切成亮色」的权力
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"theme":"light"}"#);
+        write_project(root.path(), r#"{"theme":"dark"}"#);
+        let loaded = load(home.path(), Some(root.path()));
+        assert_eq!(loaded.settings.theme, "light", "用户全局的 light 胜出，项目层不该盖");
+        assert_eq!(loaded.report.ignored_project_keys, vec!["theme".to_owned()]);
+    }
+
+    #[test]
+    fn 主题能存回来并走用户全局层() {
+        let home = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"theme":"system"}"#);
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.theme, "system");
+        // 没写的键留给内置默认
+        assert_eq!(loaded.settings.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
     fn 存的时候会建出_dot_vela_目录() {
         // 第一次改配置时 ~/.vela 还不存在
         let home = tempfile::tempdir().unwrap();
@@ -494,8 +541,8 @@ mod tests {
     }
 
     #[test]
-    fn 存下来的文件是干净的五个键_json() {
-        // 整份重写：只含这五个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
+    fn 存下来的文件是干净的六个键_json() {
+        // 整份重写：只含这六个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
         let home = tempfile::tempdir().unwrap();
         save(home.path(), &Settings::default()).unwrap();
         let text = fs::read_to_string(user_settings_path(home.path())).unwrap();
@@ -504,6 +551,7 @@ mod tests {
         assert!(text.contains("\"codeFont\": \"maple-cn\""), "{text}");
         assert!(text.contains("\"lineHeight\": 1.75"), "{text}");
         assert!(text.contains("\"letterSpacing\": 0.0"), "{text}");
+        assert!(text.contains("\"theme\": \"dark\""), "{text}");
         assert!(!text.contains("null"), "不该写 null 键：{text}");
     }
 

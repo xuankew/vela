@@ -31,6 +31,7 @@ function stateFor(doc = '', lineWrap = true, slot = makeSlot(), onUpdate?: (info
     lineWrap,
     language: languageFor(null),
     lineWrapSlot: slot,
+    darkSlot: new Compartment(),
     languageSlot: new Compartment(),
     onUpdate,
   })

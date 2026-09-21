@@ -1,9 +1,9 @@
-import { Compartment, type EditorState } from '@codemirror/state'
+import { Compartment, type EditorState, type StateEffect } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import type { EditorSnapshot } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
 import type { PasteImageHook } from '../editor/paste'
-import { createEditorState, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
+import { createEditorState, darkThemeEnabled, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
 import { createDocumentModel, type DocumentModel } from './document'
 
 /**
@@ -31,6 +31,14 @@ export interface ViewConfig {
   lineWrap: boolean
   readonly lineWrapSlot: Compartment
   /**
+   * 当前是不是暗色（M4-C 主题系统）。与 `lineWrap` 同为**全局视图设置**：不由单个标签决定，
+   * 而由「现在这套配色是亮还是暗」决定，所以共享一个 `darkSlot` 实例，一次 reconfigure
+   * 拨动所有标签。由 workspace 的 `setDarkTheme` 改写（见 `doc/workspace.ts`）。
+   */
+  dark: boolean
+  /** 深浅色的开关槽位，共享一个实例。理由与 `lineWrapSlot` 逐字相同，见 `editor/setup.ts` 的 `darkSlot` */
+  readonly darkSlot: Compartment
+  /**
    * 词补全的「其他文档」来源，工作区内所有标签共用同一个 getter。
    *
    * 放在这儿而不是每标签一个：同伴关系是**工作区**的性质（每个标签都该看到同一批
@@ -54,11 +62,19 @@ export function createViewConfig(
   lineWrap = true,
   peerStates: () => Iterable<EditorState> = () => [],
   pasteImage?: PasteImageHook,
+  dark = true,
 ): ViewConfig {
   // `pasteImage` 是可选的，所以只能条件展开：`exactOptionalPropertyTypes` 虽然没开，
   // 但显式写一个 `pasteImage: undefined` 会让「缺省」与「传了个 undefined」在
   // 序列化与 `in` 判断上分岔，而这一份 config 是要进 state 的
-  return { lineWrap, lineWrapSlot: new Compartment(), peerStates, ...(pasteImage ? { pasteImage } : {}) }
+  return {
+    lineWrap,
+    dark,
+    lineWrapSlot: new Compartment(),
+    darkSlot: new Compartment(),
+    peerStates,
+    ...(pasteImage ? { pasteImage } : {}),
+  }
 }
 
 export interface Tab {
@@ -116,6 +132,8 @@ export function buildState(
     doc: text,
     lineWrap: config.lineWrap,
     lineWrapSlot: config.lineWrapSlot,
+    dark: config.dark,
+    darkSlot: config.darkSlot,
     languageSlot,
     peerStates: config.peerStates,
     ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
@@ -189,7 +207,15 @@ export function replaceTabText(tab: Tab, text: string, config: ViewConfig) {
 export function applyViewConfig(tab: Tab, config: ViewConfig) {
   // 已经一致就什么都不做：不这样的话，切一次换行会把**所有**标签的 state 对象都换掉，
   // 内容虽然没变，但任何靠 `===` 判断「state 没动过」的地方都会失准。
-  if (lineWrapEnabled(tab.snapshot.state) === config.lineWrap) return
-  const effects = config.lineWrapSlot.reconfigure(config.lineWrap ? [EditorView.lineWrapping] : [])
-  tab.snapshot = { ...tab.snapshot, state: tab.snapshot.state.update({ effects }).state }
+  // 换行与深浅色是两个独立的槽位，各自比对、各自补一条 reconfigure，都一致时才整个跳过
+  const state = tab.snapshot.state
+  const effects: StateEffect<unknown>[] = []
+  if (lineWrapEnabled(state) !== config.lineWrap) {
+    effects.push(config.lineWrapSlot.reconfigure(config.lineWrap ? [EditorView.lineWrapping] : []))
+  }
+  if (darkThemeEnabled(state) !== config.dark) {
+    effects.push(config.darkSlot.reconfigure(EditorView.darkTheme.of(config.dark)))
+  }
+  if (effects.length === 0) return
+  tab.snapshot = { ...tab.snapshot, state: state.update({ effects }).state }
 }

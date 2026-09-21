@@ -35,7 +35,7 @@ use vela_core::session::{
 use vela_core::settings::{
     load as load_settings, save as save_settings, user_settings_path, LayerStatus, LoadedSettings, SaveReport,
     Settings, SettingsReport, DEFAULT_CODE_FONT, DEFAULT_FONT_SIZE, DEFAULT_FONT_VARIANT, DEFAULT_LETTER_SPACING,
-    DEFAULT_LINE_HEIGHT,
+    DEFAULT_LINE_HEIGHT, DEFAULT_THEME,
 };
 use vela_core::watcher::FileChange;
 
@@ -1444,7 +1444,7 @@ fn settings_的线上形状() {
     let json = serde_json::to_string(&Settings::default()).unwrap();
     assert_eq!(
         json,
-        r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0}"#
+        r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0,"theme":"dark"}"#
     );
 
     // save 命令收的就是这个形状，必须能原样读回来（含 JS 那侧会发的整数字面量 `0`）
@@ -1452,7 +1452,7 @@ fn settings_的线上形状() {
     assert_eq!(parsed, Settings::default());
     assert_eq!(
         serde_json::from_str::<Settings>(
-            r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0}"#
+            r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark"}"#
         )
         .unwrap(),
         Settings::default(),
@@ -1460,20 +1460,20 @@ fn settings_的线上形状() {
     );
 
     // 非默认值也一样：字段是具体值不是 Option，任何一档都走同一条反序列化路径
-    let custom =
-        r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05}"#;
+    let custom = r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05,"theme":"light"}"#;
     let parsed: Settings = serde_json::from_str(custom).unwrap();
     assert_eq!(
         (parsed.font_size, parsed.font_variant.as_str(), parsed.code_font.as_str()),
         (16, "screen-r", "inherit")
     );
     assert_eq!((parsed.line_height, parsed.letter_spacing), (2.0, 0.05));
+    assert_eq!(parsed.theme, "light");
 }
 
-/// 内置默认值两边各钉一条：这五个常量前端也各写一份（`App.tsx` 的 `DEFAULT_FONT_SIZE`、
+/// 内置默认值两边各钉一条：这六个常量前端也各写一份（`App.tsx` 的 `DEFAULT_FONT_SIZE`、
 /// `fonts/loader.ts` 的 `DEFAULT_VARIANT` / `DEFAULT_CODE_FONT`、`settings/store.ts` 的
-/// `DEFAULT_LINE_HEIGHT` / `DEFAULT_LETTER_SPACING`），没有代码生成，与 `MAX_SESSION_TABS`
-/// 同一套做法。漂了这条就红。
+/// `DEFAULT_LINE_HEIGHT` / `DEFAULT_LETTER_SPACING`、`settings/theme.ts` 的 `DEFAULT_THEME`），
+/// 没有代码生成，与 `MAX_SESSION_TABS` 同一套做法。漂了这条就红。
 #[test]
 fn 内置默认配置被钉住() {
     assert_eq!(DEFAULT_FONT_SIZE, 14);
@@ -1481,9 +1481,11 @@ fn 内置默认配置被钉住() {
     assert_eq!(DEFAULT_CODE_FONT, "maple-cn");
     assert_eq!(DEFAULT_LINE_HEIGHT, 1.75);
     assert_eq!(DEFAULT_LETTER_SPACING, 0.0);
+    assert_eq!(DEFAULT_THEME, "dark");
     assert_eq!(Settings::default().font_size, DEFAULT_FONT_SIZE);
     assert_eq!(Settings::default().line_height, DEFAULT_LINE_HEIGHT);
     assert_eq!(Settings::default().letter_spacing, DEFAULT_LETTER_SPACING);
+    assert_eq!(Settings::default().theme, DEFAULT_THEME);
 }
 
 /// `LayerStatus` 的三种线上形状。`status` 是标签字段（snake_case），
@@ -1512,6 +1514,7 @@ fn loaded_settings_的线上形状() {
             code_font: "inherit".into(),
             line_height: 2.0,
             letter_spacing: 0.05,
+            theme: "light".into(),
         },
         report: SettingsReport {
             user_layer: LayerStatus::Present,
@@ -1521,7 +1524,7 @@ fn loaded_settings_的线上形状() {
     };
     assert_eq!(
         serde_json::to_string(&loaded).unwrap(),
-        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
+        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05,"theme":"light"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
     );
 }
 
@@ -1542,7 +1545,7 @@ fn 空现场下_load_的线上形状() {
     let loaded = load_settings(home.path(), None);
     assert_eq!(
         serde_json::to_string(&loaded).unwrap(),
-        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
+        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0,"theme":"dark"},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
     );
 }
 
@@ -1562,16 +1565,17 @@ fn save_落盘再_load_回来一致() {
         code_font: "inherit".into(),
         line_height: 2.0,
         letter_spacing: 0.0,
+        theme: "dark".into(),
     };
 
     let report = save_settings(home.path(), &settings).unwrap();
     let path = user_settings_path(home.path());
     assert_eq!(report.bytes_written, fs::read(&path).unwrap().len() as u64);
 
-    // pretty 排版：五键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
+    // pretty 排版：六键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
-        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\",\n  \"lineHeight\": 2.0,\n  \"letterSpacing\": 0.0\n}"
+        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\",\n  \"lineHeight\": 2.0,\n  \"letterSpacing\": 0.0,\n  \"theme\": \"dark\"\n}"
     );
 
     // 读回来：用户层生效，项目层 absent
