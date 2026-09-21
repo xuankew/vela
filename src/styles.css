@@ -86,6 +86,60 @@
   color-scheme: light;
 }
 
+/* ────────────── Dracula 主题（MIT License）──────────────────────
+   https://github.com/dracula/dracula-theme */
+:root[data-theme='dracula'] {
+  --vela-bg: #282a36;
+  --vela-bg-alt: #21222c;
+  --vela-bg-panel: #44475a;
+  --vela-fg: #f8f8f2;
+  --vela-fg-dim: #6272a4;
+  --vela-border: #44475a;
+  --vela-guide: #3b3d4e;
+  --vela-accent: #bd93f9;
+  --vela-ok: #50fa7b;
+  --vela-warn: #ffb86c;
+  --vela-bad: #ff5555;
+
+  color-scheme: dark;
+}
+
+/* ────────────── Nord 主题（MIT License）─────────────────────────
+   https://github.com/arcticicestudio/nord */
+:root[data-theme='nord'] {
+  --vela-bg: #2e3440;
+  --vela-bg-alt: #272c36;
+  --vela-bg-panel: #3b4252;
+  --vela-fg: #d8dee9;
+  --vela-fg-dim: #616e88;
+  --vela-border: #434c5e;
+  --vela-guide: #363d4a;
+  --vela-accent: #81a1c1;
+  --vela-ok: #a3be8c;
+  --vela-warn: #ebcb8b;
+  --vela-bad: #bf616a;
+
+  color-scheme: dark;
+}
+
+/* ────────────── Solarized Dark 主题（MIT License）───────────────
+   https://github.com/altercation/solarized */
+:root[data-theme='solarized'] {
+  --vela-bg: #002b36;
+  --vela-bg-alt: #073642;
+  --vela-bg-panel: #586e75;
+  --vela-fg: #839496;
+  --vela-fg-dim: #657b83;
+  --vela-border: #586e75;
+  --vela-guide: #475b62;
+  --vela-accent: #268bd2;
+  --vela-ok: #859900;
+  --vela-warn: #b58900;
+  --vela-bad: #dc322f;
+
+  color-scheme: dark;
+}
+
 * {
   box-sizing: border-box;
 }

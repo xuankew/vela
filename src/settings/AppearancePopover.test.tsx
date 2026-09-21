@@ -158,11 +158,18 @@ describe('读数对得上 store', () => {
     expect(selectByTitle('代码区字体').value).toBe(DEFAULT_CODE_FONT)
   })
 
-  it('主题 select 的初值是内置默认，三个选项来自 THEME_LABELS', () => {
+  it('主题 select 的初值是内置默认，六个选项来自 THEME_LABELS', () => {
     click(toggle())
     const sel = row('主题').querySelector<HTMLSelectElement>('select')!
     expect(sel.value).toBe(DEFAULT_THEME)
-    expect([...sel.options].map((o) => o.textContent)).toEqual(['亮色', '暗色', '跟随系统'])
+    expect([...sel.options].map((o) => o.textContent)).toEqual([
+      '亮色',
+      '暗色',
+      '跟随系统',
+      'Dracula',
+      'Nord',
+      'Solarized',
+    ])
   })
 })
 

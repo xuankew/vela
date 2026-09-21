@@ -26,8 +26,9 @@
  * 两者分开是因为订阅需要一个能退订的生命周期，而那归 store 管（见 `store.ts`）。
  */
 
-/** 用户能选的主题 ID。`'system'` 是一个**模式**而不是第三套配色，它解析成下面两个之一 */
-export type ThemeId = 'light' | 'dark' | 'system'
+/** 用户能选的主题 ID。`'system'` 是一个**模式**而不是第三套配色，它解析成下面两个之一；
+ * dracula / nord / solarized 是三套流行配色（MIT License），见 §3.6「M4-C 实施修正」 */
+export type ThemeId = 'light' | 'dark' | 'system' | 'dracula' | 'nord' | 'solarized'
 
 /** 解析之后的具体主题：没有 `'system'`，因为那已经被 `resolveTheme` 拆掉了 */
 export type ResolvedTheme = 'light' | 'dark'
@@ -35,7 +36,7 @@ export type ResolvedTheme = 'light' | 'dark'
 /** 合法 ID 清单。选择器直接列这些值，冒出一个清单外的串（手改配置）会让 select 变空白——
  * 这正是 `sanitizeThemeId` 要把它打回默认的原因。用**数组**而不是 `Record` + `in`：
  * `Array.includes` 只匹配真实元素，天然不碰原型链，于是 `"toString"` 这种串不会被当成合法 ID */
-export const THEME_IDS: readonly ThemeId[] = ['light', 'dark', 'system']
+export const THEME_IDS: readonly ThemeId[] = ['light', 'dark', 'system', 'dracula', 'nord', 'solarized']
 
 /** 内置默认主题。与 Rust `settings::DEFAULT_THEME` 同值——两边各写一份、由
  * `wire_contract.rs` 与 `theme.test.ts` 各钉一条，没有代码生成（与 `DEFAULT_FONT_SIZE` 同一套做法） */
@@ -46,6 +47,9 @@ export const THEME_LABELS: Record<ThemeId, string> = {
   light: '亮色',
   dark: '暗色',
   system: '跟随系统',
+  dracula: 'Dracula',
+  nord: 'Nord',
+  solarized: 'Solarized',
 }
 
 /** 探测系统深浅色用的媒体查询。`watchSystemTheme` 与 `systemTheme` 共用这一条字面量，
@@ -72,9 +76,13 @@ export function systemTheme(): ResolvedTheme {
   return window.matchMedia(DARK_QUERY).matches ? 'dark' : 'light'
 }
 
-/** 把用户选的 ID 解析成一套具体的亮/暗：`'system'` 就地探测，其余原样 */
+/** 把用户选的 ID 解析成一套具体的亮/暗：`'system'` 就地探测，其余原样。
+ * dracula / nord / solarized 都是暗色主题，所以也映射到 `'dark'`（用于 CM6 darkTheme facet） */
 export function resolveTheme(id: ThemeId): ResolvedTheme {
-  return id === 'system' ? systemTheme() : id
+  if (id === 'system') return systemTheme()
+  // dracula/nord/solarized 都是暗色主题
+  if (id === 'dracula' || id === 'nord' || id === 'solarized') return 'dark'
+  return id
 }
 
 /** 这套主题是不是暗色。CM6 的 `EditorView.darkTheme` facet 要的就是这个布尔 */
