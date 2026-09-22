@@ -56,6 +56,13 @@ export interface ViewConfig {
    * 缺省 = 不接，粘贴走 CM6 的默认路径（`createEditorState` 被单独调用时，比如测试）。
    */
   readonly pasteImage?: PasteImageHook
+  /**
+   * Cmd/Ctrl+鼠标滚轮调整字号的回调。
+   *
+   * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
+   * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
+   */
+  readonly onFontSizeZoom?: (delta: number) => void
 }
 
 export function createViewConfig(
@@ -63,6 +70,7 @@ export function createViewConfig(
   peerStates: () => Iterable<EditorState> = () => [],
   pasteImage?: PasteImageHook,
   dark = true,
+  onFontSizeZoom?: (delta: number) => void,
 ): ViewConfig {
   // `pasteImage` 是可选的，所以只能条件展开：`exactOptionalPropertyTypes` 虽然没开，
   // 但显式写一个 `pasteImage: undefined` 会让「缺省」与「传了个 undefined」在
@@ -74,6 +82,7 @@ export function createViewConfig(
     darkSlot: new Compartment(),
     peerStates,
     ...(pasteImage ? { pasteImage } : {}),
+    ...(onFontSizeZoom ? { onFontSizeZoom } : {}),
   }
 }
 
@@ -137,6 +146,7 @@ export function buildState(
     languageSlot,
     peerStates: config.peerStates,
     ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
+    ...(config.onFontSizeZoom ? { onFontSizeZoom: config.onFontSizeZoom } : {}),
     onUpdate,
   })
 }

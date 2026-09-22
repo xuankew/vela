@@ -270,6 +270,13 @@ export interface WorkspaceOptions {
    * 于是图片落到隔壁文档的目录里，而链接插在另一个文档里——两边都错，而且错得对不上。
    */
   pasteImage?: PasteImageHook
+  /**
+   * Cmd/Ctrl+鼠标滚轮调整字号的回调。
+   *
+   * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
+   * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
+   */
+  onFontSizeZoom?: (delta: number) => void
 }
 
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
@@ -280,6 +287,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     liveStates,
     options.pasteImage,
     options.dark ?? true,
+    options.onFontSizeZoom,
   )
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 

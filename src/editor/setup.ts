@@ -34,6 +34,7 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
 import { createFindReplacePanel, preserveCase } from './findReplace'
+import { fontSizeZoom } from './fontSizeZoom'
 import { indentGuides } from './indentGuides'
 import type { LanguageChoice } from './language'
 import { mouseGestures } from './multiCursor'
@@ -318,6 +319,13 @@ export interface EditorSetupOptions {
    * 并跳过它自己那个默认粘贴。落地本身是异步的，那部分由钩子内部自己管（见 `src/md/paste.ts`）。
    */
   pasteImage?: PasteImageHook
+  /**
+   * Cmd/Ctrl+鼠标滚轮调整字号的回调。没传就不装这条扩展。
+   *
+   * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
+   * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
+   */
+  onFontSizeZoom?: (delta: number) => void
 }
 
 /**
@@ -356,6 +364,7 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     languageSlot,
     peerStates,
     pasteImage,
+    onFontSizeZoom,
   } = options
 
   const exts: Extension[] = [
@@ -424,6 +433,8 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   if (peerStates !== undefined) exts.push(wordPeers.of(peerStates))
   // 粘贴图片。没传就不装：CM6 内置的 paste 处理器照旧跑，行为与 M3-A-7 之前一模一样
   if (pasteImage !== undefined) exts.push(imagePaste(pasteImage))
+  // Cmd/Ctrl+鼠标滚轮调整字号。没传就不装：保持与 Mod+=/- 同一套步进逻辑
+  if (onFontSizeZoom !== undefined) exts.push(fontSizeZoom(onFontSizeZoom))
 
   return exts
 }

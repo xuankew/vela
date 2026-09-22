@@ -63,6 +63,12 @@ import { createToolBox } from './tools/store'
 const MarkdownPreview = lazy(() => import('./md/MarkdownPreview').then((m) => ({ default: m.MarkdownPreview })))
 
 /**
+ * JSON 预览面板也改成**按需加载**（M4-D）。与 MarkdownPreview 同一条理由：
+ * 只有用户按了 `Mod+Shift+K` 才需要这份代码，启动时不该为它付下载费。
+ */
+const JsonPreview = lazy(() => import('./json/JsonPreview').then((m) => ({ default: m.JsonPreview })))
+
+/**
  * 两块浮层的 UI 也改成**按需加载**（M3-C-2）：工具箱 12.3KB 净代码、命令面板 4.1KB。
  *
  * 🔴 挪走的只有**组件**，⛔ 不是它们身后那套状态：`createToolBox`（`tools/store.ts`）与
@@ -192,6 +198,7 @@ export default function App() {
   const ws = createWorkspace({
     promptDiscard: (names) => new Promise<DiscardDecision>((resolve) => setPendingClose({ names, resolve })),
     pasteImage: pasteImageInto,
+    onFontSizeZoom: settings.stepFontSize,
   })
   const activeDoc = () => ws.activeTab().doc
 
@@ -277,6 +284,17 @@ export default function App() {
    * 它答的是「这份文档长什么样」，而那份文档下次可能压根没打开
    */
   const [previewVisible, setPreviewVisible] = createSignal(false)
+
+  /**
+   * JSON 预览那一栏的可见性（M4-D）。默认关，与 Markdown 预览同一条理由：
+   * 一份不是 JSON 的文档，旁边挂一条报错的面板只是把正文区挤窄。
+   *
+   * ️ 与 Markdown 预览**互相独立**：两个都开、只开一个、都不关，四种组合都成立。
+   * Markdown 预览答「这份文档渲染出来什么样」，JSON 预览答「这段文本解析成 JSON 后的树形结构」。
+   *
+   * 同样刻意不进会话存档，理由写在上面 `previewVisible` 那条注释里
+   */
+  const [jsonPreviewVisible, setJsonPreviewVisible] = createSignal(false)
 
   /**
    * 大纲那一栏的可见性（M3-A-4）。默认关，与预览同一条理由：
@@ -802,6 +820,7 @@ export default function App() {
       closeFolder: () => tree.close(),
       toggleSidebar: () => setSidebarVisible((v) => !v),
       togglePreview: () => setPreviewVisible((v) => !v),
+      toggleJsonPreview: () => setJsonPreviewVisible((v) => !v),
       toggleOutline: () => setOutlineVisible((v) => !v),
       alignTable,
       wordCount,
@@ -1133,6 +1152,23 @@ export default function App() {
                 revision={ws.revision}
                 tabId={() => ws.activeTab().id}
                 onClose={() => setPreviewVisible(false)}
+              />
+            </Suspense>
+          </Show>
+
+          {/* JSON 预览那一栏（M4-D）。放在 Markdown 预览**之后**：两个都开时，
+              JSON 预览在最右边。顺序是「编辑器 → Markdown 预览 → JSON 预览」，
+              与「写 → 看渲染 → 看结构」的工作流一致。
+              
+              ️ 与 Markdown 预览共用同一个 `source` / `revision` / `tabId`，
+              因为两个面板都跟着聚焦的那块分屏走 */}
+          <Show when={jsonPreviewVisible()}>
+            <Suspense>
+              <JsonPreview
+                source={followedEditor}
+                revision={ws.revision}
+                tabId={() => ws.activeTab().id}
+                onClose={() => setJsonPreviewVisible(false)}
               />
             </Suspense>
           </Show>

@@ -82,6 +82,16 @@ export interface BuiltinHooks {
    */
   togglePreview: () => void
   /**
+   * 显示/隐藏 JSON 预览那一栏（M4-D）。
+   *
+   * 与 Markdown 预览是**两个独立的可见性**：Markdown 预览答「这份文档渲染出来是什么样」，
+   * JSON 预览答「这段文本解析成 JSON 后的树形结构」。关掉一个不该顺手关掉另一个。
+   *
+   * ⚠️ 命令本身**不判内容**：打开一个 `.md` 再按 `Mod+Shift+K`，面板照样出来，
+   * 里面写着「JSON 解析失败」。设 `when` gate 的话快捷键按下去什么也不发生，信息是零
+   */
+  toggleJsonPreview: () => void
+  /**
    * 显示/隐藏大纲那一栏（M3-A-4）。
    *
    * 与预览是**两个独立的可见性**，也与侧边栏是：大纲答「这份文档的结构长什么样」，
@@ -556,6 +566,16 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       run: () => hooks.openToolBox(),
     }),
 
+    // JSON 预览（M4-D）。绑 Mod+Shift+K：K = JSON (K for "Key")，与 Markdown 预览的 V 对应。
+    // 分类是「视图」，与 Markdown 预览同分类：两个都是「当前文档的另一种呈现方式」。
+    registry.register({
+      id: 'view.toggleJsonPreview',
+      title: 'JSON 预览',
+      category: '视图',
+      keybinding: 'Mod+Alt+V',
+      run: () => hooks.toggleJsonPreview(),
+    }),
+
     // 命令面板（M3-B-1d）。绑 Mod+Shift+P：VS Code 的「Show All Commands」就是 Cmd+Shift+P，
     // Sublime 的命令面板是 Cmd+Shift+P，两个参照物在这里恰好一致。
     //
@@ -602,6 +622,59 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     registry.register(cmCommand('editor.sortLinesAsc', '升序排序行', sortLinesAscending, 'Alt+Shift+A')),
     registry.register(cmCommand('editor.sortLinesDesc', '降序排序行', sortLinesDescending, 'Alt+Shift+D')),
     registry.register(cmCommand('editor.removeDuplicateLines', '删除重复行', removeDuplicateLines, 'Alt+Shift+U')),
+
+    // JSON 格式化 / 压缩（M3-B-2）。直接操作编辑器内容，不打开工具箱面板。
+    registry.register({
+      id: 'editor.formatJson',
+      title: '格式化 JSON',
+      category: '编辑器',
+      keybinding: 'Mod+Shift+J',
+      when: (ctx) => ctx.editor !== null,
+      run: (ctx) => {
+        const editor = ctx.editor
+        if (!editor) return
+        const view = editor.view
+        const text = view.state.doc.toString()
+        if (!text.trim()) return
+
+        try {
+          const value = JSON.parse(text)
+          const formatted = JSON.stringify(value, null, 2)
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: formatted },
+          })
+        } catch (err) {
+          // 解析失败时不做任何操作，保持原文不动
+          console.warn('JSON 格式化失败:', err instanceof Error ? err.message : String(err))
+        }
+      },
+    }),
+
+    registry.register({
+      id: 'editor.minifyJson',
+      title: '压缩 JSON',
+      category: '编辑器',
+      keybinding: 'Mod+Alt+J',
+      when: (ctx) => ctx.editor !== null,
+      run: (ctx) => {
+        const editor = ctx.editor
+        if (!editor) return
+        const view = editor.view
+        const text = view.state.doc.toString()
+        if (!text.trim()) return
+
+        try {
+          const value = JSON.parse(text)
+          const minified = JSON.stringify(value)
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: minified },
+          })
+        } catch (err) {
+          // 解析失败时不做任何操作，保持原文不动
+          console.warn('JSON 压缩失败:', err instanceof Error ? err.message : String(err))
+        }
+      },
+    }),
 
     // 查找替换。面板是自建的（多一个「保留大小写」开关，见 editor/findReplace），
     // 但 openSearchPanel / findNext / findPrevious / selectMatches 都是 CM6 原生的——
