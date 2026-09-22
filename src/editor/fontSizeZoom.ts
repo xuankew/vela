@@ -27,8 +27,17 @@ class FontSizeZoomPlugin implements PluginValue {
       // deltaY > 0 = 向下滚（缩小），< 0 = 向上滚（放大）
       const delta = e.deltaY < 0 ? 1 : -1
 
+      console.log('[fontSizeZoom] wheel event:', {
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        shiftKey: e.shiftKey,
+        deltaY: e.deltaY,
+        delta,
+      })
+
       // 从 state 的 facet 里取所有注册的回调并依次调用
       const callbacks = view.state.facet(fontSizeZoomFacet)
+      console.log('[fontSizeZoom] callbacks count:', callbacks.length)
       for (const cb of callbacks) {
         cb(delta)
       }
