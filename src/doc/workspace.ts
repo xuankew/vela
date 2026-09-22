@@ -453,8 +453,8 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
           // 变更计数同一条口径。⚠️ 它必须只认 `docChanged`：跟着选区一起涨的话，
           // 这个信号就退化成 `metrics` 了，而 M3-A 加它的全部理由就是不要那样
           bumpRevision()
-          // 如果当前是纯文本（无扩展名匹配），且内容现在看起来像 JSON，尝试切换语言
-          if (tab.language?.kind === 'plain') {
+          // 无路径的新建标签：如果内容现在看起来像 JSON，尝试切换语言
+          if (tab.doc.path() === null) {
             syncLanguage(tab)
           }
         }
