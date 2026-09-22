@@ -111,6 +111,10 @@ const fontTheme = EditorView.theme({
   '.cm-content': {
     caretColor: 'var(--vela-accent)',
   },
+  // 🔴 行号 gutter 必须跟随字号，否则放大时行号会重叠（PLAN.md R11）
+  '.cm-gutters': {
+    fontSize: 'var(--vela-font-size, 14px)',
+  },
 })
 
 /**
@@ -132,6 +136,10 @@ const codeDocFontTheme = EditorView.theme({
   },
   '.cm-content': {
     caretColor: 'var(--vela-accent)',
+  },
+  // 🔴 行号 gutter 必须跟随字号，否则放大时行号会重叠（PLAN.md R11）
+  '.cm-gutters': {
+    fontSize: 'var(--vela-font-size, 14px)',
   },
 })
 
