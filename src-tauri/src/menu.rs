@@ -17,12 +17,12 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItem::with_id(app, "file.new", "新建文档", true, Some("CmdOrCtrl+N"))?,
             &MenuItem::with_id(app, "file.open", "打开文件...", true, Some("CmdOrCtrl+O"))?,
             &MenuItem::with_id(app, "file.open_folder", "打开文件夹...", true, Option::<&str>::None)?,
-            &MenuItem::with_id(app, "file.recent", "最近项目", true, None)?,
+            &MenuItem::with_id(app, "file.recent", "最近项目", true, Option::<&str>::None)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "file.save", "保存", true, Some("CmdOrCtrl+S"))?,
             &MenuItem::with_id(app, "file.save_as", "另存为...", true, Some("CmdOrCtrl+Shift+S"))?,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "file.close_folder", "关闭文件夹", true, None)?,
+            &MenuItem::with_id(app, "file.close_folder", "关闭文件夹", true, Option::<&str>::None)?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::quit(app, Some("退出 Vela"))?,
         ],
@@ -79,11 +79,11 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         &[
             &MenuItem::with_id(app, "window.split_right", "右分屏", true, Some("CmdOrCtrl+\\"))?,
             &MenuItem::with_id(app, "window.split_down", "下分屏", true, Some("CmdOrCtrl+Shift+\\"))?,
-            &MenuItem::with_id(app, "window.merge_panes", "合并分屏", true, None)?,
+            &MenuItem::with_id(app, "window.merge_panes", "合并分屏", true, Option::<&str>::None)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "window.focus_next", "聚焦下一个分屏", true, Some("CmdOrCtrl+Alt+Right"))?,
             &MenuItem::with_id(app, "window.focus_prev", "聚焦上一个分屏", true, Some("CmdOrCtrl+Alt+Left"))?,
-            &MenuItem::with_id(app, "window.close_pane", "关闭分屏", true, None)?,
+            &MenuItem::with_id(app, "window.close_pane", "关闭分屏", true, Option::<&str>::None)?,
         ],
     )?;
 
@@ -93,7 +93,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         "帮助",
         true,
         &[
-            &MenuItem::with_id(app, "help.about", "关于 Vela", true, None)?,
+            &MenuItem::with_id(app, "help.about", "关于 Vela", true, Option::<&str>::None)?,
         ],
     )?;
 

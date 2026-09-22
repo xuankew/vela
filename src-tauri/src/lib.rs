@@ -107,7 +107,7 @@ pub fn run() {
         .on_menu_event(|app, event| {
             let id = event.id().0;
             // 把菜单 ID 作为事件名发给所有窗口，前端监听后走对应的命令
-            for window in app.webview_windows() {
+            for (_, window) in app.webview_windows() {
                 let _ = window.emit("menu-event", id);
             }
         })
