@@ -44,18 +44,49 @@ function baseName(path: string): string {
 }
 
 /**
+ * 快速判断文本是否可能是 JSON 内容。
+ *
+ * 用简单的启发式规则：去除空白后以 `{` 或 `[` 开头。
+ * 这不是严格的 JSON 验证，只是为了在无扩展名时给出合理的默认语法高亮。
+ */
+function looksLikeJson(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return false
+  const firstChar = trimmed[0]
+  return firstChar === '{' || firstChar === '['
+}
+
+/**
  * 无名文档当 Markdown。
  *
  * 这不是偷懒的默认值：Vela 主打 Markdown 友好，「新建标签随手写点东西」最可能写的
  * 就是笔记，而 M1-E 之前全局 `markdownMode = true` 也正是这个行为，不改它。
  */
-export function languageFor(path: string | null): LanguageChoice {
-  if (path === null) return MARKDOWN
+export function languageFor(path: string | null, content?: string): LanguageChoice {
+  if (path === null) {
+    // 无路径时，如果有内容且看起来像 JSON，就给 JSON 高亮
+    if (content !== undefined && looksLikeJson(content)) {
+      const jsonLang = LanguageDescription.matchFilename(languages, 'test.json')
+      if (jsonLang) {
+        return { kind: 'code', label: 'JSON', description: jsonLang }
+      }
+    }
+    return MARKDOWN
+  }
   const name = baseName(path)
   if (MARKDOWN_EXT.test(name)) return MARKDOWN
   // matchFilename 要的是文件名，喂全路径会让它的 filename 模式（如 /^makefile$/i）失配
   const description = LanguageDescription.matchFilename(languages, name)
-  if (description === null) return PLAIN
+  if (description === null) {
+    // 扩展名没匹配上时，如果内容看起来像 JSON，给 JSON 高亮
+    if (content !== undefined && looksLikeJson(content)) {
+      const jsonLang = LanguageDescription.matchFilename(languages, 'test.json')
+      if (jsonLang) {
+        return { kind: 'code', label: 'JSON', description: jsonLang }
+      }
+    }
+    return PLAIN
+  }
   return { kind: 'code', label: description.name, description }
 }
 

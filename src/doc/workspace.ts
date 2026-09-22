@@ -380,14 +380,16 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
-   * 按标签当前的路径把语言装进它自己的槽位。
+   * 按标签当前的路径（以及必要时的内容）把语言装进它自己的槽位。
    *
    * 三个调用点：标签刚建好、`setText` 重建了 state（新 state 的槽位是空的）、
    * 路径变了（打开文件、另存为）。语言没变时直接返回——否则每次保存都会把所有
    * 标签的 state 对象换一遍，内容虽然没变，但靠 `===` 判断「state 没动过」的地方会失准。
    */
   function syncLanguage(tab: Tab) {
-    const choice = languageFor(tab.doc.path())
+    // 取当前内容，供 languageFor 做内容检测（无扩展名时判断是否像 JSON）
+    const content = tabText(tab)
+    const choice = languageFor(tab.doc.path(), content)
     if (tab.language !== null && sameLanguage(tab.language, choice)) return
     tab.language = choice
     // 代号先自增再发请求：加载回来时对不上就说明期间又换过语言，那次结果必须丢掉。
@@ -451,6 +453,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
           // 变更计数同一条口径。⚠️ 它必须只认 `docChanged`：跟着选区一起涨的话，
           // 这个信号就退化成 `metrics` 了，而 M3-A 加它的全部理由就是不要那样
           bumpRevision()
+          // 如果当前是纯文本（无扩展名匹配），且内容现在看起来像 JSON，尝试切换语言
+          if (tab.language?.kind === 'plain') {
+            syncLanguage(tab)
+          }
         }
         // 只有正在显示的那个标签会收到事务（没显示在任何分屏里的标签没有 view，
         // 压根不产生 update），但度量属于状态栏，状态栏只跟着聚焦的分屏走，所以还是要判一次。
