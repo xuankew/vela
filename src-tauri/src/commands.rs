@@ -181,7 +181,7 @@ use vela_core::search::{
 };
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
 use vela_core::settings::{self as settings_store, LoadedSettings, SaveReport, Settings};
-use vela_core::keybindings::{self as keybindings_store, UserKeybindings, LoadedKeybindings as LoadedKeybindingsData};
+use vela_core::keybindings;
 
 /// 读一个文本文件。
 ///
@@ -484,9 +484,9 @@ pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<SaveRep
 /// 文件不存在或解析失败时返回空配置，不算错误。前端据此显示「无自定义快捷键」。
 /// 路径由 Rust 侧从 `home_dir()` 算出，前端无法影响落点——与 `save_settings` 同一条安全姿势。
 #[command]
-pub async fn load_keybindings(app: AppHandle) -> Result<LoadedKeybindingsData, WriteError> {
-    let home = home_dir(&app)?;
-    Ok(keybindings_store::load(&home))
+pub async fn load_keybindings(app: AppHandle) -> Result<keybindings::LoadedKeybindings, String> {
+    let home = home_dir(&app).map_err(|e| format!("获取主目录失败: {}", e))?;
+    Ok(keybindings::load(&home))
 }
 
 /// 把用户自定义快捷键原子写入 `~/.vela/keybindings.json`。
@@ -496,12 +496,13 @@ pub async fn load_keybindings(app: AppHandle) -> Result<LoadedKeybindingsData, W
 #[command]
 pub async fn save_keybindings(
     app: AppHandle,
-    keybindings: UserKeybindings,
-) -> Result<serde_json::Value, WriteError> {
-    let home = home_dir(&app)?;
-    let report = keybindings_store::save(&home, &keybindings)?;
-    // 返回一个通用的成功响应
-    Ok(serde_json::json!({ "success": report.success }))
+    keybindings: keybindings::UserKeybindings,
+) -> Result<serde_json::Value, String> {
+    let home = home_dir(&app).map_err(|e| format!("获取主目录失败: {}", e))?;
+    match keybindings::save(&home, &keybindings) {
+        Ok(report) => Ok(serde_json::json!({ "success": report.success })),
+        Err(e) => Err(format!("保存快捷键配置失败: {}", e)),
+    }
 }
 
 // ─── M2-C 全文搜索 / M2-D 全局替换：event 流 + 唯一一份 managed state ────────
