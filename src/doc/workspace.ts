@@ -815,16 +815,19 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
-   * Cmd+滚轮缩放后通知所有显示中的 view dispatch 空 transaction。
+   * Cmd+滚轮缩放后通知所有显示中的 view 重新测量行号 gutter。
    *
-   *  CSS 变量已更新，但 CM6 的行号 gutter 需要一次 measure 才能重新对齐字号。
-   * dispatch 一个空的 transaction（没有 changes、没有 effects）就能触发 measure，
-   * 让 gutter 重新计算尺寸。没显示中的 tab 下次切回来时 applyViewConfig 会自然对齐。
+   * CSS 变量已更新，但 CM6 的行号 gutter 需要一次 measure 才能重新对齐字号。
+   * 用 requestAnimationFrame 等一帧，确保 CSS 变量已经应用到 DOM（浏览器完成样式计算），
+   * 再 dispatch 空 transaction 触发 measure。没显示中的 tab 下次切回来时 applyViewConfig 会自然对齐。
    */
   function notifyFontSizeChanged(): void {
-    for (const pane of panes()) {
-      pane.controller?.view.dispatch({})
-    }
+    // 等一帧让 CSS 变量生效，再触发 CM6 measure
+    window.requestAnimationFrame(() => {
+      for (const pane of panes()) {
+        pane.controller?.view.dispatch({})
+      }
+    })
   }
 
   /**
