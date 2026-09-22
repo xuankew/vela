@@ -148,7 +148,7 @@ export const JSON_TOOL: ToolDefinition = {
   input: 'text',
   side: 'js',
   options: [
-    // ⚠️ 候选值就是显示文字，没有另配一份 label（`tool.ts` 的 `SelectOption` 上写着为什么）。
+    // ️ 候选值就是显示文字，没有另配一份 label（`tool.ts` 的 `SelectOption` 上写着为什么）。
     // 于是「选项条上写着 `无（压缩）`、`run` 收到的也是这个串」，中间没有能对不上的地方
     { kind: 'select', key: 'indent', label: '缩进', choices: ['2', '4', 'Tab', INDENT_NONE], default: '2' },
     { kind: 'toggle', key: 'sortKeys', label: '排序键', default: false },

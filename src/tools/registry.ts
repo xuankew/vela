@@ -98,6 +98,7 @@ export function installTools(
        * 它是**灰的**，用户得到的信息是「这个功能现在不能用」，却不知道要做什么才能用。
        * 与 `togglePreview` / `alignTable` / `wordCount` 逐字同一条理由
        */
+      keybinding: tool.keybinding,
       run: () => host.openTool(tool.id),
     }),
   )

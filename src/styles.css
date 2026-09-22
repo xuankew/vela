@@ -423,7 +423,8 @@ body {
 
 .settings-footer {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
   padding: 16px 24px;
   border-top: 1px solid var(--vela-border);
 }
@@ -442,6 +443,220 @@ body {
   color: var(--vela-fg);
   background: var(--vela-bg-alt);
   border-color: var(--vela-border);
+}
+
+.settings-keybindings-btn {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vela-accent);
+  background: transparent;
+  border: 1px solid var(--vela-accent);
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.settings-keybindings-btn:hover {
+  background: var(--vela-bg-alt);
+}
+
+/* 快捷键配置对话框（M4-E） */
+.keybindings-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 700px;
+  max-height: 85vh;
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+}
+
+.keybindings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.keybindings-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--vela-fg);
+}
+
+.keybindings-close {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  text-align: center;
+  font-size: 20px;
+  line-height: 1;
+  background: transparent;
+  border: none;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.keybindings-close:hover {
+  color: var(--vela-fg);
+  background: var(--vela-bg-alt);
+}
+
+.keybindings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 24px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.keybindings-hint {
+  font-size: 13px;
+  color: var(--vela-fg-dim);
+  padding: 8px 12px;
+  background: var(--vela-bg-alt);
+  border-radius: 6px;
+}
+
+.keybindings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.keybinding-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--vela-bg-alt);
+  border: 1px solid var(--vela-border);
+  border-radius: 8px;
+  transition: background 0.15s ease;
+}
+
+.keybinding-row:hover {
+  background: var(--vela-bg-panel);
+}
+
+.keybinding-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.keybinding-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--vela-fg);
+  margin-bottom: 2px;
+}
+
+.keybinding-id {
+  font-size: 12px;
+  color: var(--vela-fg-dim);
+  font-family: var(--vela-font-code);
+}
+
+.keybinding-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.keybinding-btn {
+  padding: 6px 12px;
+  font-size: 13px;
+  font-family: var(--vela-font-code);
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  color: var(--vela-fg);
+  cursor: pointer;
+  min-width: 120px;
+  text-align: center;
+}
+
+.keybinding-btn:hover {
+  background: var(--vela-bg-panel);
+  border-color: var(--vela-accent);
+}
+
+.keybinding-input {
+  padding: 6px 12px;
+  font-size: 13px;
+  font-family: var(--vela-font-code);
+  background: var(--vela-bg);
+  border: 2px solid var(--vela-accent);
+  border-radius: 6px;
+  color: var(--vela-fg);
+  min-width: 120px;
+  text-align: center;
+  outline: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.keybinding-cancel {
+  font-size: 11px;
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+}
+
+.keybinding-cancel:hover {
+  background: var(--vela-bg-alt);
+  color: var(--vela-fg);
+}
+
+.keybinding-reset {
+  font-size: 12px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+}
+
+.keybinding-reset:hover {
+  background: var(--vela-bg);
+  color: var(--vela-fg);
+  border-color: var(--vela-border);
+}
+
+.keybindings-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 16px 24px;
+  border-top: 1px solid var(--vela-border);
+}
+
+.keybindings-reset-all {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vela-fg-dim);
+  background: transparent;
+  border: 1px solid var(--vela-border);
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.keybindings-reset-all:hover {
+  color: var(--vela-bad);
+  background: var(--vela-bg-alt);
+  border-color: var(--vela-bad);
 }
 
 button {

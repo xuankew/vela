@@ -138,7 +138,7 @@ export interface ToolDefinition {
   /**
    * 分层命名，`tool.` 开头：`tool.json.format`。
    *
-   * 🔴 它**同时就是命令 id**——工具投影进命令注册表时原样用它（`tools/registry.ts`），
+   *  它**同时就是命令 id**——工具投影进命令注册表时原样用它（`tools/registry.ts`），
    * 所以它必须过得 `commands/registry.ts` 那条 `ID_RE`。前缀写死成 `tool.` 是为了让
    * 「这是一条工具命令」在命令面板的 id 上一眼可见，也是为了让 `validateTool` 能在
    * 注册之前就拦下 `json.format` 这种漏了前缀的写法
@@ -156,6 +156,11 @@ export interface ToolDefinition {
    * 的依据之一，也是将来给 Rust 侧工具加超时与取消时的分派点
    */
   readonly side: 'js' | 'rust'
+  /**
+   * 快捷键声明（可选）。格式与 `CommandDefinition.keybinding` 一致：
+   * `'Mod+Shift+J'` / `'Alt+K'` 等。M3-B 阶段只有 JSON 工具绑了快捷键。
+   */
+  readonly keybinding?: string
   /**
    * 跑一次。
    *

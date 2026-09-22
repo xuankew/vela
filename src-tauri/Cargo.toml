@@ -46,11 +46,12 @@ notify = "8.2"
 notify-debouncer-full = "0.6"
 # 文件 IO 的真正实现住在框架无关的 vela-core 里，这一层只是 Tauri command 适配器
 vela-core = { path = "../crates/vela-core" }
+# `tauri::generate_context!()` 宏需要 serde_json（编译期生成 tauri.conf.json 的 JSON 解析）
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # 只为了把三个搜索事件载荷的形状钉成黄金 JSON（与 `src/ipc/search.test.ts` 对照）。
 # 生产代码不序列化 JSON，Tauri 自己那一份不对外露。许可证同上：MIT OR Apache-2.0
-serde_json = { workspace = true }
 # M2-E：`ProjectIndexCache` 的缓存策略要有真的目录树才能测（见 `commands.rs` 的
 # `每次_index_project_都重建`）。许可证已核实，见根 `Cargo.toml`：MIT OR Apache-2.0
 tempfile = { workspace = true }

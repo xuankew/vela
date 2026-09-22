@@ -10,23 +10,13 @@ import {
 import { DEFAULT_FONT_SIZE, DEFAULT_LETTER_SPACING, DEFAULT_LINE_HEIGHT, FONT_SIZES, type SettingsStore } from './store'
 import { DEFAULT_THEME, THEME_IDS, THEME_LABELS, type ThemeId } from './theme'
 
-/**
- * 设置对话框（M4-B，菜单触发入口）。
- *
- * 与 `AppearancePopover` 共用同一套配置逻辑，但呈现为居中模态对话框而不是锚定下拉。
- * 工具栏隐藏后，这是访问主题 / 字号 / 行高 / 字间距 / 字体的主要入口。
- *
- * ## 键盘
- *
- * - `Escape` 关闭对话框
- * - 点遮罩层外面也关闭
- */
-
 export interface SettingsDialogProps {
   /** App 建一次、从不换引用的那份配置状态 */
   settings: SettingsStore
   visible: boolean
   onClose: () => void
+  /** 打开快捷键配置对话框（M4-E） */
+  onOpenKeybindings?: () => void
 }
 
 export function SettingsDialog(props: SettingsDialogProps) {
@@ -187,6 +177,15 @@ export function SettingsDialog(props: SettingsDialogProps) {
           <button class="settings-reset" onClick={resetAll} title="六项都回到内置默认">
             恢复默认
           </button>
+          {props.onOpenKeybindings && (
+            <button
+              class="settings-keybindings-btn"
+              onClick={props.onOpenKeybindings}
+              title="配置快捷键"
+            >
+              快捷键配置
+            </button>
+          )}
         </div>
       </div>
     </div>

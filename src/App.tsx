@@ -38,6 +38,7 @@ import type { HitRow } from './search/rows'
 import { createSearchPanel } from './search/store'
 // import { AppearancePopover } from './settings/AppearancePopover' // 工具栏隐藏后暂时不用，保留导入以备将来恢复
 import { SettingsDialog } from './settings/SettingsDialog'
+import { KeybindingsDialog } from './settings/KeybindingsDialog'
 import { createSettingsStore } from './settings/store'
 import { BUILTIN_TOOLS } from './tools/builtin'
 import { createToolBox } from './tools/store'
@@ -390,6 +391,13 @@ export default function App() {
    * 两者共用同一套配置状态（`settings`），只是呈现方式不同——工具栏隐藏后需要这个入口
    */
   const [settingsDialogVisible, setSettingsDialogVisible] = createSignal(false)
+
+  /**
+   * 快捷键配置对话框的可见性（M4-E）。
+   *
+   * 从设置对话框中的"快捷键配置"按钮打开，独立于设置对话框。
+   */
+  const [keybindingsDialogVisible, setKeybindingsDialogVisible] = createSignal(false)
 
   /**
    * 大纲那一栏的可见性（M3-A-4）。默认关，与预览同一条理由：
@@ -1284,7 +1292,36 @@ export default function App() {
 
       {/* 设置对话框（菜单触发，View → 设置... / Cmd+,）*/}
       <Show when={settingsDialogVisible()}>
-        <SettingsDialog settings={settings} visible={settingsDialogVisible()} onClose={() => setSettingsDialogVisible(false)} />
+        <SettingsDialog
+          settings={settings}
+          visible={settingsDialogVisible()}
+          onClose={() => setSettingsDialogVisible(false)}
+          onOpenKeybindings={() => {
+            setSettingsDialogVisible(false)
+            setKeybindingsDialogVisible(true)
+          }}
+        />
+      </Show>
+
+      {/* 快捷键配置对话框（M4-E）*/}
+      <Show when={keybindingsDialogVisible()}>
+        <KeybindingsDialog
+          visible={keybindingsDialogVisible()}
+          onClose={() => setKeybindingsDialogVisible(false)}
+          commands={registry.list(appContext())}
+          getKeybindings={(id) => {
+            const cmd = registry.get(id)
+            return cmd?.keybinding ? (Array.isArray(cmd.keybinding) ? cmd.keybinding : [cmd.keybinding]) : []
+          }}
+          setKeybinding={(id, keybinding) => {
+            // TODO: 实现快捷键修改逻辑，需要更新命令注册表
+            console.log('Set keybinding for', id, ':', keybinding)
+          }}
+          resetKeybinding={(id) => {
+            // TODO: 实现重置快捷键逻辑
+            console.log('Reset keybinding for', id)
+          }}
+        />
       </Show>
     </div>
   )
