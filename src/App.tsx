@@ -128,6 +128,56 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/**
+ * 菜单事件路由：把 Rust 侧转发的菜单 ID 映射到前端的命令执行。
+ *
+ * 所有菜单项的快捷键已经在 builtins.ts 里注册过了，这里只是把菜单点击
+ * 翻译成对应的命令调用，保持单一入口。
+ */
+function routeMenuEvent(
+  id: string,
+  ws: ReturnType<typeof createWorkspace>,
+  ctx: { editor: EditorController | null },
+): void {
+  // File
+  if (id === 'file.new') ws.hooks.newDocument()
+  else if (id === 'file.open') ws.hooks.openFile()
+  else if (id === 'file.open_folder') ws.hooks.openFolder()
+  else if (id === 'file.recent') ws.hooks.openRecentProject()
+  else if (id === 'file.save') ctx.editor && ws.commands.run('editor.save', ctx)
+  else if (id === 'file.save_as') ctx.editor && ws.commands.run('editor.saveAs', ctx)
+  else if (id === 'file.close_folder') ws.hooks.closeFolder()
+  // Edit
+  else if (id === 'edit.find_in_files') ws.hooks.findInFiles()
+  else if (id === 'edit.replace_in_files') ws.hooks.replaceInFiles()
+  else if (id === 'edit.format_json') ws.commands.run('editor.formatJson', ctx)
+  else if (id === 'edit.minify_json') ws.commands.run('editor.minifyJson', ctx)
+  else if (id === 'edit.align_table') ws.hooks.alignTable()
+  else if (id === 'edit.word_count') ws.hooks.wordCount()
+  // View
+  else if (id === 'view.toggle_sidebar') ws.hooks.toggleSidebar()
+  else if (id === 'view.toggle_preview') ws.hooks.togglePreview()
+  else if (id === 'view.toggle_outline') ws.hooks.toggleOutline()
+  else if (id === 'view.toggle_json_preview') ws.hooks.toggleJsonPreview()
+  else if (id === 'view.zoom_in') ws.hooks.adjustFontSize(1)
+  else if (id === 'view.zoom_out') ws.hooks.adjustFontSize(-1)
+  else if (id === 'view.reset_zoom') ws.hooks.resetFontSize()
+  else if (id === 'view.toggle_line_wrap') ws.hooks.toggleLineWrap()
+  else if (id === 'view.command_palette') ws.hooks.openCommandPalette()
+  // Window
+  else if (id === 'window.split_right') ws.hooks.splitRight()
+  else if (id === 'window.split_down') ws.hooks.splitDown()
+  else if (id === 'window.merge_panes') ws.hooks.mergePanes()
+  else if (id === 'window.focus_next') ws.hooks.focusNextPane()
+  else if (id === 'window.focus_prev') ws.hooks.focusPreviousPane()
+  else if (id === 'window.close_pane') ws.hooks.closePane()
+  // Help
+  else if (id === 'help.about') {
+    // TODO: 打开关于对话框
+    console.log('About Vela')
+  }
+}
+
 export default function App() {
   let disposeCommands: (() => void) | undefined
   let detachKeys: (() => void) | undefined
@@ -858,6 +908,17 @@ export default function App() {
       if (tornDown) unlisten()
       else detachCloseGuard = unlisten
     })
+    // 菜单事件监听：Rust 侧把所有菜单项点击转发成 `menu-event` 事件，
+    // 载荷是菜单 ID（如 "file.new"）。这里路由到对应的命令。
+    let detachMenu: (() => void) | undefined
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      void listen<string>('menu-event', ({ payload: id }) => {
+        routeMenuEvent(id, ws, ctx)
+      }).then((unlisten) => {
+        if (tornDown) unlisten()
+        else detachMenu = unlisten
+      })
+    })
     // ⚠️ 三个搜索事件在**启动时挂一次、挂着不放**，不是每次搜索挂一遍：`listen` 本身是
     // 异步的，注册之前到达的事件永久丢失。而 `start_search` 是先 spawn 后台线程再返回
     // taskId 的，所以「事件已经在路上」与「前端还没挂好」这两件事会重叠——
@@ -891,6 +952,7 @@ export default function App() {
     tornDown = true
     sync?.stop()
     detachCloseGuard?.()
+    detachMenu?.()
     detachSearch?.()
     detachReplace?.()
     detachFileWatch?.()

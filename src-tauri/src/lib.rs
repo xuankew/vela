@@ -1,4 +1,5 @@
 mod commands;
+mod menu;
 mod shard;
 mod watcher;
 
@@ -62,7 +63,7 @@ const FILE_CHANGED: &str = "vela://file-changed";
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::UpdaterBuilder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // M2-C 起的 `taskId → 取消标志` 注册表，M2-D 的替换与搜索**共用这一份**。
         // 见 `commands::TaskRegistry`
         .manage(commands::TaskRegistry::default())
@@ -76,6 +77,7 @@ pub fn run() {
         // （⚠️ 它是这四份里唯一一个**必须有人来收尾**的：一个条目就是一个 fd，
         // 而 fd 不会因为没人再提它就自己关掉）
         .manage(shard::ShardRegistry::default())
+        .menu(|app| menu::build_menu(app))
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::save_file,
@@ -101,6 +103,14 @@ pub fn run() {
             shard::read_lines,
             shard::close_large
         ])
+        // 菜单项点击事件：全部转发给前端，由前端的命令系统统一处理。
+        .on_menu_event(|app, event| {
+            let id = event.id().0;
+            // 把菜单 ID 作为事件名发给所有窗口，前端监听后走对应的命令
+            for window in app.webview_windows() {
+                let _ = window.emit("menu-event", id);
+            }
+        })
         // 未保存改动的关闭拦截（PLAN.md M1-D-4）。
         //
         // 两个入口都要拦，只拦第一个在 macOS 上等于没拦：
