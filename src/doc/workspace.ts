@@ -388,7 +388,8 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
    */
   function syncLanguage(tab: Tab) {
     // 取当前内容，供 languageFor 做内容检测（无扩展名时判断是否像 JSON）
-    const content = tabText(tab)
+    // ⚠️ 显示中的标签内容在 view.state.doc 里，不在 snapshot 里
+    const content = viewOf(tab)?.view.state.doc.toString() ?? tabText(tab)
     const choice = languageFor(tab.doc.path(), content)
     if (tab.language !== null && sameLanguage(tab.language, choice)) return
     tab.language = choice
