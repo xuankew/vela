@@ -181,6 +181,7 @@ use vela_core::search::{
 };
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
 use vela_core::settings::{self as settings_store, LoadedSettings, SaveReport, Settings};
+use vela_core::keybindings::{self as keybindings_store, UserKeybindings, LoadedKeybindings as LoadedKeybindingsData};
 
 /// 读一个文本文件。
 ///
@@ -474,6 +475,33 @@ pub async fn load_settings(app: AppHandle, roots: Vec<String>) -> Result<LoadedS
 pub async fn save_settings(app: AppHandle, settings: Settings) -> Result<SaveReport, WriteError> {
     let home = home_dir(&app)?;
     settings_store::save(&home, &settings)
+}
+
+// ─── M4-E 快捷键配置 ──────────────────────────────────────────────────────
+
+/// 读取用户自定义快捷键配置（`~/.vela/keybindings.json`）。
+///
+/// 文件不存在或解析失败时返回空配置，不算错误。前端据此显示「无自定义快捷键」。
+/// 路径由 Rust 侧从 `home_dir()` 算出，前端无法影响落点——与 `save_settings` 同一条安全姿势。
+#[command]
+pub async fn load_keybindings(app: AppHandle) -> Result<LoadedKeybindingsData, WriteError> {
+    let home = home_dir(&app)?;
+    Ok(keybindings_store::load(&home))
+}
+
+/// 把用户自定义快捷键原子写入 `~/.vela/keybindings.json`。
+///
+/// ⚠️ **不校验快捷键串**：这只是个不透明 JSON 对象，前端负责解析与冲突检测。
+/// Rust 侧只负责读写文件，像对待 settings 一样把它当成「前端定义的结构」。
+#[command]
+pub async fn save_keybindings(
+    app: AppHandle,
+    keybindings: UserKeybindings,
+) -> Result<serde_json::Value, WriteError> {
+    let home = home_dir(&app)?;
+    let report = keybindings_store::save(&home, &keybindings)?;
+    // 返回一个通用的成功响应
+    Ok(serde_json::json!({ "success": report.success }))
 }
 
 // ─── M2-C 全文搜索 / M2-D 全局替换：event 流 + 唯一一份 managed state ────────

@@ -21,6 +21,7 @@
 //! `UTF8`/`ASCII` → `纯文本编码`/`英文`。小写 ASCII 词（`literal`、`rel`）不受影响。
 
 pub mod fs;
+pub mod keybindings;
 pub mod project;
 pub mod search;
 pub mod session;

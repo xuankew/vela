@@ -93,6 +93,8 @@ pub fn run() {
             commands::save_session,
             commands::load_settings,
             commands::save_settings,
+            commands::load_keybindings,
+            commands::save_keybindings,
             commands::start_search,
             commands::start_replace,
             commands::cancel_task,
