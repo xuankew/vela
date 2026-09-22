@@ -105,10 +105,10 @@ pub fn run() {
         ])
         // 菜单项点击事件：全部转发给前端，由前端的命令系统统一处理。
         .on_menu_event(|app, event| {
-            let id = event.id().0;
+            let id = event.id().0.clone();
             // 把菜单 ID 作为事件名发给所有窗口，前端监听后走对应的命令
             for (_, window) in app.webview_windows() {
-                let _ = window.emit("menu-event", id);
+                let _ = window.emit("menu-event", &id);
             }
         })
         // 未保存改动的关闭拦截（PLAN.md M1-D-4）。
