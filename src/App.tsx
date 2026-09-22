@@ -159,7 +159,11 @@ export default function App() {
    * 闭包引用 `ws`（声明在后面）是安全的：它只在 `load`/`applyNow`/`setTheme` 时被调，
    * 那都在组件体跑完之后，`ws` 早已初始化。
    */
-  const settings = createSettingsStore({ onWarn: setSettingsNotice, applyDark: (dark) => ws.setDarkTheme(dark) })
+  const settings = createSettingsStore({
+    onWarn: setSettingsNotice,
+    applyDark: (dark) => ws.setDarkTheme(dark),
+    onFontSizeChange: () => ws.notifyFontSizeChanged(),
+  })
 
   /**
    * 会话这一层的提示：存档读不回来、写不下去、草稿超预算被丢。

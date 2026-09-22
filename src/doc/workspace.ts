@@ -215,6 +215,8 @@ export interface Workspace {
   toggleLineWrap: () => void
   /** 切换 CM6 的深/浅色 facet（M4-C）。颜色的 `data-theme` 由 store 负责，两者要一起做 */
   setDarkTheme: (on: boolean) => void
+  /** Cmd+滚轮缩放后通知所有显示中的 view dispatch 空 transaction，触发 measure 对齐行号 */
+  notifyFontSizeChanged: () => void
   /** 有没有任何标签还没落盘 */
   anyDirty: () => boolean
   /**
@@ -813,6 +815,19 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
+   * Cmd+滚轮缩放后通知所有显示中的 view dispatch 空 transaction。
+   *
+   *  CSS 变量已更新，但 CM6 的行号 gutter 需要一次 measure 才能重新对齐字号。
+   * dispatch 一个空的 transaction（没有 changes、没有 effects）就能触发 measure，
+   * 让 gutter 重新计算尺寸。没显示中的 tab 下次切回来时 applyViewConfig 会自然对齐。
+   */
+  function notifyFontSizeChanged(): void {
+    for (const pane of panes()) {
+      pane.controller?.view.dispatch({})
+    }
+  }
+
+  /**
    * 要存进会话的标签。超出 `MAX_SESSION_TABS` 时从后面截断，但**正在显示的标签一个都不丢**。
    *
    * 丢一个显示中的标签会让 `panes` 里的一个下标悬空，而 Rust 侧的 `validate` 会因此
@@ -1078,6 +1093,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     setLineWrap,
     toggleLineWrap: () => setLineWrap(!config.lineWrap),
     setDarkTheme,
+    notifyFontSizeChanged,
     anyDirty: () => tabs().some((t) => t.doc.dirty()),
     dirtyPaths: () =>
       tabs().flatMap((t) => {

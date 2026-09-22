@@ -158,7 +158,7 @@ export interface SettingsStoreOptions {
   /**
    * 深/浅色生效时的回调（M4-C）。`App.tsx` 注入成 `(dark) => ws.setDarkTheme(dark)`。
    *
-   * 🔴 为什么是注入而不是 store 直接 import workspace：与 `pasteImage` / `promptDiscard`
+   *  为什么是注入而不是 store 直接 import workspace：与 `pasteImage` / `promptDiscard`
    * 同一条理由——store 不该知道宿主长什么样，而且那样会成环。store 只负责「算出当前该是
    * 亮还是暗」（`resolveTheme`）与「把 `data-theme` 写进 `<html>`」（管 `--vela-*` 那套颜色）；
    * CM6 base theme 的 `&dark` facet 归 workspace 的 `setDarkTheme` 管。两件事必须一起做，
@@ -167,6 +167,14 @@ export interface SettingsStoreOptions {
    * 没注入（测试、首屏还没接 workspace 时）就只写 `data-theme`，CM6 那边保持缺省的暗色。
    */
   applyDark?: (dark: boolean) => void
+  /**
+   * 字号变化后的回调。`App.tsx` 注入成 `() => ws.notifyFontSizeChanged()`。
+   *
+   * 🔴 用途：Cmd+滚轮无级缩放后，CSS 变量已更新，但 CM6 的行号 gutter 需要一次 measure
+   * 才能重新对齐。dispatch 一个空 transaction 就能触发 measure。
+   * 没注入就不做额外操作（档位选择走 setFontSize，本身就会 persist → 下次启动一致）。
+   */
+  onFontSizeChange?: () => void
 }
 
 export interface SettingsStore {
@@ -461,12 +469,14 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     const next = Math.min(ZOOMED_FONT_SIZE_MAX, Math.max(ZOOMED_FONT_SIZE_MIN, base + delta))
     setZoomedFontSizeSignal(next)
     applyFontSizeVar(next)
+    options.onFontSizeChange?.()
   }
 
   /** 重置滚轮缩放，回到档位值 */
   function resetZoomedFontSize(): void {
     setZoomedFontSizeSignal(null)
     applyFontSizeVar(fontSize())
+    options.onFontSizeChange?.()
   }
 
   /**
