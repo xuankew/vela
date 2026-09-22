@@ -3,7 +3,7 @@ mod menu;
 mod shard;
 mod watcher;
 
-use tauri::{Emitter, RunEvent, WindowEvent};
+use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
 /// 前端要回答「能不能关」的事件名。另一半在 `src/ipc/windowClose.ts`。
 const REQUEST_CLOSE: &str = "vela://request-close";

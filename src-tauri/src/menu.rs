@@ -16,7 +16,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         &[
             &MenuItem::with_id(app, "file.new", "新建文档", true, Some("CmdOrCtrl+N"))?,
             &MenuItem::with_id(app, "file.open", "打开文件...", true, Some("CmdOrCtrl+O"))?,
-            &MenuItem::with_id(app, "file.open_folder", "打开文件夹...", true, None)?,
+            &MenuItem::with_id(app, "file.open_folder", "打开文件夹...", true, Option::<&str>::None)?,
             &MenuItem::with_id(app, "file.recent", "最近项目", true, None)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "file.save", "保存", true, Some("CmdOrCtrl+S"))?,
