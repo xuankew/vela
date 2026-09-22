@@ -27,8 +27,9 @@
  */
 
 /** 用户能选的主题 ID。`'system'` 是一个**模式**而不是第三套配色，它解析成下面两个之一；
- * dracula / nord / solarized 是三套流行配色（MIT License），见 §3.6「M4-C 实施修正」 */
-export type ThemeId = 'light' | 'dark' | 'system' | 'dracula' | 'nord' | 'solarized'
+ * dracula / nord / solarized 是三套流行配色（MIT License），见 §3.6「M4-C 实施修正」；
+ * eye-care 是护眼模式（暖色调，减少蓝光刺激） */
+export type ThemeId = 'light' | 'dark' | 'system' | 'dracula' | 'nord' | 'solarized' | 'eye-care'
 
 /** 解析之后的具体主题：没有 `'system'`，因为那已经被 `resolveTheme` 拆掉了 */
 export type ResolvedTheme = 'light' | 'dark'
@@ -36,7 +37,7 @@ export type ResolvedTheme = 'light' | 'dark'
 /** 合法 ID 清单。选择器直接列这些值，冒出一个清单外的串（手改配置）会让 select 变空白——
  * 这正是 `sanitizeThemeId` 要把它打回默认的原因。用**数组**而不是 `Record` + `in`：
  * `Array.includes` 只匹配真实元素，天然不碰原型链，于是 `"toString"` 这种串不会被当成合法 ID */
-export const THEME_IDS: readonly ThemeId[] = ['light', 'dark', 'system', 'dracula', 'nord', 'solarized']
+export const THEME_IDS: readonly ThemeId[] = ['light', 'dark', 'system', 'dracula', 'nord', 'solarized', 'eye-care']
 
 /** 内置默认主题。与 Rust `settings::DEFAULT_THEME` 同值——两边各写一份、由
  * `wire_contract.rs` 与 `theme.test.ts` 各钉一条，没有代码生成（与 `DEFAULT_FONT_SIZE` 同一套做法） */
@@ -50,6 +51,7 @@ export const THEME_LABELS: Record<ThemeId, string> = {
   dracula: 'Dracula',
   nord: 'Nord',
   solarized: 'Solarized',
+  'eye-care': '护眼模式',
 }
 
 /** 探测系统深浅色用的媒体查询。`watchSystemTheme` 与 `systemTheme` 共用这一条字面量，
@@ -80,8 +82,8 @@ export function systemTheme(): ResolvedTheme {
  * dracula / nord / solarized 都是暗色主题，所以也映射到 `'dark'`（用于 CM6 darkTheme facet） */
 export function resolveTheme(id: ThemeId): ResolvedTheme {
   if (id === 'system') return systemTheme()
-  // dracula/nord/solarized 都是暗色主题
-  if (id === 'dracula' || id === 'nord' || id === 'solarized') return 'dark'
+  // dracula/nord/solarized/eye-care 都是暗色主题
+  if (id === 'dracula' || id === 'nord' || id === 'solarized' || id === 'eye-care') return 'dark'
   return id
 }
 
@@ -91,13 +93,15 @@ export function isDarkTheme(id: ThemeId): boolean {
 }
 
 /**
- * 把解析好的具体主题写到 `<html data-theme>`，CSS 级联据此挑那块颜色 token。
+ * 把主题 ID 写到 `<html data-theme>`，CSS 级联据此挑那块颜色 token。
  *
- * 收的是 `ResolvedTheme` 而不是 `ThemeId`：`data-theme` 只有 'light' / 'dark' 两个合法值，
- * `'system'` 必须先经 `resolveTheme` 拆掉。让类型来挡「把 'system' 直接写进属性」这个错，
- * 比在函数体里再判断一次更省事。
+ * ⚠️ 收的是 **ThemeId**（light/dark/system/dracula/nord/solarized），不是 ResolvedTheme：
+ * CSS 里 `[data-theme='dracula']` 等选择器要靠这个匹配。CM6 那边才用 isDarkTheme(id) 的布尔值。
+ *
+ * 'system' 在这里是合法的——它会被写进 data-theme，但 CSS 里没有对应的选择器块，
+ * 所以会落到兜底的暗色。真正跟随系统靠的是 store 里的 matchMedia 订阅 + applyResolvedTheme 重算。
  */
-export function applyThemeAttr(theme: ResolvedTheme): void {
+export function applyThemeAttr(theme: ThemeId): void {
   if (typeof document === 'undefined') return
   document.documentElement.dataset.theme = theme
 }

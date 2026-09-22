@@ -72,13 +72,14 @@ afterEach(() => {
 })
 
 describe('注册表常量', () => {
-  it('六个 ID 与它们的标签一一对应', () => {
-    expect(THEME_IDS).toEqual(['light', 'dark', 'system', 'dracula', 'nord', 'solarized'])
+  it('七个 ID 与它们的标签一一对应', () => {
+    expect(THEME_IDS).toEqual(['light', 'dark', 'system', 'dracula', 'nord', 'solarized', 'eye-care'])
     for (const id of THEME_IDS) expect(typeof THEME_LABELS[id]).toBe('string')
     expect(THEME_LABELS.system).toBe('跟随系统')
     expect(THEME_LABELS.dracula).toBe('Dracula')
     expect(THEME_LABELS.nord).toBe('Nord')
     expect(THEME_LABELS.solarized).toBe('Solarized')
+    expect(THEME_LABELS['eye-care']).toBe('护眼模式')
   })
 
   it('🔴 默认是 dark，与 Rust DEFAULT_THEME 同值', () => {
@@ -91,7 +92,7 @@ describe('注册表常量', () => {
 
 describe('sanitizeThemeId', () => {
   it('合法 ID 原样通过', () => {
-    for (const id of ['light', 'dark', 'system', 'dracula', 'nord', 'solarized']) expect(sanitizeThemeId(id)).toBe(id)
+    for (const id of ['light', 'dark', 'system', 'dracula', 'nord', 'solarized', 'eye-care']) expect(sanitizeThemeId(id)).toBe(id)
   })
 
   it('不认识的串打回默认', () => {
@@ -117,17 +118,18 @@ describe('systemTheme / resolveTheme', () => {
     expect(systemTheme()).toBe('dark')
   })
 
-  it("resolveTheme 把 'system' 拆开，其余原样；dracula/nord/solarized 都映射到 dark", () => {
+  it("resolveTheme 把 'system' 拆开，其余原样；dracula/nord/solarized/eye-care 都映射到 dark", () => {
     const mql = installMatchMedia(false)
     expect(resolveTheme('system')).toBe('light')
     mql.setMatches(true)
     expect(resolveTheme('system')).toBe('dark')
     expect(resolveTheme('light')).toBe('light')
     expect(resolveTheme('dark')).toBe('dark')
-    // 三套流行配色都是暗色主题
+    // 三套流行配色 + 护眼模式都是暗色主题
     expect(resolveTheme('dracula')).toBe('dark')
     expect(resolveTheme('nord')).toBe('dark')
     expect(resolveTheme('solarized')).toBe('dark')
+    expect(resolveTheme('eye-care')).toBe('dark')
   })
 
   it('isDarkTheme 跟着解析结果走', () => {
@@ -135,10 +137,11 @@ describe('systemTheme / resolveTheme', () => {
     expect(isDarkTheme('dark')).toBe(true)
     expect(isDarkTheme('light')).toBe(false)
     expect(isDarkTheme('system')).toBe(true)
-    // 三套流行配色都是暗色
+    // 三套流行配色 + 护眼模式都是暗色
     expect(isDarkTheme('dracula')).toBe(true)
     expect(isDarkTheme('nord')).toBe(true)
     expect(isDarkTheme('solarized')).toBe(true)
+    expect(isDarkTheme('eye-care')).toBe(true)
     mql.setMatches(false)
     expect(isDarkTheme('system')).toBe(false)
   })

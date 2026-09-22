@@ -16,7 +16,7 @@ import type { ShardView } from './doc/shardView'
 import { describeStats, textStats } from './doc/stats'
 import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
-import { createWorkspace, MAX_PANES, type DiscardDecision, type Pane } from './doc/workspace'
+import { createWorkspace, type DiscardDecision, type Pane } from './doc/workspace'
 import { EditorPane } from './editor/EditorPane'
 import { QuickOpen } from './goto/QuickOpen'
 import { createQuickOpen, type Commit } from './goto/store'
@@ -36,7 +36,8 @@ import { ReplaceConfirm } from './search/ReplaceConfirm'
 import { revealTarget } from './search/reveal'
 import type { HitRow } from './search/rows'
 import { createSearchPanel } from './search/store'
-import { AppearancePopover } from './settings/AppearancePopover'
+// import { AppearancePopover } from './settings/AppearancePopover' // 工具栏隐藏后暂时不用，保留导入以备将来恢复
+import { SettingsDialog } from './settings/SettingsDialog'
 import { createSettingsStore } from './settings/store'
 import { BUILTIN_TOOLS } from './tools/builtin'
 import { createToolBox } from './tools/store'
@@ -136,41 +137,72 @@ async function copyText(text: string): Promise<boolean> {
  */
 function routeMenuEvent(
   id: string,
-  ws: ReturnType<typeof createWorkspace>,
-  ctx: { editor: EditorController | null },
+  actions: {
+    newTab: () => void
+    openViaDialog: () => void
+    openFolder: () => void
+    openRecentProject: () => void
+    closeFolder: () => void
+    save: (ctx: { editor: any }) => void
+    saveAs: (ctx: { editor: any }) => void
+    findInFiles: () => void
+    replaceInFiles: () => void
+    formatJson: (ctx: { editor: any }) => void
+    minifyJson: (ctx: { editor: any }) => void
+    alignTable: () => void
+    wordCount: () => void
+    toggleSidebar: () => void
+    togglePreview: () => void
+    toggleOutline: () => void
+    toggleJsonPreview: () => void
+    zoomIn: () => void
+    zoomOut: () => void
+    resetZoom: () => void
+    toggleLineWrap: () => void
+    openCommandPalette: () => void
+    showSettings: () => void
+    splitRight: () => void
+    splitDown: () => void
+    mergePanes: () => void
+    focusNextPane: () => void
+    focusPrevPane: () => void
+    closePane: () => void
+  },
+  ctx: { editor: any },
 ): void {
   // File
-  if (id === 'file.new') ws.hooks.newDocument()
-  else if (id === 'file.open') ws.hooks.openFile()
-  else if (id === 'file.open_folder') ws.hooks.openFolder()
-  else if (id === 'file.recent') ws.hooks.openRecentProject()
-  else if (id === 'file.save') ctx.editor && ws.commands.run('editor.save', ctx)
-  else if (id === 'file.save_as') ctx.editor && ws.commands.run('editor.saveAs', ctx)
-  else if (id === 'file.close_folder') ws.hooks.closeFolder()
+  if (id === 'file.new') actions.newTab()
+  else if (id === 'file.open') actions.openViaDialog()
+  else if (id === 'file.open_folder') actions.openFolder()
+  else if (id === 'file.recent') actions.openRecentProject()
+  else if (id === 'file.save') actions.save(ctx)
+  else if (id === 'file.save_as') actions.saveAs(ctx)
+  else if (id === 'file.close_folder') actions.closeFolder()
   // Edit
-  else if (id === 'edit.find_in_files') ws.hooks.findInFiles()
-  else if (id === 'edit.replace_in_files') ws.hooks.replaceInFiles()
-  else if (id === 'edit.format_json') ws.commands.run('editor.formatJson', ctx)
-  else if (id === 'edit.minify_json') ws.commands.run('editor.minifyJson', ctx)
-  else if (id === 'edit.align_table') ws.hooks.alignTable()
-  else if (id === 'edit.word_count') ws.hooks.wordCount()
+  else if (id === 'edit.find_in_files') actions.findInFiles()
+  else if (id === 'edit.replace_in_files') actions.replaceInFiles()
+  else if (id === 'edit.format_json') actions.formatJson(ctx)
+  else if (id === 'edit.minify_json') actions.minifyJson(ctx)
+  else if (id === 'edit.align_table') actions.alignTable()
+  else if (id === 'edit.word_count') actions.wordCount()
   // View
-  else if (id === 'view.toggle_sidebar') ws.hooks.toggleSidebar()
-  else if (id === 'view.toggle_preview') ws.hooks.togglePreview()
-  else if (id === 'view.toggle_outline') ws.hooks.toggleOutline()
-  else if (id === 'view.toggle_json_preview') ws.hooks.toggleJsonPreview()
-  else if (id === 'view.zoom_in') ws.hooks.adjustFontSize(1)
-  else if (id === 'view.zoom_out') ws.hooks.adjustFontSize(-1)
-  else if (id === 'view.reset_zoom') ws.hooks.resetFontSize()
-  else if (id === 'view.toggle_line_wrap') ws.hooks.toggleLineWrap()
-  else if (id === 'view.command_palette') ws.hooks.openCommandPalette()
+  else if (id === 'view.toggle_sidebar') actions.toggleSidebar()
+  else if (id === 'view.toggle_preview') actions.togglePreview()
+  else if (id === 'view.toggle_outline') actions.toggleOutline()
+  else if (id === 'view.toggle_json_preview') actions.toggleJsonPreview()
+  else if (id === 'view.zoom_in') actions.zoomIn()
+  else if (id === 'view.zoom_out') actions.zoomOut()
+  else if (id === 'view.reset_zoom') actions.resetZoom()
+  else if (id === 'view.toggle_line_wrap') actions.toggleLineWrap()
+  else if (id === 'view.command_palette') actions.openCommandPalette()
+  else if (id === 'view.settings') actions.showSettings()
   // Window
-  else if (id === 'window.split_right') ws.hooks.splitRight()
-  else if (id === 'window.split_down') ws.hooks.splitDown()
-  else if (id === 'window.merge_panes') ws.hooks.mergePanes()
-  else if (id === 'window.focus_next') ws.hooks.focusNextPane()
-  else if (id === 'window.focus_prev') ws.hooks.focusPreviousPane()
-  else if (id === 'window.close_pane') ws.hooks.closePane()
+  else if (id === 'window.split_right') actions.splitRight()
+  else if (id === 'window.split_down') actions.splitDown()
+  else if (id === 'window.merge_panes') actions.mergePanes()
+  else if (id === 'window.focus_next') actions.focusNextPane()
+  else if (id === 'window.focus_prev') actions.focusPrevPane()
+  else if (id === 'window.close_pane') actions.closePane()
   // Help
   else if (id === 'help.about') {
     // TODO: 打开关于对话框
@@ -185,6 +217,7 @@ export default function App() {
   let detachSearch: (() => void) | undefined
   let detachReplace: (() => void) | undefined
   let detachFileWatch: (() => void) | undefined
+  let detachMenu: (() => void) | undefined
   /** 卸载比 `listen` 的 promise 先落地时，拿到的注销函数要立刻用掉，见 onMount */
   let tornDown = false
   let sync: SessionSync | undefined
@@ -349,6 +382,14 @@ export default function App() {
    * 同样刻意不进会话存档，理由写在上面 `previewVisible` 那条注释里
    */
   const [jsonPreviewVisible, setJsonPreviewVisible] = createSignal(false)
+
+  /**
+   * 设置对话框的可见性（菜单触发，见 `view.settings`）。
+   *
+   * 与 AppearancePopover 不同：那个是锚定在工具栏按钮下的下拉，而这个是居中模态对话框。
+   * 两者共用同一套配置状态（`settings`），只是呈现方式不同——工具栏隐藏后需要这个入口
+   */
+  const [settingsDialogVisible, setSettingsDialogVisible] = createSignal(false)
 
   /**
    * 大纲那一栏的可见性（M3-A-4）。默认关，与预览同一条理由：
@@ -910,10 +951,45 @@ export default function App() {
     })
     // 菜单事件监听：Rust 侧把所有菜单项点击转发成 `menu-event` 事件，
     // 载荷是菜单 ID（如 "file.new"）。这里路由到对应的命令。
-    let detachMenu: (() => void) | undefined
     import('@tauri-apps/api/event').then(({ listen }) => {
       void listen<string>('menu-event', ({ payload: id }) => {
-        routeMenuEvent(id, ws, ctx)
+        const ctx = appContext()
+        routeMenuEvent(
+          id,
+          {
+            newTab: () => ws.newTab(),
+            openViaDialog: ws.openViaDialog,
+            openFolder,
+            openRecentProject: () => void goto.show('', 'project'),
+            closeFolder: () => tree.close(),
+            save: (c) => void registry.execute('editor.save', c),
+            saveAs: (c) => void registry.execute('editor.saveAs', c),
+            findInFiles: () => search.show(),
+            replaceInFiles: () => search.showReplace(),
+            formatJson: (c) => void registry.execute('editor.formatJson', c),
+            minifyJson: (c) => void registry.execute('editor.minifyJson', c),
+            alignTable,
+            wordCount,
+            toggleSidebar: () => setSidebarVisible((v) => !v),
+            togglePreview: () => setPreviewVisible((v) => !v),
+            toggleOutline: () => setOutlineVisible((v) => !v),
+            toggleJsonPreview: () => setJsonPreviewVisible((v) => !v),
+            zoomIn: () => settings.stepFontSize(1),
+            zoomOut: () => settings.stepFontSize(-1),
+            resetZoom: settings.resetFontSize,
+            toggleLineWrap: () => ws.setLineWrap(!ws.lineWrap()),
+            openCommandPalette: () => palette.show(),
+            showSettings: () => setSettingsDialogVisible(true),
+            splitRight: () => ws.split('row'),
+            splitDown: () => ws.split('column'),
+            // TODO: mergePanes 尚未实现，菜单项保留但暂不绑定
+            mergePanes: () => {},
+            focusNextPane: () => ws.cyclePane(1),
+            focusPrevPane: () => ws.cyclePane(-1),
+            closePane: () => ws.closePane(ws.focusedPaneId()),
+          },
+          ctx,
+        )
       }).then((unlisten) => {
         if (tornDown) unlisten()
         else detachMenu = unlisten
@@ -1204,6 +1280,11 @@ export default function App() {
         <Suspense>
           <ToolBox box={toolbox} />
         </Suspense>
+      </Show>
+
+      {/* 设置对话框（菜单触发，View → 设置... / Cmd+,）*/}
+      <Show when={settingsDialogVisible()}>
+        <SettingsDialog settings={settings} visible={settingsDialogVisible()} onClose={() => setSettingsDialogVisible(false)} />
       </Show>
     </div>
   )

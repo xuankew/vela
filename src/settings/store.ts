@@ -294,11 +294,17 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
    * 把当前主题选择解析成亮/暗，写到两处：`<html data-theme>`（管 `--vela-*` 那套颜色）
    * 与 CM6 的 `darkSlot`（管 base theme 的 `&dark` 规则，经注入的 `applyDark` 回调）。
    *
+   * ⚠️ `data-theme` 写的是**原始 ThemeId**（light/dark/system/dracula/nord/solarized），
+   * 不是解析后的 ResolvedTheme——CSS 里 `[data-theme='dracula']` 等选择器要靠这个匹配。
+   * CM6 那边才用解析后的布尔值（isDark）。
+   *
    * 两处必须一起更新，少一处就会「颜色换了但光标/选区/弹层底色还是旧的」或反过来。
    */
   function applyResolvedTheme(): void {
-    const resolved = resolveTheme(theme())
-    applyThemeAttr(resolved)
+    const id = theme()
+    const resolved = resolveTheme(id)
+    // data-theme 用原始 ID，让 CSS 选择器能匹配到具体主题
+    applyThemeAttr(id as any)
     options.applyDark?.(resolved === 'dark')
   }
 
@@ -406,16 +412,21 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   function setFontSize(n: number): void {
     const clamped = sanitizeFontSize(n)
     setFontSizeSignal(clamped)
+    // 用户手动选档位时，清除滚轮缩放状态，避免下次打开对话框时 effectiveFontSize 返回旧值
+    setZoomedFontSizeSignal(null)
     applyFontSizeVar(clamped)
     persist()
   }
 
   function stepFontSize(delta: number): void {
+    // ⚠️ 必须读原始的 fontSize 信号，而不是 effectiveFontSize()：
+    // 如果用户之前用过滚轮缩放，effectiveFontSize() 会返回缩放值（不在 FONT_SIZES 里），
+    // 导致 indexOf 永远返回 -1，步进器从默认档起步而不是从当前档
     const index = FONT_SIZES.indexOf(fontSize())
     // 档外（被手改过、或还没 sanitize）时回到默认档，而不是从 -1 起步
     const next =
       index < 0 ? DEFAULT_FONT_SIZE : FONT_SIZES[Math.min(FONT_SIZES.length - 1, Math.max(0, index + delta))]!
-    // next 一定是合法档位，走 setFontSize 会再 sanitize 一次（无副作用），顺带写穿
+    // next 一定是合法档位，走 setFontSize 会再 sanitize 一次（无副作用），顺带写穿并清除缩放状态
     setFontSize(next)
   }
 

@@ -140,6 +140,26 @@
   color-scheme: dark;
 }
 
+/* 护眼模式：Catppuccin Latte 配色，2024-2025 年最流行的粉彩主题之一。
+   背景用柔和的灰白色（#eff1f5），文字用深靛蓝灰（#4c4f69），
+   整体色调温和、现代、有质感，被广泛认为是最舒适的亮色主题。
+   适合长时间编码和写作，视觉疲劳最小化。 */
+:root[data-theme='eye-care'] {
+  --vela-bg: #eff1f5;
+  --vela-bg-alt: #e6e9ef;
+  --vela-bg-panel: #dce0e8;
+  --vela-fg: #4c4f69;
+  --vela-fg-dim: #8c8fa1;
+  --vela-border: #ccd0da;
+  --vela-guide: #bcc0cc;
+  --vela-accent: #7287fd;
+  --vela-ok: #40a02b;
+  --vela-warn: #df8e1d;
+  --vela-bad: #d20f39;
+
+  color-scheme: light;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -286,6 +306,141 @@ body {
 
 .appearance-reset:hover {
   color: var(--vela-fg);
+  border-color: var(--vela-border);
+}
+
+/* 设置对话框（M4-B，菜单触发入口）。居中模态对话框，复用 appearance 的控件样式 */
+.settings-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 360px;
+  max-height: 80vh;
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 12px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.settings-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--vela-fg);
+}
+
+.settings-close {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  text-align: center;
+  font-size: 20px;
+  line-height: 1;
+  background: transparent;
+  border: none;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.settings-close:hover {
+  color: var(--vela-fg);
+  background: var(--vela-bg-alt);
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-label {
+  color: var(--vela-fg);
+  font-size: 14px;
+  font-weight: 500;
+  flex: 0 0 auto;
+}
+
+.settings-row select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 13px;
+  background: var(--vela-bg-alt);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  color: var(--vela-fg);
+}
+
+.settings-stepper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-stepper button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  text-align: center;
+  font-size: 16px;
+  line-height: 1;
+  background: var(--vela-bg-alt);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  color: var(--vela-fg);
+  cursor: pointer;
+}
+
+.settings-stepper button:hover {
+  background: var(--vela-bg-panel);
+}
+
+.settings-value {
+  min-width: 70px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--vela-fg);
+}
+
+.settings-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 16px 24px;
+  border-top: 1px solid var(--vela-border);
+}
+
+.settings-reset {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vela-fg-dim);
+  background: transparent;
+  border-color: transparent;
+  padding: 8px 16px;
+  border-radius: 6px;
+}
+
+.settings-reset:hover {
+  color: var(--vela-fg);
+  background: var(--vela-bg-alt);
   border-color: var(--vela-border);
 }
 
@@ -1034,7 +1189,7 @@ select {
   justify-content: center;
   /* 遮罩可以用 rgba：它不承载语义色，只是压暗背景，换主题时对比度不会失控
      （提示条那一段刻意不混色，理由不同） */
-  background: rgba(0, 0, 0, 0.45);
+  background: rgba(0, 0, 0, 0.65);
   z-index: 10;
 }
 
@@ -2555,5 +2710,16 @@ select {
 
 .cm-gutterElement {
   font-size: var(--vela-font-size, 14px) !important;
+}
+
+/* 护眼模式下让行号区域背景与编辑器一致，避免割裂感 */
+:root[data-theme='eye-care'] .cm-gutters {
+  background: var(--vela-bg);
+  border-right-color: var(--vela-border);
+}
+
+/* 护眼模式下选中行的行号也要用选中色，保持整体一致 */
+:root[data-theme='eye-care'] .cm-activeLineGutter {
+  background: #e6e9ef;
 }
 
