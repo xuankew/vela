@@ -80,6 +80,14 @@ function sanitizeFontSize(n: number): number {
 }
 
 /**
+ * Cmd+滚轮无级缩放的上下限。比预设档位宽得多，但仍有边界防止失控。
+ * 下限 8px 是「勉强可读」的底线，上限 72px 是「标题级别」的极限。
+ */
+export const ZOOMED_FONT_SIZE_MIN = 8
+export const ZOOMED_FONT_SIZE_MAX = 72
+export const ZOOMED_FONT_SIZE_STEP = 1
+
+/**
  * 不认识的字体 ID 打回注册表默认。
  *
  * ⚠️ 用 `hasOwnProperty` 而不是 `in`：`in` 会命中原型链，于是 `"toString"` 这种字符串
@@ -166,7 +174,7 @@ export interface SettingsStore {
   readonly fontKey: Accessor<FontVariantId>
   /** 当前代码区字体 ID（已 sanitize） */
   readonly codeFontKey: Accessor<CodeFontId>
-  /** 当前字号（已夹到 `FONT_SIZES` 里的某一档） */
+  /** 当前字号（档位选择或滚轮缩放后的实际值） */
   readonly fontSize: Accessor<number>
   /** 当前行高（无单位倍数，已夹到 `LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX`、归一化到两位小数） */
   readonly lineHeight: Accessor<number>
@@ -197,6 +205,10 @@ export interface SettingsStore {
   stepFontSize: (delta: number) => void
   /** `Cmd/Ctrl + 0`：回到默认字号 */
   resetFontSize: () => void
+  /** Cmd+滚轮无级缩放：步进 +/- 1px，不写盘，只改 CSS 变量 */
+  stepZoomedFontSize: (delta: number) => void
+  /** 重置滚轮缩放，回到档位值 */
+  resetZoomedFontSize: () => void
   /** 用户设了行高（会夹 + 归一化）：更新 + 应用 + 写穿 */
   setLineHeight: (n: number) => void
   /** 外观浮层里的行高步进器：走一步 `LINE_HEIGHT_STEP` */
@@ -232,6 +244,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
   const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
   const [fontSize, setFontSizeSignal] = createSignal(DEFAULT_FONT_SIZE)
+  /** Cmd+滚轮缩放后的字号（无级，不写盘）。`null` = 没缩放过，用档位值 */
+  const [zoomedFontSize, setZoomedFontSizeSignal] = createSignal<number | null>(null)
   const [lineHeight, setLineHeightSignal] = createSignal(DEFAULT_LINE_HEIGHT)
   const [letterSpacing, setLetterSpacingSignal] = createSignal(DEFAULT_LETTER_SPACING)
   const [theme, setThemeSignal] = createSignal<ThemeId>(DEFAULT_THEME)
@@ -441,10 +455,30 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     persist()
   }
 
+  /** Cmd+滚轮无级缩放：步进 +/- 1px，不写盘，只改 CSS 变量 */
+  function stepZoomedFontSize(delta: number): void {
+    const base = zoomedFontSize() ?? fontSize()
+    const next = Math.min(ZOOMED_FONT_SIZE_MAX, Math.max(ZOOMED_FONT_SIZE_MIN, base + delta))
+    setZoomedFontSizeSignal(next)
+    applyFontSizeVar(next)
+  }
+
+  /** 重置滚轮缩放，回到档位值 */
+  function resetZoomedFontSize(): void {
+    setZoomedFontSizeSignal(null)
+    applyFontSizeVar(fontSize())
+  }
+
+  /**
+   * 实际字号的 accessor：优先返回缩放值（如果有），否则返回档位值。
+   * 这样外观浮层的下拉菜单仍然显示档位值，但编辑器用的是缩放后的值。
+   */
+  const effectiveFontSize = (): number => zoomedFontSize() ?? fontSize()
+
   return {
     fontKey,
     codeFontKey,
-    fontSize,
+    fontSize: effectiveFontSize,
     lineHeight,
     letterSpacing,
     theme,
@@ -454,6 +488,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setFontSize,
     stepFontSize,
     resetFontSize,
+    stepZoomedFontSize,
+    resetZoomedFontSize,
     setLineHeight,
     stepLineHeight,
     resetLineHeight,

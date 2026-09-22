@@ -198,7 +198,7 @@ export default function App() {
   const ws = createWorkspace({
     promptDiscard: (names) => new Promise<DiscardDecision>((resolve) => setPendingClose({ names, resolve })),
     pasteImage: pasteImageInto,
-    onFontSizeZoom: settings.stepFontSize,
+    onFontSizeZoom: settings.stepZoomedFontSize,
   })
   const activeDoc = () => ws.activeTab().doc
 
