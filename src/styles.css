@@ -2425,3 +2425,135 @@ select {
 .md-preview-body sup {
   font-size: 0.72em;
 }
+
+/* ────────────── JSON 预览面板（M4-D）────────────────────── */
+
+.json-preview-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--vela-bg-alt);
+  border-left: 1px solid var(--vela-border);
+}
+
+.json-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--vela-bg-panel);
+  border-bottom: 1px solid var(--vela-border);
+  font-family: var(--vela-font-ui);
+  font-size: 13px;
+}
+
+.json-preview-title {
+  color: var(--vela-fg);
+  font-weight: 600;
+}
+
+.json-preview-close {
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 3px;
+}
+
+.json-preview-close:hover {
+  background: var(--vela-bg);
+  color: var(--vela-fg);
+}
+
+.json-preview-note {
+  padding: 8px 12px;
+  color: var(--vela-warn);
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.json-preview-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
+}
+
+.json-preview-body {
+  font-family: var(--vela-font-code);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--vela-fg);
+}
+
+/* JSON 树形结构样式 */
+.json-tree {
+  white-space: pre;
+}
+
+.json-toggle {
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+  padding: 0 4px 0 0;
+  font-size: 12px;
+  line-height: 1;
+  vertical-align: middle;
+  font-family: monospace;
+}
+
+.json-toggle:hover {
+  color: var(--vela-accent);
+}
+
+.json-key {
+  color: var(--vela-accent);
+}
+
+.json-string {
+  color: var(--vela-ok);
+}
+
+.json-number {
+  color: var(--vela-warn);
+}
+
+.json-boolean {
+  color: var(--vela-bad);
+}
+
+.json-null {
+  color: var(--vela-fg-dim);
+  font-style: italic;
+}
+
+.json-bracket {
+  color: var(--vela-fg-dim);
+}
+
+.json-size {
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+  margin-left: 4px;
+}
+
+.json-children {
+  margin-left: 20px;
+}
+
+/* ──────────────────────── CM6 行号 gutter（R11）─────────────────────────
+   🔴 必须用 `!important`：CM6 base theme 的 `.cm-lineNumbers .cm-gutterElement`
+   没有显式字号，但它的样式模块挂载顺序可能晚于我们的 theme 模块，导致覆盖失败。
+   行号要跟随 `--vela-font-size`，否则 Cmd+滚轮缩放时编辑器内容变大但行号保持原尺寸。 */
+.cm-gutters {
+  font-size: var(--vela-font-size, 14px) !important;
+}
+
+.cm-gutterElement {
+  font-size: var(--vela-font-size, 14px) !important;
+}
+
