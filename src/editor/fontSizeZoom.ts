@@ -11,9 +11,11 @@ import { EditorView, ViewPlugin, type PluginValue } from '@codemirror/view'
 const fontSizeZoomFacet = Facet.define<(delta: number) => void>()
 
 class FontSizeZoomPlugin implements PluginValue {
+  private view: EditorView
   private handler: (e: WheelEvent) => void
 
   constructor(view: EditorView) {
+    this.view = view
     const dom = view.dom as HTMLElement
     this.handler = (e: WheelEvent) => {
       // macOS: metaKey (Cmd), Windows/Linux: ctrlKey (Ctrl)
@@ -40,8 +42,8 @@ class FontSizeZoomPlugin implements PluginValue {
   }
 
   destroy() {
-    // destroy 时拿不到 view，但 handler 是闭包，GC 会处理
-    // 实际上 CM6 会在 destroy 前移除监听器，这里不需要额外操作
+    const dom = this.view.dom as HTMLElement
+    dom.removeEventListener('wheel', this.handler)
   }
 }
 
