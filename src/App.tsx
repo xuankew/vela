@@ -163,6 +163,7 @@ function routeMenuEvent(
     toggleLineWrap: () => void
     openCommandPalette: () => void
     showSettings: () => void
+    toggleMdToolbar: () => void
     splitRight: () => void
     splitDown: () => void
     mergePanes: () => void
@@ -197,7 +198,7 @@ function routeMenuEvent(
   else if (id === 'view.reset_zoom') actions.resetZoom()
   else if (id === 'view.toggle_line_wrap') actions.toggleLineWrap()
   else if (id === 'view.command_palette') actions.openCommandPalette()
-  else if (id === 'view.toggle_md_toolbar') setMdToolbarVisible((v) => !v)
+  else if (id === 'view.toggle_md_toolbar') actions.toggleMdToolbar()
   else if (id === 'view.settings') actions.showSettings()
   // Window
   else if (id === 'window.split_right') actions.splitRight()
@@ -997,6 +998,7 @@ export default function App() {
             toggleLineWrap: () => ws.setLineWrap(!ws.lineWrap()),
             openCommandPalette: () => palette.show(),
             showSettings: () => setSettingsDialogVisible(true),
+            toggleMdToolbar: () => setMdToolbarVisible((v) => !v),
             splitRight: () => ws.split('row'),
             splitDown: () => ws.split('column'),
             // TODO: mergePanes 尚未实现，菜单项保留但暂不绑定
@@ -1070,7 +1072,6 @@ export default function App() {
       <Show when={mdToolbarVisible()}>
         <MarkdownToolbar
           editor={() => ws.focusedEditor()}
-          visible={mdToolbarVisible}
           onToggle={() => setMdToolbarVisible(false)}
         />
       </Show>

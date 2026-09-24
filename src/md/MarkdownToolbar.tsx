@@ -10,9 +10,7 @@ import type { EditorController } from '../editor/controller'
 export interface MarkdownToolbarProps {
   /** 当前编辑器实例 */
   editor: () => EditorController | null
-  /** 是否可见 */
-  visible: boolean
-  /** 切换可见性 */
+  /** 点击关闭按钮时隐藏工具栏 */
   onToggle: () => void
 }
 

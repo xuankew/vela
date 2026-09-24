@@ -86,8 +86,6 @@ function getBuiltinKeybinding(id: string): string | string[] | undefined {
 export function createKeybindingStore(platform: Platform): KeybindingStore {
   /** 用户自定义配置（内存缓存） */
   let userConfig: UserKeybindings = {}
-  /** 是否已经加载过 */
-  let loaded = false
 
   /** 写队列的尾巴 */
   let tail: Promise<void> = Promise.resolve()
@@ -156,32 +154,6 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
     return [...b.mods.map((m) => modLabels[m]), key].join('+')
   }
 
-  /** 检测当前配置中的所有冲突 */
-  function detectConflicts(allCommands: { id: string; title: string; bindings: Keybinding[] }[]): KeybindingConflict[] {
-    const byBinding = new Map<string, { ids: string[]; titles: string[] }>()
-    for (const cmd of allCommands) {
-      for (const b of cmd.bindings) {
-        const key = [...b.mods, b.key].join('+')
-        const existing = byBinding.get(key)
-        if (existing) {
-          if (!existing.ids.includes(cmd.id)) {
-            existing.ids.push(cmd.id)
-            existing.titles.push(cmd.title)
-          }
-        } else {
-          byBinding.set(key, { ids: [cmd.id], titles: [cmd.title] })
-        }
-      }
-    }
-    return [...byBinding.values()]
-      .filter((entry) => entry.ids.length > 1)
-      .map((entry) => ({
-        keybinding: formatBinding(parseKeybinding(entry.ids[0] + '+dummy', platform)), // 占位，下面会替换
-        commandIds: entry.ids,
-        titles: entry.titles,
-      }))
-  }
-
   return {
     list() {
       // 这个函数需要外部传入命令列表，这里只提供框架
@@ -197,7 +169,7 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
       if (keybindings.length === 0) {
         delete userConfig[id]
       } else {
-        userConfig[id] = keybindings.length === 1 ? keybindings[0] : keybindings
+        userConfig[id] = keybindings.length === 1 ? keybindings[0]! : keybindings
       }
       persist()
     },
@@ -223,7 +195,6 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
         const loaded_data: LoadedKeybindings = await loadKeybindings()
         userConfig = loaded_data.keybindings
         lastSent = JSON.stringify(userConfig)
-        loaded = true
       } catch (err) {
         console.warn('[keybindings] 加载失败，使用空配置:', err)
         userConfig = {}

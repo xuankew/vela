@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, Show } from 'solid-js'
+import { createSignal, For, onCleanup } from 'solid-js'
 import type { CommandInfo } from '../commands/registry'
 
 export interface KeybindingsDialogProps {
