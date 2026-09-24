@@ -5,7 +5,6 @@
  * 支持显示/隐藏，按钮根据当前选区智能启用/禁用。
  */
 
-import { createSignal, Show } from 'solid-js'
 import type { EditorController } from '../editor/controller'
 
 export interface MarkdownToolbarProps {
@@ -230,34 +229,32 @@ const BUTTONS: ToolbarButton[] = [
 
 export function MarkdownToolbar(props: MarkdownToolbarProps) {
   return (
-    <Show when={props.visible()}>
-      <div class="md-toolbar" role="toolbar" aria-label="Markdown 工具栏">
-        <div class="md-toolbar-toggle">
-          <button
-            class="md-toolbar-toggle-btn"
-            onClick={props.onToggle}
-            title="隐藏工具栏"
-            aria-label="隐藏工具栏"
-          >
-            ✕
-          </button>
-        </div>
-        <div class="md-toolbar-buttons">
-          {BUTTONS.map((btn) => (
-            <button
-              class="md-toolbar-btn"
-              title={btn.title}
-              aria-label={btn.title}
-              onClick={() => {
-                const ed = props.editor()
-                if (ed) btn.action(ed)
-              }}
-            >
-              {btn.icon}
-            </button>
-          ))}
-        </div>
+    <div class="md-toolbar" role="toolbar" aria-label="Markdown 工具栏">
+      <div class="md-toolbar-toggle">
+        <button
+          class="md-toolbar-toggle-btn"
+          onClick={props.onToggle}
+          title="隐藏工具栏"
+          aria-label="隐藏工具栏"
+        >
+          ✕
+        </button>
       </div>
-    </Show>
+      <div class="md-toolbar-buttons">
+        {BUTTONS.map((btn) => (
+          <button
+            class="md-toolbar-btn"
+            title={btn.title}
+            aria-label={btn.title}
+            onClick={() => {
+              const ed = props.editor()
+              if (ed) btn.action(ed)
+            }}
+          >
+            {btn.icon}
+          </button>
+        ))}
+      </div>
+    </div>
   )
 }
