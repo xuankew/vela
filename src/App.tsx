@@ -1066,6 +1066,15 @@ export default function App() {
 
       <TabStrip workspace={ws} />
 
+      {/* Markdown 工具栏（M4-F）*/}
+      <Show when={mdToolbarVisible()}>
+        <MarkdownToolbar
+          editor={() => ws.focusedEditor()}
+          visible={mdToolbarVisible}
+          onToggle={() => setMdToolbarVisible(false)}
+        />
+      </Show>
+
       {/* 常驻容器：.app 是 grid，行数必须固定。两条提示各自当 grid item 的话，
           出现 0/1/2 条时 1fr 会落到不同的行上，正文区被挤掉 */}
       <div class="notices">
@@ -1171,15 +1180,6 @@ export default function App() {
           </Show>
 
           <div class="body" classList={{ column: ws.direction() === 'column' }}>
-            {/* Markdown 工具栏（M4-F）*/}
-            <Show when={mdToolbarVisible()}>
-              <MarkdownToolbar
-                editor={() => ws.focusedEditor()}
-                visible={mdToolbarVisible}
-                onToggle={() => setMdToolbarVisible(false)}
-              />
-            </Show>
-
             <For each={ws.panes()}>
               {(pane) => (
                 <div class="editor-host" classList={{ focused: ws.focusedPaneId() === pane.id }}>
