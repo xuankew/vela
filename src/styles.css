@@ -2740,6 +2740,89 @@ select {
   text-decoration: underline;
 }
 
+/* Markdown 工具栏（M4-F）*/
+.md-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--vela-bg-alt);
+  border-bottom: 1px solid var(--vela-border);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.md-toolbar-toggle {
+  flex-shrink: 0;
+}
+
+.md-toolbar-toggle-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  color: var(--vela-fg-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.md-toolbar-toggle-btn:hover {
+  background: var(--vela-bg-panel);
+  color: var(--vela-fg);
+}
+
+.md-toolbar-buttons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+
+.md-toolbar-btn {
+  min-width: 32px;
+  height: 32px;
+  padding: 0 8px;
+  font-size: 14px;
+  font-weight: 500;
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  color: var(--vela-fg);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.md-toolbar-btn:hover {
+  background: var(--vela-bg-panel);
+  border-color: var(--vela-accent);
+  color: var(--vela-accent);
+}
+
+.md-toolbar-btn:active {
+  transform: translateY(1px);
+}
+
+/* 编辑器区域包含工具栏时的布局 */
+.editor-with-toolbar {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+}
+
+.md-preview-body a:hover {
+  text-decoration: underline;
+}
+
 /* 协议不在白名单里、被 `safeUrl` 拦下来的那一条（render.ts）。
    用 `--vela-bad` 而不是照常渲染成链接：它长得像链接但点不动，
    不给标记的话用户会以为是自己点歪了。`cursor: not-allowed` 补上鼠标那一半的说明 */

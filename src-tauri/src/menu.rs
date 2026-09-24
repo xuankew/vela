@@ -69,6 +69,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItem::with_id(app, "view.toggle_line_wrap", "切换换行", true, Some("Alt+Z"))?,
             &MenuItem::with_id(app, "view.command_palette", "命令面板...", true, Some("CmdOrCtrl+Shift+P"))?,
             &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, "view.toggle_md_toolbar", "Markdown 工具栏", true, None)?,
             &MenuItem::with_id(app, "view.settings", "设置...", true, Some("CmdOrCtrl+,"))?,
         ],
     )?;

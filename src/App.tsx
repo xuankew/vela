@@ -27,6 +27,7 @@ import { attachSearchListeners } from './ipc/search'
 import { attachWindowCloseGuard } from './ipc/windowClose'
 import { acceptsPastedImage, landPastedImage } from './md/paste'
 import { OutlinePanel } from './md/OutlinePanel'
+import { MarkdownToolbar } from './md/MarkdownToolbar'
 import type { FollowedEditor } from './md/panel'
 import { alignTableAt } from './md/table'
 import { createProjectTree } from './project/store'
@@ -196,6 +197,7 @@ function routeMenuEvent(
   else if (id === 'view.reset_zoom') actions.resetZoom()
   else if (id === 'view.toggle_line_wrap') actions.toggleLineWrap()
   else if (id === 'view.command_palette') actions.openCommandPalette()
+  else if (id === 'view.toggle_md_toolbar') setMdToolbarVisible((v) => !v)
   else if (id === 'view.settings') actions.showSettings()
   // Window
   else if (id === 'window.split_right') actions.splitRight()
@@ -383,6 +385,13 @@ export default function App() {
    * 同样刻意不进会话存档，理由写在上面 `previewVisible` 那条注释里
    */
   const [jsonPreviewVisible, setJsonPreviewVisible] = createSignal(false)
+
+  /**
+   * Markdown 工具栏的可见性（M4-F）。默认关，用户可通过 View 菜单或编辑器上方的按钮切换。
+   *
+   * 与预览面板独立：工具栏答「编辑时有没有快捷按钮」，预览答「渲染出来是什么样」。
+   */
+  const [mdToolbarVisible, setMdToolbarVisible] = createSignal(false)
 
   /**
    * 设置对话框的可见性（菜单触发，见 `view.settings`）。
@@ -1162,6 +1171,15 @@ export default function App() {
           </Show>
 
           <div class="body" classList={{ column: ws.direction() === 'column' }}>
+            {/* Markdown 工具栏（M4-F）*/}
+            <Show when={mdToolbarVisible()}>
+              <MarkdownToolbar
+                editor={() => ws.focusedEditor()}
+                visible={mdToolbarVisible}
+                onToggle={() => setMdToolbarVisible(false)}
+              />
+            </Show>
+
             <For each={ws.panes()}>
               {(pane) => (
                 <div class="editor-host" classList={{ focused: ws.focusedPaneId() === pane.id }}>
