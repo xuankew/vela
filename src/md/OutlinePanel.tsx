@@ -132,9 +132,18 @@ export function OutlinePanel(props: OutlinePanelProps) {
       return
     }
     const table = symbolTable(src.view.state, src.path)
+    if (table.kind === 'code') {
+      setHeadings(null)
+      // 大纲这块面板画的是**有层级的标题**：它能逐节折叠，而代码符号是一张平铺清单
+      // （见 `goto/symbols.ts` 里「平铺，不缩进」那段）。同一个 `symbolTable` 喂两个面板，
+      // 这一支不挡掉的话 Java 的方法名会全以「第 0 级」挤进这棵树，看着像树坏了。
+      // 那一句不提语言名：`code` 这一支没有 `label`，而此刻要说的不是「有没有」而是「在哪看」
+      setNote('大纲只列 Markdown 标题；代码符号请用 Cmd+R 看')
+      return
+    }
     if (table.kind === 'unsupported') {
       setHeadings(null)
-      // 🔴 措辞与 `Cmd+R` 那一句**逐字相同**（`goto/store.ts:452`）。同一个事实两种说法的话，
+      // 🔴 措辞与 `Cmd+R` 那一句**逐字相同**（`goto/store.ts`）。同一个事实两种说法的话，
       // 用户会以为浮层与面板答的是两个问题
       setNote(`${table.label} 还没有符号表`)
       return

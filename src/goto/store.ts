@@ -189,7 +189,7 @@ export interface QuickOpen {
    * 这一次展开在办哪一件事（M2-F-6）。
    *
    * 组件只拿它来换**输入框上的提示语与无障碍标签**：`Cmd+P` 那一格写的是
-   * 「按名字找文件…（:42 跳行，@ 列标题）」，而在项目模式里那三个前后缀一个都不认，
+   * 「按名字找文件…（:42 跳行，@ 列符号）」，而在项目模式里那三个前后缀一个都不认，
    * 照抄等于在教用户一套这一刻压根不成立的文法
    */
   readonly kind: Accessor<OverlayKind>
@@ -249,6 +249,13 @@ export function createQuickOpen(options: QuickOpenOptions): QuickOpen {
   const [total, setTotal] = createSignal(0)
   /** 符号模式下那句「这个语言还没有符号表」的主语 */
   const [symbolNote, setSymbolNote] = createSignal<string | null>(null)
+  /**
+   * 手上这份符号清单是哪来的，只用来决定底下那句的量词。
+   *
+   * Markdown 说「3 个标题」，代码说「12 个符号」。存 `kind` 而不是直接存那句名词：
+   * 措辞是**这一层**的产物，规则表那一层（`./symbols.ts`）不认识「标题」这个字
+   */
+  const [symbolKind, setSymbolKind] = createSignal<'headings' | 'code'>('headings')
   /** 这一次展开在办哪一件事。由 `show()` 的第二个参数写，输入框里的字改不动它 */
   const [overlay, setOverlay] = createSignal<OverlayKind>('goto')
   /**
@@ -296,8 +303,11 @@ export function createQuickOpen(options: QuickOpenOptions): QuickOpen {
     if (which === 'symbol') {
       const note = symbolNote()
       if (note !== null) return note
+      // 量词跟着清单的来路走：Markdown 是「3 个标题」，代码是「12 个符号」。
+      // 把 Java 文件里的一堆方法叫成「标题」不是省字，是说一句错话
+      const noun = symbolKind() === 'code' ? '符号' : '标题'
       const n = rows().length
-      return n === 0 ? '这份文档里没有匹配的标题' : `${n} 个标题`
+      return n === 0 ? `这份文档里没有匹配的${noun}` : `${n} 个${noun}`
     }
     if (error() !== null) return ''
     if (!ready()) return '正在建索引…'
@@ -449,9 +459,11 @@ export function createQuickOpen(options: QuickOpenOptions): QuickOpen {
         setRows([])
         // ⛔ 这里绝不能退化成全文搜索：那会让 `Cmd+R` 与 `Cmd+Shift+F` 变成两个入口
         // 一个行为，而用户按 `Cmd+R` 时想要的是**结构**。如实说没有，是唯一诚实的做法
+        // （语法包还在懒加载的那几种情况也走这一句：此刻「还没有」确实是实话）
         setSymbolNote(`${table.label} 还没有符号表`)
         return
       }
+      setSymbolKind(table.kind)
       const items = filterSymbols(table.items, q.needle)
       setRows(symbolRows(items))
       return

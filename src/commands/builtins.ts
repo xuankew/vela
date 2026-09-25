@@ -155,6 +155,20 @@ export interface BuiltinHooks {
    */
   replaceInFiles: () => void
   /**
+   * 拿光标处那个词当搜索词，在项目里搜（M5-1，`Mod+Alt+F`）。
+   *
+   * 与 `replaceInFiles` 是同一个面板、同一份状态，差别只在进去之前搜索框已经被填好了，
+   * 而且**整词开着**：按这个键的人要的是「`get` 出现在哪儿」，不开整词的话结果里
+   * 大半是 `getName` 与 `target`，那份清单等于没搜。
+   *
+   * ⚠️ 拿不到词（空窗口、光标停在空白或标点上）时**面板照样打开**，只是搜索框是空的，
+   * 同时把原因说在提示条上。⛔ 不是什么都不做——一个按下去没反应的快捷键信息是零，
+   * 与 `togglePreview` / `alignTable` / `wordCount` 同一条理由。
+   * 中文正文**是**取得到词的（CM6 的字类表里 CJK 算字母，见 `goto/syntax.ts` 的
+   * `wordUnderCaret`），所以「在中文笔记里按这个键」是这一条最顺的一个用例
+   */
+  searchWordInFiles: () => void
+  /**
    * 展开跳转浮层，输入框是空的（M2-E，`Mod+P`）——按名字找项目里的文件。
    *
    * 与全局搜索那两条同一条道理：它作用于那个浮层而不是 `ctx.editor`，所以 `when` 不设。
@@ -169,6 +183,26 @@ export interface BuiltinHooks {
    * （见 `goto/store.ts` 的 `show`）
    */
   gotoSymbol: () => void
+  /**
+   * 跳到**这份文件里**叫这个名字的符号（M5-1，`Mod+Alt+D`）。
+   *
+   * 与 `gotoSymbol` 共用同一张符号表（`goto/symbols.ts` 的 `CODE_RULES`），差别只在
+   * 那个是「列出来让人挑」，这一个是「拿光标处那个词去查，查到就走」。所以它的答案
+   * 一定在 `Cmd+R` 那份清单里——两边同源，不会出现「浮层里有、按定义却找不到」。
+   *
+   * ⛔ 它不是 LSP：不看作用域、不看类型、不跨文件，重名时回文档里最早的那一个。
+   * 这四条正是它可以存在的理由：零常驻内存、零依赖、一次语法树遍历。
+   *
+   * 不设 `when`，四种情况（这块分屏没有编辑器 / 光标处没有一个词 / 这门语言没有符号表 /
+   * 这份文件里没有这个词）全归宿主说，与 `alignTable` / `wordCount` 同一条
+   *
+   * ⚠️ 同一个查询还有第二个入口：`Cmd/Ctrl+Click`（M5-2，见 `editor/clickJump.ts`）。
+   * 两边共用 `goto/definition.ts` 的同一份查询，但**反应是相反的**——快捷键四种拒绝各说一句，
+   * 点击一句都不说：它要么跳走、要么改去项目里搜那个词、要么把那一下还给 CM6 的
+   * 「加一个光标」（三路分流见 `goto/definition.ts` 的 `clickAction`）。
+   * 弹一句「没找到定义」等于把用户一次正常的多光标操作染成报错
+   */
+  gotoDefinition: () => void
   /**
    * 展开工具箱那块大浮层（M3-B-1，`Mod+Shift+T`）。
    *
@@ -518,6 +552,22 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       run: () => hooks.replaceInFiles(),
     }),
 
+    // 拿光标处那个词在项目里搜（M5-1）。绑 Mod+Alt+F：F = Find，与 `Mod+Shift+F`
+    // 同一个字母，差一个「进去之前先把你正指着的那个词填上」。
+    // 这个键此前是空的（`Mod-Alt-` 在 CM6 只有 `ArrowUp` / `ArrowDown` / `\` / `g` 四条，
+    // 见下面 `goto.definition` 那段完整的核账），而 F 与搜索的对应关系不用另发明。
+    //
+    // ⚠️ 这是「跨文件**找**」，不是「跨文件**跳**」：后者要一份跨文件的符号索引，
+    // 那是一份常驻内存的副作用（M5 的口径写在 `goto/symbols.ts` 文件头）。
+    // 复用已有的全局搜索而不是新写一套索引，就是为了让这一步**不引入任何新状态**
+    registry.register({
+      id: 'search.wordInFiles',
+      title: '在项目里搜索光标处的词',
+      category: '搜索',
+      keybinding: 'Mod+Alt+F',
+      run: () => hooks.searchWordInFiles(),
+    }),
+
     // 跳转浮层（M2-E）。新开一个「跳转」分类，不塞进「搜索」：
     // 搜索答的是「哪些地方有这个词」，跳转答的是「带我去那一处」——命令面板里挨着放
     // 会让人以为按名字找文件是全文搜索的一种。`CommandDefinition.category` 是普通
@@ -540,10 +590,29 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     }),
     registry.register({
       id: 'goto.symbol',
-      title: '跳转到标题…',
+      // 标题从「跳转到标题…」改成这一句，是因为 `Cmd+R` 现在也答代码：Markdown 里
+      // 列的是标题，Java 里列的是方法名，两者共用一个键、一个浮层、一句量词（「N 个符号」）。
+      // 命令面板里还写「标题」的话，用户不会想到在 `.java` 上按它
+      title: '跳转到符号…',
       category: '跳转',
       keybinding: 'Mod+R',
       run: () => hooks.gotoSymbol(),
+    }),
+    // 同文件跳到定义（M5-1）。绑 Mod+Alt+D：D = Definition，且与 `Cmd+R` 那一条同分类、
+    // 挨着放。这个键此前是空的：`node_modules/@codemirror/*/dist/index.js` 里 `Mod-Alt-`
+    // 只有 `ArrowUp` / `ArrowDown` / `\`（commands）、`g`（search 的 gotoLine）三条，
+    // 本项目注册表里已经占着的 `Mod+Alt-` 是 `←→↑↓` / `Enter` / `V` / `J`，
+    // 而 Rust 侧没有任何 `accelerator`（原生菜单不占键）。
+    //
+    // ⚠️ 与 VS Code 的 `F12` 不同字母：那个功能位要留给「跳出去之后还能回得来」的一整套
+    // 上下文栈，而这一条只是「在同一份文件里找到它的声明」，不需要历史。
+    // 换文件的那一半是 `search.wordInFiles`，不在这里
+    registry.register({
+      id: 'goto.definition',
+      title: '跳到定义',
+      category: '跳转',
+      keybinding: 'Mod+Alt+D',
+      run: () => hooks.gotoDefinition(),
     }),
     // ⛔ 刻意**不**注册 `goto.line`。跳行这件事已经有两个入口了：CM6 原生的 `gotoLine`
     // （绑 Mod+Alt+G，它自己会弹一个输入框），以及这个浮层里的 `:42` 语法。再注册一条

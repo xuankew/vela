@@ -3,6 +3,7 @@ import { EditorView } from '@codemirror/view'
 import { indentUnit, type LanguageSupport } from '@codemirror/language'
 import { batch, createSignal, type Accessor, type Setter } from 'solid-js'
 import { open as pickToOpen } from '@tauri-apps/plugin-dialog'
+import type { DefinitionClickHook } from '../editor/clickJump'
 import type { EditorController } from '../editor/controller'
 import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../editor/language'
 import type { PasteImageHook } from '../editor/paste'
@@ -175,6 +176,15 @@ export interface Workspace {
    */
   tabOfView: (view: EditorView) => Tab | null
   /**
+   * 反查：这个编辑器实例是哪块分屏挂着的那个控制器（M5-2）。
+   *
+   * 与 [`Workspace.tabOfView`] 成对使用，因为 `Cmd+Click` 一次要两样东西：路径来自标签，
+   * **落点**来自控制器。落点不能用 `focusedEditor()`——处理器跑在 CM6 自己的 mousedown
+   * 之前，那一刻焦点还留在用户上一碰的那块分屏上。拿错控制器的后果比粘错图片更狠：
+   * 光标会跑到**隔壁文档**的同名符号上，还顺带把那边滚动、把这边什么都不动。
+   */
+  controllerOfView: (view: EditorView) => EditorController | null
+  /**
    * `focusedEditor()` 的**响应式**孪生（M3-A-3）。
    *
    * 🔴 差别只有一件事：这一个额外读了 `attachedAt()` 与那块分屏的 `tabId()`，于是在
@@ -279,6 +289,19 @@ export interface WorkspaceOptions {
    * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
    */
   onFontSizeZoom?: (delta: number) => void
+  /**
+   * `Cmd/Ctrl+Click` 查到定义时问谁（M5-2）。
+   *
+   * ⚠️ 与 [`WorkspaceOptions.pasteImage`] 同一条时序竞态：钩子拿到的是**收到点击的那个 view**，
+   * 换回文档只能走 `tabOfView`。这里比粘贴更要紧，因为「跳到哪份文件的哪一行」一旦算错，
+   * 用户看到的是**另一个标签的同名符号**被跳到、光标还挪走了，比图片进错目录更难察觉。
+   *
+   * 返回值决定这一次点击归谁：`true` = 这一下有了归宿（跳走，或改去项目里搜那个词），
+   * CM6 不再处理；`false` = 这一位仍然是「加一个光标」那个既有手势（见 `editor/clickJump.ts`）。
+   * 所以钩子没有下一步可做时必须安静地回 `false`，⛔ 不能顺手弹一句「没有找到定义」
+   * ——那等于把加光标那次点击污染成报错。
+   */
+  clickDefinition?: DefinitionClickHook
 }
 
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
@@ -290,6 +313,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     options.pasteImage,
     options.dark ?? true,
     options.onFontSizeZoom,
+    options.clickDefinition,
   )
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
@@ -1065,6 +1089,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       // `?? null` 那一半是「分屏还在、但它显示的标签已经被关掉了」：
       // 与 `focusedView` 返回 null 的理由同一条——没有「当前文档」就别假装有
       return pane === undefined ? null : (tabById(pane.tabId()) ?? null)
+    },
+    controllerOfView(view) {
+      const pane = panes().find((p) => p.controller?.view === view)
+      // 与 `tabOfView` 同一个「找不到就算了」的语义：实例正在被 destroy 时什么都不该做
+      return pane?.controller ?? null
     },
     focusedView,
     attach,

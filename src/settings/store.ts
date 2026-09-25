@@ -294,17 +294,22 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
    * 把当前主题选择解析成亮/暗，写到两处：`<html data-theme>`（管 `--vela-*` 那套颜色）
    * 与 CM6 的 `darkSlot`（管 base theme 的 `&dark` 规则，经注入的 `applyDark` 回调）。
    *
-   * ⚠️ `data-theme` 写的是**原始 ThemeId**（light/dark/system/dracula/nord/solarized），
-   * 不是解析后的 ResolvedTheme——CSS 里 `[data-theme='dracula']` 等选择器要靠这个匹配。
-   * CM6 那边才用解析后的布尔值（isDark）。
+   * ⚠️ `data-theme` 写的是**具体配色**：非 `system` 时就是那个原始 ThemeId
+   * （CSS 里 `[data-theme='dracula']` 等选择器要靠它匹配），`system` 时写**解析后的**
+   * `light` / `dark`。
+   *
+   * 后面那半条是修出来的：原先这里一律写原始 id，而 `styles.css` 既没有
+   * `[data-theme='system']` 覆盖块、也没有 `prefers-color-scheme` 媒体查询——于是
+   * 「跟随系统 + 系统浅色」下 `--vela-*` 永远落到 `:root` 那份暗色兜底，而 CM6 拿的却是
+   * 解析后的亮色（下一行），裂成「编辑器亮底、标签条/侧边栏/状态栏暗底」。
+   * `styles.css` 开头那段注释从一开始就按「写解析出的具体值」写的，是这一行没跟上它。
    *
    * 两处必须一起更新，少一处就会「颜色换了但光标/选区/弹层底色还是旧的」或反过来。
    */
   function applyResolvedTheme(): void {
     const id = theme()
     const resolved = resolveTheme(id)
-    // data-theme 用原始 ID，让 CSS 选择器能匹配到具体主题
-    applyThemeAttr(id as any)
+    applyThemeAttr(id === 'system' ? resolved : id)
     options.applyDark?.(resolved === 'dark')
   }
 

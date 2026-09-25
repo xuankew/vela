@@ -155,7 +155,7 @@ export function QuickOpen(props: QuickOpenProps) {
           ref={inputEl}
           type="text"
           value={goto.raw()}
-          placeholder={goto.kind() === 'project' ? '按名字或路径找最近项目…' : '按名字找文件…（:42 跳行，@ 列标题）'}
+          placeholder={goto.kind() === 'project' ? '按名字或路径找最近项目…' : '按名字找文件…（:42 跳行，@ 列符号）'}
           aria-label={goto.kind() === 'project' ? '最近项目' : '跳转'}
           aria-controls="palette-list"
           spellcheck={false}

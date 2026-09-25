@@ -1,0 +1,49 @@
+name: Release build（手动出安装包）
+
+# 与 ci.yml 的 bundle-macos 分开：那条是每次 tag/手触发都跑的冒烟验证，
+# 这一条是**发版专用**——一次跑完 mac + windows 两个平台，产物打包上传。
+# Windows 包无法在 macOS 上交叉编译（依赖 MSVC 链接器与 WebView2），
+# 想在 mac 上一键出两个平台的包只能走 CI。
+on:
+  workflow_dispatch:
+
+jobs:
+  installers:
+    name: ${{ matrix.os }} · tauri build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@v2
+
+      - run: pnpm install --frozen-lockfile
+
+      # createUpdaterArtifacts 覆盖成 false：仓库没有 minisign 私钥
+      # （secrets 里也没配），开着它 tauri build 会在签名 updater 产物那步失败。
+      # 正式接自动更新时把这条 --config 去掉并配 TAURI_SIGNING_PRIVATE_KEY。
+      # bundle.targets 里的 dmg 在 Windows 上会被 tauri 自动跳过，NSIS/MSI
+      # 由 tauri 按平台补默认值，所以两个平台共用一条命令。
+      - name: tauri build
+        run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vela-${{ matrix.os }}
+          # 路径根是仓库根而不是 src-tauri/：Cargo workspace 声明在根 Cargo.toml，
+          # target 目录归 workspace 所有
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+          if-no-files-found: error

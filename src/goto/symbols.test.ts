@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { filterSymbols, headingLevel, symbolsFrom, type DocSymbol, type SymbolDoc, type SymbolNode } from './symbols'
+import {
+  codeRulesFor,
+  codeSymbolsFrom,
+  filterSymbols,
+  findSymbol,
+  headingLevel,
+  matchesCodeRule,
+  symbolsFrom,
+  type CodeRule,
+  type CodeSymbolNode,
+  type DocSymbol,
+  type SymbolDoc,
+  type SymbolNode,
+} from './symbols'
 
 /**
  * 手搓的 `SymbolDoc`。
@@ -210,5 +223,119 @@ describe('filterSymbols：大小写不敏感的**子串**匹配', () => {
   it('空表回空表', () => {
     expect(filterSymbols([], 'a')).toEqual([])
     expect(filterSymbols([], '')).toEqual([])
+  })
+})
+
+describe('findSymbol：精确同名，与 filterSymbols 刻意不是一套匹配', () => {
+  const items: DocSymbol[] = [
+    { name: 'get', level: 0, pos: 3 },
+    { name: 'getName', level: 0, pos: 20 },
+    { name: 'Widget', level: 0, pos: 40 },
+    // 重名：C++ 的头文件声明与实现各一行，Rust 的 trait 与 impl 各一行
+    { name: 'get', level: 0, pos: 99 },
+  ]
+
+  it('精确同名才命中，子串不算', () => {
+    // 🔴 这一条是整段匹配规则的立足点：`get` 必须命中 `get` 而**不是** `getName`。
+    // 改成模糊的话按 `Mod+Alt+D` 会跳到隔壁那个符号上——那不是跳转而是猜，
+    // 而猜错的跳转比不跳更糟（用户得自己找回原来那一处）
+    expect(findSymbol(items, 'get')?.pos).toBe(3)
+    expect(findSymbol(items, 'Widget')?.pos).toBe(40)
+    expect(findSymbol(items, 'Name')).toBeNull()
+    expect(findSymbol(items, 'ge')).toBeNull()
+  })
+
+  it('大小写敏感：标识符就是大小写敏感的', () => {
+    expect(findSymbol(items, 'widget')).toBeNull()
+    expect(findSymbol(items, 'WIDGET')).toBeNull()
+  })
+
+  it('重名回文档里最早的那一个，不回「离光标最近的那一个」', () => {
+    // 后者要先算作用域，那是 LSP 的活（口径写在 `symbols.ts` 文件头）。
+    // 两个都能跳，而第一个是稳定答案——连按同一个键不会在两处之间跳来跳去
+    expect(findSymbol(items, 'get')?.pos).toBe(3)
+  })
+
+  it('空清单与空串一律 null，不是「返回第一个」', () => {
+    expect(findSymbol([], 'get')).toBeNull()
+    expect(findSymbol(items, '')).toBeNull()
+  })
+})
+
+describe('代码符号规则表：形状与命中', () => {
+  /** 一条最小规则，够用来考 `matchesCodeRule` 的两个维度 */
+  const rules: CodeRule[] = [{ node: 'VariableDefinition', parents: ['ClassDeclaration', 'FunctionDeclaration'] }]
+
+  it('节点名对、父节点名不对 → 不命中（`parents` 存在的全部理由）', () => {
+    expect(matchesCodeRule('VariableDefinition', 'ClassDeclaration', rules)).toBe(true)
+    // 参数与导入与真正的声明**共用节点名**，只能靠父节点挡在外面
+    expect(matchesCodeRule('VariableDefinition', 'Parameter', rules)).toBe(false)
+    expect(matchesCodeRule('VariableDefinition', '', rules)).toBe(false)
+    expect(matchesCodeRule('PropertyName', 'ClassDeclaration', rules)).toBe(false)
+  })
+
+  it('多条规则是**或**的关系，命中任一条即可', () => {
+    const two: CodeRule[] = [...rules, { node: 'TypeDefinition', parents: ['InterfaceDeclaration'] }]
+    expect(matchesCodeRule('TypeDefinition', 'InterfaceDeclaration', two)).toBe(true)
+    // 加了规则不该让原来的命中翻掉：两张表是分语言拼起来的，改一处会牵连邻居
+    expect(matchesCodeRule('VariableDefinition', 'FunctionDeclaration', two)).toBe(true)
+  })
+
+  it('十种 label 全查得到表，其余语言一律 null', () => {
+    for (const label of ['TypeScript', 'TSX', 'JavaScript', 'JSX', 'Java', 'Python', 'Rust', 'Go', 'C', 'C++']) {
+      expect(codeRulesFor(label)).not.toBeNull()
+    }
+    // 这三个是真会被 `languageFor` 回出来的 label，不是随手编的字母
+    expect(codeRulesFor('JSON')).toBeNull()
+    expect(codeRulesFor('CSS')).toBeNull()
+    expect(codeRulesFor('纯文本')).toBeNull()
+    expect(codeRulesFor('')).toBeNull()
+  })
+
+  it('每条规则的 `parents` 都非空：空清单等于「永不命中」，写错时看不出来', () => {
+    // 🔴 元检查。少这一条的话，「某个 label 的符号永远是空的」这类 bug 会伪装成
+    // 「这份文件里确实没有声明」，而它其实是一个手误的 `parents: []`
+    for (const label of ['TypeScript', 'TSX', 'JavaScript', 'JSX', 'Java', 'Python', 'Rust', 'Go', 'C', 'C++']) {
+      for (const rule of codeRulesFor(label)!) {
+        expect(rule.parents.length, `${label} / ${rule.node}`).toBeGreaterThan(0)
+        expect(rule.node, label).not.toBe('')
+      }
+    }
+  })
+
+  it('TS 与 JS 是同一张表（同一套语法树），C 与 C++ 也是', () => {
+    expect(codeRulesFor('TypeScript')).toBe(codeRulesFor('JavaScript'))
+    expect(codeRulesFor('C')).toBe(codeRulesFor('C++'))
+    // 而 Java 不是同一张：它的节点名是 `Definition` 那一套
+    expect(codeRulesFor('Java')).not.toBe(codeRulesFor('TypeScript'))
+  })
+
+  it('codeSymbolsFrom：按规则挑、抠名字、pos 指向节点起点、顺序不变', () => {
+    const text = 'class A {\n  f() {}\n  p: number\n}'
+    const nodes: CodeSymbolNode[] = [
+      { name: 'VariableDefinition', from: 6, to: 7, parent: 'ClassDeclaration' },
+      // 参数：节点名与真声明一样，靠父节点挡掉
+      { name: 'VariableDefinition', from: 0, to: 0, parent: 'Parameter' },
+      { name: 'PropertyName', from: 21, to: 22, parent: 'PropertyType' },
+    ]
+    expect(
+      codeSymbolsFrom(nodes, docOf(text), [
+        { node: 'VariableDefinition', parents: ['ClassDeclaration'] },
+        { node: 'PropertyName', parents: ['PropertyType'] },
+      ]),
+    ).toEqual([
+      { name: 'A', level: 0, pos: 6 },
+      { name: 'p', level: 0, pos: 21 },
+    ])
+  })
+
+  it('代码符号的 level 恒为 0：平铺，不缩进', () => {
+    // 标题的 1–6 级是 CommonMark 直接给的事实；代码的嵌套层级要比祖先链，
+    // 每种语言单独调一遍，算错会缩进出一个**看起来很像**的错结构（见 CODE_RULES 上面那段）
+    const text = 'x'
+    const out = codeSymbolsFrom([{ name: 'Identifier', from: 0, to: 1, parent: 'FunctionDeclarator' }], docOf(text), [
+      { node: 'Identifier', parents: ['FunctionDeclarator'] },
+    ])
+    expect(out).toEqual([{ name: 'x', level: 0, pos: 0 }])
   })
 })

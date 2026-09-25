@@ -86,6 +86,40 @@ const cssLineHeight = (): string => document.documentElement.style.getPropertyVa
 const cssLetterSpacing = (): string => document.documentElement.style.getPropertyValue('--vela-letter-spacing')
 const dataTheme = (): string | undefined => document.documentElement.dataset.theme
 
+/**
+ * 装一个能改 `matches`、能手动 fire 的 `window.matchMedia`，用完 `restore()` 还原。
+ *
+ * ⚠️ 为什么必须自己装：本仓库这份 jsdom（30.x）里 `window.matchMedia` 读出来就是
+ * `undefined`——那是一个返回 undefined 的 getter，赋值能盖住它。不装的话
+ * `systemTheme()` 会走「探测不到 → 退回 dark」那条兜底，于是 `'system' + 系统浅色`
+ * 的断言会因为**环境**而不是因为产品红。
+ */
+function installMatchMedia(matches: boolean): {
+  set: (v: boolean) => void
+  fire: () => void
+  restore: () => void
+} {
+  const listeners = new Set<() => void>()
+  const state = { matches }
+  const fake = {
+    addEventListener: (_: string, cb: () => void) => void listeners.add(cb),
+    removeEventListener: (_: string, cb: () => void) => void listeners.delete(cb),
+  }
+  Object.defineProperty(fake, 'matches', { get: () => state.matches })
+  const previous = Object.getOwnPropertyDescriptor(window, 'matchMedia')
+  window.matchMedia = (() => fake) as unknown as typeof window.matchMedia
+  return {
+    set: (v) => void (state.matches = v),
+    fire: () => {
+      for (const cb of [...listeners]) cb()
+    },
+    restore: () => {
+      if (previous) Object.defineProperty(window, 'matchMedia', previous)
+      else delete (window as { matchMedia?: unknown }).matchMedia
+    },
+  }
+}
+
 let store: SettingsStore
 const warnings: string[] = []
 /** `applyDark` 回调收到的深浅色序列。App.tsx 里它接的是 `ws.setDarkTheme`，这里用数组盯着 */
@@ -462,6 +496,38 @@ describe('主题（M4-C）：data-theme 属性 + applyDark 回调 + 写穿', () 
     expect(darkCalls).toEqual([false, true])
     expect(dataTheme()).toBe('dark')
     expect(store.theme()).toBe('dark')
+  })
+
+  it("'system' 写进 data-theme 的是**解析出来的**那个值，不是字面量 'system'", () => {
+    // 🔴 这一条钉的是一个已经踩过的坑：styles.css 里既没有 `[data-theme='system']` 覆盖块、
+    // 也没有 `prefers-color-scheme` 媒体查询，所以写原始 id 等于让 `--vela-*` 永远停在
+    // `:root` 那份暗色兜底，而下一行的 applyDark 拿的却是解析值——「跟随系统 + 系统浅色」
+    // 就裂成「编辑器亮底、标签条/侧边栏/状态栏暗底」。文件树的图标颜色（`.tree-glyph`）
+    // 直接吃这两个变量，所以它比任何一格都先暴露这条。
+    const media = installMatchMedia(false)
+    try {
+      store.setTheme('system')
+      expect(dataTheme()).toBe('light')
+      expect(darkCalls).toEqual([false])
+
+      // OS 中途切到深色：matchMedia 的 change 回调要重算并重应用同样的两处
+      media.set(true)
+      media.fire()
+      expect(dataTheme()).toBe('dark')
+      expect(darkCalls).toEqual([false, true])
+      // 存的仍然是 `system`：这一档不该把解析结果写穿成用户选择
+      expect(store.theme()).toBe('system')
+    } finally {
+      media.restore()
+    }
+  })
+
+  it('非 system 的具体主题照旧写原始 ID：CSS 靠 `[data-theme=dracula]` 匹配那一块', () => {
+    // 上面那条不能顺手把所有 id 都换成解析值——那样 dracula / nord / solarized / eye-care /
+    // warm-beige 那五块覆盖全都会失效，整个主题系统塌成亮暗两套
+    store.setTheme('dracula')
+    expect(dataTheme()).toBe('dracula')
+    expect(darkCalls).toEqual([true])
   })
 
   it('不认识的 theme ID 打回默认（sanitize）', async () => {

@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { createSignal } from 'solid-js'
 import { render } from 'solid-js/web'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -67,9 +68,9 @@ function textFile(overrides: Partial<TextFile> = {}): TextFile {
   }
 }
 
-function mount(): Workspace {
+function mount(sidebar?: { open: () => boolean; toggle: () => void }): Workspace {
   const ws = createWorkspace()
-  dispose = render(() => <StatusBar workspace={ws} />, container)
+  dispose = render(() => <StatusBar workspace={ws} sidebar={sidebar} />, container)
   return ws
 }
 
@@ -550,5 +551,58 @@ describe('只读分片那一排（M2-H）', () => {
     await flush()
 
     expect(cells()[0]).toBe('huge.log')
+  })
+})
+
+/* ---------- 侧边栏开关那一格 ---------- */
+
+describe('侧边栏开关那一格', () => {
+  it('不传 sidebar 时压根不渲染：这一排的其余格子不依赖它', () => {
+    mount()
+    expect(container.querySelector('.status-side')).toBeNull()
+  })
+
+  it('在最左边，也就是路径格之前', () => {
+    mount({ open: () => false, toggle: () => {} })
+    expect(container.querySelector('.statusbar')?.firstElementChild?.className).toBe('status-side')
+  })
+
+  it('点一下调一次 toggle', () => {
+    const toggle = vi.fn()
+    mount({ open: () => false, toggle })
+
+    container.querySelector<HTMLButtonElement>('.status-side')!.click()
+
+    expect(toggle).toHaveBeenCalledOnce()
+  })
+
+  it('aria-pressed 与 title 跟着 open() 走，包括运行中翻面', () => {
+    const [open, setOpen] = createSignal(false)
+    mount({ open, toggle: () => setOpen((v) => !v) })
+    const btn = () => container.querySelector<HTMLButtonElement>('.status-side')!
+
+    expect(btn().getAttribute('aria-pressed')).toBe('false')
+    expect(btn().title).toBe('打开侧边栏（项目文件树）')
+
+    setOpen(true)
+
+    expect(btn().getAttribute('aria-pressed')).toBe('true')
+    expect(btn().title).toBe('隐藏侧边栏')
+  })
+
+  it('🔴 它不带 .status-cell：那是「关于这份文档的一个读数」，按钮不是读数', () => {
+    // 上面那条「七格齐全」的断言按这个类名收下标——挂上去的话这里会红
+    mount({ open: () => false, toggle: () => {} })
+    expect(cells()[0]).toBe('空文档')
+  })
+
+  it('换成只读分片那一排时它还在：去看旁边的文件在分片上照样成立', async () => {
+    const ws = mount({ open: () => false, toggle: () => {} })
+
+    await makeShardTab(ws)
+    await flush()
+
+    expect(cells()).not.toContain('行 1，列 1')
+    expect(container.querySelector('.status-side')).not.toBeNull()
   })
 })

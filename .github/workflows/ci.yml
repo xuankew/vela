@@ -87,12 +87,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
-      # beforeBuildCommand 已经是 `pnpm build`，所以这一条把前端与 Rust 一起带出来
-      - run: pnpm tauri build
+      # beforeBuildCommand 已经是 `pnpm build`，所以这一条把前端与 Rust 一起带出来。
+      # createUpdaterArtifacts 覆盖成 false：CI 没配 minisign 私钥，开着它
+      # tauri build 会在签名 updater 产物那步失败
+      - run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
       - uses: actions/upload-artifact@v4
         with:
           name: vela-macos
-          # bundle.targets 只有 "app"（没有 dmg），所以只有这一个路径
-          path: src-tauri/target/release/bundle/macos/*.app
+          # 路径根是仓库根而不是 src-tauri/：Cargo workspace 声明在根 Cargo.toml，
+          # target 目录归 workspace 所有。bundle.targets 是 ["app", "dmg"]，
+          # 所以 .app 在 bundle/macos/、.dmg 在 bundle/dmg/
+          path: |
+            target/release/bundle/macos/*.app
+            target/release/bundle/dmg/*.dmg
           # 打不出包就该红，别上传一个空 artifact 装作成功
           if-no-files-found: error

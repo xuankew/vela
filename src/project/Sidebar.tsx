@@ -1,5 +1,7 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
+import { iconForPath } from '../editor/language'
 import { visibleWindow } from '../ui/virtual'
+import { TreeGlyphIcon } from './icons'
 import type { ProjectTree } from './store'
 import { NameDialog, type NameDialogProps } from './NameDialog'
 import { TreeMenu } from './TreeMenu'
@@ -351,6 +353,9 @@ export function Sidebar(props: SidebarProps) {
                     onContextMenu={(e) => onRowContextMenu(e, row)}
                   >
                     <span class="tree-twisty">{row.isDir ? (row.expanded ? '▾' : '▸') : ''}</span>
+                    {/* 图形紧跟箭头、名字在它右边。目录一律 folder 而**不看名字**：
+                        `iconForPath` 只按路径猜，而 `row.isDir` 是磁盘上问回来的真话 */}
+                    <TreeGlyphIcon glyph={row.isDir ? 'folder' : iconForPath(row.path)} />
                     <span class="tree-name">{row.name}</span>
                     {/* loading 与 error 都占同一行的剩余空间，不另起一行：
                         多出一行会让这一行的高度不再是 ROW_HEIGHT，窗口算术立刻失准 */}

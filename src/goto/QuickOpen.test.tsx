@@ -276,7 +276,7 @@ describe('挂载与结构', () => {
 
   it('placeholder 把三种用法一次说完：不知道 `:42` 与 `@` 的人根本不会去试', async () => {
     await open()
-    expect(input().placeholder).toBe('按名字找文件…（:42 跳行，@ 列标题）')
+    expect(input().placeholder).toBe('按名字找文件…（:42 跳行，@ 列符号）')
   })
 
   it('列表上没有 tabIndex：焦点必须留在输入框上', async () => {
@@ -731,6 +731,6 @@ describe('最近项目（Cmd+Shift+O）', () => {
     await panel.show()
     await flush()
     expect(ipc.indexProject).toHaveBeenCalledTimes(1)
-    expect(input().placeholder).toBe('按名字找文件…（:42 跳行，@ 列标题）')
+    expect(input().placeholder).toBe('按名字找文件…（:42 跳行，@ 列符号）')
   })
 })

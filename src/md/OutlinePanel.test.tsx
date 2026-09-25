@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
-import { EditorState } from '@codemirror/state'
+import { EditorState, type Extension } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { createSignal } from 'solid-js'
 import { render } from 'solid-js/web'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { languageFor } from '../editor/language'
 import { OUTLINE_ROW_HEIGHT } from './outline'
 import { OutlinePanel } from './OutlinePanel'
 import { PANEL_DEBOUNCE_MS, type FollowedEditor } from './panel'
@@ -30,25 +31,52 @@ import { PANEL_DEBOUNCE_MS, type FollowedEditor } from './panel'
  * 「几千个标题滚起来不卡」这件事只能在看得到像素的地方判断。
  */
 
-function mdState(doc: string): EditorState {
-  return EditorState.create({ doc, extensions: markdown({ base: markdownLanguage, codeLanguages: languages }) })
-}
+/**
+ * 真装着的 TypeScript 语法包，整个文件加载一次。
+ *
+ * ⛔ 不直接 import `@codemirror/lang-javascript`：与 `goto/syntax.test.ts` 同一条理由——
+ * 手搓 import 等于在测试里再造一份「扩展名 → 语言」映射，而这条映射唯一的作用是
+ * 让 `state.facet(language)` 非空，而 `symbolTable` 判的正是它。
+ */
+let codeSupport: Extension
+
+beforeAll(async () => {
+  const description = languageFor('/r/a.ts').description
+  if (description === null) throw new Error('用例写错了：.ts 在 language-data 里没有语法包')
+  const support = await description.load()
+  if (support === null) throw new Error('用例写错了：.ts 的语法包 load() 回了 null')
+  codeSupport = support
+})
 
 let container: HTMLElement
 let unmount: () => void
 /** 组件外面建的编辑器要在组件之后收，否则卸载时的 `removeEventListener` 会摸到一个已销毁的 view */
 const views: EditorView[] = []
 
-function makeView(doc: string): EditorView {
+/** 这份编辑器实例挂的是哪一档语言扩展，对应 `languageExtensions` 的三个分支 */
+type LanguageMount = 'markdown' | 'unloaded' | 'code'
+
+function makeView(doc: string, mode: LanguageMount = 'markdown'): EditorView {
   const parent = document.createElement('div')
   document.body.appendChild(parent)
-  const view = new EditorView({ state: mdState(doc), parent })
+  // 🔴 `'unloaded'` 是**什么语言扩展都不挂**，而不是挂 Markdown。`symbolTable` 靠
+  // `state.facet(language)` 是否为空来分「语法包还没懒加载」与「这份文档里没有符号」，
+  // 而 `markdown()` 自己就装了这个 facet（它是 `codeLanguages` 那套嵌套解析的宿主）——
+  // 拿 Markdown 的 state 冒充「还没加载」会一路走到 `code` 分支，测出来的是另一件事。
+  // 真装着语法包的那一档是 `'code'`
+  const extensions =
+    mode === 'markdown'
+      ? [markdown({ base: markdownLanguage, codeLanguages: languages })]
+      : mode === 'code'
+        ? [codeSupport]
+        : []
+  const view = new EditorView({ state: EditorState.create({ doc, extensions }), parent })
   views.push(view)
   return view
 }
 
-function mount(doc: string, path: string | null) {
-  const view = makeView(doc)
+function mount(doc: string, path: string | null, mode: LanguageMount = 'markdown') {
+  const view = makeView(doc, mode)
   const [source, setSource] = createSignal<FollowedEditor | null>({ view, path })
   const [revision, setRevision] = createSignal(0)
   const [tabId, setTabId] = createSignal(1)
@@ -272,10 +300,22 @@ describe('OutlinePanel：点击跳转', () => {
 
 describe('OutlinePanel：四种说不出口的状态', () => {
   it('不是 Markdown 时说出那个语言的名字，措辞与 Cmd+R 浮层逐字相同', () => {
-    const p = mount('const x = 1', '/r/a.ts')
-    // 🔴 这一句必须与 `goto/store.ts:452` 那一句一字不差。同一个事实两种说法的话，
+    // ⚠️ 这份 state 什么语言扩展都没挂（`'unloaded'`），也就是懒加载还没落地的那一刻，
+    // 于是 `symbolTable` 走的是「语法还没到位」那一条 `unsupported`。
+    // 真装着 TypeScript 语法包的文档在下一条用例里
+    const p = mount('const x = 1', '/r/a.ts', 'unloaded')
+    // 🔴 这一句必须与 `goto/store.ts` 那一句一字不差。同一个事实两种说法的话，
     // 用户会以为浮层与面板答的是两个问题
     expect(p.note()).toBe('TypeScript 还没有符号表')
+    expect(p.names()).toEqual([])
+    expect(p.spacerHeight()).toBe('0px')
+  })
+
+  it('语法真的装上了、而它是代码时：大纲不画它，说的是「请用 Cmd+R 看」', () => {
+    // `symbolTable` 现在对十种代码语言会回一份 `code` 清单，而这块面板要的是**有层级的标题**
+    // （它能逐节折叠），平铺的方法名挤进折叠树里看着像树坏了。这一条钉住那道挡板
+    const p = mount('const x = 1\n', '/r/a.ts', 'code')
+    expect(p.note()).toBe('大纲只列 Markdown 标题；代码符号请用 Cmd+R 看')
     expect(p.names()).toEqual([])
     expect(p.spacerHeight()).toBe('0px')
   })
@@ -309,7 +349,7 @@ describe('OutlinePanel：四种说不出口的状态', () => {
   })
 
   it('从「不是 Markdown」切回来时提示会跟着消失', () => {
-    const p = mount('const x = 1', '/r/a.ts')
+    const p = mount('const x = 1', '/r/a.ts', 'unloaded')
     expect(p.note()).toBe('TypeScript 还没有符号表')
     const md = makeView('# 甲\n')
     p.setSource({ view: md, path: '/r/a.md' })

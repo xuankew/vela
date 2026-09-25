@@ -556,6 +556,40 @@ describe('渲染', () => {
     expect(rowByRel('README.md')!.querySelector('.tree-twisty')!.textContent).toBe('')
   })
 
+  it('每行一个图形：目录一律 folder，文件按 `iconForPath` 分', async () => {
+    mount()
+    await openRepo()
+    await tree.toggle(k('src'))
+    await flush()
+
+    expect(rowByRel('')!.querySelector('.tree-glyph')!.classList.contains('t-folder')).toBe(true)
+    expect(rowByRel('src')!.querySelector('.tree-glyph')!.classList.contains('t-folder')).toBe(true)
+    expect(rowByRel('README.md')!.querySelector('.tree-glyph')!.classList.contains('t-markdown')).toBe(true)
+    expect(rowByRel('src/a.ts')!.querySelector('.tree-glyph')!.classList.contains('t-code')).toBe(true)
+    // 一行恰好一个图形：多画一个会把名字推歪，也会让上面那些 `querySelector` 取到错的那个
+    expect(rowByRel('src')!.querySelectorAll('.tree-glyph')).toHaveLength(1)
+  })
+
+  it('⚠️ 目录不看名字：`docs.md/` 这种目录仍然是 folder', async () => {
+    // `iconForPath` 只按路径猜，而 `row.isDir` 是磁盘上问回来的真话。
+    // 这一条钉住「isDir 优先」那个分支——写成 `iconForPath(row.path)` 一统天下的话，
+    // 一个名叫 `notes.json` 的目录会被画成数据文件，而点它是展开而不是打开
+    mount({ ...copyFs(), docs: [f('docs/notes.json', true)] })
+    await openRepo()
+    await tree.toggle(k('docs'))
+    await flush()
+
+    expect(rowByRel('docs/notes.json')!.querySelector('.tree-glyph')!.classList.contains('t-folder')).toBe(true)
+  })
+
+  it('图形对读屏软件隐身：它没有任何可朗读的内容，名字那一格已经说过了', async () => {
+    mount()
+    await openRepo()
+    const svg = rowByRel('README.md')!.querySelector('.tree-glyph')!
+    expect(svg.getAttribute('aria-hidden')).toBe('true')
+    expect(svg.tagName.toLowerCase()).toBe('svg')
+  })
+
   it('摊开一层之后箭头翻向，孩子出现', async () => {
     mount()
     await openRepo()

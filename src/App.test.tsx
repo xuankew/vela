@@ -2647,7 +2647,7 @@ describe('最近项目接线（M2-F）', () => {
     await flush()
 
     expect(projectCmd.indexed).toEqual([['/notes']])
-    expect(paletteInput().placeholder).toBe('按名字找文件…（:42 跳行，@ 列标题）')
+    expect(paletteInput().placeholder).toBe('按名字找文件…（:42 跳行，@ 列符号）')
   })
 
   it('打字就地过滤最近项目，按父目录也认', async () => {

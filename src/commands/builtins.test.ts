@@ -46,8 +46,10 @@ function makeHooks(): BuiltinHooks {
     exportHtml: vi.fn(),
     findInFiles: vi.fn(),
     replaceInFiles: vi.fn(),
+    searchWordInFiles: vi.fn(),
     gotoFile: vi.fn(),
     gotoSymbol: vi.fn(),
+    gotoDefinition: vi.fn(),
     openToolBox: vi.fn(),
     openCommandPalette: vi.fn(),
   }
@@ -165,7 +167,7 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('四十八条命令全部注册成功，且互不抢占快捷键', () => {
+  it('五十条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按 id 前缀分组的：
     // 「工具」(U+5DE5) < 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」(U+7F16)
@@ -179,6 +181,7 @@ describe('内置命令', () => {
       'toolbox.open',
       'search.findInFiles',
       'search.replaceInFiles',
+      'search.wordInFiles',
       'file.exportHtml',
       'file.new',
       'file.open',
@@ -224,6 +227,7 @@ describe('内置命令', () => {
       'view.toggleOutline',
       'view.togglePreview',
       'view.toggleSidebar',
+      'goto.definition',
       'goto.file',
       'goto.symbol',
       'project.addFolder',
@@ -687,7 +691,7 @@ describe('M2-E：跳转浮层命令的接线', () => {
   it('标题与分类：新开的「跳转」分类排在「视图」之后、「项目」之前', () => {
     const { registry } = makeRegistry(fakeController(false))
     expect(registry.get('goto.file')?.title).toBe('跳转到文件…')
-    expect(registry.get('goto.symbol')?.title).toBe('跳转到标题…')
+    expect(registry.get('goto.symbol')?.title).toBe('跳转到符号…')
     expect(registry.get('goto.file')?.category).toBe('跳转')
     expect(registry.get('goto.symbol')?.category).toBe('跳转')
     // 展示名分平台，注册表缺省 'macos'（registry.ts:90）；没有 shift，所以就是 ⌘ 加字母
@@ -715,6 +719,70 @@ describe('M2-E：跳转浮层命令的接线', () => {
     expect(registry.findForKey(event('g', { metaKey: true, altKey: true }))).toBeNull()
     // 浮层里的 `:42` 不走命令，走 goto/store.ts 的查询解析，所以注册表里也没有对应 id
     expect(registry.list().map((c) => c.id)).not.toContain('goto.line')
+  })
+})
+
+describe('M5-1：跳到定义与「拿这个词去搜」的接线', () => {
+  it('两条各分派到自己的 hook，不蹭同分类里那几条', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('goto.definition')).toBe(true)
+    expect(hooks.gotoDefinition).toHaveBeenCalledOnce()
+    // ⚠️ 这四条 `not.toHaveBeenCalled` 是这一组里唯一能发现接错人的断言：
+    // `goto.definition` 接到 `gotoSymbol` 上的话，按 `Mod+Alt+D` 弹的是整个浮层，
+    // 用户以为「跳转坏了」，而命令照样返回 true
+    expect(hooks.gotoSymbol).not.toHaveBeenCalled()
+    expect(hooks.gotoFile).not.toHaveBeenCalled()
+
+    expect(await registry.execute('search.wordInFiles')).toBe(true)
+    expect(hooks.searchWordInFiles).toHaveBeenCalledOnce()
+    expect(hooks.findInFiles).not.toHaveBeenCalled()
+    expect(hooks.replaceInFiles).not.toHaveBeenCalled()
+  })
+
+  it('Mod+Alt+D 与 Mod+Alt+F 各命中自己那条，少一个 Alt 就是普通字符输入', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    // 🔴 必须带 `code`：真机上 ⌘⌥D 浏览器给的 `key` 是 Option 转出来的 `∂`，
+    // 命中靠的是 `event.code` 那个物理键位（见 keybinding.ts 的 CODE_ALIASES）。
+    // 现成的 `macOptionEvent` 帮不上忙——它把 `metaKey` 写死成 false，服务的是不带 ⌘ 的 Alt+ 那一族
+    const cmdOption = (key: string, code: string): KeyEventLike => ({
+      key,
+      code,
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: false,
+      metaKey: true,
+    })
+    expect(registry.findForKey(cmdOption('∂', 'KeyD'))?.id).toBe('goto.definition')
+    expect(registry.findForKey(cmdOption('ƒ', 'KeyF'))?.id).toBe('search.wordInFiles')
+    // 少一个 Alt：⌘D 归 CM6 的 selectNextOccurrence（注册表不接管，见多光标那组），⌘F 归文档内查找
+    expect(registry.findForKey(event('d', { metaKey: true }))?.id).not.toBe('goto.definition')
+    expect(registry.findForKey(event('f', { metaKey: true }))?.id).not.toBe('search.wordInFiles')
+    // 带 Shift 的两种组合仍然空着：新命令不该顺手把邻居占了
+    expect(registry.findForKey(event('D', { metaKey: true, altKey: true, shiftKey: true }))).toBeNull()
+    expect(registry.findForKey(event('F', { metaKey: true, altKey: true, shiftKey: true }))).toBeNull()
+  })
+
+  it('标题与分类：定义在「跳转」里、按词搜索在「搜索」里', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.get('goto.definition')?.title).toBe('跳到定义')
+    expect(registry.get('goto.definition')?.category).toBe('跳转')
+    expect(registry.get('search.wordInFiles')?.title).toBe('在项目里搜索光标处的词')
+    expect(registry.get('search.wordInFiles')?.category).toBe('搜索')
+    // 展示名分平台，注册表缺省 'macos'（registry.ts:90）。MOD_ORDER 里 alt 排在 meta **之前**，
+    // 所以读作 ⌥⌘D 而不是 ⌘⌥D——与 ⇧⌘F 那条是同一条规矩，凭键盘上按下的顺序猜必错
+    expect(registry.list().find((c) => c.id === 'goto.definition')?.keybindings).toEqual(['⌥⌘D'])
+    expect(registry.list().find((c) => c.id === 'search.wordInFiles')?.keybindings).toEqual(['⌥⌘F'])
+  })
+
+  it('没有编辑器时照样执行成功——两种拒绝都归宿主说，⛔ 不是快捷键哑掉', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    // `when` 一律不设，理由与 `togglePreview` / `alignTable` / `wordCount` 逐字相同：
+    // gate 掉的话按下去什么也不发生，而用户得到的信息是零。
+    // 「这块分屏里没有可跳转的符号」「光标处没有一个词」那几句由 App 的 hook 说
+    expect(await registry.execute('goto.definition')).toBe(true)
+    expect(hooks.gotoDefinition).toHaveBeenCalledOnce()
+    expect(await registry.execute('search.wordInFiles')).toBe(true)
+    expect(hooks.searchWordInFiles).toHaveBeenCalledOnce()
   })
 })
 

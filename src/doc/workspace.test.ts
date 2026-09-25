@@ -1381,6 +1381,57 @@ describe('M1-D-5：分屏', () => {
   })
 })
 
+describe('从事件目标反查：tabOfView 与 controllerOfView（M5-2）', () => {
+  /**
+   * 两条反查都必须认「**谁收到事件**」，而不是「此刻聚焦谁」。
+   *
+   * `Cmd+Click` 的处理器跑在 CM6 自己的 mousedown **之前**，那一刻焦点还留在用户上一碰的
+   * 那块分屏上。拿聚焦那块去算落点，就会把光标挪到隔壁文档的同名符号上——不报错，
+   * 只是错，而且错得对用户不可见（他点的那块一动不动）
+   */
+  it('两块分屏时反查回被点那块，而 focusedEditor 回的是另一块', () => {
+    const pane = mounted()
+    const right = pane.splitPane('row')
+    // `split` 之后聚焦在新分屏上，拨回左边：这正是「点右边、焦点在左边」那个时序
+    pane.ws.focusPane(pane.ws.panes()[0]!.id)
+
+    expect(pane.ws.focusedEditor()).toBe(pane.controller)
+    expect(pane.ws.controllerOfView(right.controller.view)).toBe(right.controller)
+    expect(pane.ws.controllerOfView(right.controller.view)).not.toBe(pane.ws.focusedEditor())
+  })
+
+  it('两条反查同源：拿到的控制器与拿到的标签属于同一块分屏', () => {
+    // App 那侧一次要两样东西——路径来自标签、落点来自控制器。两者拼错了不会报错，
+    // 只会「在 A 文档里查、往 B 文档里跳」，所以这一条钉住它们必然指向同一块分屏
+    const pane = mounted()
+    const right = pane.splitPane('row')
+    pane.type('左边')
+    right.type('右边')
+
+    const view = right.controller.view
+    const tab = pane.ws.tabOfView(view)
+    const controller = pane.ws.controllerOfView(view)
+    expect(tab).not.toBeNull()
+    expect(controller).not.toBeNull()
+    expect(pane.ws.panes().find((p) => p.tabId() === tab!.id)!.controller).toBe(controller)
+    expect(controller!.doc).toBe('右边')
+    // 左边那一份没有被串进来
+    expect(pane.ws.tabOfView(pane.controller.view)!.id).not.toBe(tab!.id)
+    expect(pane.ws.controllerOfView(pane.controller.view)!.doc).toBe('左边')
+  })
+
+  it('编辑器摘下去之后两条都回 null：那一刻没有落点，什么都不该做', () => {
+    const pane = mounted()
+    const view = pane.controller.view
+    expect(pane.ws.controllerOfView(view)).toBe(pane.controller)
+
+    pane.ws.detach(pane.ws.panes()[0]!.id)
+
+    expect(pane.ws.controllerOfView(view)).toBeNull()
+    expect(pane.ws.tabOfView(view)).toBeNull()
+  })
+})
+
 describe('关闭确认', () => {
   /** 记下问过什么、并一律答同一个决策 */
   function recorder(decision: DiscardDecision) {

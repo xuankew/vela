@@ -2,6 +2,7 @@ import { Compartment, type EditorState, type StateEffect } from '@codemirror/sta
 import { EditorView } from '@codemirror/view'
 import type { EditorSnapshot } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
+import type { DefinitionClickHook } from '../editor/clickJump'
 import type { PasteImageHook } from '../editor/paste'
 import { createEditorState, darkThemeEnabled, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
 import { createDocumentModel, type DocumentModel } from './document'
@@ -63,6 +64,16 @@ export interface ViewConfig {
    * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
    */
   readonly onFontSizeZoom?: (delta: number) => void
+  /**
+   * `Cmd/Ctrl+Click` 跳到定义的处理者，工作区内所有标签共用同一个（M5-2）。
+   *
+   * 与 `pasteImage` 同一条理由：「点到的那个词在**哪份文档**里查定义」是工作区的知识，
+   * 而且这条更严格——钩子拿到的是收到点击的那个 view，必须用 `Workspace.tabOfView` 换回
+   * 标签，⛔ 不能用 `activeTab()`（那条时序竞态写在 `doc/workspace.ts` 的 `pasteImage` 上）。
+   *
+   * 缺省 = 不装，那一下仍然是「加一个光标」（见 `editor/clickJump.ts`）。
+   */
+  readonly clickDefinition?: DefinitionClickHook
 }
 
 export function createViewConfig(
@@ -71,6 +82,7 @@ export function createViewConfig(
   pasteImage?: PasteImageHook,
   dark = true,
   onFontSizeZoom?: (delta: number) => void,
+  clickDefinition?: DefinitionClickHook,
 ): ViewConfig {
   // `pasteImage` 是可选的，所以只能条件展开：`exactOptionalPropertyTypes` 虽然没开，
   // 但显式写一个 `pasteImage: undefined` 会让「缺省」与「传了个 undefined」在
@@ -83,6 +95,7 @@ export function createViewConfig(
     peerStates,
     ...(pasteImage ? { pasteImage } : {}),
     ...(onFontSizeZoom ? { onFontSizeZoom } : {}),
+    ...(clickDefinition ? { clickDefinition } : {}),
   }
 }
 
@@ -147,6 +160,7 @@ export function buildState(
     peerStates: config.peerStates,
     ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
     ...(config.onFontSizeZoom ? { onFontSizeZoom: config.onFontSizeZoom } : {}),
+    ...(config.clickDefinition ? { clickDefinition: config.clickDefinition } : {}),
     onUpdate,
   })
 }

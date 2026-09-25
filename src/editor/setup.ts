@@ -34,6 +34,7 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
 import { createFindReplacePanel, preserveCase } from './findReplace'
+import { definitionClick, type DefinitionClickHook } from './clickJump'
 import { fontSizeZoom } from './fontSizeZoom'
 import { indentGuides } from './indentGuides'
 import type { LanguageChoice } from './language'
@@ -220,32 +221,52 @@ export const codeFontBySyntax = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 )
 
-/** 当前的 token 配色。正式主题系统在 M4 接管，这里只求能看清 token 边界。 */
+/**
+ * token 配色。⚠️ 颜色**不写在这里**，全部走 `--tok-*` 变量（定义在 `src/styles.css`）。
+ *
+ * 原来这一份是写死的 Tokyo Night 暗色值（`#bb9af7` 关键字、`#c0caf5` 标识符、`#565f89` 注释），
+ * 而 M4 的主题系统只接管了外壳（`--vela-*`）与 CM6 的亮暗 facet，没有接管这里——于是三套亮色
+ * 主题（light / eye-care / warm-beige）的正文代码全是「浅底配浅色」，标识符几乎看不见。
+ *
+ * 走 CSS 变量而不是按主题建多份 `HighlightStyle`：后者要在主题切换时重配每个已打开的编辑器
+ * （`Compartment` 里换 extension），而变量是级联自己换，一处定义、八套主题同时生效，
+ * 与刚做完的文件树图标（`.tree-glyph` 吃 `--vela-icon-sat`）是同一条路子。
+ *
+ * 亮色那一组按 WCAG 对过：每个颜色对三套亮色底（`#f7f8fc` / `#eff1f5` / `#fbf1c7`）
+ * 都 ≥ 4.7:1（`contentSeparator` 与 `processingInstruction` 是装饰性的，只要求 ≥ 3.4:1）。
+ */
 const tokenHighlight = HighlightStyle.define([
-  { tag: tags.heading, color: '#7aa2f7', fontWeight: '700' },
+  { tag: tags.heading, color: 'var(--tok-heading)', fontWeight: '700' },
   { tag: tags.heading1, fontSize: '1.4em' },
   { tag: tags.heading2, fontSize: '1.25em' },
   { tag: tags.strong, fontWeight: '700' },
   { tag: tags.emphasis, fontStyle: 'italic' },
   { tag: tags.strikethrough, textDecoration: 'line-through' },
-  { tag: tags.link, color: '#7dcfff', textDecoration: 'underline' },
-  { tag: tags.url, color: '#9ece6a' },
-  { tag: tags.monospace, color: '#bb9af7' },
-  { tag: tags.quote, color: '#565f89', fontStyle: 'italic' },
-  { tag: tags.keyword, color: '#bb9af7' },
-  { tag: tags.operator, color: '#89ddff' },
-  { tag: tags.string, color: '#9ece6a' },
-  { tag: tags.number, color: '#ff9e64' },
-  { tag: tags.bool, color: '#ff9e64' },
-  { tag: tags.comment, color: '#565f89', fontStyle: 'italic' },
-  { tag: tags.function(tags.variableName), color: '#7aa2f7' },
-  { tag: tags.typeName, color: '#2ac3de' },
-  { tag: tags.propertyName, color: '#73daca' },
-  { tag: tags.definition(tags.variableName), color: '#c0caf5' },
-  { tag: tags.variableName, color: '#c0caf5' },
-  { tag: tags.contentSeparator, color: '#565f89' },
-  { tag: tags.list, color: '#e0af68' },
-  { tag: tags.processingInstruction, color: '#565f89' },
+  { tag: tags.link, color: 'var(--tok-link)', textDecoration: 'underline' },
+  { tag: tags.url, color: 'var(--tok-url)' },
+  { tag: tags.monospace, color: 'var(--tok-mono)' },
+  { tag: tags.quote, color: 'var(--tok-quote)', fontStyle: 'italic' },
+  { tag: tags.keyword, color: 'var(--tok-keyword)' },
+  // `public` / `final` / `static` 在 Java 那一类语言里是 `modifier` 而不是 `keyword`
+  // （见截图：只配 keyword 时这两个词会漏到兜底样式里去，仍然是暗色值），与关键字同色
+  { tag: tags.modifier, color: 'var(--tok-keyword)' },
+  { tag: tags.operator, color: 'var(--tok-operator)' },
+  { tag: tags.string, color: 'var(--tok-string)' },
+  { tag: tags.number, color: 'var(--tok-number)' },
+  { tag: tags.bool, color: 'var(--tok-number)' },
+  { tag: tags.comment, color: 'var(--tok-comment)', fontStyle: 'italic' },
+  { tag: tags.function(tags.variableName), color: 'var(--tok-function)' },
+  { tag: tags.typeName, color: 'var(--tok-type)' },
+  // 包名 / 命名空间（`com.mxbc.smartEye.common`）与类型同色
+  { tag: tags.namespace, color: 'var(--tok-type)' },
+  { tag: tags.self, color: 'var(--tok-mono)' },
+  { tag: tags.propertyName, color: 'var(--tok-property)' },
+  // 标识符就是正文本色：它跟着 `--vela-fg` 走，任何主题下都不会比正文更难读
+  { tag: tags.definition(tags.variableName), color: 'var(--vela-fg)' },
+  { tag: tags.variableName, color: 'var(--vela-fg)' },
+  { tag: tags.contentSeparator, color: 'var(--tok-dim)' },
+  { tag: tags.list, color: 'var(--tok-list)' },
+  { tag: tags.processingInstruction, color: 'var(--tok-dim)' },
 ])
 
 /**
@@ -320,6 +341,15 @@ export interface EditorSetupOptions {
    */
   pasteImage?: PasteImageHook
   /**
+   * `Cmd/Ctrl+Click` 落在一个位置上时问谁（M5-2）。缺省 = 不装这条扩展，
+   * 那一下仍然是 `multiCursor.ts` 那张表里的「加一个光标」。
+   *
+   * 🔴 钩子必须**同步**回答接不接，理由与 `pasteImage` 同一条：mousedown 处理器的返回值
+   * 决定 CM6 要不要跳过自己那个内置处理。而这里的「不接」不是静默——它退回到加光标，
+   * 那本来就是这个手势位上的既有行为（见 `src/editor/clickJump.ts` 文件头）
+   */
+  clickDefinition?: DefinitionClickHook
+  /**
    * Cmd/Ctrl+鼠标滚轮调整字号的回调。没传就不装这条扩展。
    *
    * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
@@ -364,6 +394,7 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     languageSlot,
     peerStates,
     pasteImage,
+    clickDefinition,
     onFontSizeZoom,
   } = options
 
@@ -433,6 +464,10 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   if (peerStates !== undefined) exts.push(wordPeers.of(peerStates))
   // 粘贴图片。没传就不装：CM6 内置的 paste 处理器照旧跑，行为与 M3-A-7 之前一模一样
   if (pasteImage !== undefined) exts.push(imagePaste(pasteImage))
+  // Cmd/Ctrl+Click 跳定义。没传就不装：那一下仍然是 `multiCursor.ts` 表里的「加一个光标」。
+  // ⚠️ 装了也**不等于接管每一次点击**——宿主回 false 时 CM6 的内置处理照旧跑，
+  // 这正是那条口径（查不到定义就不动这个手势位）的落点，见 `./clickJump` 文件头
+  if (clickDefinition !== undefined) exts.push(definitionClick(clickDefinition))
   // Cmd/Ctrl+鼠标滚轮调整字号。没传就不装：保持与 Mod+=/- 同一套步进逻辑
   if (onFontSizeZoom !== undefined) exts.push(fontSizeZoom(onFontSizeZoom))
 

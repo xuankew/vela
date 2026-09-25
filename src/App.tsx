@@ -18,9 +18,11 @@ import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
 import { createWorkspace, type DiscardDecision, type Pane } from './doc/workspace'
 import { EditorPane } from './editor/EditorPane'
+import { clickAction, definitionAt } from './goto/definition'
 import { QuickOpen } from './goto/QuickOpen'
 import { createQuickOpen, type Commit } from './goto/store'
-import { symbolTable } from './goto/syntax'
+import { symbolTable, wordUnderCaret } from './goto/syntax'
+import { attachFileDrop, handleDroppedPaths } from './ipc/dragDrop'
 import { describeFsError, saveFile } from './ipc/fs'
 import { attachReplaceListeners } from './ipc/replace'
 import { attachSearchListeners } from './ipc/search'
@@ -221,6 +223,7 @@ export default function App() {
   let detachSearch: (() => void) | undefined
   let detachReplace: (() => void) | undefined
   let detachFileWatch: (() => void) | undefined
+  let detachDrop: (() => void) | undefined
   let detachMenu: (() => void) | undefined
   /** 卸载比 `listen` 的 promise 先落地时，拿到的注销函数要立刻用掉，见 onMount */
   let tornDown = false
@@ -289,6 +292,7 @@ export default function App() {
   const ws = createWorkspace({
     promptDiscard: (names) => new Promise<DiscardDecision>((resolve) => setPendingClose({ names, resolve })),
     pasteImage: pasteImageInto,
+    clickDefinition: definitionFromClick,
     onFontSizeZoom: settings.stepZoomedFontSize,
   })
   const activeDoc = () => ws.activeTab().doc
@@ -695,6 +699,123 @@ export default function App() {
   }
 
   /**
+   * 跳到这份文件里那个符号的声明（M5-1，`Mod+Alt+D`）。
+   *
+   * 🔴 查的是 `symbolTable`，也就是 `Cmd+R` 那份清单**本身**，⛔ 不是另算一遍：
+   * 两边同源之后，「浮层里列着却跳不过去」在结构上不可能发生——与 `outlineJump`
+   * 复用 `gotoCommit` 的 `gotoPos` 是同一条道理，只是这一次是查的那一半共用。
+   *
+   * 落点也复用同一段代码（`gotoCommit`），于是分片标签、`reveal` 顺带 `focus`、
+   * 「打开失败就别动光标」那几条判断一处都不必重写。
+   *
+   * ⚠️ 四种拒绝一种都不沉默，理由与 `alignTable` / `wordCount` 逐字相同。
+   * 「这份文件里没有」那一句额外指了一条出路（`Mod+Alt+F`），因为那恰恰是用户
+   * 按下一个「跳到定义」之后真正想要的事——**别的地方**有没有这个东西
+   */
+  function gotoDefinition() {
+    const controller = ws.focusedEditor()
+    if (controller === null) {
+      setEditorNotice({ level: 'plain', text: '这块分屏里没有可跳转的符号' })
+      return
+    }
+    const { state } = controller.view
+    const result = definitionAt(state, ws.activeTab().doc.path(), state.selection.main.head)
+    if (result.kind === 'noWord') {
+      setEditorNotice({ level: 'plain', text: '光标处没有一个词可跳（停在空白或标点了）' })
+      return
+    }
+    if (result.kind === 'noTable') {
+      // 措辞与 `Cmd+R` 浮层底下那一句逐字相同：同一个事实两种说法的话，
+      // 用户会以为是两个不同的功能坏了
+      setEditorNotice({ level: 'plain', text: `${result.label} 还没有符号表` })
+      return
+    }
+    if (result.kind === 'notFound') {
+      setEditorNotice({
+        level: 'plain',
+        text: `这份文件里没有叫 ${result.word} 的符号，试试 Mod+Alt+F 在项目里搜`,
+      })
+      return
+    }
+    // ⛔ 不 `reveal` 之后再 `focus`：`reveal` 自己会 focus（`editor/controller.ts:109`），
+    // 而这一条链路里 `gotoCommit` 已经替我们走了一遍分片判断
+    void gotoCommit({ kind: 'gotoPos', pos: result.pos })
+  }
+
+  /**
+   * `Cmd+Click`（macOS）/ `Ctrl+Click`（其余）跳到定义（M5-2）。
+   *
+   * 🔴 与 `⌥⌘D` 共用 [`definitionAt`]，但**反应是相反的**：快捷键查不到要说出口，
+   * 点击查不到要么改去搜项目、要么一个字都不说（那一下退回「加一个光标」）。
+   * 那三路分流是 [`clickAction`]——单独一个纯函数，因为它会改掉一个既有手势，
+   * 改坏了只会表现为「加光标莫名其妙不灵了」，必须有用例钉住。
+   *
+   * ⚠️ 路径与落点都从 `view` 反查，⛔ 都不碰 `activeTab()` / `focusedEditor()`：
+   * 处理器跑在 CM6 自己的 mousedown **之前**，那一刻焦点还在用户上一碰的分屏上。
+   * 于是也不能复用 `gotoCommit`——它那条 `gotoPos` 分支跳的是**聚焦**那块，
+   * 在未聚焦的分屏里 Cmd+点击会跳错文档，所以这里直接拿本分屏的控制器 `reveal`
+   */
+  function definitionFromClick(view: EditorView, pos: number): boolean {
+    const tab = ws.tabOfView(view)
+    const controller = ws.controllerOfView(view)
+    // 两者取其一为 null 就什么都不做：与 `pasteImageInto` 同一条兜法（类型收窄为主）
+    if (tab === null || controller === null) return false
+    const action = clickAction(definitionAt(view.state, tab.doc.path(), pos), tree.roots().length > 0)
+    if (action.kind === 'jump') {
+      // `reveal` 自带 `focus` 与居中滚动，正是「在点的那块分屏里跳过去」的完整语义。
+      // 走它而不是 `gotoCommit`：后者只认聚焦分屏，而这一条链路的定义就在**这一块**里
+      controller.reveal(action.pos, action.pos)
+      return true
+    }
+    if (action.kind === 'search') {
+      // 跨文件那一跳：不建索引，把词交给已有的全局搜索（口径见 `clickAction`）
+      runWordSearch(action.word)
+      return true
+    }
+    return false
+  }
+
+  /**
+   * 拿光标处那个词到项目里搜（M5-1，`Mod+Alt+F`）。
+   *
+   * 🔴 复用 `search` 那一份状态，⛔ 不新写一套「跨文件找符号」：后者要一份常驻的跨文件
+   * 索引，而那份索引正是这个编辑器不内存化的东西（口径见 `goto/symbols.ts` 文件头）。
+   * 全局搜索已经会做「给一个词、列出所有命中并且点一行就跳过去」，这一条命令的全部
+   * 新增内容就是**把那个词填进去并按下回车**。
+   *
+   * ⚠️ 拿不到词也照样展开面板（搜索框是空的）再说一句为什么：一个按下去没反应的
+   * 快捷键信息是零，与 `togglePreview` / `alignTable` 同一条理由
+   */
+  function searchWordInFiles() {
+    const controller = ws.focusedEditor()
+    const word = controller === null ? null : wordUnderCaret(controller.view.state)
+    if (word === null) {
+      search.show()
+      setEditorNotice({ level: 'plain', text: '光标处没有一个词，搜索框是空的（自己输）' })
+      return
+    }
+    runWordSearch(word)
+  }
+
+  /**
+   * 「给一个词，展开搜索面板并起搜」。两个入口共用：`⌥⌘F`（光标处那个词）与
+   * `Cmd+Click`（点着的那个词在这份文件里没有声明时，见 [`clickAction`]）。
+   *
+   * ⚠️ 顺序是先填词与开关，再 `show()`（那一下只是写两个信号：可见 + 请求焦点），
+   * 最后起搜。反过来先 `show()` 会让面板带着**上一轮**的词闪一帧
+   *
+   * ⚠️ 整词开关只在关着的时候打开，不主动关：用户自己开着整词搜过一轮的话，
+   * 这里不该替他改回去——那会让「上一次搜 `get` 看到了 `getName`」这件事
+   * 变成他下一次没看到 `getName` 的原因，一个开关两副面孔
+   */
+  function runWordSearch(word: string) {
+    search.setPattern(word)
+    if (!search.wholeWord()) search.toggle('wholeWord')
+    search.show()
+    void search.search()
+  }
+
+  /**
    * ⌘V 进来一张图（M3-A-7）：把它落到文档旁边的 `assets/` 里，光标处插一行相对链接。
    *
    * 🔴 返回值必须是同步的，而落地是异步的：paste 处理器的返回值决定 CM6 要不要
@@ -940,8 +1061,10 @@ export default function App() {
       exportHtml: exportDocument,
       findInFiles: () => search.show(),
       replaceInFiles: () => search.showReplace(),
+      searchWordInFiles,
       gotoFile: () => void goto.show(),
       gotoSymbol: () => void goto.show('@'),
+      gotoDefinition,
       // 两条都**不带参数**：`toolbox.show()` 停在上次那个工具上，`palette.show()` 清空查询词。
       // 「从命令面板里挑一个工具」那条路径不走这里——`tools/registry.ts` 的 `openTool(id)`
       // 是工具箱自己投影进注册表的那一条命令，与 `toolbox.open` 是两扇门，理由写在那儿
@@ -1041,6 +1164,17 @@ export default function App() {
       if (tornDown) dispose()
       else detachFileWatch = dispose
     })
+    // 拖文件进窗口打开（M4-G）。与关窗守卫同一条要求：启动第一时间挂上，
+    // 挂上之前到达的 drop 事件会丢——而那一下就发生在窗口刚出现的时候
+    void attachFileDrop((paths) => {
+      void handleDroppedPaths(paths, {
+        openAt: (p) => ws.openAt(p),
+        notify: (text) => setEditorNotice({ level: 'error', text }),
+      })
+    }).then((unlisten) => {
+      if (tornDown) unlisten()
+      else detachDrop = unlisten
+    })
   })
 
   onCleanup(() => {
@@ -1051,6 +1185,7 @@ export default function App() {
     detachSearch?.()
     detachReplace?.()
     detachFileWatch?.()
+    detachDrop?.()
     detachKeys?.()
     disposeCommands?.()
     // 与上面那一条是两笔账：`disposeCommands` 注销的是内置命令，这一条注销的是
@@ -1248,7 +1383,7 @@ export default function App() {
         </Show>
       </div>
 
-      <StatusBar workspace={ws} />
+      <StatusBar workspace={ws} sidebar={{ open: sidebarVisible, toggle: () => setSidebarVisible((v) => !v) }} />
 
       {/* `.modal-backdrop` 是 position:fixed，脱离 grid 流，所以不会给行数固定的
           `.app` 多加出一行来（绝对定位的子元素不是 grid item） */}

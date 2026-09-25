@@ -16,6 +16,14 @@ import type { Workspace } from './workspace'
 
 export interface StatusBarProps {
   workspace: Workspace
+  /**
+   * 侧边栏那一格的接线。由 `App.tsx` 注入它的两个 signal 访问器。
+   *
+   * ⚠️ 可选，而且**不传就不渲染那一格**：这一排的其余格子只需要 `workspace`，
+   * 侧边栏的可见性却活在 `App` 里（那里还有「打开文件夹就自动弹出来」那几条规则）。
+   * 为了一格按钮把整套侧边栏状态搬进 workspace 是倒过来做——`workspace` 管的是标签与文档。
+   */
+  sidebar?: { open: () => boolean; toggle: () => void }
 }
 
 /** 编码下拉里「一次性动作」那一组的前缀。另一半（保存格式）用 `save:` */
@@ -70,6 +78,29 @@ export function StatusBar(props: StatusBarProps) {
 
   return (
     <footer class="statusbar">
+      {/* 侧边栏的开关（左下角）。放在这里是因为**它是唯一一处看得见的位置**：
+          侧边栏收起时整栏不渲染（`App.tsx` 的 `<Show when={sidebarVisible()}>`），
+          栏头里那三个动作也就跟着没了，于是想把它打开只剩原生菜单（View → 切换侧边栏，`⌘B` / `Ctrl+B`）一条路——
+          一个不在界面里的入口不算入口。
+          这一格在 `<Show when={doc().shard() === null}>` **之外**：分片标签那排格子全都不渲染，
+          但「我想去看看旁边的文件」在分片上照样成立，而且是更成立（他多半就是想换个文件）。
+
+          ⚠️ 类名是 `.status-side` 而不是 `.status-cell`：`.status-cell` 是「关于这份文档的一个读数」，
+          按钮不是读数；而测试里那些格子计数（`StatusBar.test.tsx` 与 `App.test.tsx` 各有一处）
+          就是按这个类名收的，挂上去会把它们的下标断言全搅乱 */}
+      <Show when={props.sidebar}>
+        {(side) => (
+          <button
+            class="status-side"
+            aria-pressed={side().open()}
+            title={side().open() ? '隐藏侧边栏' : '打开侧边栏（项目文件树）'}
+            onClick={side().toggle}
+          >
+            ▥
+          </button>
+        )}
+      </Show>
+
       <span class="status-cell status-path" title={doc().path() ?? UNTITLED_LABEL}>
         {doc().busy() ? '读写中…' : `${doc().dirty() ? '● ' : ''}${doc().name()}`}
       </span>

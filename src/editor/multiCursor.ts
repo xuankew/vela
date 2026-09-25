@@ -22,7 +22,7 @@ import { detectPlatform, type Platform } from '../commands/keybinding'
  * | **Option+单击** | 加一个光标；点在已有光标上则把它移除 |
  * | **Option+拖拽** | 加一个光标并拖出选区 |
  * | **Option+Shift+拖拽** | 列块选择，替换整个选区 |
- * | Cmd+单击（macOS）/ Ctrl+单击（其余） | 加一个光标，CM6 平台默认，保留 |
+ * | Cmd+单击（macOS）/ Ctrl+单击（其余） | 加一个光标，CM6 平台默认；**代码文件里被 `editor/clickJump.ts` 换成「跳到定义」**（那边论证了为什么夺得起：加光标另有 Option+单击） |
  * | Shift+拖拽 | 扩展当前选区，CM6 默认，保留 |
  *
  * ⚠️ `clickAddsSelectionRange` 这个 facet **一旦注册就完全接管**：CM6 的 `addsSelectionRange()`

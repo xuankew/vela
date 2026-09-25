@@ -61,6 +61,31 @@
   --vela-ok: #9ece6a;
   --vela-warn: #e0af68;
   --vela-bad: #f7768e;
+  /* 文件树图标的饱和与明度。**色相不属于这里**——色相是文件类型自己的属性
+     （见下面 `.t-*` 那一段），跟着主题改的只有「在这块底上要多亮才看得清」。
+     分成这两个维度，新增一套主题只写这两行，新增一类图标只写一个 hue。
+     暗底取亮一档：图标压在 #16161e 的壳上，40% 明度会糊进背景。 */
+  --vela-icon-sat: 55%;
+  --vela-icon-lit: 68%;
+
+  /* 编辑器语法高亮的 token 配色（暗色 = Tokyo Night 原值，与主题系统接入前逐字一致）。
+     消费方是 `src/editor/setup.ts` 的 `tokenHighlight`，它只写 `var(--tok-…)`。
+     ⚠️ 标识符（variableName）不在这里——它直接吃 `--vela-fg`，见下面亮色那一段的说明 */
+  --tok-heading: #7aa2f7;
+  --tok-link: #7dcfff;
+  --tok-url: #9ece6a;
+  --tok-mono: #bb9af7;
+  --tok-quote: #565f89;
+  --tok-keyword: #bb9af7;
+  --tok-operator: #89ddff;
+  --tok-string: #9ece6a;
+  --tok-number: #ff9e64;
+  --tok-comment: #565f89;
+  --tok-function: #7aa2f7;
+  --tok-type: #2ac3de;
+  --tok-property: #73daca;
+  --tok-list: #e0af68;
+  --tok-dim: #565f89;
 
   color-scheme: dark;
 }
@@ -82,6 +107,9 @@
   --vela-ok: #4f7a28;
   --vela-warn: #96691a;
   --vela-bad: #d1415f;
+  /* 亮底反过来压暗：同一批色相在 #dfe3ee 的壳上，68% 明度会浅得看不见边界 */
+  --vela-icon-sat: 60%;
+  --vela-icon-lit: 38%;
 
   color-scheme: light;
 }
@@ -156,8 +184,65 @@
   --vela-ok: #40a02b;
   --vela-warn: #df8e1d;
   --vela-bad: #d20f39;
+  /* Latte 那套本身偏柔，图标跟着压一档饱和，免得在一整片浅灰紫里跳得太狠 */
+  --vela-icon-sat: 52%;
+  --vela-icon-lit: 42%;
 
   color-scheme: light;
+}
+
+/* ────────────── 暖米护眼（warm-beige）──────────────────────
+   纸感米黄配色，取自用户提供的截图取色：正文底 #fbf1c7、界面壳 #ebdeb4、
+   浮起面 #e3d5aa、选中行 #f1e1ba、正文 #282828、行号 #a9a389。
+   亮度序 alt < panel < bg（与亮色主题同一条 hover 关系：hover 行相对壳更暗，
+   在这套暖底上「更暗 = 更浮起」，与 eye-care 的 Latte 排序一致）。
+   语义色压深到能在米黄底上作为文字读：ok/warn/bad 走暖调，accent 用赭褐。 */
+:root[data-theme='warm-beige'] {
+  --vela-bg: #fbf1c7;
+  --vela-bg-alt: #ebdeb4;
+  --vela-bg-panel: #e3d5aa;
+  --vela-fg: #282828;
+  --vela-fg-dim: #a9a389;
+  --vela-border: #d5c391;
+  --vela-guide: #e6d8ac;
+  --vela-accent: #b57614;
+  --vela-ok: #5f8554;
+  --vela-warn: #af861a;
+  --vela-bad: #c32a30;
+  /* 米黄底本身是**有颜色的**（#ebdeb4），比纯白更吃对比：黄色系那几个类别
+     （archive / lock）与底色同相，只能靠压得更暗才分得开，所以这一套的 lit 是三套亮色里最低的 */
+  --vela-icon-sat: 55%;
+  --vela-icon-lit: 33%;
+
+  color-scheme: light;
+}
+
+/* ────────────── 亮色主题共用的语法高亮 ──────────────
+   三套亮色底（#f7f8fc / #eff1f5 / #fbf1c7）都很接近，一份配色就能同时压住，
+   所以这里不按主题拆——拆成三份只会让「改一个 token 类别」变成改三处。
+   ⚠️ 这一组不是照抄某个亮色主题，是按**对比度**定的：每个颜色对三块底都 ≥ 4.7:1
+   （`--tok-dim` 只用于分隔线与预处理指令这类装饰性内容，放宽到 ≥ 3.4:1）。
+   原来这里没有覆盖块，亮色主题于是直接吃到 `:root` 那批为暗底设计的浅色——
+   浅米底上配 `#c0caf5` 的标识符和 `#bb9af7` 的关键字，等于把正文擦掉一半。
+   标识符仍然不进这一组：它跟着 `--vela-fg` 走，正文多清楚它就多清楚。 */
+:root[data-theme='light'],
+:root[data-theme='eye-care'],
+:root[data-theme='warm-beige'] {
+  --tok-heading: #1d4ed8;
+  --tok-link: #0a63b8;
+  --tok-url: #2b7320;
+  --tok-mono: #7c3aed;
+  --tok-quote: #5a5f6e;
+  --tok-keyword: #a5217b;
+  --tok-operator: #0a6a8a;
+  --tok-string: #0a6b2e;
+  --tok-number: #96440a;
+  --tok-comment: #5e6373;
+  --tok-function: #1c5bd8;
+  --tok-type: #0c6b84;
+  --tok-property: #0f766e;
+  --tok-list: #8a5800;
+  --tok-dim: #7c8090;
 }
 
 * {
@@ -318,7 +403,9 @@ body {
   background: var(--vela-bg);
   border: 1px solid var(--vela-border);
   border-radius: 12px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.05) inset;
 }
 
 .settings-header {
@@ -469,7 +556,9 @@ body {
   background: var(--vela-bg);
   border: 1px solid var(--vela-border);
   border-radius: 12px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+  box-shadow:
+    0 24px 64px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(255, 255, 255, 0.05) inset;
 }
 
 .keybindings-header {
@@ -1043,6 +1132,82 @@ select {
   text-overflow: ellipsis;
 }
 
+/* ---------- 文件树图标 ---------- */
+
+.tree-glyph {
+  flex: 0 0 14px;
+  width: 14px;
+  height: 14px;
+  /* 类别色从 `--h` 来（下面每条 `.t-*` 给一个色相），明暗从主题的
+     `--vela-icon-sat` / `--vela-icon-lit` 来。`--h` 没给到的类别落到 0（红）也无所谓：
+     那两类（doc / file）在下一条规则里被整体换成 `--vela-fg-dim`，压根不用 hsl */
+  color: hsl(var(--h, 0) var(--vela-icon-sat) var(--vela-icon-lit));
+}
+
+/* 通用文件与说明文档染成灰：它们说的是「这就一份普通文本」，
+   给个彩色反而抢过旁边那些有信息量的颜色 */
+.tree-glyph.t-file,
+.tree-glyph.t-doc {
+  color: var(--vela-fg-dim);
+}
+
+/* 目录用主题强调色，而不是也分一个 hue。两个理由：结构性的一栏该跟着界面的主色走，
+   而它下面那十几类文件已经把这圈色相占满了，再挤一个只会互相认不出来 */
+.tree-glyph.t-folder {
+  color: var(--vela-accent);
+}
+
+/* 色相表。相邻类别之间刻意留 20° 以上，让「同明度同饱和、只有色相不同」这件事
+   真的看得出来；剩下的区分靠形状，颜色只是第二道线索（色觉障碍下不影响辨认）。
+   ⚠️ 这一张表与 `src/project/icons.tsx` 的 `TreeGlyph`、`language.ts` 的 `FileIcon`
+   是同一套名字的三种写法（图形 / 分类 / 颜色）。类名拼错的失败方式是「那一类退回红色」，
+   不会报错，所以加类别时三处一起加。 */
+.tree-glyph.t-markdown {
+  --h: 210;
+}
+.tree-glyph.t-data {
+  --h: 190;
+}
+.tree-glyph.t-image {
+  --h: 165;
+}
+.tree-glyph.t-code {
+  --h: 145;
+}
+.tree-glyph.t-media {
+  --h: 120;
+}
+.tree-glyph.t-shell {
+  --h: 95;
+}
+.tree-glyph.t-archive {
+  --h: 55;
+}
+.tree-glyph.t-lock {
+  --h: 40;
+}
+.tree-glyph.t-markup {
+  --h: 22;
+}
+.tree-glyph.t-git {
+  --h: 8;
+}
+.tree-glyph.t-binary {
+  --h: 348;
+}
+.tree-glyph.t-style {
+  --h: 320;
+}
+.tree-glyph.t-config {
+  --h: 290;
+}
+.tree-glyph.t-docker {
+  --h: 265;
+}
+.tree-glyph.t-font {
+  --h: 240;
+}
+
 /* 「读取中…」与错误文本都占同一行的剩余空间，绝不另起一行——
    多一行就不再是 ROW_HEIGHT，窗口算术立刻失准 */
 .tree-note {
@@ -1300,6 +1465,33 @@ select {
 
 .status-cell:last-child {
   border-right: none;
+}
+
+/* 侧边栏那一格是这一排唯一可点的**按钮**。全局的 button 规则（面板底色 + 边框 + 4px 圆角
+   + 3px 内边距）是给工具栏那种 28px 高的控件写的，塞进 22px 的条里会把整条撑高——
+   与下面 `.status-pick` 同一条理由，所以装饰全抹平，只靠变色说明「这个能点」 */
+.status-side {
+  flex: 0 0 auto;
+  padding: 0 8px;
+  background: none;
+  border: none;
+  border-right: 1px solid var(--vela-border);
+  border-radius: 0;
+  color: var(--vela-fg-dim);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.status-side:hover {
+  border: none;
+  border-right: 1px solid var(--vela-border);
+  color: var(--vela-fg);
+}
+
+/* 侧边栏已经开着时这一格要能看出「它是那个开关，而且现在是开的位置」。
+   平时灰着、按下变强调色——两态都得比旁边那几格读数显眼，又不能显眼过路径那一格 */
+.status-side[aria-pressed='true'] {
+  color: var(--vela-accent);
 }
 
 /* 路径是唯一需要伸缩的一格：窗口窄时先把省略号让给它，而不是把右边的编码/语言挤掉。
@@ -3011,7 +3203,8 @@ select {
 }
 
 /* 护眼模式下让行号区域背景与编辑器一致，避免割裂感 */
-:root[data-theme='eye-care'] .cm-gutters {
+:root[data-theme='eye-care'] .cm-gutters,
+:root[data-theme='warm-beige'] .cm-gutters {
   background: var(--vela-bg);
   border-right-color: var(--vela-border);
 }
@@ -3021,3 +3214,6 @@ select {
   background: #e6e9ef;
 }
 
+:root[data-theme='warm-beige'] .cm-activeLineGutter {
+  background: #f1e1ba;
+}
