@@ -54,6 +54,12 @@ export interface TabStripProps {
  * ⚠️ 菜单渲染在 `.tab-strip` **里面**而不是它旁边：`.app` 是固定五行的 grid，
  * 多一个兄弟元素就把下面三行全推错位（那条 grid 的注释里写明了行数为什么必须固定）。
  * 在里面也不参与 flex 布局——`.tree-menu` 是 `position: fixed`，脱离文档流。
+ *
+ * ## 双击空白处新建标签
+ *
+ * 与 VS Code 同一条手势。认它的判据是「事件目标就是标签条自己」：标签与「+」都是它的
+ * 子元素，双击它们时 `target` 是子元素而不是标签条，于是「双击标签」不会顺手多开一个
+ * 空标签，「双击 +」也不会一次开两个。标签多到横向溢出时没有空白处可点，手势自然失效
  */
 export function TabStrip(props: TabStripProps) {
   // 与 StatusBar 同理：`workspace` 是 createWorkspace() 返回的普通对象，不是 signal，
@@ -112,6 +118,12 @@ export function TabStrip(props: TabStripProps) {
         // 标签多到横向滚动时，滚走的标签底下留着一份指着别处的菜单（`.tree-menu` 是 fixed，
         // 不跟着滚）。这是 TreeMenu 文档里那条「第四条关闭路径归宿主」的落点
         if (menu() !== null) setMenu(null)
+      }}
+      onDblClick={(e) => {
+        // 双击空白处 = 新建标签（与 VS Code 同一条手势）。判据是「事件目标就是标签条
+        // 自己」：标签、「+」都是它的子元素，双击它们时 target 是子元素，不会走到这里——
+        // 于是「双击标签」不会顺手多开一个空标签，「双击 +」也不会一次开两个
+        if (e.target === e.currentTarget) ws.newTab()
       }}
     >
       <For each={ws.tabs()}>

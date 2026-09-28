@@ -162,6 +162,24 @@ describe('交互', () => {
     expect(tabs()[1]!.classList.contains('active')).toBe(true)
   })
 
+  it('双击标签条空白处新建一个标签；双击标签或「+」不会多开', () => {
+    const ws = mount(createWorkspace())
+    const strip = container.querySelector<HTMLElement>('.tab-strip')!
+
+    // 空白处：事件目标就是标签条自己
+    strip.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    expect(ws.tabs()).toHaveLength(2)
+
+    // 双击标签：dblclick 会冒泡到标签条，但 target 是那个标签，不该多开
+    tabs()[0]!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    expect(ws.tabs()).toHaveLength(2)
+
+    // 双击「+」：真实浏览器里它是两次 click（开两个）加一次 dblclick。这里只派发
+    // dblclick 那一下，钉的是「这一下不会再多开一个」——否则连点两下 + 会开出三个
+    newTabButton().dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    expect(ws.tabs()).toHaveLength(2)
+  })
+
   it('点关闭按钮只摘掉那一个标签，当前激活的不受影响', () => {
     const ws = mount(createWorkspace())
     ws.newTab()
