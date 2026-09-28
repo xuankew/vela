@@ -1,28 +1,55 @@
 import { createEffect, createSignal, For, onCleanup, onMount, Show, untrack } from 'solid-js'
-import type { TreeMenuAction, TreeMenuItem } from './tree'
+import type { TreeMenuAction } from './tree'
 
-export interface TreeMenuProps {
+/**
+ * 菜单里的一项。`A` 是「用户选了之后要告诉宿主的动作」，由宿主自己定义。
+ *
+ * 🔴 刻意**不复用** `tree.ts` 的 `TreeMenuItem`：那一个的 `action` 是 `TreeMenuAction`，
+ * 七个值全是文件树的动作。让它泛化的话就得动 `tree.ts` 与 `menuFor` 的签名，而这个组件
+ * 要的其实只是「一个标签 + 一个动作 + 上面要不要分隔线」这个形状——结构上兼容就够了，
+ * `TreeMenuItem[]` 原样能递给 `ContextMenuItem<TreeMenuAction>[]`
+ */
+export interface ContextMenuItem<A> {
+  action: A
+  label: string
+  /** 在这一项**上面**画一条分隔线（分组理由见 `tree.ts` 的 `TreeMenuItem.separator`） */
+  separator?: boolean
+}
+
+export interface TreeMenuProps<A = TreeMenuAction> {
   /** 视口坐标，来自 `contextmenu` 事件的 clientX / clientY */
   x: number
   y: number
-  items: TreeMenuItem[]
-  onPick: (action: TreeMenuAction) => void
+  items: ContextMenuItem<A>[]
+  onPick: (action: A) => void
   onClose: () => void
 }
 
 /**
- * 文件树的右键菜单。
+ * 跟着光标弹出的上下文菜单。
  *
  * **为什么自己写而不用原生菜单**：Tauri 2 的 `menu` API 建的是**应用菜单**（挂在窗口上、
  * 有固定的层级与生命周期），不是一个跟着光标弹出的上下文菜单；而 Web 这一侧没有
- * 任何原生的「弹一个自定义菜单」的东西。菜单一共六项、形状固定，自己写只是几十行。
+ * 任何原生的「弹一个自定义菜单」的东西。菜单一共几项、形状固定，自己写只是几十行。
+ *
+ * ## 两个宿主
+ *
+ * 文件树（`Sidebar.tsx`，`A = TreeMenuAction`）与标签条（`doc/TabStrip.tsx`，`A` 是它自己
+ * 那一个动作）。共用的是这一层**唯一有价值的那部分**：贴边 clamp、三条关闭路径、
+ * 分隔线——都是「改坏了不报错、只是菜单赖在屏幕上或飘走」的微妙逻辑，写第二份就会漂移。
+ *
+ * ⚠️ 名字里的 `Tree` 与 CSS 类名 `.tree-menu*` 都是历史遗留：改成中性的名字要动
+ * 5 条 CSS 规则与 `Sidebar.test.tsx` 的 4 处查询，而那两处都在已上线的功能上。
+ * 泛型参数默认值 `TreeMenuAction` 同理——它让文件树那一侧一行都不用改。
  *
  * ## 三条关闭路径
  *
  * 点菜单外面、按 Escape、以及**选了一项**——三条都归到 `onClose`。少掉任何一条的失败
- * 方式都是「菜单赖在屏幕上」，而它赖着的时候底下那一行点不到，用户会以为树卡死了。
- * 树滚动时也关（见 Sidebar 的 onScroll）：菜单是 `position: fixed`，行滚走了它不会跟着走，
- * 留着的是一份指着别处的菜单。
+ * 方式都是「菜单赖在屏幕上」，而它赖着的时候底下那一行点不到，用户会以为界面卡死了。
+ *
+ * ⚠️ 还有第四条在**宿主**那边：菜单是 `position: fixed`，底下的列表滚走了它不会跟着走，
+ * 留着的是一份指着别处的菜单，所以会滚的宿主必须在 onScroll 里关掉它（见 Sidebar）。
+ * 这一层不知道宿主的滚动容器是哪个，替不了它。
  *
  * ## ⚠️ 分隔线与危险动作
  *
@@ -30,7 +57,7 @@ export interface TreeMenuProps {
  * 把其中一项画成危险会让整条菜单看起来不可信。它的可挽回性由提示条上那句
  * 「已移到废纸篓，可以在 Finder 里找回」来说，而不是由颜色来说。
  */
-export function TreeMenu(props: TreeMenuProps) {
+export function TreeMenu<A = TreeMenuAction>(props: TreeMenuProps<A>) {
   let el: HTMLDivElement | undefined
 
   /**

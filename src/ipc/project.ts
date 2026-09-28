@@ -158,6 +158,32 @@ export function revealEntry(root: string, rel: string): Promise<void> {
 }
 
 /**
+ * 在 Finder 中显示并选中**一个绝对路径**指向的文件（标签条右键菜单的「打开文件所在目录」）。
+ *
+ * 🔴 它就是 `revealEntry`，只是把绝对路径拆成 `(所在目录, 文件名)` 递下去。这不是绕路：
+ * `resolve` 对 root 只要求「是绝对路径」、对 rel 只要求「全是普通组件」
+ * （`crates/vela-core/src/project/tree.rs`），而一个文件名恰好就是一个普通组件。
+ * 于是 `(root, rel)` 这对入参在这里读作「(所在目录, 文件名)」，与树上那对
+ * 「(项目根, 相对路径)」是同一条契约的两种填法——**Rust 侧一行没改**。
+ *
+ * ⚠️ 为什么要这么填，而不是「先找哪个项目根是它的前缀」：标签页手上的路径**不一定在
+ * 任何根下面**（「打开…」对话框与拖放都能打开根外的文件），按根去找的话那些文件就没有
+ * 答案了。一个「有时能显示有时不能」的菜单项，比一个只在 macOS 上能用的更难查。
+ *
+ * ⚠️ 平台限制原样继承 `revealEntry`：只在 macOS 上真的能用，别的平台 reject 一句 `io`。
+ * 效果是 Finder 打开所在目录**并选中这个文件**，比「只打开目录」少一次找。
+ */
+export function revealFile(path: string): Promise<void> {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  // `cut < 0`：手上根本不是绝对路径。⛔ 不兜成 `('/', path)`——那会去根目录找一个同名
+  // 文件，找到了就在 Finder 里选中一个与用户无关的东西，比报错糟得多
+  if (cut < 0) return Promise.reject(new Error(`不是一个绝对路径：${path}`))
+  // `cut === 0` 是根目录下的文件（`/a.txt`）：目录那一份得写 `/`，空字符串会被
+  // `resolve` 判成 `bad_root`
+  return revealEntry(cut === 0 ? '/' : path.slice(0, cut), path.slice(cut + 1))
+}
+
+/**
  * 把这一项的绝对路径放进系统剪贴板（macOS 的 `pbcopy`）。
  *
  * 走 Rust 而不是 `navigator.clipboard.writeText`：后者要求安全上下文，而 Tauri 在

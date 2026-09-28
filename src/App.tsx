@@ -1201,7 +1201,10 @@ export default function App() {
       {/* 工具栏已移入标准桌面菜单（File/Edit/View/Window/Help），保持界面简洁 */}
       {/* <div class="toolbar"> ... </div> */}
 
-      <TabStrip workspace={ws} />
+      {/* 标签右键菜单的失败一句话接到 `treeNotice` 那一条上：提示条是横贯窗口的，
+          而「在 Finder 里显示不出来」既不专属某一块分屏（那是 `editorNotice`，切分屏就清），
+          也不是设置对话框的事。成功不说话，理由在 TabStripProps.onError 上 */}
+      <TabStrip workspace={ws} onError={(text) => setTreeNotice({ level: 'error', text })} />
 
       {/* Markdown 工具栏（M4-F）*/}
       <Show when={mdToolbarVisible()}>

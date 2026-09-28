@@ -8,18 +8,36 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  * 调度逻辑本身（激活谁、关掉之后落到谁、重排后的顺序）在 `workspace.test.ts` 里已经测过了，
  * 这里只测「点对了地方会不会调到对的方法」与「渲染出来的东西对不对」。
  * 所以**不挂编辑器**：标签条读的是 `tab.snapshot` 与 `doc`，不需要 view。
+ *
+ * 右键菜单那一组测的也是接线，⛔ 不是菜单外壳本身：贴边 clamp、点外面关、Escape 关
+ * 那三条在 `Sidebar.test.tsx` 里已经钉过了，共用的是同一个组件（`project/TreeMenu.tsx`）。
+ * 这里只钉**这一侧独有的四件事**——弹不弹（未命名文档不弹）、拦没拦原生菜单、
+ * 选完之后递出去的是哪条路径、以及滚动时关掉。
+ *
+ * ⚠️ `open -R` 本身钉不住：jsdom 里没有 Tauri 运行时，桩只能验「调了没、参数对不对」，
+ * 「Finder 真的打开并选中了那个文件」要在真实窗口里看。
  */
 
-const { ipc } = vi.hoisted(() => ({
+const { ipc, project } = vi.hoisted(() => ({
   ipc: {
     openFile: vi.fn(),
     saveFile: vi.fn(),
     describeFsError: (err: unknown) => `模拟错误：${JSON.stringify(err)}`,
     ENCODING_LABELS: { utf8: 'UTF-8', utf16_le: 'UTF-16 LE', utf16_be: 'UTF-16 BE', gbk: 'GBK' },
   },
+  /**
+   * ⚠️ 与 `Sidebar.test.tsx` 同一条注意：这两个名字是**这个模块图**从 `ipc/project` 里
+   * 按名字导入的全部（`TabStrip.tsx` 用两个，`doc/fileWatch.ts` 用 `describeTreeError`）。
+   * 少一个不会在 mock 那一刻报错，而是等到真去访问时变成 `undefined is not a function`
+   */
+  project: {
+    revealFile: vi.fn(),
+    describeTreeError: (err: unknown) => `打不开：${JSON.stringify(err)}`,
+  },
 }))
 
 vi.mock('../ipc/fs', () => ipc)
+vi.mock('../ipc/project', () => project)
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }))
 
 import { TabStrip } from './TabStrip'
@@ -27,9 +45,12 @@ import { createWorkspace } from './workspace'
 
 let container: HTMLDivElement
 let dispose: () => void
+/** `onError` 收到的话。App 那边把它接到窗口顶部的提示条上，这里只需要看它说了什么 */
+let errors: string[]
 
 function mount(ws: ReturnType<typeof createWorkspace>) {
-  dispose = render(() => <TabStrip workspace={ws} />, container)
+  errors = []
+  dispose = render(() => <TabStrip workspace={ws} onError={(text) => errors.push(text)} />, container)
   return ws
 }
 
@@ -68,6 +89,11 @@ beforeEach(() => {
     lossy: false,
     bytes: 6,
   }))
+  // ⚠️ 必须 `mockResolvedValue` 而不是让它默认回 `undefined`：组件里是
+  // `void revealFile(path).catch(...)`，桩回 undefined 的话这行自己就抛
+  // `Cannot read properties of undefined (reading 'catch')`，看起来像组件坏了
+  project.revealFile.mockReset()
+  project.revealFile.mockResolvedValue(undefined)
   container = document.createElement('div')
   document.body.appendChild(container)
 })
@@ -253,5 +279,104 @@ describe('拖拽重排', () => {
     fire(tabs()[0]!, 'dragend')
     fire(tabs()[1]!, 'drop')
     expect(ws.tabs().map((t) => t.id)).toEqual(before)
+  })
+})
+
+describe('右键菜单：打开文件所在目录', () => {
+  /** 右键。必须是 `MouseEvent`：组件要读 `clientX/clientY` 当菜单的落点 */
+  function rightClick(el: Element, x = 40, y = 12): MouseEvent {
+    const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: x, clientY: y })
+    el.dispatchEvent(e)
+    return e
+  }
+
+  function menu(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.tree-menu')
+  }
+
+  function menuItems(): string[] {
+    return [...container.querySelectorAll<HTMLButtonElement>('.tree-menu-item')].map((b) => b.textContent ?? '')
+  }
+
+  function item(label: string): HTMLButtonElement {
+    const el = menuItems().indexOf(label)
+    if (el < 0) throw new Error(`菜单里没有「${label}」这一项（现有：${menuItems().join('、') || '空'}）`)
+    return container.querySelectorAll<HTMLButtonElement>('.tree-menu-item')[el]!
+  }
+
+  it('右键一个打开了文件的标签 → 弹出菜单，只有「打开文件所在目录」一项', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/Users/x/notes/win.txt')
+
+    const e = rightClick(tabs()[0]!)
+
+    // 拦下来是必须的：不拦的话 macOS 会在我们的菜单旁边再弹一个原生的，两个叠在一起
+    expect(e.defaultPrevented).toBe(true)
+    expect(menu()).not.toBeNull()
+    expect(menuItems()).toEqual(['打开文件所在目录'])
+  })
+
+  it('选那一项 → 递出去的是这个标签的完整路径，菜单随即关掉', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/Users/x/notes/win.txt')
+    rightClick(tabs()[0]!)
+
+    item('打开文件所在目录').click()
+
+    expect(project.revealFile).toHaveBeenCalledWith('/Users/x/notes/win.txt')
+    expect(menu()).toBeNull()
+  })
+
+  it('右键未命名文档不弹菜单：磁盘上没有对应文件，而菜单只有这一项', () => {
+    mount(createWorkspace())
+
+    // 连 preventDefault 都不做：这一下右键该归系统，弹一份空的／灰的菜单只是让用户多点一次关闭
+    expect(rightClick(tabs()[0]!).defaultPrevented).toBe(false)
+    expect(menu()).toBeNull()
+  })
+
+  it('菜单弹着的时候关掉那个标签，选下去仍然是原来那条路径', async () => {
+    /**
+     * 菜单里存的是**路径快照**而不是标签 id。存 id 的话这一步会查到复用了同一个 id 的
+     * 另一份文档（或者查不到），在 Finder 里选中一个与用户刚才右键的东西无关的文件，
+     * 而且不报错
+     */
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/a.txt')
+    await ws.openAt('/repo/b.txt')
+    rightClick(tabs()[0]!)
+
+    tabs()[0]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
+    expect(names()).toEqual(['b.txt'])
+
+    item('打开文件所在目录').click()
+    expect(project.revealFile).toHaveBeenCalledWith('/repo/a.txt')
+  })
+
+  it('标签条滚动时关掉菜单：菜单是 fixed，滚走的标签底下留着的是一份指着别处的菜单', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/a.txt')
+    rightClick(tabs()[0]!)
+    expect(menu()).not.toBeNull()
+
+    fire(container.querySelector('.tab-strip')!, 'scroll')
+
+    expect(menu()).toBeNull()
+  })
+
+  it('做成了不说话（Finder 被推到前台本身就是回话），没做成才说一句', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/gone.txt')
+    rightClick(tabs()[0]!)
+    item('打开文件所在目录').click()
+    expect(errors).toEqual([])
+
+    project.revealFile.mockRejectedValue({ kind: 'not_found', path: '/repo/gone.txt' })
+    rightClick(tabs()[0]!)
+    item('打开文件所在目录').click()
+    // `.catch` 里的话是在微任务里说的；等一个宏任务，保证所有微任务都跑完了
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(errors).toEqual(['打不开：{"kind":"not_found","path":"/repo/gone.txt"}'])
   })
 })

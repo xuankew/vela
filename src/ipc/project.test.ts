@@ -19,6 +19,7 @@ import {
   queryProject,
   renameEntry,
   revealEntry,
+  revealFile,
   trashEntry,
   type DirListing,
   type FileQuery,
@@ -158,7 +159,55 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     await copyEntryPath('/repo', 'src/doc')
     expect(invoke).toHaveBeenLastCalledWith('copy_entry_path', { root: '/repo', rel: 'src/doc' })
     // 三条都不接绝对路径：路径由 Rust 侧从 (root, rel) 自己解析出来，
-    // 前端递一条 `/Users/...` 过去就等于把「不会逃出项目根」这条保证交回给逐处审计
+    // 前端递一条 `/Users/...` 过去就等于把「不会逃出项目根」这条保证交回给逐处审计。
+    // ⚠️ `revealFile`（下面那组）看着像是反例，其实不是：它把绝对路径拆成
+    // `(所在目录, 文件名)` 再走这一条，rel 仍然是单个普通组件，`resolve` 那套
+    // 「`..` 与绝对路径一律拒绝」的检查一个字都没绕过
+  })
+})
+
+describe('revealFile：把一个绝对路径拆成 (root, rel)', () => {
+  /**
+   * 这一组钉的是**拆分**，而不是 `open -R` 本身——后者是系统调用，jsdom 里没有 Tauri
+   * 运行时，桩只能验「调了没、参数对不对」。
+   *
+   * 🔴 拆错了不会报错，只会在 Finder 里选中一个无关的东西，所以三种边界各一条用例：
+   * 普通路径、根目录下的文件（`cut === 0`，目录那一份必须补成 `/`，空字符串会被
+   * Rust 侧判成 `bad_root`）、以及反斜杠（Windows 路径）
+   */
+  beforeEach(() => {
+    invoke.mockReset()
+    invoke.mockResolvedValue(undefined)
+  })
+
+  it('普通路径 → (所在目录, 文件名)', async () => {
+    await revealFile('/repo/src/doc/tab.ts')
+    expect(invoke).toHaveBeenCalledWith('reveal_entry', { root: '/repo/src/doc', rel: 'tab.ts' })
+  })
+
+  it('根目录下的文件 → root 是「/」而不是空字符串', async () => {
+    await revealFile('/a.txt')
+    expect(invoke).toHaveBeenCalledWith('reveal_entry', { root: '/', rel: 'a.txt' })
+  })
+
+  it('反斜杠也算分隔符（Windows 路径）', async () => {
+    await revealFile('C:\\repo\\a.ts')
+    expect(invoke).toHaveBeenCalledWith('reveal_entry', { root: 'C:\\repo', rel: 'a.ts' })
+  })
+
+  it('两种分隔符都在时取靠后的那个', async () => {
+    await revealFile('/repo/sub\\dir/a.ts')
+    expect(invoke).toHaveBeenCalledWith('reveal_entry', { root: '/repo/sub\\dir', rel: 'a.ts' })
+  })
+
+  /**
+   * ⛔ 这一条是「宁可报错也不猜」：没有分隔符就说明手上不是绝对路径，兜成
+   * `('/', path)` 的话会去**根目录**找一个同名文件，找到了就在 Finder 里选中一个
+   * 与用户右键的那份文档毫无关系的东西——静默的错误结果比一次失败难查得多
+   */
+  it('不是绝对路径时 reject，且不惊动 IPC', async () => {
+    await expect(revealFile('a.ts')).rejects.toThrow(/不是一个绝对路径/)
+    expect(invoke).not.toHaveBeenCalled()
   })
 })
 
