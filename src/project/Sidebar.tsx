@@ -36,6 +36,11 @@ export interface TreeNotice {
 export interface SidebarProps {
   tree: ProjectTree
   onNotice?: (notice: TreeNotice) => void
+  /**
+   * 侧边栏宽（px）。信号在 App 那边：收起再展开不该回到默认值，那是用户调过的现场；
+   * 窗口 resize 时还要把它重新夹进上下限（见 `project/SidebarResize.tsx`）
+   */
+  width: number
 }
 
 /**
@@ -281,7 +286,7 @@ export function Sidebar(props: SidebarProps) {
   }
 
   return (
-    <aside class="sidebar" style={{ '--vela-tree-row-height': `${ROW_HEIGHT}px` }}>
+    <aside class="sidebar" style={{ width: `${props.width}px`, '--vela-tree-row-height': `${ROW_HEIGHT}px` }}>
       <div class="sidebar-head">
         <Show
           when={tree.roots().length > 0}

@@ -23,15 +23,21 @@ import { PANEL_DEBOUNCE_MS, type FollowedEditor } from './panel'
  *    选中的文字、以及浏览器给这一栏记着的滚动位置全部丢掉。
  * 3. 🔴 **卸载时把在飞的那一次取消掉**。漏了它不会报错，只是 150ms 之后往一个已经
  *    从 DOM 上摘下来的节点里写东西。
+ * 4. 🔴 **源编辑器没有布局时不同步滚动**。阅读模式把 `.body` `display: none` 掉了，
+ *    于是 `scrollDOM` 的几何量全是 0 而 `atBottom(0,0,0)` 恒为真——不挡的话每一次重画
+ *    都把预览甩到文末（守卫在 `MarkdownPreview.tsx` 的 `follow()` 里）。
  *
  * 最后一组（M3-A-5）测的是**唯一一处反向**：点预览里的 GFM 勾选框会把 `[ ]` ↔ `[x]`
  * 写回源文档。它要验的三件事是：认的是 `data-pos` 而不是「第几个」、过期偏移一个字都不改、
  * 以及它是一次**普通编辑事务**（进撤销栈，不是预览自己另立的一份状态）。
  *
- * ⚠️ 这里钉不住的：滚动跟得准不准（jsdom 的 `scrollTop` 赋值是空操作，
- * `clientHeight` / `scrollHeight` 恒为 0，于是 `atBottom` 永远为真、
- * `lineBlockAtHeight` 那一条压根走不到）、排版长什么样、外链点下去 WKWebView 怎么反应、
+ * ⚠️ 这里钉不住的：滚动**跟得准不准**（插值要的是一份真实排版，jsdom 的
+ * `getBoundingClientRect` 恒为 0，量出来的锚点表全是 0）、「同步到底跑没跑」以外的
+ * 滚动细节、排版长什么样、外链点下去 WKWebView 怎么反应、
  * 以及点完勾选框那一下在真实排版里**看不看得出来**（这里只能验 `data-checked` 变了）。
+ * 第 4 条那道守卫能钉住，靠的是 `recordScrollTop` 接管了 `scrollTop`、
+ * `fakeEditorLayout` 编了一对几何量——两个都是**替 jsdom 补它没有的那一半**，
+ * 不是在替组件造前提
  */
 
 function mdState(doc: string): EditorState {
@@ -57,16 +63,43 @@ function makeView(doc: string): EditorView {
   return view
 }
 
-function mount(doc: string, path: string | null) {
+/**
+ * 把预览那一栏的 `scrollTop` 换成一个记录器，返回「到目前为止写过哪些值」。
+ *
+ * ⚠️ 非接管不可：jsdom 里给 `scrollTop` 赋值是空操作，而 `follow()` 唯一的外部效果
+ * 就是写它。不接管的话「同步到底跑了没有」在测试里完全不可见，于是 `follow()` 开头那道
+ * 「源没有布局就不同步」的守卫加与不加都是绿的——而少了它在真实窗口里是肉眼可见的坏
+ */
+function recordScrollTop(el: HTMLElement): () => number[] {
+  const writes: number[] = []
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get: () => 0,
+    set: (value: number) => {
+      writes.push(value)
+    },
+  })
+  return () => writes
+}
+
+/** 给 jsdom 里恒为 0 的那两个几何量编一对真实值，用来把「没有布局」与「有布局」分开 */
+function fakeEditorLayout(view: EditorView, clientHeight: number, scrollHeight: number): void {
+  const el = view.scrollDOM
+  Object.defineProperty(el, 'clientHeight', { configurable: true, value: clientHeight })
+  Object.defineProperty(el, 'scrollHeight', { configurable: true, value: scrollHeight })
+}
+
+function mount(doc: string, path: string | null, alone = false) {
   const view = makeView(doc)
   const [source, setSource] = createSignal<FollowedEditor | null>({ view, path })
   const [revision, setRevision] = createSignal(0)
   const [tabId, setTabId] = createSignal(1)
+  const [aloneSig, setAlone] = createSignal(alone)
   const onClose = vi.fn()
   container = document.createElement('div')
   document.body.appendChild(container)
   const dispose = render(
-    () => <MarkdownPreview source={source} revision={revision} tabId={tabId} onClose={onClose} />,
+    () => <MarkdownPreview source={source} revision={revision} tabId={tabId} alone={aloneSig} onClose={onClose} />,
     container,
   )
   let disposed = false
@@ -87,6 +120,8 @@ function mount(doc: string, path: string | null) {
     view,
     setSource,
     setTabId,
+    /** 阅读模式开/关。真实链路里这一下由 App 的 `editorHidden()` 发出 */
+    setAlone,
     onClose,
     unmount: () => unmount(),
     /** 正文变了一次。真实链路里这一下由 workspace 的 `revision` 计数发出 */
@@ -107,6 +142,10 @@ function mount(doc: string, path: string | null) {
      */
     tasks: () => [...body.querySelectorAll<HTMLElement>('.md-task')],
     note: () => panel.querySelector('.md-preview-note')?.textContent ?? null,
+    /** 那句限定是不是「怎么退出阅读模式」——它与文档级的那一句共用一个位置，但**不是警告色** */
+    hinted: () => panel.querySelector('.md-preview-note.hint') !== null,
+    title: () => panel.querySelector('.md-preview-title')!.textContent,
+    scrollEl: () => container.querySelector<HTMLElement>('.md-preview-scroll')!,
     /** 在渲染结果上留一个记号：`innerHTML` 被重写的话它就没了 */
     mark: () => body.firstElementChild!.setAttribute('data-probe', '1'),
     marked: () => body.querySelector('[data-probe]') !== null,
@@ -252,6 +291,64 @@ describe('MarkdownPreview：卸载', () => {
     // 所以这条断言是真的在看组件的行为，不是在看 jsdom 的怪癖
     p.settle()
     expect(p.bodyHtml()).toContain('甲')
+  })
+})
+
+describe('MarkdownPreview：阅读模式（编辑区被藏起来）', () => {
+  it('标题换成「阅读模式」，并补一句怎么退出', () => {
+    const p = mount('# 甲\n', '/r/a.md', true)
+    // 🔴 标题必须换字，不能只把提示塞进右边：这一档下 `Mod+F` 那类命令还在往一块
+    // 看不见的编辑器上作用，而标题是用户唯一能拿到的「我不在编辑态」的信号
+    expect(p.title()).toBe('阅读模式')
+    expect(p.note()).toBe('再按一次切换预览可回到编辑')
+    expect(p.hinted(), '那不是警告，不该用警告色').toBe(true)
+  })
+
+  it('默认（并排）就是「预览」，也没有那句提示', () => {
+    const p = mount('# 甲\n', '/r/a.md')
+    expect(p.title()).toBe('预览')
+    expect(p.note()).toBeNull()
+  })
+
+  it('文档级的限定优先：「还没有预览」比「怎么退出」更该说', () => {
+    const p = mount('const x = 1', '/r/a.ts', true)
+    expect(p.title()).toBe('阅读模式')
+    expect(p.note()).toBe('TypeScript 还没有预览')
+    expect(p.hinted()).toBe(false)
+  })
+
+  it('进出这一档标题跟着走，不用重挂', () => {
+    const p = mount('# 甲\n', '/r/a.md')
+    p.setAlone(true)
+    expect(p.title()).toBe('阅读模式')
+    p.setAlone(false)
+    expect(p.title()).toBe('预览')
+    expect(p.note()).toBeNull()
+  })
+
+  it('🔴 源编辑器没有布局时一个字都不写预览的滚动位置', () => {
+    const p = mount('# 甲\n\n乙\n\n丙\n', '/r/a.md')
+    const writes = recordScrollTop(p.scrollEl())
+    p.retype('# 甲\n\n乙\n\n丙\n\n丁\n')
+    p.bump()
+    p.settle()
+    // 正文照常重画：守卫只挡**同步滚动**，不挡渲染
+    expect(p.bodyHtml()).toContain('丁')
+    // jsdom 里 `clientHeight` 恒为 0，正是「藏起来」那一态。少了 `follow()` 开头那道守卫的话
+    // `atBottom(0,0,0)` 恒为真，这里会看到一次「滚到最底下」的写入——
+    // 在真实窗口里它就是「阅读模式下预览永远停在文末」
+    expect(writes(), '源没有布局却按一份退化的几何对齐了').toEqual([])
+  })
+
+  it('同一块预览，源编辑器一有了高度同步就照常写', () => {
+    const p = mount('# 甲\n\n乙\n\n丙\n', '/r/a.md')
+    const writes = recordScrollTop(p.scrollEl())
+    fakeEditorLayout(p.view, 400, 1000)
+    p.retype('# 甲\n\n乙\n\n丙\n\n丁\n')
+    p.bump()
+    p.settle()
+    // 上一条的绿必须**不是**因为「`follow()` 压根没被调到」：这条是它的对照
+    expect(writes().length, '有布局却不同步').toBeGreaterThan(0)
   })
 })
 

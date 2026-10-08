@@ -6,7 +6,7 @@
  * `ws.split()` 建的是**一个新的空标签**（一个标签只能显示在一块分屏里，见 `workspace.ts`
  * 文件头的不变量 2）。拿它装预览的话，那个空标签会出现在标签条上、能被关掉、能被切走，
  * 而它其实不是一个文档。所以预览走的是侧边栏那条路：一个独立的可见性 signal +
- * `.body-row` 里的一栏，`.body` 与它各占一半宽。
+ * `.body-row` 里的一栏，`.body` 与它各占一半宽（阅读模式那一档下它独占，见下面）。
  *
  * ⚠️ 代价说清楚：**只有一个预览，跟着聚焦的那块分屏走**。分屏看两个文件时，
  * 预览显示的是聚焦那一个。要做「每块分屏一个预览」得先让分屏能装非文档内容，
@@ -39,6 +39,16 @@
  * 因为它的语义与文档位置是**一对一**的（一个 `data-pos` 就是那三个字符），
  * 而「点一下把这条打勾」在纯文本编辑器里做起来反而难得多
  *
+ * ## ⚠️ 阅读模式：这一栏可能是屏幕上唯一的一栏
+ *
+ * `previewMode.ts` 的 `only` 档把 `.body` 藏起来，于是这块面板吃掉整个正文区。
+ * 这一层对此只做两件事，都不涉及布局：把标题从「预览」换成「阅读模式」（那是用户唯一能拿到的
+ * 「我不在编辑态」的信号，因为 `Mod+F` 那类命令还在往看不见的编辑器上作用），
+ * 以及在没有别的限定可说时补一句怎么退出。
+ *
+ * 🔴 真正会坏的是 `follow()`：编辑区 `display: none` 之后 `scrollDOM` 的几何量全是 0，
+ * 而 `atBottom(0,0,0)` 恒为真，于是每一次重画都把预览甩到文末。守卫在那个函数里。
+ *
  * ## ⚠️ 这里钉不住的东西
  *
  * 滚动跟得准不准、`data-line` 的插值在真实排版下偏多少、外链点下去 WKWebView 怎么反应、
@@ -54,6 +64,18 @@ import { atBottom, collectAnchors, fractionalLine, topForLine, type LineAnchor }
 
 export interface MarkdownPreviewProps extends PanelRefreshSource {
   onClose: () => void
+  /**
+   * 编辑区此刻是不是被藏起来了（`previewMode.ts` 的 `only` 档）。
+   *
+   * ⚠️ 这是宿主算好递进来的一个**结论**，不是那一档本身：宿主还要判断「这份文档到底有没有
+   * 预览可看」，没有的话即使是 `only` 档也不会藏编辑器（判据在 App 的 `editorHidden()`）。
+   * 做成必选而不是可选，就是为了不让「忘了传」与「确实没藏」共用同一个 `undefined`
+   *
+   * 🔴 这一层不认识 `PreviewMode`：它只回答「标题该写『预览』还是『阅读模式』」，
+   * 以及要不要补一句怎么退出。藏编辑区是宿主的事（`.body.preview-only`），
+   * 而**为什么必须藏而不能卸载**写在 `previewMode.ts` 的文件头
+   */
+  alone: () => boolean
 }
 
 /**
@@ -66,6 +88,20 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   /** 面板顶上那句话。null = 没什么要说的 */
   const [note, setNote] = createSignal<string | null>(null)
 
+  const alone = () => props.alone()
+
+  /**
+   * 头部实际显示的那一句限定。
+   *
+   * **真话优先**：文档级的那一句（「只预览了前面一部分」「X 还没有预览」）比「怎么退出阅读模式」
+   * 更该说——前者说的是他正在看的这份文档出了什么状况，后者随时能从 View 菜单里找到。
+   * 所以阅读模式那句只在没有别的可说时才出现。
+   *
+   * ⚠️ 刻意不写键名：菜单里那一项是 `CmdOrCtrl+Shift+V`，写死「Cmd」在 Windows 上就是错的，
+   * 而为了一个提示把 `commands/keybinding.ts` 拽进这个懒加载块也不划算（理由见 `./panel.ts`
+   * 文件头那条「不要为了借一层包装去依赖别的层」）。所以这里说的是**菜单项的名字**
+   */
+  const headNote = () => note() ?? (alone() ? '再按一次切换预览可回到编辑' : null)
   let scrollEl: HTMLDivElement | undefined
   let bodyEl: HTMLDivElement | undefined
   /** 当前这份渲染结果的行号锚点。每次改 `bodyEl.innerHTML` 之后重量一遍 */
@@ -135,6 +171,14 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   function follow(src: FollowedEditor) {
     if (scrollEl === undefined) return
     const el = src.view.scrollDOM
+    // 🔴 源编辑器**没有布局**时不同步：阅读模式（`previewMode.ts` 的 `only` 档）把 `.body`
+    // 整个 `display: none` 掉了，于是这三个几何量全是 0，而 `atBottom(0, 0, 0)` 恒为真
+    // （`./scrollSync.ts:145`）——不拦的话每一次防抖重画都会走「直接到底」那一支，
+    // 症状是「阅读模式里预览永远停在文末」。
+    // ⚠️ 这道守卫不是为阅读模式特设的：任何「面板活着而源还没排版」的瞬时态都该走它，
+    // 而同步滚动是单向的（见 `./scrollSync.ts` 文件头），少同步一次的代价只是不动，
+    // 按一份退化的几何去对齐的代价是把用户正在读的地方甩走
+    if (el.clientHeight === 0) return
     // 到底了就直接到底：源文档最后一行往往只是预览的中间位置，按行号对齐会差出一屏
     if (atBottom(el.scrollTop, el.clientHeight, el.scrollHeight)) {
       scrollEl.scrollTop = scrollEl.scrollHeight
@@ -244,8 +288,17 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   return (
     <section class="md-preview" aria-label="Markdown 预览">
       <div class="md-preview-head">
-        <span class="md-preview-title">预览</span>
-        <Show when={note()}>{(text) => <span class="md-preview-note">{text()}</span>}</Show>
+        {/* 「阅读模式」而不只是「预览」：这一档下编辑区被藏起来了，而 `Mod+F` 那类命令
+            还在往那块看不见的编辑器上作用。标题是用户唯一能拿到的「我不在编辑态」的信号，
+            所以它必须换一个字，而不是只把提示塞进右边那句限定里 */}
+        <span class="md-preview-title">{alone() ? '阅读模式' : '预览'}</span>
+        <Show when={headNote()}>
+          {(text) => (
+            <span class="md-preview-note" classList={{ hint: note() === null }}>
+              {text()}
+            </span>
+          )}
+        </Show>
         <button class="md-preview-close" onClick={() => props.onClose()} title="关闭预览">
           ×
         </button>

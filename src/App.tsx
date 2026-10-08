@@ -18,6 +18,7 @@ import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
 import { createWorkspace, type DiscardDecision, type Pane } from './doc/workspace'
 import { EditorPane } from './editor/EditorPane'
+import { languageFor } from './editor/language'
 import { clickAction, definitionAt } from './goto/definition'
 import { QuickOpen } from './goto/QuickOpen'
 import { createQuickOpen, type Commit } from './goto/store'
@@ -31,9 +32,11 @@ import { acceptsPastedImage, landPastedImage } from './md/paste'
 import { OutlinePanel } from './md/OutlinePanel'
 import { MarkdownToolbar } from './md/MarkdownToolbar'
 import type { FollowedEditor } from './md/panel'
+import { nextPreviewMode, type PreviewMode } from './md/previewMode'
 import { alignTableAt } from './md/table'
 import { createProjectTree } from './project/store'
 import { Sidebar, type TreeNotice } from './project/Sidebar'
+import { clampSidebarWidth, SidebarResize } from './project/SidebarResize'
 import { FindInFiles } from './search/FindInFiles'
 import { ReplaceConfirm } from './search/ReplaceConfirm'
 import { revealTarget } from './search/reveal'
@@ -347,6 +350,19 @@ export default function App() {
    */
   const [sidebarVisible, setSidebarVisible] = createSignal(false)
 
+  /**
+   * 侧边栏宽（px）。与 `sidebarVisible` 同一条理由放在这里：收起再展开、窗口 resize 时
+   * 重新夹取，都要它活着——放进 `Sidebar` 里的话收起一次就回到默认值，用户调过的现场没了
+   */
+  const [sidebarWidth, setSidebarWidth] = createSignal(220)
+  onMount(() => {
+    // 上限是「窗口的一半」，跟着窗口走：窗口缩过之后存着的宽度可能越界，不重新夹一次的话
+    // 正文区会被挤到比侧边栏还窄，而用户这一次什么都没拖
+    const onResize = () => setSidebarWidth((w) => clampSidebarWidth(w))
+    window.addEventListener('resize', onResize)
+    onCleanup(() => window.removeEventListener('resize', onResize))
+  })
+
   /** 对话框取消时不显示侧边栏：用户什么都没选，弹出一条空栏是净损失 */
   async function openFolder() {
     await tree.openViaDialog()
@@ -367,18 +383,19 @@ export default function App() {
   }
 
   /**
-   * Markdown 预览那一栏的可见性（M3-A-3）。默认关，与侧边栏同一条理由：
+   * Markdown 预览那一栏的形态（M3-A-3，`only` 一档是后来加的）。默认关，与侧边栏同一条理由：
    * 空窗口里多一栏只会把正文区挤窄，而「还没有文档」时它里面什么也没有。
    *
    * ⚠️ 刻意不进会话存档：存了的话每次启动都得先渲染一份预览，而「上次开着」
-   * 与「这次要看」是两件事——他可能只是想接着改一段代码。
+   * 与「这次要看」是两件事——他可能只是想接着改一段代码。这一条对 `only` 更要紧：
+   * 存档里带回来一个「编辑区是藏着的」现场，用户启动看到的第一眼就是找不到自己在哪儿。
    *
    * 侧边栏那一栏在存档里也没有自己的字段，但它是**搭 `project.roots` 的便车回来的**
    * （见下面 `sync.start().then(...)` 里那句 `if (tree.roots().length > 0)`）：
    * 「这个项目长什么样」每次启动都成立，所以有根就该看得见根。预览没有这么一件能搭车的事实——
    * 它答的是「这份文档长什么样」，而那份文档下次可能压根没打开
    */
-  const [previewVisible, setPreviewVisible] = createSignal(false)
+  const [previewMode, setPreviewMode] = createSignal<PreviewMode>('off')
 
   /**
    * JSON 预览那一栏的可见性（M4-D）。默认关，与 Markdown 预览同一条理由：
@@ -387,7 +404,7 @@ export default function App() {
    * ️ 与 Markdown 预览**互相独立**：两个都开、只开一个、都不关，四种组合都成立。
    * Markdown 预览答「这份文档渲染出来什么样」，JSON 预览答「这段文本解析成 JSON 后的树形结构」。
    *
-   * 同样刻意不进会话存档，理由写在上面 `previewVisible` 那条注释里
+   * 同样刻意不进会话存档，理由写在上面 `previewMode` 那条注释里
    */
   const [jsonPreviewVisible, setJsonPreviewVisible] = createSignal(false)
 
@@ -420,7 +437,7 @@ export default function App() {
    * ⚠️ 与预览**互相独立**：两个都开、只开一个、都不关，四种组合都成立。
    * 大纲答「这份文档的结构」，预览答「它渲染出来什么样」，关掉一个不该顺手关掉另一个。
    *
-   * 同样刻意不进会话存档，理由写在上面 `previewVisible` 那条注释里
+   * 同样刻意不进会话存档，理由写在上面 `previewMode` 那条注释里
    */
   const [outlineVisible, setOutlineVisible] = createSignal(false)
 
@@ -444,6 +461,22 @@ export default function App() {
     if (controller === null) return null
     return { view: controller.view, path: ws.activeTab().doc.path() }
   }
+
+  /**
+   * 阅读模式（`previewMode` 的 `only` 档）**此刻真的把编辑区藏起来了吗**。
+   *
+   * 🔴 三个条件缺一不可，后两个是「不许出现死胡同」：`.ts` 文件与只读大文件分片都没有预览
+   * 可看，那种时候藏掉编辑器，等于把整块屏幕让给一句「TypeScript 还没有预览」——
+   * 用户既看不到正文也看不到编辑区，而他想不明白是怎么走到这一步的。所以 `only` 档在这两种
+   * 文档上**降级成并排**：那一档说的其实是「让预览独占」，而没有预览可独占时这句话不成立。
+   *
+   * ⚠️ 判据是 `followedEditor() !== null` 而不是「路径以 .md 结尾」：前者正是预览自己
+   * 决定「有没有正文可渲染」用的那一个（`MarkdownPreview` 的 `src === null` 那一支），
+   * 两边同源才不会说出两种答案。语言那一半同样取自 `languageFor`，与 `md/preview.ts`
+   * 判 `unsupported` 用的是同一个函数
+   */
+  const editorHidden = () =>
+    previewMode() === 'only' && followedEditor() !== null && languageFor(ws.activeTab().doc.path()).kind === 'markdown'
 
   /**
    * 全局替换落盘之后的一句回话（M2-D）：几个开着的标签被从磁盘重读了一遍。
@@ -1053,7 +1086,7 @@ export default function App() {
       openRecentProject: () => void goto.show('', 'project'),
       closeFolder: () => tree.close(),
       toggleSidebar: () => setSidebarVisible((v) => !v),
-      togglePreview: () => setPreviewVisible((v) => !v),
+      togglePreview: () => setPreviewMode((m) => nextPreviewMode(m)),
       toggleJsonPreview: () => setJsonPreviewVisible((v) => !v),
       toggleOutline: () => setOutlineVisible((v) => !v),
       alignTable,
@@ -1112,7 +1145,7 @@ export default function App() {
             alignTable,
             wordCount,
             toggleSidebar: () => setSidebarVisible((v) => !v),
-            togglePreview: () => setPreviewVisible((v) => !v),
+            togglePreview: () => setPreviewMode((m) => nextPreviewMode(m)),
             toggleOutline: () => setOutlineVisible((v) => !v),
             toggleJsonPreview: () => setJsonPreviewVisible((v) => !v),
             zoomIn: () => settings.stepFontSize(1),
@@ -1300,7 +1333,9 @@ export default function App() {
       <div class="main">
         <div class="body-row">
           <Show when={sidebarVisible()}>
-            <Sidebar tree={tree} onNotice={setTreeNotice} />
+            <Sidebar tree={tree} onNotice={setTreeNotice} width={sidebarWidth()} />
+            {/* 把手是 `.body-row` 的 flex 子项，必须紧跟侧边栏：它画的就是这两栏之间那条线 */}
+            <SidebarResize width={sidebarWidth} onWidth={setSidebarWidth} />
           </Show>
 
           {/* 大纲那一栏（M3-A-4）。放在侧边栏**之后**、`.body` **之前**：
@@ -1318,7 +1353,13 @@ export default function App() {
             />
           </Show>
 
-          <div class="body" classList={{ column: ws.direction() === 'column' }}>
+          {/* 阅读模式（`previewMode` 的 `only` 档）：`.preview-only` 把这一整块 `display: none`。
+              🔴 是**藏**不是卸载——预览的数据源 `followedEditor` 拿的是一个活的 CM6 view，
+              卸载的话 `ws.focusedView()` 变 null，预览跟着就空了。完整理由与两笔认了的债
+              写在 `md/previewMode.ts` 的文件头。
+              ⚠️ 判据是 `editorHidden()` 而不是 `previewMode() === 'only'`：没有预览可看的文档
+              （`.ts`、只读大文件分片）会降级成并排，理由在它自己的注释里 */}
+          <div class="body" classList={{ column: ws.direction() === 'column', 'preview-only': editorHidden() }}>
             <For each={ws.panes()}>
               {(pane) => (
                 <div class="editor-host" classList={{ focused: ws.focusedPaneId() === pane.id }}>
@@ -1351,14 +1392,20 @@ export default function App() {
 
               ⚠️ `tabId` 传的是**当前活动标签**：预览跟着聚焦的那块分屏走，
               而 `activeTab()` 定义就是「聚焦分屏显示的那个标签」，两者天然对得上。
-              ⚠️ `source` 与大纲那一栏是**同一个访问器**，理由写在 `followedEditor` 上 */}
-          <Show when={previewVisible()}>
+              ⚠️ `source` 与大纲那一栏是**同一个访问器**，理由写在 `followedEditor` 上。
+              ⚠️ 可见性是三档而不是布尔（`md/previewMode.ts`），所以这里判的是 `!== 'off'`；
+              阅读模式**不需要**给这一栏另加宽度——`.body` 一 `display: none` 就不再是 flex 子项，
+              而它是 `flex: 1 1 0%`，剩下的宽度自然全归它。
+              ⚠️ 面板上的 × 直接回 `off` 而不是退一档：× 的语义是「关掉这一栏」，
+              用户点它的时候要的就是预览消失，不是换一个形态 */}
+          <Show when={previewMode() !== 'off'}>
             <Suspense>
               <MarkdownPreview
                 source={followedEditor}
                 revision={ws.revision}
                 tabId={() => ws.activeTab().id}
-                onClose={() => setPreviewVisible(false)}
+                alone={editorHidden}
+                onClose={() => setPreviewMode('off')}
               />
             </Suspense>
           </Show>

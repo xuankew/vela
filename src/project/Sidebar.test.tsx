@@ -207,7 +207,7 @@ function mount(fs: Record<string, DirEntry[]> = FS): ProjectTree {
     tree = createProjectTree({ openFile: async (path) => void opened.push(path) })
     return teardown
   })
-  disposeRender = render(() => <Sidebar tree={tree} onNotice={(n) => notices.push(n)} />, container)
+  disposeRender = render(() => <Sidebar tree={tree} onNotice={(n) => notices.push(n)} width={220} />, container)
   return tree
 }
 

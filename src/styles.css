@@ -940,6 +940,19 @@ select {
   flex-direction: column;
 }
 
+/* 阅读模式（`md/previewMode.ts` 的 `only` 档）：编辑区整个不参与布局，
+   预览那一栏（`flex: 1 1 0%`）自然吃掉剩下的全部宽度，所以这里不需要另配一份宽度。
+
+   ⛔ 用 display: none 而不是 width: 0 / visibility: hidden：后两者仍然参与排版，
+   于是 CM6 会一遍遍去量一个零宽（或量得到但看不见）的盒子，白做的活儿全在滚动与
+   measure 的那条热路径上。
+   ⚠️ 代价是藏起来之后 `scrollDOM` 的三个几何量全是 0，而 `atBottom(0,0,0)` 恒为真——
+   所以 `md/MarkdownPreview.tsx` 的 `follow()` 必须自己认「源没有布局」这一态，
+   否则阅读模式里每次重画都把预览甩到文末。那两处是同一条约束的两半，改一边要看另一边 */
+.body.preview-only {
+  display: none;
+}
+
 .editor-host {
   flex: 1;
   min-width: 0;
@@ -1000,14 +1013,44 @@ select {
    两种都很难看出是「高度有两个真相」造成的。 */
 
 .sidebar {
-  /* 固定宽，不参与 flex 伸缩：文件树里的路径本来就要靠 hover 的 title 看全，
-     让它跟着窗口宽度变只会让「同一棵树在不同窗口下长得不一样」 */
-  flex: 0 0 220px;
+  /* 不伸不缩、按给的宽：宽度由拖拽把手的信号内联给（`project/SidebarResize.tsx`），
+     这里的 220px 是没给内联宽度时的兜底。刻意不参与 flex 伸缩——文件树里的路径本来就要
+     靠 hover 的 title 看全，让它跟着窗口宽度变只会让「同一棵树在不同窗口下长得不一样」 */
+  flex: 0 0 auto;
+  width: 220px;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--vela-bg-alt);
   font-size: 12px;
+}
+
+/* 侧边栏右缘那条分隔线，同时是拖拽改宽度的把手（组件见 `project/SidebarResize.tsx`）。
+   它自己画出同色的 1px，再用 -1px 外边距吃掉 `.body-row` 两侧各 1px 的 gap，
+   于是这条线与分屏之间那条逐像素相同——加把手这件事在布局上等于没发生。
+   真正能抓的地方是 ::after 向两边各扩的 3px：1px 宽的命中区没人点得中 */
+.sidebar-resize {
+  flex: 0 0 1px;
+  margin: 0 -1px;
+  position: relative;
+  background: var(--vela-border);
+  cursor: col-resize;
+  user-select: none;
+}
+
+.sidebar-resize::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+
+/* 悬停时把那条线染成 accent。反馈只有 1px 是弱，但把手加宽就会破坏
+   「所有分隔线同宽」这条肉眼在校的约定 */
+.sidebar-resize:hover {
+  background: var(--vela-accent);
 }
 
 .sidebar-head {
@@ -1017,6 +1060,11 @@ select {
   height: 26px;
   padding: 0 4px 0 8px;
   border-bottom: 1px solid var(--vela-border);
+  /* 侧边栏能被拖到 40px 宽（`SidebarResize` 的 SIDEBAR_MIN_WIDTH），而头部那三个按钮
+     不收缩、加内边距约 79px。没有这条的话它们会溢出头部、盖到右边的正文区上面；
+     有了它，窄的时候是「按钮被裁掉一部分」——× 可能点不到，但 Mod+B 与状态栏
+     都能收起/展开侧边栏，拖宽也随时可以 */
+  overflow: hidden;
 }
 
 /* 根目录名是唯一需要伸缩的一格：窗口再窄也先把省略号让给它，
@@ -2708,6 +2756,13 @@ select {
   overflow: hidden;
   text-overflow: ellipsis;
   color: var(--vela-warn);
+}
+
+/* 阅读模式下那句「怎么退出」。同一个位置、同一个截断口径，但**不是警告**：
+   文档级的那一句说的是「这份文档出状况了」，这一句只是说明当前形态，
+   用警告色的话每次进阅读模式都像出了错 */
+.md-preview-note.hint {
+  color: var(--vela-fg-dim);
 }
 
 /* 关闭按钮：`margin-left: auto` 把它推到最右（与 `.notice-close` 一致）。
