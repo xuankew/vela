@@ -14,7 +14,12 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const SIZE = 512
+const CANVAS = 1024
+// Apple macOS 图标模板：1024 画布上主体 824×824 居中，四周留透明边。
+// 主体铺满画布会在 Dock 里比标准图标显大约 24%。
+const BODY = 824
+const OFFSET = (CANVAS - BODY) / 2
+const ART = 512 // 图案坐标空间，下面所有常数都在这个空间里
 const CORNER = 112 // ≈ macOS 图标圆角比例
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
@@ -62,10 +67,10 @@ function outsideRoundedRect(x, y, size, r) {
 }
 
 /** @returns {[number, number, number, number]} RGBA */
-function pixel(x, y) {
-  if (outsideRoundedRect(x, y, SIZE, CORNER)) return [0, 0, 0, 0]
+function artwork(x, y) {
+  if (outsideRoundedRect(x, y, ART, CORNER)) return [0, 0, 0, 0]
 
-  const t = y / SIZE
+  const t = y / ART
   // 背景：Tokyo Night 系的深蓝垂直渐变
   const r = lerp(0x1a, 0x24, t)
   const g = lerp(0x1b, 0x28, t)
@@ -100,13 +105,21 @@ function pixel(x, y) {
   return [r, g, b, 255]
 }
 
+/** @returns {[number, number, number, number]} RGBA */
+function pixel(x, y) {
+  if (x < OFFSET || y < OFFSET || x >= OFFSET + BODY || y >= OFFSET + BODY) {
+    return [0, 0, 0, 0]
+  }
+  return artwork(((x - OFFSET) * ART) / BODY, ((y - OFFSET) * ART) / BODY)
+}
+
 // ---------- 组装 ----------
 
-const raw = Buffer.alloc(SIZE * (1 + SIZE * 4))
-for (let y = 0; y < SIZE; y++) {
-  const rowStart = y * (1 + SIZE * 4)
+const raw = Buffer.alloc(CANVAS * (1 + CANVAS * 4))
+for (let y = 0; y < CANVAS; y++) {
+  const rowStart = y * (1 + CANVAS * 4)
   raw[rowStart] = 0 // 每行首字节是 filter type，0 = None
-  for (let x = 0; x < SIZE; x++) {
+  for (let x = 0; x < CANVAS; x++) {
     const i = rowStart + 1 + x * 4
     const [r, g, b, a] = pixel(x, y)
     raw[i] = r
@@ -117,8 +130,8 @@ for (let y = 0; y < SIZE; y++) {
 }
 
 const ihdr = Buffer.alloc(13)
-ihdr.writeUInt32BE(SIZE, 0)
-ihdr.writeUInt32BE(SIZE, 4)
+ihdr.writeUInt32BE(CANVAS, 0)
+ihdr.writeUInt32BE(CANVAS, 4)
 ihdr[8] = 8 // bit depth
 ihdr[9] = 6 // color type: RGBA
 ihdr[10] = 0 // compression
@@ -134,4 +147,4 @@ const png = Buffer.concat([
 
 mkdirSync(dirname(outPath), { recursive: true })
 writeFileSync(outPath, png)
-console.log(`✓ ${outPath}  (${(png.length / 1024).toFixed(1)} KB, ${SIZE}×${SIZE})`)
+console.log(`✓ ${outPath}  (${(png.length / 1024).toFixed(1)} KB, ${CANVAS}×${CANVAS})`)

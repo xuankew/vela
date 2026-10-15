@@ -165,3 +165,38 @@ describe('conflicts', () => {
     expect(registry.conflicts()).toEqual([])
   })
 })
+
+describe('rebind（用户自定义快捷键）', () => {
+  it('覆盖后分派与清单都跟新绑定走', () => {
+    const registry = makeRegistry()
+    registry.register({ id: 'file.open', title: '打开文件', category: '文件', keybinding: 'Mod+O', run: () => {} })
+    registry.rebind('file.open', 'Cmd+P')
+    expect(registry.findForKey(event('p', true))?.id).toBe('file.open')
+    expect(registry.findForKey(event('o', true))).toBeNull()
+    expect(registry.list().find((c) => c.id === 'file.open')?.keybindings).toEqual(['⌘P'])
+  })
+
+  it('不动 def：内置默认还在，重置就是把它递回去', () => {
+    const registry = makeRegistry()
+    registry.register({ id: 'file.open', title: '打开文件', category: '文件', keybinding: 'Mod+O', run: () => {} })
+    registry.rebind('file.open', 'Cmd+P')
+    expect(registry.get('file.open')?.keybinding).toBe('Mod+O')
+    registry.rebind('file.open', registry.get('file.open')?.keybinding)
+    expect(registry.findForKey(event('o', true))?.id).toBe('file.open')
+  })
+
+  it('undefined 清空绑定', () => {
+    const registry = makeRegistry()
+    registry.register({ id: 'file.open', title: '打开文件', category: '文件', keybinding: 'Mod+O', run: () => {} })
+    registry.rebind('file.open', undefined)
+    expect(registry.findForKey(event('o', true))).toBeNull()
+    expect(registry.list().find((c) => c.id === 'file.open')?.keybindings).toEqual([])
+  })
+
+  it('未注册命令与非法声明都立刻抛', () => {
+    const registry = makeRegistry()
+    expect(() => registry.rebind('editor.missing', 'Mod+O')).toThrow(/未注册的命令/)
+    registry.register({ id: 'file.open', title: '打开文件', category: '文件', run: () => {} })
+    expect(() => registry.rebind('file.open', 'Hyper+X')).toThrow(/未知修饰键/)
+  })
+})

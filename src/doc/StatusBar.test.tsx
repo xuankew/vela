@@ -606,3 +606,213 @@ describe('侧边栏开关那一格', () => {
     expect(container.querySelector('.status-side')).not.toBeNull()
   })
 })
+
+/* ---------- 当前分支那一格 ---------- */
+
+const { gitIpc } = vi.hoisted(() => ({
+  gitIpc: { gitHeads: vi.fn<typeof import('../ipc/git').gitHeads>() },
+}))
+vi.mock('../ipc/git', () => gitIpc)
+
+describe('当前分支那一格', () => {
+  /** 挂一个带 `roots` 的状态栏。返回那个 signal 的写端，方便用例里换工作区 */
+  function mountGit(initial: readonly string[] = []): [Workspace, (next: readonly string[]) => void] {
+    const [roots, setRoots] = createSignal<readonly string[]>(initial)
+    const ws = createWorkspace()
+    dispose = render(() => <StatusBar workspace={ws} roots={roots} />, container)
+    return [ws, setRoots]
+  }
+
+  /** 这一格是异步的（一次 IPC），所以每条用例都得等一下 */
+  function gitCells(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('.statusbar .status-git')]
+  }
+
+  function gitTexts(): string[] {
+    return gitCells().map((el) => (el.textContent ?? '').replace(/\s+/g, ' ').trim())
+  }
+
+  beforeEach(() => {
+    gitIpc.gitHeads.mockReset()
+    gitIpc.gitHeads.mockResolvedValue([])
+  })
+
+  it('不传 roots 时压根不渲染，也一次 IPC 都不发', () => {
+    mount()
+
+    expect(gitCells()).toEqual([])
+    expect(gitIpc.gitHeads).not.toHaveBeenCalled()
+  })
+
+  it('一个根都没有时不发 IPC：状态栏上没有什么可报的', async () => {
+    mountGit([])
+    await flush()
+
+    expect(gitIpc.gitHeads).not.toHaveBeenCalled()
+    expect(gitTexts()).toEqual([])
+  })
+
+  it('在分支上：报「分支 X」，title 里带根路径与「回到窗口会重读」', async () => {
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    mountGit(['/Users/x/dev/vela'])
+    await flush()
+
+    // 「分支」是**两个字**不是一个记号，理由（字体覆盖量过）写在 `BRANCH_LABEL` 上；
+    // 这一条把字面量钉住，改回记号的话这里会红
+    expect(gitTexts()).toEqual(['分支 main'])
+    expect(gitCells()[0]?.title).toBe('当前分支（/Users/x/dev/vela）。回到这个窗口时会重读一次')
+    expect(gitIpc.gitHeads).toHaveBeenCalledWith(['/Users/x/dev/vela'])
+  })
+
+  it('🔴 游离 HEAD 必须说出来：那一位 name 装的是短 sha，不是分支名', async () => {
+    // 画成 `分支 6a1b2c3` 是一句假话——它读起来像「在分支 6a1b2c3 上」，
+    // 而它真正的意思是「提交不会落到任何分支里」。这一条钉住「游离」那两个字
+    gitIpc.gitHeads.mockResolvedValue([{ name: '6a1b2c3', detached: true }])
+    mountGit(['/repo'])
+    await flush()
+
+    expect(gitTexts()).toEqual(['分支 6a1b2c3（游离）'])
+    expect(gitCells()[0]?.title).toContain('不在任何分支上')
+  })
+
+  it('不是仓库的根（null）没有格子', async () => {
+    gitIpc.gitHeads.mockResolvedValue([null])
+    mountGit(['/Users/x/notes'])
+    await flush()
+
+    expect(gitTexts()).toEqual([])
+  })
+
+  it('🔴 多根：一个 git 根一格，而且 null 那一位不会把后面的分支往前挪', async () => {
+    // Rust 侧那条「null 留在原位」的契约在前端的这一半：滤掉 null 的话，
+    // 第三个根的分支会被画在第二个根的名字下面——每格都长得对，说的是别人的分支
+    gitIpc.gitHeads.mockResolvedValue([null, { name: 'main', detached: false }, { name: 'dev', detached: false }])
+    mountGit(['/plain', '/repo-a', '/repo-b'])
+    await flush()
+
+    expect(gitTexts()).toEqual(['repo-a 分支 main', 'repo-b 分支 dev'])
+  })
+
+  it('单根时不带根的名字：那一格说的就是「我这个项目」', async () => {
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    mountGit(['/Users/x/dev/a-very-long-folder-name'])
+    await flush()
+
+    expect(gitTexts()).toEqual(['分支 main'])
+  })
+
+  it('关掉文件夹之后那一格跟着消失，而且不再发 IPC', async () => {
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    const [, setRoots] = mountGit(['/repo'])
+    await flush()
+    expect(gitTexts()).toEqual(['分支 main'])
+    gitIpc.gitHeads.mockClear()
+
+    setRoots([])
+    await flush()
+
+    expect(gitTexts()).toEqual([])
+    expect(gitIpc.gitHeads).not.toHaveBeenCalled()
+  })
+
+  it('换了工作区就重读一次，报的是新根的分支', async () => {
+    gitIpc.gitHeads
+      .mockResolvedValueOnce([{ name: 'main', detached: false }])
+      .mockResolvedValueOnce([{ name: 'release/1.2', detached: false }])
+    const [, setRoots] = mountGit(['/repo-a'])
+    await flush()
+    expect(gitTexts()).toEqual(['分支 main'])
+
+    setRoots(['/repo-b'])
+    await flush()
+
+    expect(gitIpc.gitHeads).toHaveBeenLastCalledWith(['/repo-b'])
+    expect(gitTexts()).toEqual(['分支 release/1.2'])
+  })
+
+  it('窗口重新获得焦点时重读：用户换分支几乎总是在 Vela 外面干的', async () => {
+    gitIpc.gitHeads
+      .mockResolvedValueOnce([{ name: 'main', detached: false }])
+      .mockResolvedValueOnce([{ name: 'feature', detached: false }])
+    mountGit(['/repo'])
+    await flush()
+    expect(gitTexts()).toEqual(['分支 main'])
+
+    window.dispatchEvent(new Event('focus'))
+    await flush()
+
+    expect(gitIpc.gitHeads).toHaveBeenCalledTimes(2)
+    expect(gitTexts()).toEqual(['分支 feature'])
+  })
+
+  it('页面重新可见时也重读：应用被重新激活时 WKWebView 递哪一个事件不一定', async () => {
+    // ⚠️ 漏掉这一半的表现是这一格**安静地**停在旧分支上：它没有错误通道，
+    // 所以不会有第二个信号说明它没刷新。jsdom 的 visibilityState 恒为 'visible'，
+    // 于是这一条测的正是「事件到了、而且没有被 visible 那个判断挡掉」
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    mountGit(['/repo'])
+    await flush()
+
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flush()
+
+    expect(gitIpc.gitHeads).toHaveBeenCalledTimes(2)
+  })
+
+  it('卸载时把两个监听都摘掉', async () => {
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    mountGit(['/repo'])
+    await flush()
+    expect(gitIpc.gitHeads).toHaveBeenCalledTimes(1)
+
+    dispose()
+    window.dispatchEvent(new Event('focus'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    await flush()
+
+    expect(gitIpc.gitHeads).toHaveBeenCalledTimes(1)
+    // `dispose()` 已经被 afterEach 调过一次，这里换成空函数免得它再调一遍
+    dispose = () => {}
+  })
+
+  it('在最右边，也就是所有读数格之后', async () => {
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    mountGit(['/repo'])
+    await flush()
+
+    const bar = container.querySelector('.statusbar')!
+    expect(bar.lastElementChild?.className).toContain('status-git')
+    // 它也带着 .status-cell：这一格是**读数**，与侧边栏那个按钮不同（那一格刻意不带，
+    // 理由写在 `.status-side` 那段注释里）
+    expect(cells().at(-1)).toBe('分支 main')
+  })
+
+  it('换成只读分片那一排时它还在：这一格说的是项目根，不是这份文档', async () => {
+    gitIpc.gitHeads.mockResolvedValue([{ name: 'main', detached: false }])
+    const [ws] = mountGit(['/repo'])
+    await flush()
+    expect(gitTexts()).toEqual(['分支 main'])
+
+    await makeShardTab(ws)
+    await flush()
+
+    expect(cells()).not.toContain('行 1，列 1')
+    expect(gitTexts()).toEqual(['分支 main'])
+  })
+
+  it('读失败时那一格不出现，留下一句日志而不是一条没人接的 rejection', async () => {
+    // `git_heads` 自己没有错误通道（理由在 `ipc/git.ts` 上），能走到这里的只有 IPC 层
+    // 出问题：命令没编进去、webview 与 Rust 二进制版本对不上。
+    // 🔴 Solid 的资源只在有人读 `.error` 时才消化那个 rejection，而这一格没有错误 UI、
+    // 没人读——不在组件里就地接住的话它就是一条 unhandled rejection，界面上什么都没有
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    gitIpc.gitHeads.mockRejectedValue(new Error('ipc 挂了'))
+    mountGit(['/repo'])
+    await flush()
+
+    expect(gitTexts()).toEqual([])
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn.mock.calls[0]?.join(' ')).toContain('读不到当前分支')
+    warn.mockRestore()
+  })
+})

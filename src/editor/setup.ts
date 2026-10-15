@@ -37,7 +37,8 @@ import { createFindReplacePanel, preserveCase } from './findReplace'
 import { definitionClick, type DefinitionClickHook } from './clickJump'
 import { fontSizeZoom } from './fontSizeZoom'
 import { indentGuides } from './indentGuides'
-import type { LanguageChoice } from './language'
+import { jsonLint } from './jsonLint'
+import { isJsonLanguage, type LanguageChoice } from './language'
 import { mouseGestures } from './multiCursor'
 import { imagePaste, type PasteImageHook } from './paste'
 import { coveredRange, escapesCoverage } from './viewport'
@@ -359,10 +360,15 @@ export interface EditorSetupOptions {
 }
 
 /**
- * 一种语言对应的扩展：语法 + 字体分区。
+ * 一种语言对应的扩展：语法 + 字体分区（+ JSON 的格式校验）。
  *
  * `support` 为 null 表示懒加载还没落地，此时只有字体分区生效——字体不能等，
  * 否则用户会先看到一屏正文字体的代码，再闪一下变成等宽。
+ *
+ * 🔴 校验**必须等** `support`：错误位置是读 Lezer 语法树的 error 节点（见 `./jsonLint`），
+ * 语法包没装上就没有树，校验只能退到位置 0——红点钉在第一行，而那正是真机上暴露过的
+ * 症状。早装也换不来「早出结果」：扩展实例是模块级共享的，树到位那次 reconfigure
+ * 认不出「配置变了」，压根不会重跑校验，钉错地方的红点会一直留着。
  */
 export function languageExtensions(choice: LanguageChoice, support: LanguageSupport | null): Extension[] {
   switch (choice.kind) {
@@ -371,7 +377,9 @@ export function languageExtensions(choice: LanguageChoice, support: LanguageSupp
       // ts/rust/json 按需解析；正文用文楷，代码块与表格行由装饰换成等宽字体
       return [markdown({ base: markdownLanguage, codeLanguages: languages }), fontTheme, codeFontBySyntax]
     case 'code':
-      return [...(support === null ? [] : [support]), codeDocFontTheme]
+      // support 为 null 时连校验一起不装，理由见本函数的文档注释
+      if (support === null) return [codeDocFontTheme]
+      return [support, codeDocFontTheme, ...(isJsonLanguage(choice) ? jsonLint() : [])]
     case 'plain':
       // 没匹配上的扩展名一律等宽且不挂语言：等宽对日志与表格的列对齐是刚需
       return [codeDocFontTheme]
@@ -382,7 +390,8 @@ export function languageExtensions(choice: LanguageChoice, support: LanguageSupp
  * 组装编辑器扩展集。
  *
  * 刻意不使用 `basicSetup`：要精确知道每一个扩展的成本，而且 basicSetup 里含不需要的
- * 部分（如 lint gutter）。
+ * 部分（如 lint gutter）。⚠️ lint 现在**是**装了的，但只在 JSON 文档上、且由
+ * `languageExtensions` 按语言装——basicSetup 那种「一律装上」的口径正是要避开的。
  */
 export function buildExtensions(options: EditorSetupOptions): Extension[] {
   const {

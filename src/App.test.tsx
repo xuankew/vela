@@ -33,6 +33,7 @@ const {
   shardCmd,
   assetCmd,
   settingsCmd,
+  gitCmd,
 } = vi.hoisted(() => {
   /**
    * 会话存档这一头（M1-F）。App 一挂载就会 `load_session`，关窗放行后会 `save_session`，
@@ -182,6 +183,22 @@ const {
     loadError: null,
     saved: [],
   }
+  /**
+   * 状态栏那一格「当前分支」。`git_heads` 也走 `tauriCore.invoke`。
+   *
+   * `calls` 记每次收到的那份根清单，`heads` 是要回的答案（`null` = 那一个根不是仓库）。
+   *
+   * ⚠️ `heads` 缺省是 `null`，意思是「按根回一份全 `null` 的清单」——那是这份假文件系统
+   * 的真相（`projectCmd.fs` 里一个 `.git` 都没有），也是唯一**合法形状**的缺省值：
+   * 回 undefined 的话状态栏会在 `heads.forEach` 上抛，而那一抛发生在一条 await 之后，
+   * 用例看到的只是「状态栏没了」，与上面 `settingsCmd.loaded` 逐字同一类坑。
+   * 🔴 回来的清单必须**与根同长**：状态栏按位配对，滤掉 `null` 的话多根之下后一个根的
+   * 分支会被画到前一个根的名字下面（Rust 侧那条契约的前端一半）。
+   */
+  const gitCmd: { calls: string[][]; heads: ({ name: string; detached: boolean } | null)[] | null } = {
+    calls: [],
+    heads: null,
+  }
   return {
     ipc: {
       openFile: vi.fn<typeof import('./ipc/fs').openFile>(),
@@ -202,6 +219,7 @@ const {
     shardCmd,
     assetCmd,
     settingsCmd,
+    gitCmd,
   }
 })
 
@@ -333,6 +351,8 @@ beforeEach(async () => {
   replaceCmd.taskId = 'task-r1'
   watchCmd.sent = []
   watchCmd.stats = { dirs: 1, files: 1, failed: 0, skipped: 0, truncated: false }
+  gitCmd.calls = []
+  gitCmd.heads = null
   // ⚠️ `opened` 一并清掉：句柄是拿它的长度发的号，不清的话第二个用例里的句柄就成了 2，
   // 而「关掉再打开拿到的是新句柄」这类断言会读到一个跨用例漂过来的数
   shardCmd.header = { totalLines: 5_000, bytes: 104_857_600, encoding: 'utf8', bom: false, eol: 'lf', lossy: false }
@@ -416,6 +436,14 @@ beforeEach(async () => {
       const recent = Array.isArray(raw) ? raw.filter((r): r is string => typeof r === 'string') : []
       projectCmd.queries.push({ roots, needle, recent })
       return projectCmd.result
+    }
+    if (cmd === 'git_heads') {
+      const roots = rootsOf(args)
+      gitCmd.calls.push(roots)
+      // 🔴 缺省回一份**与根同长**的全 null 清单。少一位的话状态栏会把后一个根的分支
+      // 挂到前一个根的名字下面（它按位配对）；回 undefined 更糟——它在 `heads.forEach`
+      // 上抛，而那一抛发生在一条 await 之后，用例只看得见「状态栏没了」
+      return gitCmd.heads ?? roots.map(() => null)
     }
     if (cmd === 'start_search') {
       searchCmd.calls.push({ roots: rootsOf(args), query: args?.query })
@@ -1775,6 +1803,34 @@ describe('侧边栏接线（M2-B）', () => {
     // 里的任何抛变成一条提示，而那之前标签已经装好了——只看上面两条断言的话，
     // 「恢复失败了一半」与「恢复成功」长得一模一样
     expect(notices()).toEqual([])
+  })
+
+  /* ---------- 状态栏那一格「当前分支」----------
+     住在这个 describe 里只因为 `archiveWith` / `restartWith` 在这儿：这一格的数据源是
+     **工作区的根**，而「让 App 手上有一组根」最省事的办法就是给它一份存档。
+     格子自己怎么画（游离 HEAD、多根、重读时机）在 `doc/StatusBar.test.tsx` 里，
+     这一组只钉 `App.tsx` 那一个 prop 有没有接上 */
+
+  it('开着文件夹时，状态栏最右边那一格报的是它的分支', async () => {
+    ipc.openFile.mockResolvedValue(textFile({ text: '磁盘上的样子' }))
+    gitCmd.heads = [{ name: 'feature/m5', detached: false }]
+
+    await restartWith(archiveWith({ roots: [{ root: '/repo', expanded: [] }] }))
+
+    // 🔴 递下去的必须是**工作区那份根清单**。这一格在 App 侧的接线只有一个 prop
+    // （`roots={tree.roots}`），少传的话它会安静地消失——它没有错误通道，
+    // 而其余所有用例照样绿，所以这一条断言是它唯一的看守
+    expect(gitCmd.calls.at(-1)).toEqual(['/repo'])
+    expect(container.querySelector('.status-git')?.textContent).toContain('feature/m5')
+  })
+
+  it('没开文件夹时压根不去问分支：状态栏上没有什么可报的', async () => {
+    ipc.openFile.mockResolvedValue(textFile({ text: '磁盘上的样子' }))
+
+    await restartWith(archiveWith(null))
+
+    expect(gitCmd.calls).toEqual([])
+    expect(container.querySelector('.status-git')).toBeNull()
   })
 
   it('上次没开文件夹：侧边栏保持收起，不弹一条空栏出来', async () => {

@@ -65,6 +65,7 @@ import type { ShardHeader } from '../ipc/shard'
 import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
 import type { ShardView } from './shardView'
 import { tabText } from './tab'
+import { UNTITLED_LABEL } from './document'
 import {
   createWorkspace,
   MAX_PANES,
@@ -363,6 +364,115 @@ describe('closeTab', () => {
     const pane = mounted()
     await pane.ws.closeTab(4242)
     expect(pane.ws.tabs()).toHaveLength(1)
+  })
+})
+
+describe('closeOtherTabs / closeAllTabs（标签右键菜单）', () => {
+  /** 三个标签：`a.txt`、`b.txt` 都改脏了，第三个是干净的空文档并且是活动的 */
+  async function three(pane: ReturnType<typeof mounted>) {
+    await pane.ws.openAt('/a.txt')
+    pane.type('改')
+    await pane.ws.openAt('/b.txt') // 新建的那个空文档被就地复用成 b.txt
+    pane.type('改')
+    const kept = pane.ws.newTab()
+    return { kept, names: () => pane.ws.tabs().map((t) => t.doc.name()) }
+  }
+
+  it('关闭其它标签：只留右键的那一个，它成为活动的那个', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    await pane.ws.openAt('/b.txt')
+    const c = pane.ws.newTab()
+    pane.ws.activateTab(pane.ws.tabs()[0]!.id) // 活动的是 a，留着的是 c
+
+    await pane.ws.closeOtherTabs(c.id)
+
+    expect(pane.ws.tabs()).toEqual([c])
+    expect(pane.ws.activeTab()).toBe(c)
+  })
+
+  it('关闭所有标签：全关，补一个新的空标签进来（tabs 永远非空）', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    await pane.ws.openAt('/b.txt')
+
+    await pane.ws.closeAllTabs()
+
+    expect(pane.ws.tabs()).toHaveLength(1)
+    expect(pane.ws.activeTab().doc.path()).toBeNull()
+    expect(pane.ws.activeTab().doc.dirty()).toBe(false)
+    expect(pane.doc).toBe('')
+  })
+
+  it('脏的那些**一次问完**，不是逐个弹框', async () => {
+    const calls: string[][] = []
+    const pane = mounted({
+      promptDiscard: async (names) => {
+        calls.push(names)
+        return 'discard'
+      },
+    })
+    const { kept } = await three(pane)
+
+    await pane.ws.closeOtherTabs(kept.id)
+
+    expect(calls).toEqual([['a.txt', 'b.txt']])
+    expect(pane.ws.tabs()).toEqual([kept])
+  })
+
+  it('答「取消」：一个都不关——半关一半留在屏幕上比什么都没发生更难解释', async () => {
+    const pane = mounted({ promptDiscard: async () => 'cancel' })
+    const { kept, names } = await three(pane)
+
+    await pane.ws.closeOtherTabs(kept.id)
+
+    expect(names()).toEqual(['a.txt', 'b.txt', UNTITLED_LABEL])
+    expect(pane.ws.tabs().filter((t) => t.doc.dirty())).toHaveLength(2)
+    expect(kept.doc.dirty()).toBe(false)
+  })
+
+  it('关闭所有标签时同样一次问完，取消就全留着', async () => {
+    const calls: string[][] = []
+    const pane = mounted({
+      promptDiscard: async (names) => {
+        calls.push(names)
+        return 'cancel'
+      },
+    })
+    const { names } = await three(pane)
+
+    await pane.ws.closeAllTabs()
+
+    expect(calls).toEqual([['a.txt', 'b.txt']])
+    expect(names()).toEqual(['a.txt', 'b.txt', UNTITLED_LABEL])
+  })
+
+  it('只有一个标签时「关闭其它标签」什么都不做：不问、不关、不换', async () => {
+    const calls: string[][] = []
+    const pane = mounted({
+      promptDiscard: async (names) => {
+        calls.push(names)
+        return 'discard'
+      },
+    })
+    pane.type('正文')
+    const only = pane.ws.activeTab()
+
+    await pane.ws.closeOtherTabs(only.id)
+
+    expect(calls).toEqual([])
+    expect(pane.ws.tabs()).toEqual([only])
+    expect(only.doc.dirty()).toBe(true)
+  })
+
+  it('关掉一个不存在的 id（菜单弹着的时候那个标签已经被关了）是安全的空操作', async () => {
+    const pane = mounted()
+    await pane.ws.openAt('/a.txt')
+    const before = pane.ws.tabs()
+
+    await pane.ws.closeOtherTabs(4242)
+
+    expect(pane.ws.tabs()).toEqual(before)
   })
 })
 

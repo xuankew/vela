@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { baseName, iconForPath, isBinaryPath, languageFor, loadSupport, sameLanguage } from './language'
+import { baseName, iconForPath, isBinaryPath, isJsonLanguage, languageFor, loadSupport, sameLanguage } from './language'
 
 describe('languageFor：路径 → 语言', () => {
   it('无名文档当 Markdown，label 是给人看的「Markdown」', () => {
@@ -53,6 +53,36 @@ describe('languageFor：路径 → 语言', () => {
     // CMakeLists.txt、Dockerfile、Jenkinsfile、Gemfile/Rakefile、PKGBUILD、nginx*.conf），
     // 所以 Makefile 落到 plain 是上游的行为，不是这里的 bug
     expect(languageFor('/a/Makefile').kind).toBe('plain')
+  })
+})
+
+describe('isJsonLanguage：哪些文档要校验 JSON 格式', () => {
+  it('.json 与 .map 算（language-data 给 JSON 登记的就这两个扩展名）', () => {
+    expect(isJsonLanguage(languageFor('/a/pkg.json'))).toBe(true)
+    expect(isJsonLanguage(languageFor('/a/bundle.js.map'))).toBe(true)
+  })
+
+  it('无名但内容像 JSON 的草稿也算——looksLikeJson 认出来时塞的是同一个 description', () => {
+    expect(isJsonLanguage(languageFor(null, '{"a": 1}'))).toBe(true)
+    expect(isJsonLanguage(languageFor('/a/notes', '[1, 2]'))).toBe(true)
+  })
+
+  it('.jsonc / .json5 / .jsonl 不算：校验用的是 JSON.parse，带注释的会被它判成非法', () => {
+    // 树上这几个扩展名画的是 data 图标（`DATA_EXT`），但语言那一档压根没匹配上 → plain
+    for (const path of ['/a/settings.jsonc', '/a/x.json5', '/a/events.jsonl', '/a/x.ndjson']) {
+      expect(isJsonLanguage(languageFor(path)), path).toBe(false)
+    }
+  })
+
+  it('其余语言与纯文本都不算', () => {
+    for (const choice of [
+      languageFor(null),
+      languageFor('/a/x.ts'),
+      languageFor('/a/run.log'),
+      languageFor('/a/n.md'),
+    ]) {
+      expect(isJsonLanguage(choice), choice.label).toBe(false)
+    }
   })
 })
 

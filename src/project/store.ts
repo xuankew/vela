@@ -161,7 +161,7 @@ export interface ProjectTree {
   removeRoot: (index: number) => void
   /** 关掉所有文件夹。不动任何标签页——已经打开的文件仍然是打开的 */
   close: () => void
-  /** 摊开/收起一层。摊开时按需去读 */
+  /** 摊开/收起一层。摊开时按需去读；读过的那一层静默重读一遍对账（见 `rootTree.expand`） */
   toggle: (key: RowKey) => Promise<void>
   select: (key: RowKey) => void
   /** 执行一个 `actionForKey` 或点击产生的动作 */
@@ -169,8 +169,9 @@ export interface ProjectTree {
   /**
    * 重读所有根里摊开着的层（并行），正在读的跳过。
    *
-   * 树外面的世界随时在变（`git checkout`、构建产物、别的编辑器），而 M2-G 的文件监听
-   * 还没落地，所以先给一个手动出口。读失败只在那一层留一句错误，不影响别层。
+   * 摊开一层已经会静默对账那一层了，但「树一直摊着没动、外面却变了」（`git checkout`、
+   * 构建产物、别的编辑器）只有这条能一次性拉平——它是显式动作，所以进 loading、
+   * 失败也在行上留一句错误。读失败只影响那一层。
    */
   refresh: () => Promise<void>
   /**

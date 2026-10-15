@@ -1,7 +1,20 @@
 import type { EditorState } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
 import { save as pickToSave } from '@tauri-apps/plugin-dialog'
-import { batch, createEffect, createSignal, For, lazy, on, onCleanup, onMount, Show, Suspense, untrack } from 'solid-js'
+import {
+  batch,
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  lazy,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+  Suspense,
+  untrack,
+} from 'solid-js'
 import { registerBuiltinCommands } from './commands/builtins'
 import { attachKeybindingDispatch } from './commands/dispatch'
 import { detectPlatform } from './commands/keybinding'
@@ -45,6 +58,7 @@ import { createSearchPanel } from './search/store'
 // import { AppearancePopover } from './settings/AppearancePopover' // 工具栏隐藏后暂时不用，保留导入以备将来恢复
 import { SettingsDialog } from './settings/SettingsDialog'
 import { KeybindingsDialog } from './settings/KeybindingsDialog'
+import { createKeybindingStore } from './settings/keybindings'
 import { createSettingsStore } from './settings/store'
 import { BUILTIN_TOOLS } from './tools/builtin'
 import { createToolBox } from './tools/store'
@@ -1017,6 +1031,18 @@ export default function App() {
   })
 
   /**
+   * 用户自定义快捷键（M4-E）。store 只管「覆盖配置」的内存缓存与写穿，
+   * 运行时生效靠把它 rebind 进上面那个注册表——dispatch 与命令面板读的都是注册表。
+   */
+  const keybindingStore = createKeybindingStore(registry.platform)
+  /** rebind 不是信号，注册表变了靠这个版本号让命令清单重算 */
+  const [kbVersion, setKbVersion] = createSignal(0)
+  const commandList = createMemo(() => {
+    kbVersion()
+    return registry.list(appContext())
+  })
+
+  /**
    * 工具箱（M3-B-1）。宿主能力只有三条，全是「工具箱自己不知道、只有 App 知道」的事：
    * 哪一块分屏正被聚焦、怎么改它、剪贴板在哪儿。
    *
@@ -1078,6 +1104,10 @@ export default function App() {
       closePane: () => ws.closePane(ws.focusedPaneId()),
       focusNextPane: () => ws.cyclePane(1),
       focusPreviousPane: () => ws.cyclePane(-1),
+      // ⚠️ 「其它」的参照物是**活动标签**（`activeTab()`），不是右键菜单里那个被点的标签：
+      // 按键时用户看着的就是活动的那个。语义差一个字，理由写在 `BuiltinHooks.closeOtherTabs` 上
+      closeOtherTabs: () => void ws.closeOtherTabs(ws.activeTab().id),
+      closeAllTabs: () => void ws.closeAllTabs(),
       openFolder,
       addFolder,
       // 与上面两条不同：它不弹系统对话框，而是把那个跳转浮层以「最近项目」的意图展开。
@@ -1105,6 +1135,18 @@ export default function App() {
       openCommandPalette: () => palette.show(),
     })
     detachKeys = attachKeybindingDispatch(registry)
+    // 装回用户自定义快捷键。必须排在 registerBuiltinCommands 之后（rebind 对未注册命令抛错）；
+    // load 是异步的，回来时注册早已完成。磁盘上解析不了的条目跳过而不是炸启动
+    void keybindingStore.load().then((overrides) => {
+      for (const [id, sources] of Object.entries(overrides)) {
+        try {
+          registry.rebind(id, sources)
+        } catch (err) {
+          console.warn(`[keybindings] 跳过磁盘上无效的绑定 "${id}":`, err)
+        }
+      }
+      setKbVersion((v) => v + 1)
+    })
     sync = createSessionSync({ workspace: ws, project: tree, onWarn: setSessionWarning })
     // 不 await：读存档与重新读盘可能要几百毫秒，编辑器该先出来给用户看
     void sync.start().then(() => {
@@ -1241,10 +1283,7 @@ export default function App() {
 
       {/* Markdown 工具栏（M4-F）*/}
       <Show when={mdToolbarVisible()}>
-        <MarkdownToolbar
-          editor={() => ws.focusedEditor()}
-          onToggle={() => setMdToolbarVisible(false)}
-        />
+        <MarkdownToolbar editor={() => ws.focusedEditor()} onToggle={() => setMdToolbarVisible(false)} />
       </Show>
 
       {/* 常驻容器：.app 是 grid，行数必须固定。两条提示各自当 grid item 的话，
@@ -1433,7 +1472,11 @@ export default function App() {
         </Show>
       </div>
 
-      <StatusBar workspace={ws} sidebar={{ open: sidebarVisible, toggle: () => setSidebarVisible((v) => !v) }} />
+      <StatusBar
+        workspace={ws}
+        sidebar={{ open: sidebarVisible, toggle: () => setSidebarVisible((v) => !v) }}
+        roots={tree.roots}
+      />
 
       {/* `.modal-backdrop` 是 position:fixed，脱离 grid 流，所以不会给行数固定的
           `.app` 多加出一行来（绝对定位的子元素不是 grid item） */}
@@ -1512,18 +1555,24 @@ export default function App() {
         <KeybindingsDialog
           visible={keybindingsDialogVisible()}
           onClose={() => setKeybindingsDialogVisible(false)}
-          commands={registry.list(appContext())}
-          getKeybindings={(id) => {
-            const cmd = registry.get(id)
-            return cmd?.keybinding ? (Array.isArray(cmd.keybinding) ? cmd.keybinding : [cmd.keybinding]) : []
-          }}
+          commands={commandList()}
+          platform={registry.platform}
           setKeybinding={(id, keybinding) => {
-            // TODO: 实现快捷键修改逻辑，需要更新命令注册表
-            console.log('Set keybinding for', id, ':', keybinding)
+            try {
+              registry.rebind(id, keybinding)
+            } catch (err) {
+              console.warn(`[keybindings] 命令 "${id}" 的绑定 "${keybinding}" 无效:`, err)
+              return false
+            }
+            keybindingStore.set(id, [keybinding])
+            setKbVersion((v) => v + 1)
+            return true
           }}
           resetKeybinding={(id) => {
-            // TODO: 实现重置快捷键逻辑
-            console.log('Reset keybinding for', id)
+            // def.keybinding 永远是内置默认（rebind 不动 def），递回去就是重置
+            registry.rebind(id, registry.get(id)?.keybinding)
+            keybindingStore.reset(id)
+            setKbVersion((v) => v + 1)
           }}
         />
       </Show>

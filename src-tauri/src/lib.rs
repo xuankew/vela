@@ -100,6 +100,7 @@ pub fn run() {
             commands::cancel_task,
             commands::index_project,
             commands::query_project,
+            commands::git_heads,
             watcher::set_watched,
             shard::open_large,
             shard::read_lines,

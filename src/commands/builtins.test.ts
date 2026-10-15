@@ -33,6 +33,8 @@ function makeHooks(): BuiltinHooks {
     closePane: vi.fn(),
     focusNextPane: vi.fn(),
     focusPreviousPane: vi.fn(),
+    closeOtherTabs: vi.fn(),
+    closeAllTabs: vi.fn(),
     openFolder: vi.fn(),
     addFolder: vi.fn(),
     openRecentProject: vi.fn(),
@@ -122,18 +124,28 @@ const PANE_COMMAND_IDS: readonly string[] = [
 ]
 
 /**
- * `editor.*` 里**刻意不设 `when`** 的那几条，共七条。
+ * `editor.*` 里**刻意不设 `when`** 的那几条，共九条。
  *
- * 前五条就是分屏那五条。后两条理由不同、结论相同：`editor.alignTable`（M3-A-5）与
- * `editor.wordCount`（M3-A-6）都作用于**文档**而不是面板，而只读分片那块分屏里
- * `ctx.editor` 同样是 null——「没有编辑器」在这儿的意思可能是「聚焦的是一份只读大文件」，
- * 不是「没有表可对齐」。字数那条更是反过来的：几百万行的日志恰恰是**最不该**被数的，
- * 但那句话得由宿主说出来，不能靠一个按下去毫无反应的快捷键表达。
+ * 前五条就是分屏那五条。中间两条（对齐表格、字数统计）理由不同、结论相同：
+ * `editor.alignTable`（M3-A-5）与 `editor.wordCount`（M3-A-6）都作用于**文档**而不是面板，
+ * 而只读分片那块分屏里 `ctx.editor` 同样是 null——「没有编辑器」在这儿的意思可能是
+ * 「聚焦的是一份只读大文件」，不是「没有表可对齐」。字数那条更是反过来的：
+ * 几百万行的日志恰恰是**最不该**被数的，但那句话得由宿主说出来，不能靠一个按下去毫无反应的快捷键表达。
+ *
+ * 最后两条是关标签那两条（`closeOtherTabs` / `closeAllTabs`）：关标签跟聚焦的那块分屏里
+ * 有没有 CM6 实例压根无关，而「只剩一个标签时按 ⌥⌘O 什么也没发生」这句话也该由宿主说
+ * （它知道为什么没关成），不能靠命令置灰表达——置灰之后连命令面板里都调不到。
  *
  * ⛔ 不要顺手并进 `PANE_COMMAND_IDS`：那份清单还担着「五条各分派到自己的 hook」那组
- * 断言（M1-D-5），把后两条混进去会把它们也拽进那组，而它们压根不是分屏命令。
+ * 断言（M1-D-5），把其余几条混进去会把它们也拽进那组，而它们压根不是分屏命令。
  */
-const UNGATED_EDITOR_COMMAND_IDS: readonly string[] = [...PANE_COMMAND_IDS, 'editor.alignTable', 'editor.wordCount']
+const UNGATED_EDITOR_COMMAND_IDS: readonly string[] = [
+  ...PANE_COMMAND_IDS,
+  'editor.alignTable',
+  'editor.wordCount',
+  'editor.closeOtherTabs',
+  'editor.closeAllTabs',
+]
 
 /**
  * 建一套「带真文档的假编辑器 + 注册表」。需要连按几次的手势直接用它——
@@ -167,7 +179,7 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('五十条命令全部注册成功，且互不抢占快捷键', () => {
+  it('五十七条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按 id 前缀分组的：
     // 「工具」(U+5DE5) < 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」(U+7F16)
@@ -190,6 +202,8 @@ describe('内置命令', () => {
       'editor.addCursorAbove',
       'editor.addCursorBelow',
       'editor.alignTable',
+      'editor.closeAllTabs',
+      'editor.closeOtherTabs',
       'editor.closePane',
       'editor.copyLineDown',
       'editor.copyLineUp',
@@ -382,11 +396,12 @@ describe('M1-C-1：行操作与排序去重', () => {
     expect(registry.findForKey(event('K', { metaKey: true, shiftKey: true }))?.id).toBe('editor.deleteLine')
   })
 
-  // 🔴 点名的那七条是**例外**：M2-H 之后 `ctx.editor === null` 不再等于「没东西可
+  // 🔴 点名的那九条是**例外**：M2-H 之后 `ctx.editor === null` 不再等于「没东西可
   // 编辑」，也可能是「聚焦的是一块只读分片」（`ShardPane` 不是 CM6，压根没有
-  // `EditorController`），而 M3-A-5 的对齐表格与 M3-A-6 的字数统计同受其害。例外的代价是
-  // 这条不变式对它们失效，所以只能靠 `UNGATED_EDITOR_COMMAND_IDS` 点名，不能靠「凡 editor.* 都要 gate」一刀切
-  it('没有编辑器时，除点名的那七条外所有 editor.* 命令一律置灰，且执行返回 false 而不是抛错', async () => {
+  // `EditorController`），而 M3-A-5 的对齐表格、M3-A-6 的字数统计与关标签那两条同受其害。
+  // 例外的代价是这条不变式对它们失效，所以只能靠 `UNGATED_EDITOR_COMMAND_IDS` 点名，
+  // 不能靠「凡 editor.* 都要 gate」一刀切
+  it('没有编辑器时，除点名的那九条外所有 editor.* 命令一律置灰，且执行返回 false 而不是抛错', async () => {
     const { registry } = makeRegistry(null)
     const editorCommands = registry
       .list()
@@ -535,6 +550,79 @@ describe('M1-D-5：分屏命令的接线', () => {
 
     // 按键那条路同一条规矩：`findForKey` 也过 `when`，gate 一加 ⌘\ 就一起哑
     expect(registry.findForKey(event('\\', { metaKey: true }))?.id).toBe('editor.splitRight')
+  })
+})
+
+describe('关标签两条命令的接线（标签右键菜单那两项的快捷键入口）', () => {
+  /**
+   * ⌥⌘ 加字母在真机上给的 `key` 是 Option 转出来的特殊字符（⌥⌘O → `ø`，⌥⌘A → `å`），
+   * 命中靠的是 `code` 那个物理键位——所以必须带 `code`。现成的 `macOptionEvent` 帮不上忙：
+   * 它把 `metaKey` 写死成 false，服务的是不带 ⌘ 的 `Alt+` 那一族。
+   */
+  const cmdOption = (key: string, code: string): KeyEventLike => ({
+    key,
+    code,
+    ctrlKey: false,
+    altKey: true,
+    shiftKey: false,
+    metaKey: true,
+  })
+
+  it('两条各分派到自己的 hook，不蹭「合并分屏」也不蹭对方', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('editor.closeOtherTabs')).toBe(true)
+    expect(hooks.closeOtherTabs).toHaveBeenCalledOnce()
+    expect(hooks.closeAllTabs).not.toHaveBeenCalled()
+
+    expect(await registry.execute('editor.closeAllTabs')).toBe(true)
+    expect(hooks.closeAllTabs).toHaveBeenCalledOnce()
+    expect(hooks.closeOtherTabs).toHaveBeenCalledOnce()
+    // ⚠️ 三条都长得像「关掉点什么」，接错人不会报错、只会关错东西：
+    // `closeOtherTabs` 接到 `closeAllTabs` 上的话用户想留一个标签，结果一个都不剩
+    expect(hooks.closePane).not.toHaveBeenCalled()
+  })
+
+  it('⌥⌘O 与 ⌥⌘A 各命中自己那条，同一个字母的其余组合都还是原来的样子', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.findForKey(cmdOption('ø', 'KeyO'))?.id).toBe('editor.closeOtherTabs')
+    expect(registry.findForKey(cmdOption('å', 'KeyA'))?.id).toBe('editor.closeAllTabs')
+    // O 这一族现在有三条：⌘O 打开文件、⇧⌘O 最近项目、⌥⌘O 关其它标签。
+    // 修饰键是严格相等，少一个多一个都各走各的
+    expect(registry.findForKey(event('o', { metaKey: true }))?.id).toBe('file.open')
+    expect(registry.findForKey(event('O', { metaKey: true, shiftKey: true }))?.id).toBe('project.openRecent')
+    // A 这一族同理：⇧⌘A 对齐表格、⇧⌥A（Å）升序排序行
+    expect(registry.findForKey(event('A', { metaKey: true, shiftKey: true }))?.id).toBe('editor.alignTable')
+    expect(registry.findForKey(macOptionEvent('KeyA', 'Å', true))?.id).toBe('editor.sortLinesAsc')
+    // ⛔ W 那一族必须仍然空着：macOS 上「关闭窗口 / 关闭所有窗口」的等价物在事件到达
+    // webview 之前就被系统吃掉了，绑在这儿收不到按键（与「合并分屏」不绑 ⌘W 同一条理由）
+    expect(registry.findForKey(event('w', { metaKey: true }))).toBeNull()
+    expect(registry.findForKey(event('W', { metaKey: true, shiftKey: true }))).toBeNull()
+    expect(registry.findForKey(cmdOption('˚', 'KeyW'))).toBeNull()
+  })
+
+  it('标题、分类与展示用的快捷键', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.get('editor.closeOtherTabs')?.title).toBe('关闭其它标签')
+    expect(registry.get('editor.closeAllTabs')?.title).toBe('关闭所有标签')
+    expect(registry.get('editor.closeOtherTabs')?.category).toBe('编辑器')
+    expect(registry.get('editor.closeAllTabs')?.category).toBe('编辑器')
+    // MOD_ORDER 里 alt 排在 meta **之前**，所以读作 ⌥⌘O 而不是 ⌘⌥O（与 ⌥⌘D 那条同一条规矩）
+    expect(registry.list().find((c) => c.id === 'editor.closeOtherTabs')?.keybindings).toEqual(['⌥⌘O'])
+    expect(registry.list().find((c) => c.id === 'editor.closeAllTabs')?.keybindings).toEqual(['⌥⌘A'])
+    // 标题末尾**没有**省略号：两条都不弹系统对话框。可能弹的是「未保存要不要放弃」那个确认框，
+    // 而那与「另存为…」不是一类打断——它是这次动作的一部分，不是另开一件事
+  })
+
+  it('没有编辑器时照样执行成功——聚焦的可能是一块只读分片，而标签照样能关', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    expect(registry.list().find((c) => c.id === 'editor.closeOtherTabs')?.enabled).toBe(true)
+    expect(registry.list().find((c) => c.id === 'editor.closeAllTabs')?.enabled).toBe(true)
+    expect(await registry.execute('editor.closeOtherTabs')).toBe(true)
+    expect(await registry.execute('editor.closeAllTabs')).toBe(true)
+    expect(hooks.closeOtherTabs).toHaveBeenCalledOnce()
+    expect(hooks.closeAllTabs).toHaveBeenCalledOnce()
+    // 按键那条路同一条规矩：`findForKey` 也过 `when`，gate 一加 ⌥⌘O 就一起哑
+    expect(registry.findForKey(cmdOption('ø', 'KeyO'))?.id).toBe('editor.closeOtherTabs')
   })
 })
 

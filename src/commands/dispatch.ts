@@ -9,6 +9,11 @@ import type { CommandRegistry } from './registry'
  */
 export function attachKeybindingDispatch(registry: CommandRegistry, target: Window = window): () => void {
   const onKeyDown = (event: KeyboardEvent) => {
+    // 快捷键录制框（M4-E）正在收键时让路：本监听挂在 window 的**捕获**阶段，先于录制框
+    // 自己的 handler，不让路的话录制时按到已有组合（如 Cmd+S）会先把命令触发掉
+    const target = event.target as Element | null
+    if (target && typeof target.closest === 'function' && target.closest('.keybinding-input')) return
+
     const def = registry.findForKey(event)
     if (!def) return
     event.preventDefault()

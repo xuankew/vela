@@ -53,6 +53,14 @@ export interface CommandRegistry {
   readonly platform: Platform
   /** 返回注销函数 */
   register(def: CommandDefinition): () => void
+  /**
+   * 覆盖已注册命令的绑定（M4-E 用户自定义快捷键）。
+   *
+   * 只换 `entry.bindings`、不动 `def`——`def.keybinding` 永远是内置默认，
+   * 重置就是把它原样递回这里。`undefined` 表示清空该命令的绑定。
+   * 与注册时同一条规矩：声明解析失败立刻抛，不留到按键时炸。
+   */
+  rebind(id: string, sources: string | string[] | undefined): void
   has(id: string): boolean
   get(id: string): CommandDefinition | undefined
   /** 命令不存在时抛错；`when` 不满足时返回 false（不是错误，面板本来就会置灰） */
@@ -115,6 +123,13 @@ export function createCommandRegistry(options: CommandRegistryOptions): CommandR
       return () => {
         entries.delete(def.id)
       }
+    },
+
+    rebind(id, sources) {
+      const entry = entries.get(id)
+      if (!entry) throw new Error(`未注册的命令 "${id}"`)
+      const declared = sources === undefined ? [] : Array.isArray(sources) ? sources : [sources]
+      entry.bindings = declared.map((source) => parseKeybinding(source, platform))
     },
 
     has: (id) => entries.has(id),

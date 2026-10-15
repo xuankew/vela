@@ -11,8 +11,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  *
  * 右键菜单那一组测的也是接线，⛔ 不是菜单外壳本身：贴边 clamp、点外面关、Escape 关
  * 那三条在 `Sidebar.test.tsx` 里已经钉过了，共用的是同一个组件（`project/TreeMenu.tsx`）。
- * 这里只钉**这一侧独有的四件事**——弹不弹（未命名文档不弹）、拦没拦原生菜单、
- * 选完之后递出去的是哪条路径、以及滚动时关掉。
+ * 这里只钉**这一侧独有的几件事**——弹不弹（未命名文档也弹，只是少一项）、拦没拦原生菜单、
+ * 每一项落到哪个 workspace 方法上、选完之后递出去的是哪条路径、以及滚动时关掉。
  *
  * ⚠️ `open -R` 本身钉不住：jsdom 里没有 Tauri 运行时，桩只能验「调了没、参数对不对」，
  * 「Finder 真的打开并选中了那个文件」要在真实窗口里看。
@@ -300,13 +300,16 @@ describe('拖拽重排', () => {
   })
 })
 
-describe('右键菜单：打开文件所在目录', () => {
+describe('右键菜单', () => {
   /** 右键。必须是 `MouseEvent`：组件要读 `clientX/clientY` 当菜单的落点 */
   function rightClick(el: Element, x = 40, y = 12): MouseEvent {
     const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: x, clientY: y })
     el.dispatchEvent(e)
     return e
   }
+
+  /** 菜单项的落点是 workspace 的 async 方法，点完之后要把在飞的 promise 冲干净 */
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
   function menu(): HTMLElement | null {
     return container.querySelector<HTMLElement>('.tree-menu')
@@ -322,7 +325,7 @@ describe('右键菜单：打开文件所在目录', () => {
     return container.querySelectorAll<HTMLButtonElement>('.tree-menu-item')[el]!
   }
 
-  it('右键一个打开了文件的标签 → 弹出菜单，只有「打开文件所在目录」一项', async () => {
+  it('右键一个打开了文件的标签 → 三项：打开所在目录、关闭其它、关闭所有', async () => {
     const ws = mount(createWorkspace())
     await ws.openAt('/Users/x/notes/win.txt')
 
@@ -331,10 +334,10 @@ describe('右键菜单：打开文件所在目录', () => {
     // 拦下来是必须的：不拦的话 macOS 会在我们的菜单旁边再弹一个原生的，两个叠在一起
     expect(e.defaultPrevented).toBe(true)
     expect(menu()).not.toBeNull()
-    expect(menuItems()).toEqual(['打开文件所在目录'])
+    expect(menuItems()).toEqual(['打开文件所在目录', '关闭其它标签', '关闭所有标签'])
   })
 
-  it('选那一项 → 递出去的是这个标签的完整路径，菜单随即关掉', async () => {
+  it('选「打开文件所在目录」→ 递出去的是这个标签的完整路径，菜单随即关掉', async () => {
     const ws = mount(createWorkspace())
     await ws.openAt('/Users/x/notes/win.txt')
     rightClick(tabs()[0]!)
@@ -345,19 +348,46 @@ describe('右键菜单：打开文件所在目录', () => {
     expect(menu()).toBeNull()
   })
 
-  it('右键未命名文档不弹菜单：磁盘上没有对应文件，而菜单只有这一项', () => {
+  it('右键未命名文档也弹菜单：少了「打开所在目录」，两项关闭照常可用', () => {
     mount(createWorkspace())
 
-    // 连 preventDefault 都不做：这一下右键该归系统，弹一份空的／灰的菜单只是让用户多点一次关闭
-    expect(rightClick(tabs()[0]!).defaultPrevented).toBe(false)
+    // 原来这一档连菜单都不弹——那时菜单里只有「打开文件所在目录」一项，而它对未命名文档
+    // 无从谈起。多了两项关闭动作之后这个前提没了：关标签与它在不在磁盘上无关
+    const e = rightClick(tabs()[0]!)
+    expect(e.defaultPrevented).toBe(true)
+    expect(menuItems()).toEqual(['关闭其它标签', '关闭所有标签'])
+  })
+
+  it('选「关闭其它标签」→ 只留右键的那一个', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/a.txt')
+    await ws.openAt('/repo/b.txt')
+    await ws.openAt('/repo/c.txt')
+
+    rightClick(tabs()[1]!)
+    item('关闭其它标签').click()
+    await flush()
+
+    expect(names()).toEqual(['b.txt'])
     expect(menu()).toBeNull()
+  })
+
+  it('选「关闭所有标签」→ 全关，补一个空文档进来', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/a.txt')
+    await ws.openAt('/repo/b.txt')
+
+    rightClick(tabs()[0]!)
+    item('关闭所有标签').click()
+    await flush()
+
+    expect(names()).toEqual(['空文档'])
   })
 
   it('菜单弹着的时候关掉那个标签，选下去仍然是原来那条路径', async () => {
     /**
-     * 菜单里存的是**路径快照**而不是标签 id。存 id 的话这一步会查到复用了同一个 id 的
-     * 另一份文档（或者查不到），在 Finder 里选中一个与用户刚才右键的东西无关的文件，
-     * 而且不报错
+     * 菜单里存的是**路径快照**。「打开文件所在目录」要的是用户右键那一刻的那份文档：
+     * 标签被关掉之后 `doc.path()` 已经无处可读了，而未命名文档存了盘之后路径还会变
      */
     const ws = mount(createWorkspace())
     await ws.openAt('/repo/a.txt')
@@ -369,6 +399,20 @@ describe('右键菜单：打开文件所在目录', () => {
 
     item('打开文件所在目录').click()
     expect(project.revealFile).toHaveBeenCalledWith('/repo/a.txt')
+  })
+
+  it('菜单弹着的时候那个标签被关掉了，「关闭其它标签」是安全的空操作', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/a.txt')
+    await ws.openAt('/repo/b.txt')
+    rightClick(tabs()[0]!)
+
+    tabs()[0]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
+    item('关闭其它标签').click()
+    await flush()
+
+    // 存的是 id，而那个 id 已经不在了：什么都不关（尤其不能顺手把 b 关掉）
+    expect(names()).toEqual(['b.txt'])
   })
 
   it('标签条滚动时关掉菜单：菜单是 fixed，滚走的标签底下留着的是一份指着别处的菜单', async () => {

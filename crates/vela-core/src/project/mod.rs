@@ -14,12 +14,17 @@
 //! 与 `search` 那几条命令从收一个根改成收一组根。「最近项目」同样在前端，
 //! 它记的是「换过哪些工作区」，这一层只把它当加分权重。
 //! `.vela/settings.json` 分层合并**推到了 M4**（PLAN.md §3.4「M2-F 实施修正」1）。
+//!
+//! `git` 是状态栏那一格「当前分支」的全部后端：只读 `.git/HEAD`，不跑 git 也不链
+//! libgit2，理由与它的边界（不知道脏不脏、不往祖先目录找）都写在那个模块的文件头。
 
+mod git;
 mod index;
 mod ops;
 mod tree;
 pub(crate) mod walk;
 
+pub use git::{read_head, GitHead};
 pub use index::{
     check_root, merge_stats, query_many, FileIndex, FileMatch, FileQuery, IndexStats, MAX_INDEX_FILES, MAX_RECENT,
 };

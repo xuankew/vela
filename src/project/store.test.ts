@@ -319,12 +319,64 @@ describe('按需列举', () => {
     expect(calls.map((c) => c[1])).toEqual(['', 'src'])
   })
 
-  it('收起再摊开不重读，缓存命中', async () => {
+  it('收起再摊开会静默重读一遍，把树外面新增的文件带进来', async () => {
     await tree.toggle(k('src'))
     await tree.toggle(k('src')) // 收起
     expect(row('src')?.expanded).toBe(false)
-    await tree.toggle(k('src')) // 再摊开
     expect(calls).toHaveLength(2)
+
+    // 收起的这段时间里，外面往这一层塞了一个新文件
+    const withNew = { ...FS, src: [...FS['src']!, f('src/新增.rs')] }
+    installFs(withNew)
+    calls.length = 0
+
+    await tree.toggle(k('src')) // 再摊开
+    // 静默那一档：照样发一次 listDir（这正是「重读对账」），但只发这一次
+    expect(calls).toEqual([['/repo', 'src']])
+    expect(rels()).toContain('src/新增.rs')
+  })
+
+  it('静默重读不进 loading：用户点开时不闪「读取中…」', async () => {
+    await tree.toggle(k('src'))
+    await tree.toggle(k('src')) // 收起，缓存留着
+
+    let release: (() => void) | undefined
+    ipc.listDir.mockImplementation((_root: string, rel: string): Promise<DirListing> => {
+      calls.push([_root, rel])
+      if (rel !== 'src') return Promise.resolve({ rel, entries: FS[rel] ?? [] })
+      return new Promise<DirListing>((resolve) => {
+        release = () => resolve({ rel, entries: FS['src']! })
+      })
+    })
+
+    const pending = tree.toggle(k('src')) // 再摊开：命中缓存 → 走静默档
+    // 已经摊开了（照缓存显示旧条目），但那一行**不**标 loading——这是「静默」的全部含义
+    expect(row('src')?.expanded).toBe(true)
+    expect(row('src')?.loading).toBe(false)
+    expect(rels()).toContain('src/main.rs') // 缓存的内容还在，没有清空成 loading 态
+
+    release!()
+    await pending
+    expect(row('src')?.loading).toBe(false)
+    expect(rels()).toContain('src/main.rs')
+  })
+
+  it('静默重读失败时不写错误：缓存照旧摊着，行上不挂那句话', async () => {
+    await tree.toggle(k('src'))
+    await tree.toggle(k('src')) // 收起
+
+    // 外面把这一层变得读不出来了（权限、被移走）
+    ipc.listDir.mockImplementation((_root: string, rel: string): Promise<DirListing> => {
+      calls.push([_root, rel])
+      if (rel === 'src') return rejected<DirListing>({ kind: 'io', reason: 'PermissionDenied', message: '权限不够' })
+      return Promise.resolve({ rel, entries: FS[rel] ?? [] })
+    })
+
+    await tree.toggle(k('src')) // 再摊开：静默重读失败
+    // 失败**不**落到 errors 上，也不动缓存：用户正在看的那些行保持原样。
+    // 显式的 ↻（refresh）才是暴露这种错误的出口
+    expect(row('src')?.error).toBeNull()
+    expect(row('src')?.expanded).toBe(true)
     expect(rels()).toContain('src/main.rs')
   })
 

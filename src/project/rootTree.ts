@@ -86,15 +86,19 @@ export interface RootTree {
    * 恢复会话读存档里摊开着的那些层。所以缓存必然是空的，查它没有意义。
    */
   readLayers: (rels: readonly string[]) => Promise<void>
-  /** 摊开/收起一层。摊开时按需去读 */
+  /**
+   * 摊开/收起一层。摊开时按需去读；**已经读过的那一层会静默重读一遍对账**
+   * （先把缓存摊开给用户看，随后无感替换成磁盘上的现状，不闪 loading）
+   */
   toggle: (rel: string) => Promise<void>
   expand: (rel: string) => Promise<void>
   collapse: (rel: string) => void
   /**
    * 重读所有摊开着的层（并行），正在读的跳过。
    *
-   * 树外面的世界随时在变（`git checkout`、构建产物、别的编辑器），而 M2-G 的文件监听
-   * 还没落地，所以先给一个手动出口。读失败只在那一层留一句错误，不影响别层。
+   * 与 `expand` 那次静默对账不是一回事：这条是**显式**动作（侧边栏那个 ↻），所以它进
+   * loading、失败也在行上留错误。摊开只对账被摊开的那一层，而「树一直摊着没动、
+   * 外面却变了」这种情况只有这条能一次性拉平。
    */
   refresh: () => Promise<void>
   /**
@@ -215,9 +219,14 @@ export function createRootTree(options: RootTreeOptions): RootTree {
    * `resolve()` 的归一化下必然相同（`rel` 只可能来自上一次的 `DirEntry.rel`，那已经是
    * 归一化形式），但这里要的是**自洽**：loading / errors / listings 三个容器必须由同一个
    * 字符串索引，否则一旦哪天两边不等，loading 就永远清不掉，那一层会一直转圈。
+   *
+   * `silent` = 后台对账（摊开一层已经读过的目录时用，见 `expand`）。这一档
+   * **不进 `loading`**——屏幕上正摊着一份缓存，闪一下「读取中…」是白付的代价；
+   * 失败也**不写 `errors`**：把用户正在看的那些行换成一句他没要求的错误更糟，
+   * 那种情况留给 ↻（`refresh`）去暴露，那是显式动作。成功时照样清旧错误。
    */
-  async function read(rel: string): Promise<void> {
-    setLoading((prev) => setWith(prev, rel))
+  async function read(rel: string, silent = false): Promise<void> {
+    if (!silent) setLoading((prev) => setWith(prev, rel))
     try {
       const listing = await listDir(root, rel)
       if (disposed) return
@@ -225,10 +234,10 @@ export function createRootTree(options: RootTreeOptions): RootTree {
       // 上一次读失败留下的错误必须清掉，否则「刷新成功了但错误还挂着」
       setErrors((prev) => mapWithout(prev, rel))
     } catch (err) {
-      if (disposed) return
+      if (disposed || silent) return
       setErrors((prev) => mapWith(prev, rel, describeTreeError(err)))
     } finally {
-      if (!disposed) setLoading((prev) => setWithout(prev, rel))
+      if (!disposed && !silent) setLoading((prev) => setWithout(prev, rel))
     }
   }
 
@@ -240,9 +249,19 @@ export function createRootTree(options: RootTreeOptions): RootTree {
 
   async function expand(rel: string): Promise<void> {
     setExpanded((prev) => setWith(prev, rel))
-    // 摊开过又收起来的层不重读：缓存还在，重读会让每次点开都闪一下 loading，
-    // 而「树外面的文件变了」这件事由刷新（M2-G 之后是文件监听）负责，不该由展开负责
-    if (listings().has(rel)) return
+    // 读过的那一层：**先照缓存摊开，再静默重读一遍对账**。
+    //
+    // 「不重读」是 M2 时的取舍，当时的理由是重读会让每次点开都闪一下 loading。静默那一档
+    // 不闪，这个理由就不成立了；而树外面的世界随时在变（Finder 里新建、`git checkout`、
+    // 构建产物），M2-G 的监听只覆盖**已打开的文件**——`src-tauri/src/watcher.rs` 的事件
+    // 要先过一张「canonical 路径 → 已打开文件」的表，新建的文件不在表里就被丢掉——
+    // 树这边除了 ↻ 没有任何自动出口，用户只会觉得这棵树在说谎。
+    //
+    // 代价是每次摊开多一次 `list_dir`：一层、非递归、不进 loading，比闪一下便宜得多。
+    if (listings().has(rel)) {
+      await read(rel, true)
+      return
+    }
     await read(rel)
   }
 

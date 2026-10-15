@@ -173,7 +173,8 @@ use vela_core::fs::{
     ReadError, StoredImage, TextFile, WriteError, WriteReport, MAX_IMAGE_BYTES,
 };
 use vela_core::project::{
-    self, merge_stats, query_many, DirEntry, DirListing, EntryKind, FileIndex, FileQuery, IndexStats, TreeError,
+    self, merge_stats, query_many, DirEntry, DirListing, EntryKind, FileIndex, FileQuery, GitHead, IndexStats,
+    TreeError,
 };
 use vela_core::search::{
     apply_roots, preflight_apply_roots, preflight_roots, search_roots, ReplaceProgress, ReplaceRequest, ReplaceSummary,
@@ -1024,6 +1025,25 @@ async fn query_cached(
     .map_err(join_failed)
 }
 
+/// 逐个根读一次 HEAD，回一份**与 `roots` 同长同序**的清单（状态栏右下角那一格）。
+///
+/// 🔴 对齐是这条命令的契约，不是巧合：`out[i]` 说的就是 `roots[i]`。前端拿它按根渲染
+/// 格子，所以「跳过不是仓库的根」这种看似省事的写法会把后面每个根的分支都挂到前一个
+/// 根的名字上——多根工作区里那是一句读起来完全通顺的假话。`None` 因此**留在原位**。
+///
+/// ⚠️ 没有错误通道，这是刻意的（理由在 `vela-core/src/project/git.rs` 的模块文档最后
+/// 一段）：这一格是装饰，读不到就不显示。给它一条 `Result` 等于逼前端把
+/// 「permission denied」说给一个只想知道自己在哪个分支上的人听，而他对那句话无能为力。
+/// 也因为这个，坏根**不做预检**：`index_project` 那套 `preflight` 在这里一条都用不上。
+///
+/// 同样声明成 `async fn`，与 [`list_dir`] 一条理由：同步 command 跑在主线程上，
+/// 而一次 `stat` 在网络卷或休眠刚醒的外接盘上可以到秒级。真正的成本是每个根读一个
+/// 几十字节的文本文件，微秒量级，所以不像 [`query_project`] 那样再往 blocking 池上挪。
+#[command]
+pub async fn git_heads(roots: Vec<String>) -> Vec<Option<GitHead>> {
+    roots.iter().map(|root| project::read_head(Path::new(root))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1512,5 +1532,49 @@ mod tests {
             assert_eq!(got.matches.len(), QUERY_LIMIT, "两个根各回 50 条，合并之后没有截断");
             assert_eq!(got.total as usize, total * 2, "total 报的是回来的条数，前端就没法说「还有更多」了");
         });
+    }
+
+    /// 造一个「在 `branch` 上」的假仓库：只有 `.git/HEAD` 那一个文件。
+    ///
+    /// ⚠️ 够用了——`read_head` 只读那一个文件，而这一层要钉的是**清单的对齐**，
+    /// 不是 HEAD 的解析（那一层的十五种写法在 `vela-core/src/project/git.rs` 里钉过了）
+    fn git_fixture(branch: &str) -> tempfile::TempDir {
+        let dir = index_fixture();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
+        dir
+    }
+
+    /// 🔴 [`git_heads`] 唯一的契约：**清单与 `roots` 同长同序**，不是仓库的那一位是 `None`。
+    ///
+    /// 「把 `None` 滤掉再回来」是一个看着更省事的写法，而它的失败方式是**静默的错位**：
+    /// 多根工作区里第二个根不是仓库时，第三个根的分支会被挂到第二个根的名字上——
+    /// 界面上每一格都长得对，只是说的是别人的分支。这一条钉住的就是那种错位
+    ///
+    /// 顺带钉住「没有错误通道」那半：不存在的路径也是 `None`，不 reject、不 panic
+    #[test]
+    fn git_heads_与_roots_同长同序_不是仓库的那一位留着_none() {
+        let (plain, main, feature) = (index_fixture(), git_fixture("main"), git_fixture("feature/x"));
+        let missing = plain.path().join("nope").to_string_lossy().into_owned();
+        let roots = vec![root_of(&plain), root_of(&main), missing, root_of(&feature)];
+
+        let got = tauri::async_runtime::block_on(git_heads(roots.clone()));
+
+        assert_eq!(got.len(), roots.len(), "清单与 roots 不同长，前端就没法按位对了");
+        assert_eq!(got[0], None, "不是仓库的根必须占着一位");
+        assert_eq!(got[1].as_ref().map(|h| h.name.as_str()), Some("main"));
+        assert_eq!(got[2], None, "不存在的路径也是 None：这一格没有错误通道");
+        assert_eq!(got[3].as_ref().map(|h| h.name.as_str()), Some("feature/x"));
+    }
+
+    /// 一个根都没有时回一个空清单（不是 `null`，也不 reject）。
+    ///
+    /// 前端在「没打开任何文件夹」的时候压根不该调它，但会话恢复的那一瞬间、
+    /// 以及关掉文件夹的那一刻都会短暂经过这个状态——那时一次 reject 会变成
+    /// 一条没人接的 promise，而 `null` 会让前端的 `.map` 直接抛
+    #[test]
+    fn git_heads_没有根时回空清单() {
+        let got = tauri::async_runtime::block_on(git_heads(Vec::new()));
+        assert!(got.is_empty());
     }
 }

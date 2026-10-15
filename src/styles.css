@@ -268,12 +268,32 @@ body {
 
 .app {
   display: grid;
-  /* 五行：工具栏 / 标签条 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
+  /* 五行：标签条 / Markdown 工具栏 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
      行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上。
      标签条放在提示条**上面**：提示条出现或消失时只推动正文区，标签条不跟着跳。
      状态栏在最后，高度由自己定（22px），不参与 1fr 的分配 */
   grid-template-rows: auto auto auto 1fr auto;
   height: 100%;
+}
+
+/* 🔴 五个流内子元素**逐个钉死行号**，不靠自动放置：工具栏移进原生菜单之后流内子元素
+   从五个变成了四个（Markdown 工具栏还是 <Show> 条件渲染的，时有时无），自动放置会把
+   `.main` 挤到第三行的 auto 上、把状态栏挤到 1fr 上——正文区按内容高、状态栏悬在窗口当中，
+   底下整片露底。钉住行号之后「少一个子元素」只是空着一行（auto 行高 0），不会再错位 */
+.app > .tab-strip {
+  grid-row: 1;
+}
+.app > .md-toolbar {
+  grid-row: 2;
+}
+.app > .notices {
+  grid-row: 3;
+}
+.app > .main {
+  grid-row: 4;
+}
+.app > .statusbar {
+  grid-row: 5;
 }
 
 /* ---------- 工具栏 ---------- */
@@ -1554,6 +1574,17 @@ select {
 
 .status-spacer {
   flex: 1 1 auto;
+}
+
+/* 分支那一格（`doc/StatusBar.tsx` 的 `gitCells`）。与路径格同一套伸缩：分支名可以很长
+   （`feature/XXXX-123-把状态栏那一格接上` 这种），而状态栏是 `overflow: hidden` + 不许跳高的
+   ——不让它收缩的话，被挤掉的是右边那几格读数，用户看到的是「编码那一格不见了」，
+   而不是「分支名太长」。多根工作区里这一格还带着根的名字，更长 */
+.status-git {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 编码与换行符两格是 <select>。全局的 select 规则（边框 + 底色 + 3px 内边距）是给工具栏

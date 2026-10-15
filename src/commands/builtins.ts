@@ -49,6 +49,15 @@ export interface BuiltinHooks {
   closePane: () => void
   focusNextPane: () => void
   focusPreviousPane: () => void
+  /**
+   * 关标签两条（标签右键菜单那两项的快捷键入口）。
+   *
+   * ⚠️ 语义与右键菜单**差一个字**：菜单上的「其它」是相对**被右键的那个标签**，
+   * 快捷键是相对**活动标签**——按键时用户看着的就是活动的那个，与 VS Code 同一条。
+   * 所以宿主递进来的是 `ws.closeOtherTabs(ws.activeTab().id)`，不是「上次右键的那个」。
+   */
+  closeOtherTabs: () => void | Promise<void>
+  closeAllTabs: () => void | Promise<void>
   // 项目四条（M2-B 三条 + M2-F 一条）。前三条都作用于侧边栏那棵树，最后一条作用于
   // 跳转浮层，但都不是 `ctx.editor`——没有编辑器聚焦时它们照样该能用，所以 `when` 一律不设。
   /** 弹原生目录对话框，选中之后打开成项目根并把侧边栏显示出来 */
@@ -438,6 +447,32 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       title: '合并分屏',
       category: '编辑器',
       run: () => hooks.closePane(),
+    }),
+
+    // 关标签两条。⛔ 刻意避开 `W` 那一族（`Mod+W` / `Mod+Shift+W` / `Mod+Alt+W`）：
+    // 它们在 macOS 上是「关闭窗口 / 关闭所有窗口」的既有等价物，事件在到达 webview 之前
+    // 就被吃掉了，绑在这儿收不到按键——与上面「合并分屏」不绑 `Mod+W` 同一条理由。
+    // 于是取 O = Others、A = All，两个键此前都是空的：`@codemirror` 与 `@lezer` 的 dist 里
+    // 搜不到 `Mod-Alt-o` / `Mod-Alt-a`（`Mod-Alt-` 那一批只有 ArrowUp/ArrowDown 与 Enter），
+    // 本项目的原生菜单占的是 `⌥⌘J` / `⌥⌘V` / `⌥⌘←→`，注册表里已占的是 `⌥⌘F` / `⌥⌘D`。
+    //
+    // 不设 `when`：与分屏那五条同一条理由——只读分片里 `ctx.editor` 是 null，
+    // 而「关掉其它标签」跟有没有编辑器无关；gate 上去的后果是打开一个 100 MB 的日志
+    // 之后这两条命令全哑掉。⚠️ 于是这两条要登记进 `builtins.test.ts` 的
+    // `UNGATED_EDITOR_COMMAND_IDS`，否则那条「凡 editor.* 都要 gate」的不变式会红。
+    registry.register({
+      id: 'editor.closeOtherTabs',
+      title: '关闭其它标签',
+      category: '编辑器',
+      keybinding: 'Mod+Alt+O',
+      run: () => hooks.closeOtherTabs(),
+    }),
+    registry.register({
+      id: 'editor.closeAllTabs',
+      title: '关闭所有标签',
+      category: '编辑器',
+      keybinding: 'Mod+Alt+A',
+      run: () => hooks.closeAllTabs(),
     }),
 
     // 项目（M2-B）。

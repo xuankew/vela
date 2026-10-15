@@ -215,6 +215,20 @@ export interface Workspace {
   openAt: (path: string) => Promise<void>
   /** 脏标签会先弹确认；用户选「取消」或保存没成功时，标签留在原处 */
   closeTab: (id: number) => Promise<void>
+  /**
+   * 关掉除 `id` 之外的所有标签（右键菜单的「关闭其它标签」）。
+   *
+   * 脏的那些**一次问完**（与 `requestWindowClose` 同一条口径），选「取消」就一个都不关。
+   * `id` 不存在时什么都不做——菜单弹着的时候那个标签可能已经被关掉了
+   */
+  closeOtherTabs: (id: number) => Promise<void>
+  /**
+   * 关掉所有标签（右键菜单的「关闭所有标签」）。
+   *
+   * 关完之后标签条上是一个**新的空标签**，不是空的标签条：那是文件头那条不变量
+   * （至少一个标签、至少一块分屏）要求的，`removeFromList` 在关掉最后一个时自己会补
+   */
+  closeAllTabs: () => Promise<void>
   /** 标签已经在某个分屏里显示时聚焦那个分屏，否则把它装进聚焦的分屏 */
   activateTab: (id: number) => void
   /** 拖拽重排：把 dragged 挪到 target 原来的位置上 */
@@ -763,6 +777,34 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     if (await settle([tab])) dropTab(id)
   }
 
+  /**
+   * 关掉一批标签：脏的那些**一次问完**，随后逐个摘掉。
+   *
+   * 一次问完而不是逐个问：「关闭所有标签」可能一下要关十几个，逐个弹框就是十几轮打断，
+   * 而用户其实只需要对「这些还没保存的」表一次态——与 `requestWindowClose` 同一条口径。
+   *
+   * ⚠️ 取消（或保存没成功）时**一个都不关**，而不是「关掉干净的那些」：用户点的是取消，
+   * 半关一半留在屏幕上比什么都没发生更难解释。
+   *
+   * 逐个 `dropTab` 而不是自己拼一个新列表：摘掉一个标签要顺带处理「哪块分屏改显示谁」
+   * 与「还掉分片的 fd」，那两件事都已经在 `removeFromList` / `dropTab` 里写对了，
+   * 自己拼等于把它们重抄一遍。
+   */
+  async function dropTabs(doomed: readonly Tab[]) {
+    if (doomed.length === 0) return
+    if (!(await settle(doomed.filter((t) => t.doc.dirty())))) return
+    for (const tab of doomed) dropTab(tab.id)
+  }
+
+  async function closeOtherTabs(id: number) {
+    if (!tabById(id)) return
+    await dropTabs(tabs().filter((t) => t.id !== id))
+  }
+
+  async function closeAllTabs() {
+    await dropTabs(tabs())
+  }
+
   function reorder(draggedId: number, targetId: number) {
     if (draggedId === targetId) return
     const list = [...tabs()]
@@ -1106,6 +1148,8 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     openViaDialog,
     openAt,
     closeTab,
+    closeOtherTabs,
+    closeAllTabs,
     activateTab,
     reorder,
     async save() {

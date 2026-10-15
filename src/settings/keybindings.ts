@@ -64,8 +64,8 @@ export interface KeybindingStore {
   resetAll: () => void
   /** 检测当前配置中的冲突 */
   conflicts: () => KeybindingConflict[]
-  /** 从磁盘加载配置 */
-  load: () => Promise<void>
+  /** 从磁盘加载配置，返回加载到的覆盖映射（供启动时 rebind 进注册表） */
+  load: () => Promise<UserKeybindings>
 }
 
 /** 内置默认快捷键映射（从 builtins 提取，这里只存原始声明串） */
@@ -109,18 +109,20 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
   /** 解析用户的快捷键声明，返回规范化的 Keybinding 数组 */
   function parseUserBindings(id: string, raw: string | string[]): Keybinding[] {
     const declared = Array.isArray(raw) ? raw : [raw]
-    return declared.map((source) => {
-      try {
-        return parseKeybinding(source.trim(), platform)
-      } catch (err) {
-        console.warn(`[keybindings] 命令 "${id}" 的快捷键 "${source}" 解析失败:`, err)
-        return null
-      }
-    }).filter((b): b is Keybinding => b !== null)
+    return declared
+      .map((source) => {
+        try {
+          return parseKeybinding(source.trim(), platform)
+        } catch (err) {
+          console.warn(`[keybindings] 命令 "${id}" 的快捷键 "${source}" 解析失败:`, err)
+          return null
+        }
+      })
+      .filter((b): b is Keybinding => b !== null)
   }
 
   /** 获取某个命令的当前快捷键（用户配置优先，否则内置默认） */
-  function getKeybindingsForCommand(id: string): { bindings: Keybinding[], isCustom: boolean } {
+  function getKeybindingsForCommand(id: string): { bindings: Keybinding[]; isCustom: boolean } {
     const userRaw = userConfig[id]
     if (userRaw !== undefined) {
       const parsed = parseUserBindings(id, userRaw)
@@ -142,11 +144,18 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
     const modSymbols: Record<string, string> = { ctrl: '⌃', alt: '⌥', shift: '⇧', meta: '⌘' }
     const modLabels: Record<string, string> = { ctrl: 'Ctrl', alt: 'Alt', shift: 'Shift', meta: 'Win' }
     const displayKeys: Record<string, string> = {
-      arrowup: '↑', arrowdown: '↓', arrowleft: '←', arrowright: '→',
-      space: 'Space', escape: 'Esc', enter: 'Enter', tab: 'Tab',
-      delete: 'Del', backspace: '⌫',
+      arrowup: '↑',
+      arrowdown: '↓',
+      arrowleft: '←',
+      arrowright: '→',
+      space: 'Space',
+      escape: 'Esc',
+      enter: 'Enter',
+      tab: 'Tab',
+      delete: 'Del',
+      backspace: '⌫',
     }
-    
+
     const key = displayKeys[b.key] ?? (b.key.length === 1 ? b.key.toUpperCase() : b.key)
     if (platform === 'macos') {
       return b.mods.map((m) => modSymbols[m]).join('') + key
@@ -190,7 +199,7 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
       return []
     },
 
-    async load(): Promise<void> {
+    async load(): Promise<UserKeybindings> {
       try {
         const loaded_data: LoadedKeybindings = await loadKeybindings()
         userConfig = loaded_data.keybindings
@@ -199,6 +208,7 @@ export function createKeybindingStore(platform: Platform): KeybindingStore {
         console.warn('[keybindings] 加载失败，使用空配置:', err)
         userConfig = {}
       }
+      return userConfig
     },
   }
 }

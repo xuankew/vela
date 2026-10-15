@@ -190,6 +190,22 @@ function looksLikeJson(text: string): boolean {
 }
 
 /**
+ * 这份选择是不是 JSON。
+ *
+ * 判据是 `language-data` 给的**语言名**，不是扩展名：`.json` / `.map` 会命中，
+ * 无名草稿被 `looksLikeJson` 认出来时 `languageFor` 塞回来的也是同一个 description。
+ * 再抄一份扩展名清单就会和上面那半边分叉——症状是「树上画着 JSON 图标、
+ * 状态栏也报 JSON，编辑器却不校验格式」。
+ *
+ * ⚠️ `.jsonc` / `.json5` / `.jsonl` 都**不在**这里：`language-data` 的 JSON 只认
+ * `json` 与 `map` 两个扩展名，那几个会落到 plain。这是对的——校验用的是 `JSON.parse`，
+ * 带注释的 JSONC 会被它判成非法，标一片红。
+ */
+export function isJsonLanguage(choice: LanguageChoice): boolean {
+  return choice.description?.name === 'JSON'
+}
+
+/**
  * 无名文档当 Markdown。
  *
  * 这不是偷懒的默认值：Vela 主打 Markdown 友好，「新建标签随手写点东西」最可能写的

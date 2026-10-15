@@ -5,19 +5,31 @@ import type { Workspace } from './workspace'
 import { UNTITLED_LABEL } from './document'
 
 /**
- * 标签右键菜单的动作。只有一个，所以 `onPick` 里不需要 switch——类型已经把它钉死了，
- * 加第二项时 TS 会自己站出来要求处理
+ * 标签右键菜单的动作。
+ *
+ * 🔴 `onPick` 里必须有 switch：三项各有各的落点，而「加了第四项却忘了处理」的失败方式
+ * 是点下去什么也没发生（类型只在 `action` 上帮忙，不会替你写分支）
  */
-type TabMenuAction = 'reveal'
+type TabMenuAction = 'reveal' | 'closeOthers' | 'closeAll'
 
 /**
- * 菜单里就一项。
+ * 菜单里那几项，按「这一个标签自己的事 / 一批标签的事」分成两组，中间一条分隔线。
  *
- * ⚠️ 措辞与树菜单那一项（「在 Finder 中显示」）**刻意不同**：树上右键的是磁盘里的一个
- * 条目，「显示」说的就是它；标签上右键的是一份**打开着的文档**，用户想知道的是
- * 「这个文件到底躺在哪儿」。两句背后是同一个 `open -R`，而后者不要求用户先知道 Finder 这个词。
+ * ⚠️ 「打开文件所在目录」的措辞与树菜单那一项（「在 Finder 中显示」）**刻意不同**：
+ * 树上右键的是磁盘里的一个条目，「显示」说的就是它；标签上右键的是一份**打开着的文档**，
+ * 用户想知道的是「这个文件到底躺在哪儿」。两句背后是同一个 `open -R`，
+ * 而后者不要求用户先知道 Finder 这个词。
+ *
+ * 未命名文档没有磁盘上的位置，所以那一项由 `itemsFor` 摘掉，剩下两项照常可用。
  */
-const MENU_ITEMS: ContextMenuItem<TabMenuAction>[] = [{ action: 'reveal', label: '打开文件所在目录' }]
+const REVEAL_ITEM: ContextMenuItem<TabMenuAction> = { action: 'reveal', label: '打开文件所在目录' }
+const CLOSE_ITEMS: ContextMenuItem<TabMenuAction>[] = [
+  { action: 'closeOthers', label: '关闭其它标签', separator: true },
+  { action: 'closeAll', label: '关闭所有标签' },
+]
+
+const itemsFor = (path: string | null): ContextMenuItem<TabMenuAction>[] =>
+  path === null ? CLOSE_ITEMS : [REVEAL_ITEM, ...CLOSE_ITEMS]
 
 export interface TabStripProps {
   workspace: Workspace
@@ -77,12 +89,15 @@ export function TabStrip(props: TabStripProps) {
   /**
    * 右键弹出来的那一份菜单。
    *
-   * 存**路径**而不是标签 id：菜单弹着的时候那个标签可能已经被关掉了（Mod+W、点 ×），
-   * 存 id 的话点下去要么查不到、要么查到复用了同一个 id 的另一份文档——后者会在
-   * Finder 里选中一个与用户刚才右键的东西无关的文件，而且不报错。
-   * 与 Sidebar 把整行 `row` 存成快照同一条理由
+   * 🔴 存**路径 + 标签 id**，两者各管一项动作：`reveal` 用路径，「关闭其它标签」用 id
+   * （workspace 那边只认 id）。菜单弹着的时候那个标签可能已经被关掉了（Mod+W、点 ×），
+   * 所以两项都自带兜底——路径是快照，`closeOtherTabs` 对不存在的 id 是空操作。
+   *
+   * id 不会被复用（`nextTabId` 只增），于是「存 id 会查到另一份文档」这件事在这里不成立；
+   * 真正需要快照的是路径：未命名文档存了盘之后 `doc.path()` 就变了，
+   * 而用户右键的是**弹出菜单那一刻**的那份文档。与 Sidebar 把整行 `row` 存成快照同一条理由
    */
-  const [menu, setMenu] = createSignal<{ x: number; y: number; path: string } | null>(null)
+  const [menu, setMenu] = createSignal<{ x: number; y: number; tabId: number; path: string | null } | null>(null)
 
   /** 显示在别的分屏里（聚焦那块不算，那是 active） */
   function shownElsewhere(tabId: number): boolean {
@@ -94,20 +109,35 @@ export function TabStrip(props: TabStripProps) {
    * 用户需要确认自己点的是哪一个；标签不会——它就摆在光标底下，而且 `title` 挂着完整路径。
    * 在这里激活等于「右键一下，正文换了」，那是用户没要求的副作用。
    *
-   * 未命名文档**连菜单都不弹**（也就不 `preventDefault`，这一下右键原样归系统）：
-   * 磁盘上没有对应文件，「打开所在目录」无从谈起，而菜单只有这一项，
-   * 弹一份空的／灰的出来只是让用户多点一次关闭
+   * ⚠️ 未命名文档也弹菜单（原来不弹）：那时菜单里只有「打开文件所在目录」一项，
+   * 而它对未命名文档无从谈起，弹一份空的／灰的出来只是让用户多点一次关闭。
+   * 现在多了两项关闭动作，它们对未命名文档一样成立，于是这一档不再例外——
+   * 只是把 `reveal` 那一项摘掉（见 `itemsFor`）
    */
-  function onTabContextMenu(e: MouseEvent, path: string | null) {
-    if (path === null) return
+  function onTabContextMenu(e: MouseEvent, tab: { id: number; path: string | null }) {
     // 不拦的话 macOS 会在我们的菜单旁边再弹一个原生的，两个叠在一起（与 Sidebar 同一条）
     e.preventDefault()
-    setMenu({ x: e.clientX, y: e.clientY, path })
+    setMenu({ x: e.clientX, y: e.clientY, tabId: tab.id, path: tab.path })
   }
 
   /** 成了不说话（Finder 被推到前台本身就是回话），没做成才把那句话交给提示条 */
   function reveal(path: string) {
     void revealFile(path).catch((err: unknown) => onError?.(describeTreeError(err)))
+  }
+
+  function onPick(action: TabMenuAction, m: { tabId: number; path: string | null }) {
+    switch (action) {
+      case 'reveal':
+        // path 为 null 时这一项压根不在菜单里，兜一句只是为了让 `reveal` 收到 string
+        if (m.path !== null) reveal(m.path)
+        return
+      case 'closeOthers':
+        void ws.closeOtherTabs(m.tabId)
+        return
+      case 'closeAll':
+        void ws.closeAllTabs()
+        return
+    }
   }
 
   return (
@@ -136,7 +166,7 @@ export function TabStrip(props: TabStripProps) {
             title={tab.doc.path() ?? UNTITLED_LABEL}
             draggable={true}
             onClick={() => ws.activateTab(tab.id)}
-            onContextMenu={(e) => onTabContextMenu(e, tab.doc.path())}
+            onContextMenu={(e) => onTabContextMenu(e, { id: tab.id, path: tab.doc.path() })}
             onDragStart={() => {
               draggedId = tab.id
             }}
@@ -178,8 +208,8 @@ export function TabStrip(props: TabStripProps) {
           <TreeMenu
             x={m().x}
             y={m().y}
-            items={MENU_ITEMS}
-            onPick={() => reveal(m().path)}
+            items={itemsFor(m().path)}
+            onPick={(action) => onPick(action, { tabId: m().tabId, path: m().path })}
             onClose={() => setMenu(null)}
           />
         )}

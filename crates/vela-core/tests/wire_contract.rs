@@ -20,8 +20,8 @@ use vela_core::fs::{
     TextFile, WriteReport, MAX_IMAGE_BYTES, MAX_INLINE_BYTES, MAX_SHARD_BYTES,
 };
 use vela_core::project::{
-    create_entry, list_dir, merge_stats, query_many, rename_entry, DirEntry, DirListing, EntryKind, FileIndex,
-    FileMatch, FileQuery, IndexStats, TreeError,
+    create_entry, list_dir, merge_stats, query_many, read_head, rename_entry, DirEntry, DirListing, EntryKind,
+    FileIndex, FileMatch, FileQuery, GitHead, IndexStats, TreeError,
 };
 use vela_core::search::{
     apply, apply_roots, preflight_apply, preflight_apply_roots, preflight_roots, search, search_roots, MatchRange,
@@ -1583,4 +1583,51 @@ fn save_落盘再_load_回来一致() {
     assert_eq!(loaded.settings, settings);
     assert_eq!(loaded.report.user_layer, LayerStatus::Present);
     assert_eq!(loaded.report.project_layer, LayerStatus::Absent);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 状态栏右下角那一格「当前分支」。钉的是**清单的形状**：`git_heads` 回的是
+// `Vec<Option<GitHead>>`，与 `roots` 同长同序，不是仓库的那一位是 `null`。
+// 前端 `src/ipc/git.ts` 的镜像类型与 `src/ipc/git.test.ts` 的黄金 JSON 是另一半。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `GitHead` 自己的形状：camelCase、两键、没有 `Option`。
+///
+/// ⚠️ `detached` 是这一格**唯一的语义开关**：`name` 在两种情况下装的是不同的东西
+/// （分支名 / 短 sha），前端不看这个布尔就会把 `6a1b2c3` 当成分支名画出来。
+/// 它写成 `is_detached` 的失败方式是前端读到 `undefined`——`undefined` 是 falsy，
+/// 于是游离 HEAD 一律被当成分支，而且一句话都不报
+#[test]
+fn git_head_的线上形状() {
+    assert_eq!(
+        serde_json::to_string(&GitHead { name: "main".to_owned(), detached: false }).unwrap(),
+        r#"{"name":"main","detached":false}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&GitHead { name: "6a1b2c3".to_owned(), detached: true }).unwrap(),
+        r#"{"name":"6a1b2c3","detached":true}"#
+    );
+}
+
+/// 🔴 `null` **留在原位**，清单与 `roots` 同长同序。
+///
+/// 这一条钉的是 `git_heads` 唯一的契约。把 `None` 滤掉再序列化看着更省事，
+/// 而它的失败方式是**静默的错位**：第二个根不是仓库时，第三个根的分支会被前端挂到
+/// 第二个根的名字上——界面上每一格都长得对，只是说的是别人的分支。
+/// 「同长同序」在 JSON 这一层就是「长度与 `null` 的位置都对得上」，所以字面量整条钉死
+#[test]
+fn git_heads_清单里不是仓库的那一位是_null_而且留在原位() {
+    let plain = tempfile::tempdir().unwrap();
+    fs::write(plain.path().join("README.md"), "# 标题").unwrap();
+
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".git")).unwrap();
+    fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // 第三个根压根不存在：`read_head` 没有错误通道，它同样是「这一位没有答案」
+    let missing = plain.path().join("nope");
+    let roots = [plain.path().to_path_buf(), repo.path().to_path_buf(), missing];
+
+    let got: Vec<Option<GitHead>> = roots.iter().map(|root| read_head(root)).collect();
+    assert_eq!(serde_json::to_string(&got).unwrap(), r#"[null,{"name":"main","detached":false},null]"#);
 }
