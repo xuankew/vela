@@ -45,9 +45,7 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
  * @param progressCallback 可选的进度回调
  * @returns 是否需要重启
  */
-export async function installUpdate(
-  _progressCallback?: (_progress: number) => void
-): Promise<boolean> {
+export async function installUpdate(_progressCallback?: (_progress: number) => void): Promise<boolean> {
   // 🔴 占位实现
   console.warn('[updater] installUpdate 尚未实现')
   return false

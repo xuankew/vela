@@ -1,5 +1,8 @@
 # M5 · 插件接口收敛 - 设计方案
 
+> 🔴 **本文档描述的代码已于 2026-10-20 回退（M5-R），只保留设计记录。**
+> 原实现（`src/bridge/`、`src/plugins/loader.ts`、`plugins/` 两个示例插件，提交 `020e7b2`）从未被 App 接线，`src/bridge/index.ts` 里 12 处 `TODO` 桩未实现，两个示例插件的核心能力都挂在永不触发的桩上。本文与 `M5-API-REVIEW.md`、`docs/plugin-api.md` 一并留存，**不要照它去找源码**。回退理由与账目见 PLAN.md「M5-R 实施修正」。
+
 ## 目标
 
 不开放第三方插件生态，只做**内部重构 + 冻结 API 边界**。把当前散落在 `src/ipc/*` 和 `src-tauri/src/commands.rs` 里的 23 个 Tauri command 收敛到一个带版本号的 `vela.*` 桥对象后面。

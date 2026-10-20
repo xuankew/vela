@@ -44,10 +44,17 @@ function valueClass(value: unknown): string {
  */
 function formatValue(value: unknown): string {
   if (value === null) return 'null'
+  if (value === undefined) return 'undefined'
   if (typeof value === 'boolean') return value.toString()
   if (typeof value === 'number') return value.toString()
+  if (typeof value === 'bigint') return value.toString()
   if (typeof value === 'string') return `"${escapeHtml(value)}"`
-  return String(value)
+  if (typeof value === 'symbol') return value.toString()
+  // 只剩 function 与 object/array，而 ⛔ 不能用 `String(value)`：那会把对象变成
+  // '[object Object]'（正是 no-base-to-string 在拦的）。object/array 在调用方
+  // renderValue 里就被 isExpandable 分流去递归了、进不到这一行，所以这里实际只承接
+  // function——JSON 里本来就没有函数，给它一个不撒谎的 'null'
+  return JSON.stringify(value) ?? 'null'
 }
 
 /**
@@ -74,7 +81,7 @@ function renderValue(
 
   // 可折叠的节点（对象或数组）
   const isArray = Array.isArray(value)
-  const size = isArray ? value.length : Object.keys(value as Record<string, unknown>).length
+  const size = isArray ? value.length : Object.keys(value).length
   const nodeId = `json-node-${path.join('-')}`
   const toggleId = `json-toggle-${path.join('-')}`
 

@@ -20,7 +20,7 @@
 2. **前端选 Solid**，runtime 8.4KB gzip，无虚拟 DOM，与 CM6 的命令式 DOM 管理边界最干净。
 3. **文档模型 v1 放在前端**（CM6 的 `Text` 本身就是 rope），编辑零 IPC 延迟。Rust 侧**不持有全文**：超大文件走只读分片，Rust 只存一份「每 1024 行一个字节偏移」的稀疏索引，正文按行号窗口现读现还。⚠️ 这里推翻了原计划的 `ropey` 方案，理由见 §3.4「M2-H 实施修正」1。
 4. **不碰任何 copyleft 代码**。Zed 编辑器核心是 GPL-3.0、athas 是 AGPL-3.0、hermes-ide 是 BUSL 1.1 且明文排除竞品编辑器——三者均不可复用于闭源商业化。可安全复用的是 MIT/Apache/Unlicense 生态：`memchr`、`ignore`、`grep-*`、`notify`、`tree-sitter`（`ropey` 也在这一档，但 M2-H 最终没有引入它）。
-5. **插件系统 v1 只收敛接口、不开放**。把宿主能力全部收到带版本号的 `vela.*` 桥对象后面，用 2–3 个「假装是第三方」的示例插件反向验证 API 表达力。将来开放 L1 方案额外仅需 5–10 人日。
+5. ⛔ **插件系统 v1 连「收敛接口」也不做了（M5-R 改判，2026-10-20）。** 原写「把宿主能力全部收到带版本号的 `vela.*` 桥对象后面，用 2–3 个『假装是第三方』的示例插件反向验证 API 表达力，将来开放 L1 额外仅需 5–10 人日」——这件事**做过一次**（提交 `020e7b2`，1433 行），而**反向验证的产出是发现了缺陷、不是通过**：桥里 12 处 `TODO` 桩从未实现，两个示例插件的核心能力恰好都挂在永不触发的桩上（`auto-backup` 整个逻辑依赖 `workspace.onFileChange`，那个桩返回空函数），而且 `M5-API-REVIEW.md` 自己列的三项待确认决策**从没人确认过**、它自己的建议就是「推迟到真有插件需求时再做」。代码已回退，三份设计文档留存。⚠️ 于是「将来开放 L1 仅需 5–10 人日」这个数**失去了证据**——它是那次收敛的产物，现在得重算。详见 §3.7「M5-R 实施修正」
 6. **中文字体是最大的体积风险**：`LXGWWenKaiScreen.ttf` 单文件 24.48MB。方案为 WOFF2 分片 + `unicode-range` 懒加载。✅ **M1-G 核实后已达标：首屏（启动 + 空文档 + 界面文案）实测 26 片 / 1.039MB，在 2MB 预算内。** M0 记的 2.219MB 是**1 万行合成压测文档滚完后的稳态**，被错标成了首屏；原写「分片按码位区块切、按字频重排可降到 1.0~1.2MB」的根因与修法**双双作废**——上游 `cn-font-split` 本来就按字频装箱，而把常用字集中成大分片反而会让典型一屏从 0.65MB 涨到 1.09MB。⛔ **不要自己动手切字体二进制**：上游 OFL 声明了 RFN `'LXGW'`，自切即成为 Modified Version 的作者，对闭源商业发布是实打实的责任（详见 §3.3「M1-G 实施修正」5）。
 7. **总量 43–54 人日**（1 名熟练 Rust+TS 全栈全职，约 9–11 周）。M1 结束（第 3 周末）即有可日用的编辑器。
 8. ✅ **M0 风险闸门已通过（2026-09-14），八项验收全部有结论**：WKWebView 的滚动/输入手感这个生态级 open issue（tauri-apps/discussions#8436）**没有被证实**——客观上机器空闲时帧计时贴着 60Hz vsync 上限（59.5~60.3fps，p95 ≤23ms），1 万行涨到 5 万行无可测退化；主观上用户在 5 万行文档用触控板连续滚动判定「没有卡顿，挺流畅」（且是在 `load 3.49` 的高负载下判的，属更严苛条件下的通过）；中文 IME 亦人工判定通过。**原计划「唯一会推翻 Tauri 路线的情形」已正式排除，Safari 对照组不必做**。**Tauri 2 路线确认，M1 可开工**。数据见 [`M0-REPORT.md`](M0-REPORT.md)。
@@ -65,7 +65,7 @@
 - ❌ **协作编辑 / CRDT**
 - ❌ **AI 补全**：将来作为插件实现，不进内核。
 - ❌ **所见即所得 Markdown（WYSIWYG）**：用分屏预览代替。Obsidian 的 Live Preview 是自研装饰层，成本极高。
-- ❌ **第三方插件开放**：v1 只收敛接口。
+- ❌ **第三方插件开放**：~~v1 只收敛接口~~ ⛔ **M5-R 改判（2026-10-20）：v1 连接口都不收敛**。桥对象与示例插件写过又回退了，理由见 §0 摘要第 5 条与 §3.7「M5-R 实施修正」。⚠️ 但架构上「一切皆命令」那条**仍然成立**（`src/commands/registry.ts` 是真在跑的单一入口），所以将来要开放时省下的那部分工作没白做
 
 ### 1.4 编辑器能力清单
 
@@ -537,6 +537,9 @@ registry.register({ ... })
 
 #### `vela.*` 桥对象（唯一对外 API 面）
 
+> ⛔ **M5-R（2026-10-20）：下面这份草图实现过一次又回退了，现在仓库里没有 `vela.*`。**
+> 留着当设计参考可以，⛔ 别照它去找源码或写插件。实现与草图的差异（多出 search/replace/session/settings 四组、`tools.register` 缺失、shim 一层没写、31 个方法里有 12 处是 `TODO` 桩）逐条记在 §3.7「M5-R 实施修正」；`docs/plugin-api.md` 顶部也钉了同样的横幅。
+
 ```ts
 const vela = {
   version: '1.0.0',
@@ -566,7 +569,7 @@ const vela = {
 
 **已排除**：Deno/V8（`rusty_v8` 使二进制增大数十 MB，与「轻量」直接冲突）、proxy-wasm（网络代理 ABI，不适用）、wasmCloud（分布式运行时，过重）。
 
-**建议：v1 只做 M5（接口收敛），把 L1 留到有真实生态需求时。**
+**建议：~~v1 只做 M5（接口收敛），把 L1 留到有真实生态需求时。~~** ⛔ **M5-R 改判：v1 连 M5 也不做，L1 一并留到有真实生态需求时。** 那次收敛的实际结果见 §3.7——它证明的恰恰是「没有真实插件需求时，收敛出来的 API 面会长歪」（多长出了四组、`when` 被硬编成 `() => true`、桩与真实现混在同一个对象里没人分得清）。⚠️ 上表 L1 的 **5–10 人日是那次收敛的产物，随代码一起作废**，将来要开放得重估。
 
 **启动性能对策**：N 个插件 = 启动时多解析执行 N 份 bundle。必须**懒激活**——manifest 声明激活时机，命令首次触发才加载（Obsidian 即如此）。
 
@@ -1658,19 +1661,40 @@ const vela = {
 
 ### 3.7 M5 · 插件接口收敛（3–5 人日）
 
+> ⛔ **本阶段已改判为「v1 不做」（M5-R，2026-10-20）。** 下表 5 个工作项在提交 `020e7b2` 里**全部实现过一次**（1433 行），其中**代码那 774 行已于 2026-10-20 回退删除**，**文档那 659 行留存**（`M5-DESIGN.md` 262 / `docs/plugin-api.md` 278 / `M5-API-REVIEW.md` 119，三份顶部各钉了一条「代码已回退」横幅）。逐项对账与回退理由见下面「M5-R 实施修正」。
+
 **目标**：不开放第三方，只做**内部重构 + 冻结 API 边界**。
 
-| 工作项 | 人日 |
-|---|---|
-| 所有宿主能力收敛到 `vela.*` 桥对象，带版本号 | 1.5 |
-| 写 **2–3 个「假装是第三方」的示例插件**，验证 API 表达力 | 1.5 |
-| 激活时机声明机制（懒激活，避免 N 个插件拖慢启动） | 0.5 |
-| 内部 API 契约文档 | 0.5 |
-| 审视并砍掉多余 API 面（**发布即冻结，现在是最便宜的时候**） | 1 |
+| 工作项 | 人日 | 实际结果（M5-R 对账） |
+|---|---|---|
+| 所有宿主能力收敛到 `vela.*` 桥对象，带版本号 | 1.5 | ⛔ **做过又删了**：8 组 / 31 个方法 / `version: '1.0.0'`，而其中 10 处是 `TODO` 桩、2 处只 `console.log`；`minAppVersion` 版本协商与 shim 适配层**一行没写** |
+| 写 **2–3 个「假装是第三方」的示例插件**，验证 API 表达力 | 1.5 | 🔴 **写了 2 个，验证结论是「不通过」**：`auto-backup` 整个逻辑挂在 `workspace.onFileChange` 那个返回空函数的桩上（永不触发）、`word-count` 的结果只能走 `ui.showToast` 那个 `console.log` 桩，两个都**跑不出可见效果**；且**零测试覆盖**（全仓测试文件里没有任何一处引用 `plugins/`） |
+| 激活时机声明机制（懒激活，避免 N 个插件拖慢启动） | 0.5 | ⛔ **半个**：`manifest.activationEvents` 字段与 `activatePlugins(vela, event)` 都写了，但**没有任何自动扫描/加载步骤**，`loadPlugin()` 必须被显式调用，而全仓没人调它 → 触发链路从未接通 |
+| 内部 API 契约文档 | 0.5 | ✅ **唯一真正留下来的产出**：`docs/plugin-api.md`（278 行）留存，但顶部已注明「这套 API 没有实现」 |
+| 审视并砍掉多余 API 面（**发布即冻结，现在是最便宜的时候**） | 1 | ⚠️ **审视做了、砍没砍成**：`M5-API-REVIEW.md` 给出了 14 暴露 / 9 排除的分类，但它末尾那 3 项「用户确认事项」**从未被确认过**，状态栏至今写着「待用户确认」；它自己的建议（选项 B：v1.0.0 不含未实现方法；示例插件推迟）恰好就是后来回退代码的理由 |
 
 > **为什么值得做**：用示例插件反向验证是发现 API 设计缺陷的唯一可靠方法。等真有第三方开发者时才发现问题，改起来就是 breaking change。
+> 🔴 **M5-R 补一句**：这条判断**被证实了，只是方向相反**——反向验证确实发现了缺陷（下面第 3 条那四处），而由于 v1 压根不开放第三方，「发现了缺陷」之后既没有动力修、也没有使用者在等，于是正确动作是**删掉代码、留下结论**，而不是把 3~5 人日投进补桩。
 >
 > **将来开放的成本**（调研估算）：L1（webview 内 JS，Obsidian 同款无沙箱）额外 **5–10 人日**；L2（权限 + 市场 + 生命周期）累计 15–30；L3（QuickJS/Wasm 沙箱）累计 35–70。
+> ⚠️ **L1 那个 5–10 人日是这次收敛的产物，随代码一起作废**，将来要开放得重估（重估时可以先读留存的三份文档，那部分价值没丢）。
+
+> **M5-R 实施修正**（插件代码回退 + CI 红灯清零，2026-10-20）
+>
+> 1. 🔴 **触发这一轮的不是插件，是「CI 一直是红的、而且红了 35 个提交没人看」。** `.github/workflows/ci.yml` 的 web job 是**硬门禁**：`pnpm lint`（:35）与 `pnpm format:check`（:37）都没有 `continue-on-error`，而 `ci.yml` 是 `1562980`（M2）就加进去的、**早于**引入这批红灯的 `020e7b2`（M5 插件）。所以从 M5 那次提交起，`origin/main` 的 web job 就该一路红到今天。⚠️ **远端 run 的实际状态未确认**（本机没装 `gh`），但本地可复现、且这两步没有任何豁免开关，逻辑上没有第二种可能。🔴 **真正的教训不是「红灯要修」，而是「有门禁却没人看门禁」**——M4-I 第 9 条与 M3-A-6 补做第 11 条都把这笔红灯记成「既有基线」然后继续往前走，两次的措辞都对、两次都没人去点那个红叉。
+> 2. ⛔ **删代码、留文档，这是用户在四个选项里选的。** 四个选项是：① 删代码留设计文档（选中）；② 全删（含 3 份 markdown）；③ 接线（最小 1 人日 / 补全所有桩 3~5 人日）；④ 代码不动、只把这两个目录从 lint 门禁里排除掉。选 ① 的理由：三份 markdown **一条 lint 都不贡献**（prettier/eslint 都不管它们），删掉等于把 262 行 API 设计与那份评审结论一起扔了；而 `src/bridge/` + `src/plugins/loader.ts` + `plugins/` 一删，**40 条 error 与 6 个 prettier 不合规文件同时消失**。④ 被否是因为它是唯一会让债变贵的选项：把 40 条真实的类型隐患藏进 ignore，死代码还留着。
+> 3. 🔴 **接线成本里有一条是「静默错」，值得单独记。** 桥的 `CommandDef` 是 `run: () => void | Promise<void>` + `when?: () => boolean`（**都不收参数**），而真在跑的 `commands/registry.ts` 的 `CommandDefinition` 是 `run: (ctx: AppContext) => …` + `when?: (ctx: AppContext) => boolean`。桥接层于是把 ctx **丢掉**，并且用 `when: meta?.when ? () => true : undefined`（`index.ts:190`，注释写着「TODO: 解析 when 表达式」）把条件**硬编成永真**。后果不是报错：插件注册的命令会**在没有编辑器聚焦时照样执行**，而那些命令的门控（`ctx.editor !== null`，本项目 61 条命令里绝大多数都有）正是防这个的。⚠️ 同一文件里 `keybindings: []`（:208）与 `enabled: true`（:209）也是同类硬编。**这类缺陷在示例插件上看不出来**——两个示例都没注册命令，所以「反向验证」验不到它，这本身就是 M5 那条方法论的一个漏洞。
+> 4. ⚠️ **另外三处桩，都是「有现成的 IPC 可接、就是没接」**：`workspace.onFileChange`（`src/ipc/watch.ts` 已经有 `FileChangedPayload`）、`search.*` / `replace.*`（`src/ipc/search.ts`、`src/ipc/replace.ts` 都在）、`ui.showToast`（没有 toast 组件，要新写）。以及一条加载方式的事实：`loader.ts` 用 `fetch(manifestPath)` 读 manifest、用 `await import()` 加载 `main.js` → **只能加载打包进 webview 的资产，读不了文件系统任意路径**；若要支持「用户自己装插件」，必须新增 Tauri command 读插件文件，那会撞上 `tests/wire_contract.rs` 与 `src/ipc/session.test.ts` 那套金标契约（成本陡增）。⚠️ 安全口径如实记：`import()` 与 CM6 同上下文、**无沙箱无权限无超时**，插件可以自己 `import('@tauri-apps/api/core')` 绕过桥对象直接调任意 Tauri command。这与 §1.3「v1 不开放第三方」是自洽的（L1 本来就是 Obsidian 同款无沙箱），但**一旦将来开放，这一条就是全部风险**。
+> 5. 🔴 **删代码是安全的，因为它是真死代码**：`git grep` 全仓（排除这两个目录自身）对 `bridge` / `plugins/loader` / `createVelaBridge` / `VelaBridge` **零命中**，`plugins/` 也没进 `vite.config.ts` / `tauri.conf.json` / `package.json` 的任何构建或打包配置。删掉 7 个文件（774 行）之后 typecheck / test / build **一字未变**（3084 passed、96 files；cargo 455 passed，Rust 侧一个字节没动）。⚠️ 删除动作走的是 `git rm`，工作树当时是干净的（全部已提交），所以整批随时可以 `git checkout 020e7b2 -- <path>` 取回。
+> 6. ⚠️ **eslint 67 → 8（0 error + 8 warning），prettier 12 → 0，两条口径都要说清楚。** ① 40 条随代码删除消失；② 剩下 19 条真修了，其中 **12 条是机械可修**（3 处 `no-unnecessary-type-assertion`：`fontSizeZoom.ts:19,45` 的 `view.dom as HTMLElement`、`json/render.ts:77` 的 `as Record<string, unknown>`；5 处 `App.tsx` 的 `no-explicit-any`：`routeMenuEvent` 那个 `{ editor: any }` 换成真类型 `AppContext`——它本来就在同一个文件里 import 了；4 处 `no-unused-vars`）+ **7 条需要做决定**（3 处 `JSON.parse` 的 `no-unsafe-assignment`：`builtins.ts` 的 formatJson/minifyJson 与 `JsonPreview.tsx`，一律标成 `const value: unknown = JSON.parse(text)`——下游 `JSON.stringify` / `renderJson` 收的本来就是 `unknown`，所以不需要收窄，而 `unknown` 才是实话；`App.tsx:1325` 的 `no-floating-promises` 加 `void`，与紧邻那行 `void attachWindowCloseGuard(...)` 同一写法；`App.tsx:1332-1333` 的 `no-misused-promises` 把 `openViaDialog: ws.openViaDialog` 与 `openFolder` 两个 async 函数包成 `() => void fn()`，因为 actions 那份签名要的是 `() => void`；`json/render.ts:50` 的 `no-base-to-string` 重写了 `formatValue`，把 bigint / undefined / symbol 各自显式接掉、末尾改走 `JSON.stringify(value) ?? 'null'`，⛔ 不再对 `unknown` 调 `String()`）。
+> 7. 🔴 **那 4 条 `no-unused-vars` 是靠改 eslint 配置修的，不是改代码——这条要单独讲清楚。** 新增规则 `'@typescript-eslint/no-unused-vars': ['error', { args: 'after-used', argsIgnorePattern: '^_', ignoreRestSiblings: true }]`。理由是这 4 处**都不能靠删参数解决**：`KeybindingsDialog.test.tsx` 的 `vi.fn((_id: string, _kb: string) => true)` 必须把参数类型写在实现里，因为变量声明是 `Mock<(id: string, kb: string) => boolean>`，而 `Mock<T>` 带着 `mock.calls: Parameters<T>[]`，实现写成 `() => true` 会让它变成 `[][]`、赋不回声明处；`ipc/updater.ts:49` 的 `_progressCallback` 是**占位实现的公开签名**（updater 插件还没装，那是 M6 的债），参数名在这里就是文档。⚠️ **刻意只放过参数**：`varsIgnorePattern` 没开，`const _foo = ...` 那种真该删的死变量仍然会报。理由全文写在 `eslint.config.js` 里（与那份配置文件既有的房规一致：每条 override 都自带一段为什么）。
+> 8. ⚠️ **剩下 8 条 `solid/reactivity` 是 warning，本轮刻意不动。** `eslint .` 只对 error 返回非零退出码，所以它们**不挡 CI**。8 条分布在 `SettingsDialog`(3)、`KeybindingsDialog`(2)、`JsonPreview`、`MarkdownToolbar`、`workspace.ts:1152`。⛔ 不要顺手「清干净」：这条规则抓的是「解构 props / 在 tracked scope 外读 signal」，每一处都要判断响应性该往哪儿挪，改错了不报错、只是**界面不再更新**——那是本项目最难查的一类 bug。要做就单独开一轮，配 `App.test.tsx` 的真实渲染断言兜底。
+> 9. ⚠️ **prettier 那 12 个文件全是纯格式差异**，6 个随删除消失，剩下 6 个（`deploy/updater-worker/index.ts` 29 行、`src/md/MarkdownToolbar.tsx` 与 `src/settings/SettingsDialog.tsx` 各 14、`src/ipc/updater.ts` 与 `src-tauri/tauri.conf.json` 各 4、`src/settings/theme.test.ts` 3）跑一次 `--write` 清零，合计 **18 insertions / 50 deletions**，逐文件 `git diff` 核过全是换行与折行、**没有一处语义改动**。⚠️ 这批文件之所以长期不合规，与第 1 条同源：`format:check` 在 CI 里也是硬门禁，红了没人看。
+> 10. ⚠️ **顺带量到一条与首屏有关的事实**：`pnpm build` 会打一条 `[INEFFECTIVE_DYNAMIC_IMPORT]`——`App.tsx:1325` 动态 import 的 `@tauri-apps/api/event`，同时被 `ipc/dragDrop.ts`、`ipc/replace.ts`、`ipc/search.ts`、`ipc/watch.ts`、`ipc/windowClose.ts` **静态**引用，所以那次动态 import **不会把它挪出主 chunk**、一个字节都省不下来。⛔ 本轮没动它（改成静态 import 才是诚实的写法，但那属于 M4-I 那条首屏归因的活）。⚠️ 记在这里是因为「有动态 import 就等于懒加载」这个直觉在本仓库已经被这条证伪过一次，别在别处再犯。
+> 11. **数字**：前端 **3084 passed / 96 files 一字未变**（删的是死代码、修的是类型标注与 lint 配置，没有一条测试涉及它们）；Rust **455 passed 一字未变**（39 + 365 + 51，`src-tauri` 只被 prettier 折了一行 `tauri.conf.json` 的 JSON）。命令注册表 **61 条未变**。`pnpm lint`：**67 problems（59 errors + 8 warnings）→ 8 problems（0 errors + 8 warnings）**，🔴 **CI 的 web job 从「必红」变成能过**（typecheck / lint / format:check / test / build 五步本地全绿）。`prettier --check .`：**12 → 0**。<br>**首屏 gzip 292.03 → 292.04KB**（entry `index-BDW22KTN.js` 183.18 → `index-COeUvF4n.js` **183.19**，**+0.01**，来自 `App.tsx` 那两个 `void` 包装与三处 `AppContext` 标注；modulepreload `dist-CvermxKb.js` **101.77、哈希与字节逐字未动**；CSS `index-bqayryRP.css` **7.08、哈希未变**——本轮一行 CSS 都没改），预算 300KB：**余量 2.66% → 2.65%**。⚠️ 删掉 774 行代码**一个字节都没省**，这坐实了「死代码不在 bundle 里」：它从没被 import，rolldown 压根没见过它。所以**别把删死代码当成瘦身手段**，它的收益在 lint 与可读性，不在体积。
+> 12. ⚠️ **本轮同时暴露出一处 PLAN.md 自身的过期记载，未修**（主题外，只登记）：§2.7 那条「✅ M3-B-1 对账」里写着「⛔ **菜单栏没有，也不打算有**——`src-tauri/src/lib.rs` 里一条 `MenuBuilder` 都没写」，而**现在原生菜单是真有的**（`src-tauri` 的 `menu.rs` + `App.tsx` 的 `routeMenuEvent`，本轮修的 3 条 promise 就在那条链上），项目记忆里也记着「工具栏按钮全部移入 File/Edit/View/Window/Help 标准菜单」。那句话是 M3-B-1 时期的事实，后来被推翻而没回头改。
+> 13. ⚠️ **真机未验（本轮基本没有真机面，但有一条）**：🔴 **CI 的 web job 在远端是不是真的转绿了**——本机没装 `gh`，五步只在本地跑过；下一次 push 之后必须去看一眼那个 run，否则「以为绿了」与过去 35 个提交的「没人看红叉」是同一种失败。②⚠️ `deploy/updater-worker/index.ts` 被 prettier 折了 29 行，那是 Cloudflare Worker 的部署产物，**没有测试覆盖**（本轮只核了 diff 是纯格式）；真要动 updater 时得先跑一次它的部署流程。
+> 14. 🔴 **本块的编号差点接错队，记下来防止下一次再撞。** 这一轮最初记作 `M5-3`，因为「§3.7 是 M5，前两个子项应该叫 M5-1/M5-2」。**这个推断是错的**：源码里的 `M5-1` / `M5-2` 指的是**代码导航**（提交 `f5b3187`「M5 代码导航：符号表、跳到定义、Cmd+Click」），分布在 `src/App.tsx`(3 处)、`src/commands/builtins.ts`(5)、`src/commands/builtins.test.ts`、`src/doc/tab.ts`、`src/doc/workspace.ts`、`src/editor/clickJump.ts`、`src/editor/setup.ts`、`src/goto/definition.ts`（`:6`「『跳到定义』的**查询**那一半（M5-1 / M5-2）」、`:64`「`Cmd/Ctrl+Click` 那一下的三种归宿（M5-2）」）。也就是说 **`M5-n` 这个前缀在本仓库已经被另一条线占用**，而那条线在 PLAN.md 里**没有对应的实施修正块**（与项目记忆 `vela-plan-unrecorded-milestones` 记的编号缺口是同一件事）。所以本块改记作 **`M5-R`**（R = rollback），刻意不占数字位、避免被读成「代码导航第三项」。⚠️ **口径**：往后引用 `M5-*` 之前必须先 `git grep` 代码与 PLAN 两边，两边不一致时按「不冒充编号」处理——宁可起一个不占位的字母后缀，也不要让同一个编号指两件事。
 
 ---
 
@@ -1697,7 +1721,7 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 | R3 | CM6 + Vite 生产构建陷阱 | 🟡 **已命中并修复** | 上线前才发现构建产物坏了 | ✅ M0 就验证 `vite build`，**果然踩中三个坑**：rolldown 拒绝对象形式 manualChunks、esbuild 不再内置（须 `minify:'oxc'`）、粗粒度 manualChunks 摧毁懒加载（623KB→284KB gzip）。详见 §2.3。**若留到 M6 才发现，返工成本会大得多** | M0 ✅ |
 | R4 | CJK 列对齐漂移 | 🟢 **已收敛** | 代码区表格/缩进视觉错位 | ✅ **M0 实测通过**：代码区换 Maple Mono CN 后，在 CM6 里真实的 `.vela-code` 行上量到 CJK/ASCII = **2.0000**、框线/ASCII = **1.0000**、ASCII 极差 **0.0001px**、50 字累积漂移 **0px**，三轮独立复现（含一次 `visible` 复测）。文楷仅用于正文/UI（其拉丁是**比例宽度**，根本不等宽，故必须分字体）。<br>📌 量具本身已自动化，**不再需要人眼判定**；剩余口子是 dPR=2 与将来新增可切换字体时要重跑一遍。详见 §3.2 #3 | M0 ✅ / M4 |
 | R5 | 大文件 IPC 序列化爆内存 | 🟢 **已收敛** | 打开大文件即崩溃 | ✅ **M2-H 已落地，而应对手段与原写不同**：原写「单次 payload 上限 4MB；>50MB 走 `ropey` 只读分片模式」——**`ropey` 从未进过 `Cargo.toml`**，改成「稀疏行索引 + 按需读盘」，Rust **不持有全文**（作废理由见 §3.4「M2-H 实施修正」1）。三条上限各管一件事：`MAX_INLINE_BYTES` **4 MiB**（单次 IPC payload，与原写一致）、`MAX_SHARD_BYTES` **256 MiB**（超过就拒绝打开，不退化成别的模式）、`MAX_PAGE_LINES` 1024 / `MAX_PAGE_BYTES` **1 MiB**（单次 `read_lines` 的回复，⚠️ **原计划里压根没有这一条**，而它才是「分片模式自己不爆内存」的真正守卫——只把 4MB 那条用在打开上、却让分片一次回一整段，等于把同一个洞挪了个位置）。<br>⚠️ **两个残留口子**：① 单行超过 1 MiB 会污染它所在的那一整段锚点，前端显示占位、继续往下滚自愈（修正 4）；② 搜索的 `MAX_FILE_BYTES` 抬到 **64 MiB** 之后，**64–256 MiB 这一段打得开却搜不到**，缺口是有意的、计入 `skipped_too_large` 上报（修正 3）。<br>🔴 **而「爆内存」这件事本身一个真机数都没有**：开着几个大分片时的 `phys_footprint`、`open_shard` 建索引的冷读耗时、64 MiB 规模的真机搜索/替换峰值，全在 §3.4「M2-H 实施修正」12 那份债里 | M2 ✅（M2-H） |
-| R6 | **API 发布即冻结** | 🟡 中 | 未来插件生态被烂 API 锁死 | M5 用示例插件反向验证；API 面从第一天就极小；带版本号 + shim 适配层 | M5 |
+| R6 | **API 发布即冻结** | 🟢 **前提已消解（M5-R，2026-10-20）** | 未来插件生态被烂 API 锁死 | ~~M5 用示例插件反向验证；API 面从第一天就极小；带版本号 + shim 适配层~~ 🔴 **v1 压根不发布任何插件 API，所以「发布即冻结」这条风险的前提不存在了**：桥对象与两个示例插件在 `020e7b2` 实现过、2026-10-20 回退删除（三份设计文档留存）。反向验证确实跑了，**结论是发现了缺陷而不是通过**——`when` 被硬编成 `() => true`、`CommandDef.run` 丢掉 `AppContext`、31 个方法里 12 处是桩，而「API 面极小」也没守住（草图 5 组长成 8 组、shim 与 `minAppVersion` 一行没写）。⚠️ **将来若真要开放第三方插件，这条风险原样复活**，且 §3.7 那个「L1 额外 5–10 人日」的估算随代码一起作废、得重估 | ~~M5~~ 已回退 |
 | R7 | License 误用（GPL/AGPL/BUSL 传染） | 🟡 中 | 闭源商业化受阻，法律风险 | 严格遵守 §2.10 清单；不 fork athas/hermes/Zed；Sarasa Gothic 与主题配色逐个核对；商用前法务复核 | 全程 |
 | R8 | 范围蔓延（想做 LSP/终端/AI） | 🟡 中 | 工期翻倍，轻量定位丢失 | §1.3 非目标清单为硬约束；任何新增功能需先证明属于四个核心场景之一 | 全程 |
 | R9 | CM6 长行 + 自动换行「pop 抖动」 | 🟢 **已实测，低** | 特定文档滚动手感 | ✅ **M0 已测**：超长行 fixture 下换行开/关两档帧率差在噪声带内（10k 59.5 vs 60.3fps、50k 60.3 vs 60.1fps，低负载），**没有可测量的抖动代价**。作者明确这是为响应性付的代价；「对超长行降级关闭换行」这条对策**当前不需要**，留作 dPR=2 复测时再看 | M0 ✅ / M1 |

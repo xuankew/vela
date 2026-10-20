@@ -170,12 +170,12 @@ function routeMenuEvent(
     openFolder: () => void
     openRecentProject: () => void
     closeFolder: () => void
-    save: (ctx: { editor: any }) => void
-    saveAs: (ctx: { editor: any }) => void
+    save: (ctx: AppContext) => void
+    saveAs: (ctx: AppContext) => void
     findInFiles: () => void
     replaceInFiles: () => void
-    formatJson: (ctx: { editor: any }) => void
-    minifyJson: (ctx: { editor: any }) => void
+    formatJson: (ctx: AppContext) => void
+    minifyJson: (ctx: AppContext) => void
     alignTable: () => void
     wordCount: () => void
     toggleSidebar: () => void
@@ -197,7 +197,7 @@ function routeMenuEvent(
     focusPrevPane: () => void
     closePane: () => void
   },
-  ctx: { editor: any },
+  ctx: AppContext,
 ): void {
   // File
   if (id === 'file.new') actions.newTab()
@@ -1322,15 +1322,18 @@ export default function App() {
     })
     // 菜单事件监听：Rust 侧把所有菜单项点击转发成 `menu-event` 事件，
     // 载荷是菜单 ID（如 "file.new"）。这里路由到对应的命令。
-    import('@tauri-apps/api/event').then(({ listen }) => {
+    // `void`：动态 import 与随后的 listen 都是「尽力挂上」的接线，挂不上没有可恢复动作
+    void import('@tauri-apps/api/event').then(({ listen }) => {
       void listen<string>('menu-event', ({ payload: id }) => {
         const ctx = appContext()
         routeMenuEvent(
           id,
           {
             newTab: () => ws.newTab(),
-            openViaDialog: ws.openViaDialog,
-            openFolder,
+            // 两者都是 async，而 actions 那一份签名要的是 `() => void`（菜单点击不关心
+            // 结果，也没有可恢复动作），所以在这里显式 `void` 掉，而不是把 async 泄漏进签名
+            openViaDialog: () => void ws.openViaDialog(),
+            openFolder: () => void openFolder(),
             openRecentProject: () => void goto.show('', 'project'),
             closeFolder: () => tree.close(),
             save: (c) => void registry.execute('editor.save', c),

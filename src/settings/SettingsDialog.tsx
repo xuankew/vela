@@ -74,13 +74,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
 
   return (
     <div class="modal-backdrop" role="presentation">
-      <div
-        class="settings-dialog"
-        ref={dialogEl}
-        role="dialog"
-        aria-label="外观设置"
-        onKeyDown={onKeyDown}
-      >
+      <div class="settings-dialog" ref={dialogEl} role="dialog" aria-label="外观设置" onKeyDown={onKeyDown}>
         <div class="settings-header">
           <h2>外观设置</h2>
           <button class="settings-close" onClick={close} title="关闭" aria-label="关闭">
@@ -178,11 +172,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
             恢复默认
           </button>
           {props.onOpenKeybindings && (
-            <button
-              class="settings-keybindings-btn"
-              onClick={props.onOpenKeybindings}
-              title="配置快捷键"
-            >
+            <button class="settings-keybindings-btn" onClick={props.onOpenKeybindings} title="配置快捷键">
               快捷键配置
             </button>
           )}

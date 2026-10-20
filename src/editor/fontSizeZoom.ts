@@ -16,7 +16,7 @@ class FontSizeZoomPlugin implements PluginValue {
 
   constructor(view: EditorView) {
     this.view = view
-    const dom = view.dom as HTMLElement
+    const dom = view.dom
     this.handler = (e: WheelEvent) => {
       // macOS: metaKey (Cmd), Windows/Linux: ctrlKey (Ctrl)
       if (!e.metaKey && !e.ctrlKey) return
@@ -42,7 +42,7 @@ class FontSizeZoomPlugin implements PluginValue {
   }
 
   destroy() {
-    const dom = this.view.dom as HTMLElement
+    const dom = this.view.dom
     dom.removeEventListener('wheel', this.handler)
   }
 }

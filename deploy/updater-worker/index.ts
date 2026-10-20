@@ -43,9 +43,7 @@ export default {
     }
 
     // 构建平台标识符（Tauri updater 期望的格式）
-    const platformKey = target === 'macos'
-      ? `darwin-${arch}`
-      : `${target}-${arch}`
+    const platformKey = target === 'macos' ? `darwin-${arch}` : `${target}-${arch}`
 
     try {
       // 从 R2 读取最新的版本元数据
@@ -70,13 +68,10 @@ export default {
       // 构建对应平台的更新信息
       const platform = meta.platforms[platformKey]
       if (!platform) {
-        return new Response(
-          JSON.stringify({ error: `No update for ${platformKey}` }),
-          {
-            status: 404,
-            headers: { 'Content-Type': 'application/json' },
-          }
-        )
+        return new Response(JSON.stringify({ error: `No update for ${platformKey}` }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        })
       }
 
       // 返回 Tauri updater 期望的格式
@@ -97,13 +92,10 @@ export default {
       })
     } catch (error) {
       console.error('Updater error:', error)
-      return new Response(
-        JSON.stringify({ error: 'Internal server error' }),
-        {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        }
-      )
+      return new Response(JSON.stringify({ error: 'Internal server error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      })
     }
   },
 }
@@ -124,8 +116,7 @@ interface UpdateMetadata {
  * 简单的 semver 比较：检查 newVersion 是否大于 currentVersion
  */
 function isNewer(newVersion: string, currentVersion: string): boolean {
-  const parse = (v: string): number[] =>
-    v.replace(/^v/, '').split('.').map(Number)
+  const parse = (v: string): number[] => v.replace(/^v/, '').split('.').map(Number)
 
   const [nMajor, nMinor, nPatch] = parse(newVersion)
   const [cMajor, cMinor, cPatch] = parse(currentVersion)

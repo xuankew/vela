@@ -805,7 +805,9 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
         if (!text.trim()) return
 
         try {
-          const value = JSON.parse(text)
+          // `JSON.parse` 的返回类型是 `any`，标成 `unknown` 才是实话：解析结果的结构
+          // 只有运行时才知道。下一行 `JSON.stringify` 接受任何值，所以不需要收窄
+          const value: unknown = JSON.parse(text)
           const formatted = JSON.stringify(value, null, 2)
           view.dispatch({
             changes: { from: 0, to: view.state.doc.length, insert: formatted },
@@ -831,7 +833,8 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
         if (!text.trim()) return
 
         try {
-          const value = JSON.parse(text)
+          // 同 `editor.formatJson` 那一处：标 `unknown` 而不是放任 `any` 往下流
+          const value: unknown = JSON.parse(text)
           const minified = JSON.stringify(value)
           view.dispatch({
             changes: { from: 0, to: view.state.doc.length, insert: minified },

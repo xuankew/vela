@@ -52,7 +52,8 @@ export function JsonPreview(props: JsonPreviewProps) {
     }
 
     try {
-      const value = JSON.parse(text)
+      // `renderJson` 收的就是 `unknown`，所以这里标 `unknown` 而不是放任 `any` 流下去
+      const value: unknown = JSON.parse(text)
       const html = renderJson(value, { defaultExpanded: true })
       bodyEl.innerHTML = html
 

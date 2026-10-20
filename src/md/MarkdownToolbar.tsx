@@ -27,12 +27,7 @@ interface ToolbarButton {
  * 在光标位置或选区周围插入标记。
  * 如果已有选区，则在选区前后插入；否则在光标处插入占位符。
  */
-function insertAround(
-  editor: EditorController,
-  before: string,
-  after: string,
-  placeholder = '文本'
-): void {
+function insertAround(editor: EditorController, before: string, after: string, placeholder = '文本'): void {
   const view = editor.view
   if (!view) return
 
@@ -229,12 +224,7 @@ export function MarkdownToolbar(props: MarkdownToolbarProps) {
   return (
     <div class="md-toolbar" role="toolbar" aria-label="Markdown 工具栏">
       <div class="md-toolbar-toggle">
-        <button
-          class="md-toolbar-toggle-btn"
-          onClick={props.onToggle}
-          title="隐藏工具栏"
-          aria-label="隐藏工具栏"
-        >
+        <button class="md-toolbar-toggle-btn" onClick={props.onToggle} title="隐藏工具栏" aria-label="隐藏工具栏">
           ✕
         </button>
       </div>

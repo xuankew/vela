@@ -93,7 +93,8 @@ describe('注册表常量', () => {
 
 describe('sanitizeThemeId', () => {
   it('合法 ID 原样通过', () => {
-    for (const id of ['light', 'dark', 'system', 'dracula', 'nord', 'solarized', 'eye-care', 'warm-beige']) expect(sanitizeThemeId(id)).toBe(id)
+    for (const id of ['light', 'dark', 'system', 'dracula', 'nord', 'solarized', 'eye-care', 'warm-beige'])
+      expect(sanitizeThemeId(id)).toBe(id)
   })
 
   it('不认识的串打回默认', () => {

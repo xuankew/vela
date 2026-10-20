@@ -42,6 +42,18 @@ export default tseslint.config(
       // 于是报 prefer-const；照它改成 `const doc!: T` 是**语法错误**。开这个选项正好只放过这类，
       // `let r = lerp(...)` 那种真正的漏网 const 仍然会报。
       'prefer-const': ['error', { ignoreReadBeforeAssign: true }],
+
+      // `_` 前缀的参数不算「忘了用」，算「刻意不用」。本仓库那 4 处全是这一类，而且
+      // 都**不能**靠删参数解决：① `KeybindingsDialog.test.tsx` 的 `vi.fn((_id: string, _kb: string) => true)`
+      // 必须把参数类型写在实现里——变量声明是 `Mock<(id: string, kb: string) => boolean>`，
+      // 而 `Mock<T>` 带着 `mock.calls: Parameters<T>[]`，实现写成 `() => true` 会让它变成
+      // `[][]`，赋不回声明处；② `ipc/updater.ts` 的 `_progressCallback` 是占位实现的
+      // **公开签名**（updater 插件还没装，见 M6 那笔债），参数名在这里就是文档。
+      // ⚠️ 只放过参数，`varsIgnorePattern` 刻意不开：`const _foo = ...` 那种是真该删的死变量。
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { args: 'after-used', argsIgnorePattern: '^_', ignoreRestSiblings: true },
+      ],
     },
   },
 
