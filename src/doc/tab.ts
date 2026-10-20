@@ -4,7 +4,14 @@ import type { EditorSnapshot } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
 import type { DefinitionClickHook } from '../editor/clickJump'
 import type { PasteImageHook } from '../editor/paste'
-import { createEditorState, darkThemeEnabled, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
+import {
+  createEditorState,
+  darkThemeEnabled,
+  lineWrapEnabled,
+  minimapEnabled,
+  type EditorUpdateInfo,
+} from '../editor/setup'
+import { minimapExtension } from '../editor/minimap'
 import { createDocumentModel, type DocumentModel } from './document'
 
 /**
@@ -39,6 +46,13 @@ export interface ViewConfig {
   dark: boolean
   /** 深浅色的开关槽位，共享一个实例。理由与 `lineWrapSlot` 逐字相同，见 `editor/setup.ts` 的 `darkSlot` */
   readonly darkSlot: Compartment
+  /**
+   * 缩略图开不开（M4-H）。与 `lineWrap` / `dark` 同为**全局视图设置**：共享一个 `minimapSlot`
+   * 实例，一次 reconfigure 拨动所有标签。由 workspace 的 `setMinimap` 改写。
+   */
+  minimap: boolean
+  /** 缩略图的开关槽位，共享一个实例。理由与 `lineWrapSlot` 逐字相同 */
+  readonly minimapSlot: Compartment
   /**
    * 词补全的「其他文档」来源，工作区内所有标签共用同一个 getter。
    *
@@ -83,6 +97,7 @@ export function createViewConfig(
   dark = true,
   onFontSizeZoom?: (delta: number) => void,
   clickDefinition?: DefinitionClickHook,
+  minimap = true,
 ): ViewConfig {
   // `pasteImage` 是可选的，所以只能条件展开：`exactOptionalPropertyTypes` 虽然没开，
   // 但显式写一个 `pasteImage: undefined` 会让「缺省」与「传了个 undefined」在
@@ -90,8 +105,10 @@ export function createViewConfig(
   return {
     lineWrap,
     dark,
+    minimap,
     lineWrapSlot: new Compartment(),
     darkSlot: new Compartment(),
+    minimapSlot: new Compartment(),
     peerStates,
     ...(pasteImage ? { pasteImage } : {}),
     ...(onFontSizeZoom ? { onFontSizeZoom } : {}),
@@ -132,6 +149,8 @@ export interface TabHost {
   focus(tab: Tab): void
   /** 路径变了（打开文件、另存为）。跟着路径走的东西——眼下只有语言——由宿主重算 */
   pathChanged(tab: Tab): void
+  /** 存盘成功、正文与磁盘一致：清掉「未保存改动」gutter 的行标记（见 `editor/changeGutter.ts`） */
+  clearChangeMarks(tab: Tab): void
 }
 
 export interface CreateTabInit {
@@ -156,6 +175,8 @@ export function buildState(
     lineWrapSlot: config.lineWrapSlot,
     dark: config.dark,
     darkSlot: config.darkSlot,
+    minimap: config.minimap,
+    minimapSlot: config.minimapSlot,
     languageSlot,
     peerStates: config.peerStates,
     ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
@@ -186,6 +207,7 @@ export function createTab(init: CreateTabInit): Tab {
       setText: (text) => init.host.setText(tab, text),
       focus: () => init.host.focus(tab),
       pathChanged: () => init.host.pathChanged(tab),
+      clearChangeMarks: () => init.host.clearChangeMarks(tab),
     }),
   }
   return tab
@@ -239,6 +261,9 @@ export function applyViewConfig(tab: Tab, config: ViewConfig) {
   }
   if (darkThemeEnabled(state) !== config.dark) {
     effects.push(config.darkSlot.reconfigure(EditorView.darkTheme.of(config.dark)))
+  }
+  if (minimapEnabled(state) !== config.minimap) {
+    effects.push(config.minimapSlot.reconfigure(config.minimap ? minimapExtension() : []))
   }
   if (effects.length === 0) return
   tab.snapshot = { ...tab.snapshot, state: state.update({ effects }).state }

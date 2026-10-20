@@ -268,31 +268,49 @@ body {
 
 .app {
   display: grid;
-  /* 五行：标签条 / Markdown 工具栏 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
+  /* 两列 × 五行（Sublime 排布）。左列是侧边栏，右列是「标签条 / Markdown 工具栏 / 提示条 /
+     正文区」这一摞，状态栏沉底跨两列。
+     侧边栏跨 1~4 行**通顶到底**，于是它打开时标签条让到它右边、只盖在编辑器上方；
+     侧边栏收起时左列没有 grid item，`auto` 塌成 0，右列吃满整窗、标签条回到通栏——
+     两种排布不需要任何分支，全靠 `auto` 列「没内容就是 0」这一条。
+     五行：标签条 / Markdown 工具栏 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
      行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上。
      标签条放在提示条**上面**：提示条出现或消失时只推动正文区，标签条不跟着跳。
      状态栏在最后，高度由自己定（22px），不参与 1fr 的分配 */
+  grid-template-columns: auto 1fr;
   grid-template-rows: auto auto auto 1fr auto;
   height: 100%;
 }
 
-/* 🔴 五个流内子元素**逐个钉死行号**，不靠自动放置：工具栏移进原生菜单之后流内子元素
+/* 🔴 流内子元素**逐个钉死行列号**，不靠自动放置：工具栏移进原生菜单之后流内子元素
    从五个变成了四个（Markdown 工具栏还是 <Show> 条件渲染的，时有时无），自动放置会把
    `.main` 挤到第三行的 auto 上、把状态栏挤到 1fr 上——正文区按内容高、状态栏悬在窗口当中，
-   底下整片露底。钉住行号之后「少一个子元素」只是空着一行（auto 行高 0），不会再错位 */
+   底下整片露底。钉住行号之后「少一个子元素」只是空着一行（auto 行高 0），不会再错位。
+   侧边栏那一列跨 1~4 行、状态栏跨两列，是这套排布里唯一两处跨格 */
+.app > .sidebar-col {
+  grid-column: 1;
+  grid-row: 1 / 5;
+  display: flex;
+  min-height: 0;
+}
 .app > .tab-strip {
+  grid-column: 2;
   grid-row: 1;
 }
 .app > .md-toolbar {
+  grid-column: 2;
   grid-row: 2;
 }
 .app > .notices {
+  grid-column: 2;
   grid-row: 3;
 }
 .app > .main {
+  grid-column: 2;
   grid-row: 4;
 }
 .app > .statusbar {
+  grid-column: 1 / -1;
   grid-row: 5;
 }
 
@@ -823,8 +841,6 @@ select {
 .tab-strip {
   display: flex;
   align-items: stretch;
-  gap: 2px;
-  padding: 4px 6px 0;
   background: var(--vela-bg-alt);
   border-bottom: 1px solid var(--vela-border);
   /* 标签多到放不下时横向滚，而不是把正文区挤窄。刻意不换行：换行会让标签条高度不定，
@@ -834,21 +850,27 @@ select {
   scrollbar-width: thin;
 }
 
+/* Sublime 口径的标签：**平的矩形块**，不圆角、不抬起、不与下方编辑器连成一块。
+   块与块之间靠「后一个标签画自己的左边框」当分隔线，而不是 strip 上留 gap——
+   gap 会把分隔线一起撑开，看着像断开的虚线；边框贴着块画才是连续的竖线。
+   ⚠️ 首块不画（`.tab + .tab`），否则标签条最左边会多出一条贴着容器边的竖线 */
 .tab {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: 0 0 auto;
   max-width: 200px;
-  padding: 4px 5px 4px 10px;
+  padding: 5px 6px 5px 10px;
   font-size: 12px;
   color: var(--vela-fg-dim);
-  border: 1px solid transparent;
-  border-bottom: none;
-  border-radius: 4px 4px 0 0;
+  border-left: 1px solid transparent;
   cursor: default;
   /* 标签是 draggable 的：不关掉文本选择，拖动的第一下会变成选中文字 */
   user-select: none;
+}
+
+.tab + .tab {
+  border-left-color: var(--vela-border);
 }
 
 .tab:hover {
@@ -856,12 +878,11 @@ select {
   background: var(--vela-bg-panel);
 }
 
-/* 激活标签用正文区同色，并且靠 strip 的 border-bottom 收口：
-   它要和下面的编辑器在视觉上连成一块，而不是一个独立的按钮 */
+/* 激活标签只是「比周围亮一档」的平块：不再用正文区同色、也不靠 border-bottom 收口。
+   Sublime 的活动标签是嵌在标签条里的一格，而不是从条里长出来、盖住下面那条边 */
 .tab.active {
   color: var(--vela-fg);
-  background: var(--vela-bg);
-  border-color: var(--vela-border);
+  background: var(--vela-bg-panel);
 }
 
 /* 显示在**别的**分屏里的标签，与 .active 互斥。
@@ -879,14 +900,47 @@ select {
   white-space: nowrap;
 }
 
+/* 脏点与 × 叠在**同一格**里（`grid-area: 1 / 1` 把两个子元素压到同一个网格位）。
+   这一格宽度固定：悬停时 × 替换脏点不会让标签变宽、把右边的邻居推走 */
+.tab-slot {
+  display: grid;
+  place-items: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 14px;
+}
+
+.tab-slot > * {
+  grid-area: 1 / 1;
+}
+
+.tab-dot {
+  font-size: 9px;
+  line-height: 1;
+  color: var(--vela-fg-dim);
+}
+
+/* × 默认藏起来（`opacity: 0`），悬停标签或键盘聚焦到它时才显形；
+   显形的那一刻把同格的脏点淡掉——Sublime 的口径是「悬停用 × 顶替脏点」，不是两个并排。
+   ⚠️ 用 opacity 而不是 display:none：display 会让这一格在悬停瞬间从无到有、宽度跳一下 */
 .tab-close {
-  padding: 0 3px;
+  padding: 0;
   background: none;
   border: none;
   color: inherit;
   font-size: 14px;
   line-height: 1;
-  opacity: 0.5;
+  opacity: 0;
+}
+
+.tab:hover .tab-close,
+.tab-close:focus-visible {
+  border: none;
+  opacity: 0.7;
+}
+
+.tab:hover .tab-dot {
+  opacity: 0;
 }
 
 .tab-close:hover {
@@ -897,7 +951,7 @@ select {
 .tab-new {
   flex: 0 0 auto;
   align-self: center;
-  margin-left: 4px;
+  margin-left: 6px;
   padding: 2px 7px;
   background: none;
   border: none;
@@ -927,10 +981,11 @@ select {
   min-height: 0;
 }
 
-/* M2-B 新增的一层：侧边栏 + 正文区横向并排。它原来是 `.app` 第四行那份 1fr 的 grid item，
+/* M2-B 新增的一层：大纲 / 正文区 / 预览横向并排（侧边栏不在这儿——它是 `.app` 的左列，
+   见 `.sidebar-col`）。它原来是 `.app` 第四行那份 1fr 的 grid item，
    M2-C 之后降级成 `.main` 的 flex 子项，`.body` 也跟着降一级。
-   分隔线沿用 `.body` 那套「gap 露出底色」的做法，于是侧边栏与正文之间那条竖线
-   跟两块分屏之间那条完全一样——不给侧边栏加 border，理由同下：border 参与盒模型，
+   分隔线沿用 `.body` 那套「gap 露出底色」的做法，于是各栏之间那条竖线
+   跟两块分屏之间那条完全一样——不给各栏加 border，理由同下：border 参与盒模型，
    而 CM6 靠父容器的 clientHeight 算可视行数 */
 .body-row {
   display: flex;
@@ -1000,10 +1055,125 @@ select {
 /* CM6 需要父容器有确定高度才能自己管滚动 */
 .editor-container .cm-editor {
   height: 100%;
+  /* 🔴 缩略图（M4-H）的 canvas 由插件 append 到 `.cm-editor` 末尾并绝对定位在右侧，
+     需要一个定位祖先；CM6 自己不给 `.cm-editor` position。查找面板走 `.cm-panels`
+     （在流里），不受这一条影响 */
+  position: relative;
 }
 
 .editor-container .cm-scroller {
   font-family: var(--vela-font-editor);
+}
+
+/* ---------- 缩略图（M4-H，editor/minimap.ts）----------
+   宽度与 `minimap.ts` 的 `MINIMAP_WIDTH` 是同一个数（90）：正文的让位由插件那边的
+   `EditorView.theme` 写 `padding-right: 98px`，这一条只管 canvas 自己占多宽。
+   条形与视口矩形的透明度在插件里用 globalAlpha 设，背景因此保持全透 */
+.cm-minimap {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 90px;
+  background: transparent;
+  cursor: pointer;
+  /* 拖拽滚动时不让浏览器把手势判成滚动/缩放 */
+  touch-action: none;
+}
+
+/* ---------- 编辑器内的查找替换面板（editor/findReplace.ts）---------- */
+
+/* 🔴 这一段的选择器一律带 `.cm-editor` 前缀、类数不少于 CM6 自己那条。两条事实决定了
+   要这么写（都在真机上量过，不是推测）：
+
+   1. CM6 的 baseTheme 是**运行时注入**的 <style>，而 style-mod 用的是
+      `insertBefore(head.firstChild)` —— 它永远排在本应用的样式表**前面**。
+      于是特异度打平时赢的是我们，不是它（`label` 那条 80% 字号正是靠这一点压住的）。
+   2. 但「排在后面」救不了特异度低的规则：`.ͼ1 .cm-button`（0,2,0）压得住全局那条
+      `button`（0,0,1），按钮于是拿到 CM6 的 `font-size: 70%` 与暗色主题那道灰渐变底
+      —— 看起来就是「主题没生效」。按钮这里必须自己写一条类数够多的，见下。
+
+   面板的底色、边框、文字、复选框颜色一律换成本应用的变量，于是七套主题白拿。 */
+.cm-editor .cm-panels.cm-panels-top,
+.cm-editor .cm-panels.cm-panels-bottom {
+  background: var(--vela-bg-alt);
+  color: var(--vela-fg);
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+}
+
+.cm-editor .cm-panels.cm-panels-top {
+  border-bottom: 1px solid var(--vela-border);
+}
+
+.cm-editor .cm-panels.cm-panels-bottom {
+  border-top: 1px solid var(--vela-border);
+}
+
+/* baseTheme 那条 `.cm-panel.cm-search label` 给的是 80% 字号 = 9.6px，在这一排里比旁边的
+   输入框小两档，读起来像注释而不是控件名。两边特异度打平（都是 3 类 + 1 元素），
+   靠上面第 1 条那个「CM6 的样式表在前」赢下来 */
+.cm-editor .cm-panel.cm-search label {
+  font-size: 12px;
+  color: var(--vela-fg);
+}
+
+/* 与全局搜索面板的 `.find-input` 同一套画法，只是宽度定死：这一排是 inline 流
+   （两排之间是一个 <br>），没有 flex 可以分宽度 */
+.cm-editor .cm-search .cm-textfield {
+  width: 14em;
+  padding: 3px 6px;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+  background: var(--vela-bg);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+}
+
+.cm-editor .cm-search .cm-textfield:focus {
+  outline: none;
+  border-color: var(--vela-accent);
+}
+
+/* 与全局 `button` 逐条对齐——不是重复，而是全局那条在这里压不住 `.cm-button`
+   （特异度 0,0,1 对 0,2,0，见这一段开头第 2 条）。
+   `background` 用简写而不是 `background-color`：CM6 的暗色主题给 `.cm-button` 画了一道
+   `linear-gradient(#393939, #111)`，只改底色那道渐变还盖在上面，看着就是「主题没生效」 */
+.cm-editor .cm-panel.cm-search .cm-button {
+  padding: 3px 9px;
+  font-family: var(--vela-font-ui);
+  font-size: 12px;
+  color: var(--vela-fg);
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.cm-editor .cm-panel.cm-search .cm-button:hover {
+  border-color: var(--vela-accent);
+}
+
+.cm-editor .cm-panel.cm-search .cm-button:active {
+  transform: translateY(1px);
+}
+
+/* 勾与底仍交给原生控件画，只把颜色接到主题上——WebKit 默认的那个蓝在两套主题里都跳 */
+.cm-editor .cm-search input[type='checkbox'] {
+  accent-color: var(--vela-accent);
+}
+
+/* 关闭按钮 baseTheme 只给了定位（右上角 absolute）与去边框，颜色不接的话继承面板正文色，
+   比旁边那排控件名还跳 */
+.cm-editor .cm-search [name='close'] {
+  color: var(--vela-fg-dim);
+}
+
+.cm-editor .cm-search [name='close']:hover {
+  color: var(--vela-fg);
 }
 
 /* ---------- 代码区字体（D2「按内容分字体」）---------- */
@@ -1028,7 +1198,7 @@ select {
 
 /* ⚠️ 这一整段的行高**只能**引用 `--vela-tree-row-height`。
    那个变量由 src/project/Sidebar.tsx 从 `tree.ts` 的 `ROW_HEIGHT` 注入，
-   是虚拟滚动窗口算术（`visibleWindow`）唯一的高度来源。这里再写一个 `22px` 字面量，
+   是虚拟滚动窗口算术（`visibleWindow`）唯一的高度来源。这里再写一个 `24px` 字面量，
    两处就会各自悄悄漂移——漂移的方向只有两种：行叠在一起，或者行间露出空隙。
    两种都很难看出是「高度有两个真相」造成的。 */
 
@@ -1046,12 +1216,11 @@ select {
 }
 
 /* 侧边栏右缘那条分隔线，同时是拖拽改宽度的把手（组件见 `project/SidebarResize.tsx`）。
-   它自己画出同色的 1px，再用 -1px 外边距吃掉 `.body-row` 两侧各 1px 的 gap，
-   于是这条线与分屏之间那条逐像素相同——加把手这件事在布局上等于没发生。
+   它自己画出同色的 1px，贴在 `.sidebar-col` 的最右缘——也就是左列（侧边栏）与右列
+   （标签条+编辑器那一摞）之间那条线，与分屏之间那条逐像素相同。
    真正能抓的地方是 ::after 向两边各扩的 3px：1px 宽的命中区没人点得中 */
 .sidebar-resize {
   flex: 0 0 1px;
-  margin: 0 -1px;
   position: relative;
   background: var(--vela-border);
   cursor: col-resize;
@@ -1077,9 +1246,10 @@ select {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 26px;
-  padding: 0 4px 0 8px;
-  border-bottom: 1px solid var(--vela-border);
+  height: 30px;
+  padding: 0 4px 0 10px;
+  /* 刻意没有下边框：题头靠留白与字距和树分区，画一条线就会把「栏目题头」
+     读成「又一个面板的标题栏」。大纲/预览那头保留自己的边框，见 `.outline-head` */
   /* 侧边栏能被拖到 40px 宽（`SidebarResize` 的 SIDEBAR_MIN_WIDTH），而头部那三个按钮
      不收缩、加内边距约 79px。没有这条的话它们会溢出头部、盖到右边的正文区上面；
      有了它，窄的时候是「按钮被裁掉一部分」——× 可能点不到，但 Mod+B 与状态栏
@@ -1088,15 +1258,19 @@ select {
 }
 
 /* 根目录名是唯一需要伸缩的一格：窗口再窄也先把省略号让给它，
-   而不是把右边那两个动作按钮挤出去 */
+   而不是把右边那两个动作按钮挤出去。
+   字距拉开 + 弱色是栏目题头的口径（参照 Sublime 侧栏的 FOLDERS 那一行）：
+   它说的是「这一栏是什么」，不是「当前在哪个文件里」，不该和树里的名字同权重 */
 .sidebar-title {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--vela-fg);
+  color: var(--vela-fg-dim);
   font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 2px;
 }
 
 /* ↻ 与 × 是两个小图标动作。全局的 button 规则（边框 + 面板底色 + 3px 内边距）
@@ -1193,6 +1367,13 @@ select {
   color: var(--vela-bad);
 }
 
+/* 弱显行：dot 目录与依赖/构建产物（判据在 `tree.ts` 的 `isMutedRow`）。
+   opacity 打在子元素上而不是整行：整行的话选中底色与 inset 色条会一起变浅，
+   而「弱显」说的是名字不该抢注意力，不是「这一行选不中」 */
+.tree-row.muted > * {
+  opacity: 0.55;
+}
+
 .tree-name {
   flex: 0 1 auto;
   min-width: 0;
@@ -1219,10 +1400,10 @@ select {
   color: var(--vela-fg-dim);
 }
 
-/* 目录用主题强调色，而不是也分一个 hue。两个理由：结构性的一栏该跟着界面的主色走，
-   而它下面那十几类文件已经把这圈色相占满了，再挤一个只会互相认不出来 */
+/* 目录用中性灰而不是强调色：一屏里目录行占多数，全染成主色会让整栏都在喊，
+   而真正该跳出来的是选中行那一条色条。形状（文件夹轮廓）已经把它和文件分开了 */
 .tree-glyph.t-folder {
-  color: var(--vela-accent);
+  color: var(--vela-fg-dim);
 }
 
 /* 色相表。相邻类别之间刻意留 20° 以上，让「同明度同饱和、只有色相不同」这件事
@@ -1345,6 +1526,15 @@ select {
   transform: none;
 }
 
+/* 灰掉的那一项不该在鼠标划过时亮起 accent 底：全局那条 `button:disabled:hover` 特异度
+   (0,2,1) 压得过 `.tree-menu-item:hover` (0,2,0)，但它只把 border-color 改回去，
+   底色与文字色还是照亮——于是「剪切」在没有选区时会变成一条半透明的蓝。
+   这里用 (0,3,0) 把两个值都收回来，禁用态就只剩全局那条 0.45 的透明度在说话 */
+.tree-menu-item:disabled:hover {
+  background: none;
+  color: var(--vela-fg);
+}
+
 /* ---------- 大纲面板（M3-A-4） ----------
 
    与 `.sidebar` 同一侧、同一套「定高行 + 虚拟窗口」的做法，但**窄一档**：
@@ -1352,9 +1542,11 @@ select {
    给 200px——够放两三级缩进加一个中等长度的标题，再宽就开始从编辑区抢地方，
    而这一栏与预览**同时开着是常态**。
 
-   ⚠️ 头部照抄 `.sidebar-head`（26px + 一条下边框），而不是 `.md-preview-head`
-   （`padding: 3px 10px`，高度是内容撑出来的）：这两栏与侧边栏并排站着，
-   头部高度不一致的话那两条下边框会错开半格，看着像哪里没对齐——而它确实没对齐。
+   ⚠️ 头部保持**固定 26px + 一条下边框**，不照抄 `.md-preview-head`
+   （`padding: 3px 10px`，高度是内容撑出来的）：内容撑高的头会随标题长短跳，
+   而这一栏的头里还有「读取中」这类会换手的短文案。
+   它也**不再与侧边栏头对齐**：侧边栏那头已经是无边框的 30px 栏目题头
+   （见 `.sidebar-head`），题头不是面板头，两边本来就不该共用一条边框线。
 
    ⚠️ 行高只有一个真相：`OUTLINE_ROW_HEIGHT`（`md/outline.ts`）由组件注入成
    `--vela-outline-row-height`，下面所有行高都引用那个变量。理由与 `.tree-row` 那条逐字相同。
@@ -3302,4 +3494,41 @@ select {
 
 :root[data-theme='warm-beige'] .cm-activeLineGutter {
   background: #f1e1ba;
+}
+
+/* ────────────「未保存改动」gutter（#28，累积改动路线）────────────
+   标记的类名由 `editor/changeGutter.ts` 的 `GutterMarker.elementClass` 打在
+   `.cm-gutterElement` 上。颜色沿用八套主题都有的语义 token：
+   新增 = `--vela-ok`（绿）、修改 = `--vela-accent`（蓝）、删除 = `--vela-bad`（红）。
+   ⚠️ 竖条用 `::before` 绝对定位撑满行高；spacer 元素只预留宽度、不上色，于是「还没有
+   改动」时这一列也在，第一处改动出现时正文不会横跳一下。
+   ⚠️ 真机未验：node/jsdom 没有真实布局，竖条的对齐与宽度得在 `pnpm tauri dev` 里看。 */
+.cm-changeGutter {
+  min-width: 5px;
+}
+
+.cm-changeGutter .cm-gutterElement {
+  position: relative;
+}
+
+.cm-changeGutter .cm-gutterElement::before {
+  content: '';
+  position: absolute;
+  left: 1px;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 1px;
+}
+
+.cm-changeGutter .vela-change-added::before {
+  background: var(--vela-ok);
+}
+
+.cm-changeGutter .vela-change-modified::before {
+  background: var(--vela-accent);
+}
+
+.cm-changeGutter .vela-change-deleted::before {
+  background: var(--vela-bad);
 }

@@ -504,7 +504,7 @@ describe('空状态', () => {
 
     expect(dialog.open).toHaveBeenCalledWith({ multiple: false, directory: true })
     expect(rowNames()).toEqual(['repo', 'src', 'README.md', 'docs'])
-    expect(container.querySelector('.sidebar-title')?.textContent).toBe('repo')
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('文件夹')
   })
 
   it('对话框取消时树保持空的——用户什么都没选，不该凭空长出个根', async () => {
@@ -520,11 +520,12 @@ describe('空状态', () => {
 })
 
 describe('渲染', () => {
-  it('头部显示根目录的 basename，全路径挂在 title 上', async () => {
+  it('头部是栏目题头「文件夹」，全路径挂在 title 上', async () => {
     mount()
     await openRepo()
     const title = container.querySelector<HTMLElement>('.sidebar-title')!
-    expect(title.textContent).toBe('repo')
+    // 根名在它自己那条根行上已经写了一遍，题头再重复一次只是让同一屏上出现两个一样的词
+    expect(title.textContent).toBe('文件夹')
     expect(title.title).toBe('/repo')
   })
 
@@ -542,10 +543,10 @@ describe('渲染', () => {
     await openRepo()
     await tree.toggle(k('src'))
     await flush()
-    // depth * 12 + 6：根行 6px，它的孩子 18px，孙辈 30px
-    expect(rowByRel('')!.style.paddingLeft).toBe('6px')
-    expect(rowByRel('src')!.style.paddingLeft).toBe('18px')
-    expect(rowByRel('src/a.ts')!.style.paddingLeft).toBe('30px')
+    // depth * 14 + 8：根行 8px，它的孩子 22px，孙辈 36px
+    expect(rowByRel('')!.style.paddingLeft).toBe('8px')
+    expect(rowByRel('src')!.style.paddingLeft).toBe('22px')
+    expect(rowByRel('src/a.ts')!.style.paddingLeft).toBe('36px')
   })
 
   it('目录行有 twisty（摊开 ▾ / 收起 ▸），文件行是空占位', async () => {
@@ -554,6 +555,30 @@ describe('渲染', () => {
     expect(rowByRel('')!.querySelector('.tree-twisty')!.textContent).toBe('▾')
     expect(rowByRel('src')!.querySelector('.tree-twisty')!.textContent).toBe('▸')
     expect(rowByRel('README.md')!.querySelector('.tree-twisty')!.textContent).toBe('')
+  })
+
+  it('弱显行：dot 目录与依赖/构建产物带 muted 类，dot 文件与根行不带', async () => {
+    mount({
+      '': [
+        f('.github', true),
+        f('node_modules', true),
+        f('dist', true),
+        f('src', true),
+        f('.gitignore'),
+        f('README.md'),
+      ],
+      src: [f('src/a.ts')],
+    })
+    await openRepo()
+
+    expect(rowByRel('.github')!.classList.contains('muted')).toBe(true)
+    expect(rowByRel('node_modules')!.classList.contains('muted')).toBe(true)
+    expect(rowByRel('dist')!.classList.contains('muted')).toBe(true)
+    expect(rowByRel('src')!.classList.contains('muted')).toBe(false)
+    // `.gitignore` 是被跟踪的普通文件：以 `.` 开头不代表它不重要
+    expect(rowByRel('.gitignore')!.classList.contains('muted')).toBe(false)
+    // 根行是「我在哪个项目里」的唯一线索，不染浅
+    expect(rowByRel('')!.classList.contains('muted')).toBe(false)
   })
 
   it('每行一个图形：目录一律 folder，文件按 `iconForPath` 分', async () => {
@@ -622,7 +647,7 @@ describe('渲染', () => {
     mount()
     await openRepo()
     // 这条钉的是「窗口算术用的那个数」与「CSS 画出来的那个高度」是同一个来源。
-    // 两处各写一个 22px 的话，失败方式是行互相压住或者中间露缝——不报错，只是难看
+    // 两处各写一个 24px 的话，失败方式是行互相压住或者中间露缝——不报错，只是难看
     expect(aside().style.getPropertyValue('--vela-tree-row-height')).toBe(`${ROW_HEIGHT}px`)
   })
 

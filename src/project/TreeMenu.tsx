@@ -14,6 +14,14 @@ export interface ContextMenuItem<A> {
   label: string
   /** 在这一项**上面**画一条分隔线（分组理由见 `tree.ts` 的 `TreeMenuItem.separator`） */
   separator?: boolean
+  /**
+   * 灰掉这一项（不响应点击，样式由全局那条 `button:disabled` 给）。
+   *
+   * 加它是为了堵住「点了没反应」这种失败方式：编辑器那份菜单里的「剪切／复制」在
+   * 没有选区时本来就做不成事，灰掉比让用户点一下、然后什么都不发生要好——
+   * 后者看起来像界面卡住了，而它没卡。
+   */
+  disabled?: boolean
 }
 
 export interface TreeMenuProps<A = TreeMenuAction> {
@@ -23,6 +31,19 @@ export interface TreeMenuProps<A = TreeMenuAction> {
   items: ContextMenuItem<A>[]
   onPick: (action: A) => void
   onClose: () => void
+  /**
+   * 菜单项被按下时**不把焦点抢过来**。
+   *
+   * 编辑器那一份必须开：焦点一旦落到菜单按钮上，动作跑完就得再把焦点还给编辑器，
+   * 而那一下 `contentDOM.focus()` 会让浏览器按 DOM 里的旧选区去滚——表现是「折完了，
+   * 视图却跳到文件开头」。这与查找面板那条链路上踩过的坑是同一个（理由写在
+   * `doc/workspace.ts` 的 `notePaneFocus` 上）。按下时就 preventDefault，焦点压根没离开
+   * 编辑器，也就不存在「还回去」这一步。
+   *
+   * 默认关：文件树与标签条那两个宿主的焦点本来就落在被右键的那一行上，抢不抢都一样，
+   * 而它们已经上线了，不顺手改行为。
+   */
+  keepFocus?: boolean
 }
 
 /**
@@ -32,24 +53,25 @@ export interface TreeMenuProps<A = TreeMenuAction> {
  * 有固定的层级与生命周期），不是一个跟着光标弹出的上下文菜单；而 Web 这一侧没有
  * 任何原生的「弹一个自定义菜单」的东西。菜单一共几项、形状固定，自己写只是几十行。
  *
- * ## 两个宿主
+ * ## 三个宿主
  *
- * 文件树（`Sidebar.tsx`，`A = TreeMenuAction`）与标签条（`doc/TabStrip.tsx`，`A` 是它自己
- * 那一个动作）。共用的是这一层**唯一有价值的那部分**：贴边 clamp、三条关闭路径、
- * 分隔线——都是「改坏了不报错、只是菜单赖在屏幕上或飘走」的微妙逻辑，写第二份就会漂移。
+ * 文件树（`Sidebar.tsx`，`A = TreeMenuAction`）、标签条（`doc/TabStrip.tsx`）与
+ * 编辑器正文（`App.tsx`，剪切/复制/粘贴/全选 + 折叠全部/展开全部），各自定义自己那一个
+ * 动作联合。共用的是这一层**唯一有价值的那部分**：贴边 clamp、四条关闭路径、
+ * 分隔线与灰项——都是「改坏了不报错、只是菜单赖在屏幕上或飘走」的微妙逻辑，
+ * 写第二份就会漂移。
  *
  * ⚠️ 名字里的 `Tree` 与 CSS 类名 `.tree-menu*` 都是历史遗留：改成中性的名字要动
  * 5 条 CSS 规则与 `Sidebar.test.tsx` 的 4 处查询，而那两处都在已上线的功能上。
  * 泛型参数默认值 `TreeMenuAction` 同理——它让文件树那一侧一行都不用改。
  *
- * ## 三条关闭路径
+ * ## 四条关闭路径
  *
- * 点菜单外面、按 Escape、以及**选了一项**——三条都归到 `onClose`。少掉任何一条的失败
- * 方式都是「菜单赖在屏幕上」，而它赖着的时候底下那一行点不到，用户会以为界面卡死了。
+ * 点菜单外面、按 Escape、宿主滚动、以及**选了一项**——四条都归到 `onClose`。少掉任何一条
+ * 的失败方式都是「菜单赖在屏幕上」，而它赖着的时候底下那一行点不到，用户会以为界面卡死了。
  *
- * ⚠️ 还有第四条在**宿主**那边：菜单是 `position: fixed`，底下的列表滚走了它不会跟着走，
- * 留着的是一份指着别处的菜单，所以会滚的宿主必须在 onScroll 里关掉它（见 Sidebar）。
- * 这一层不知道宿主的滚动容器是哪个，替不了它。
+ * ⚠️ 「宿主滚动」那一条原先留在宿主自己手里（Sidebar 的 onScroll）。现在收进这一层，
+ * 理由写在下面 `onDocScroll` 上：编辑器这个宿主的滚动容器是 CM6 自己造的，外面拿不到。
  *
  * ## ⚠️ 分隔线与危险动作
  *
@@ -106,13 +128,30 @@ export function TreeMenu<A = TreeMenuAction>(props: TreeMenuProps<A>) {
     props.onClose()
   }
 
+  /**
+   * 宿主一滚就把菜单收掉——上面那条「第四条关闭路径」，从宿主搬进这一层。
+   *
+   * 搬进来的理由是编辑器这个宿主**替不了自己**：CM6 的滚动容器是它自己造的
+   * `.cm-scroller`，外面拿不到，而滚动的来源还不止滚轮（折叠、跳转、粘贴都会
+   * `scrollIntoView`）。用 `document` 上**捕获**阶段的 scroll 就一网打尽：
+   * scroll 不冒泡，但捕获看得到任何后代元素的滚动。
+   *
+   * 对原来两个宿主是净收益：文件树自己那条 onScroll 成了冗余（留着也无害，
+   * 两个都只会调同一个 onClose），标签条那一排会横向滚，滚了菜单同样该走。
+   */
+  function onDocScroll() {
+    props.onClose()
+  }
+
   onMount(() => {
     document.addEventListener('mousedown', onDocDown, true)
     document.addEventListener('keydown', onDocKey, true)
+    document.addEventListener('scroll', onDocScroll, true)
   })
   onCleanup(() => {
     document.removeEventListener('mousedown', onDocDown, true)
     document.removeEventListener('keydown', onDocKey, true)
+    document.removeEventListener('scroll', onDocScroll, true)
   })
 
   /**
@@ -136,6 +175,8 @@ export function TreeMenu<A = TreeMenuAction>(props: TreeMenuProps<A>) {
             <button
               class="tree-menu-item"
               role="menuitem"
+              disabled={item.disabled}
+              onMouseDown={props.keepFocus ? (e: MouseEvent) => e.preventDefault() : undefined}
               onClick={() => {
                 props.onPick(item.action)
                 props.onClose()

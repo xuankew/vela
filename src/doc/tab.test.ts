@@ -34,6 +34,7 @@ function makeTab(text = '', config: ViewConfig = createViewConfig(), onUpdate?: 
     setText: (tab, next) => replaceTabText(tab, next, config),
     focus: () => {},
     pathChanged: () => {},
+    clearChangeMarks: () => {},
   }
   return createTab({ id: idSeq++, text, config, host, ...(onUpdate ? { onUpdate } : {}) })
 }
@@ -78,6 +79,9 @@ describe('createTab', () => {
         seen.push(tab)
       },
       pathChanged: (tab) => {
+        seen.push(tab)
+      },
+      clearChangeMarks: (tab) => {
         seen.push(tab)
       },
     }

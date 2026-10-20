@@ -31,6 +31,16 @@ export interface DocumentHost {
    * 都得说一声。这一层刻意不自己算语言：它连 CM6 都不该知道。
    */
   pathChanged: () => void
+  /**
+   * 正文已与磁盘一致（存盘成功）：清掉「未保存改动」gutter 累积的行标记。
+   *
+   * 🔴 **只有存盘这一条路需要显式清**。打开 / reload / 恢复草稿都走 `replaceText` →
+   * `tab.ts` 的 `replaceTabText`，那是**重建整个 state**，gutter 字段跟着新 state 一起归零，
+   * 不需要任何额外动作。而 `writeTo` 偏偏**不换正文**（buffer 原样留着，只 `setDirty(false)`），
+   * 于是那一摞标记得由宿主 dispatch 一个 `resetChanges` 手动清掉。接线见 workspace 的
+   * `host.clearChangeMarks`，语义见 `editor/changeGutter.ts` 文件头。
+   */
+  clearChangeMarks: () => void
 }
 
 /** 新建文档的默认格式：macOS 上最不可能出错的组合 */
@@ -421,6 +431,9 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
       // 保存不重建 state，所以这里只能靠槽位 reconfigure
       host.pathChanged()
       setDirty(false)
+      // 正文这一刻与磁盘一致了：清掉 gutter 累积的「未保存改动」标记。
+      // 只有存盘走这里——其余「变干净」的路都重建了 state（见 DocumentHost.clearChangeMarks）
+      host.clearChangeMarks()
       setNotice(
         report.unmappable
           ? {

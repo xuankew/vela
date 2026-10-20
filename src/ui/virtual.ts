@@ -5,7 +5,7 @@
  *
  * | 列表 | 行高 | 谁定的 |
  * | --- | --- | --- |
- * | 文件树 | 22 | `project/tree.ts` 的 `ROW_HEIGHT` |
+ * | 文件树 | 24 | `project/tree.ts` 的 `ROW_HEIGHT` |
  * | 搜索结果 | 20 | `search/rows.ts` 的 `RESULT_ROW_HEIGHT`（一屏要装的东西更多） |
  * | `Cmd+P` 浮层 | 20 | `goto/QuickOpen.tsx` 的 `QUICK_OPEN_ROW_HEIGHT` |
  * | 大纲 | 20 | `md/outline.ts` 的 `OUTLINE_ROW_HEIGHT` |

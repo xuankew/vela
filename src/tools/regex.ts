@@ -15,14 +15,17 @@ import { describeErrorAt, type LocatedError, type ToolResult } from './tool'
  * 那是**所有**工具的公共型与状态机都要跟着动。清单模式里逐处给出的行列与命中片段
  * 是同一个信息的文字版，代价是眼睛得在两个格子之间来回一次。
  *
- * ## 🔴 灾难性回溯会**卡死**这一块浮层，没有超时中断
+ * ## 🔴 灾难性回溯会**卡死跑它的那个线程**——所以生产上它跑在 worker 上
  *
- * `(a+)+$` 配上一串 `aaaaaaaaaaaaaaaaaaaaaX` 就是经典的那一例。真正的解法是把 `exec`
- * 丢进一个 Worker 并给它一个截止时间——那是一份真机器：一个 worker 分包、一层异步管道、
- * 以及在「每打一个字就重跑一次」的防抖底下把在飞的那一次取消掉。
- * ⚠️ `ToolDefinition.run` 本来就允许返回 Promise（`store.ts` 一律包一层 `Promise.resolve`），
- * 所以那条路**没有被关闭**，只是 v1 不走。输入长度的上限是 `store.ts` 的 `MAX_TOOL_CHARS`，
- * 它拦的是「输入太大」，⛔ 拦不住「模式太坏」。
+ * `(a+)+$` 配上一串 `aaaaaaaaaaaaaaaaaaaaaX` 就是经典的那一例：`exec` 是一个不让出的循环，
+ * 谁的线程跑它谁就冻住。**这一份纯函数本身没有、也不该有超时**——它是同步的、可被单测直接钉住的，
+ * 加个 `setTimeout` 进去既拦不住同步的 `exec`，也会把「纯」字毁掉。
+ *
+ * 中断这件事住在**外面一层**：`regexRunner.ts` 把 `regexReport` 丢进一个 worker 并给它一个截止时间
+ * （`REGEX_DEADLINE_MS`），到点就 `terminate()` 掉那个 worker、如实报一句「很可能是灾难性回溯」。
+ * ⚠️ worker 与 deadline 是一体的：主线程上的 `setTimeout` 永远排不进一个被同步 `exec` 占死的线程，
+ * 所以「把活挪到别的线程」是「使得放弃办得到」的前提。输入长度的上限是 `store.ts` 的 `MAX_TOOL_CHARS`，
+ * 它拦的是「输入太大」，⛔ 拦不住「模式太坏」——后者靠的是那一层 worker + deadline。
  *
  * ## ⛔ 模式或标志写错时**不带** `at`
  *

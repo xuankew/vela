@@ -8,11 +8,12 @@ import {
   moveLineDown,
   moveLineUp,
 } from '@codemirror/commands'
-import { foldAll, unfoldAll } from '@codemirror/language'
+import { unfoldAll } from '@codemirror/language'
 // selectNextOccurrence 与查找替换那几个都住在 search 包里，不在 commands 包
 import { findNext, findPrevious, openSearchPanel, selectMatches, selectNextOccurrence } from '@codemirror/search'
 import type { Command } from '@codemirror/view'
 import { replaceAllCommand, replaceNextCommand } from '../editor/findReplace'
+import { foldWholeDocument } from '../editor/fold'
 import { removeDuplicateLines, sortLinesAscending, sortLinesDescending } from '../editor/lineOps'
 import { selectAllOccurrences } from '../editor/multiCursor'
 import type { CommandDefinition, CommandRegistry } from './registry'
@@ -37,16 +38,25 @@ export interface BuiltinHooks {
    * `EditorController`（真正生效的扩展）与 App 的 signal（工具栏按钮的标签）。
    */
   applyLineWrap: (on: boolean) => void
+  /**
+   * 切换缩略图（M4-H）。与 `applyLineWrap` 同一条分工：命令只决定「翻一下」，
+   * 落值在宿主——缩略图状态活在工作区的共享槽位里，不属于任何单个编辑器实例。
+   */
+  toggleMinimap: () => void
   /** 字号是全局 CSS 变量，不属于任何单个编辑器实例 */
   adjustFontSize: (delta: number) => void
   resetFontSize: () => void
   /**
-   * 分屏五条。都作用于「聚焦的那块分屏」，而不是 `ctx.editor`——
-   * `ctx.editor` 只是那块分屏里的编辑器实例，分屏的增删与聚焦是工作区的事。
+   * 分屏六条。都作用于**工作区的分屏**而不是 `ctx.editor`——
+   * `ctx.editor` 只是聚焦那块分屏里的编辑器实例，分屏的增删与聚焦是工作区的事。
+   * ⚠️ `mergePanes` 更是横跨所有分屏（保留聚焦那块、合掉其余），压根不是「聚焦那块」的事
    */
   splitRight: () => void
   splitDown: () => void
+  /** 只收掉聚焦的那一块分屏（它的标签留在标签条上，正文先 capture 回去） */
   closePane: () => void
+  /** 除聚焦那块以外一次全合掉，塌回单栏。与「窗口」菜单的「合并分屏」是同一件事 */
+  mergePanes: () => void
   focusNextPane: () => void
   focusPreviousPane: () => void
   /**
@@ -276,7 +286,7 @@ function cmCommand(id: string, title: string, command: Command, keybinding?: str
  *
  * 折叠/展开也刻意**不绑快捷键**：CM6 的 `foldKeymap` 已经绑了 `Cmd/Ctrl+Shift+[` `]`
  * 折叠当前区块，再绑一套只会制造冲突。这两条命令的价值是让折叠能被命令面板与
- * 将来的菜单栏调用——那正是「所有功能走同一个注册表」的意义。
+ * 正文的右键菜单调用——那正是「所有功能走同一个注册表」的意义。
  */
 export function registerBuiltinCommands(registry: CommandRegistry, hooks: BuiltinHooks): () => void {
   const dispose = [
@@ -340,8 +350,11 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       title: '折叠全部',
       category: '编辑器',
       when: (ctx) => ctx.editor !== null,
-      run: (ctx) => {
-        foldAll(ctx.editor!.view)
+      // 🔴 不直接调 CM6 的 `foldAll`：它只折叠**语法树已解析到**的那些行，而 CM6 的后台解析
+      // 是视口驱动的，于是「折叠全部」在一份超过一屏的 JSON 上只折了光标附近那一段。
+      // `foldWholeDocument` 先把树推到文末再折，代价与预算写在 `editor/fold.ts` 的文件头
+      run: async (ctx) => {
+        await foldWholeDocument(ctx.editor!.view)
       },
     }),
     registry.register({
@@ -438,15 +451,27 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       keybinding: 'Mod+Alt+Left',
       run: () => hooks.focusPreviousPane(),
     }),
-    // ⛔ 「合并分屏」刻意不绑 `Mod+W`：macOS 的原生菜单快捷键等价物在事件到达 webview
-    // 之前就被系统吃掉了，绑在这里收不到按键（见 §3.3「M1-D 实施修正」）。
-    // 不绑键与 foldAll / unfoldAll 同一条理由：工具栏的「合并」按钮就是它的入口，
-    // 注册进来只为让命令面板能调用。
+    // 分屏的收口两条。⛔ 都刻意不绑 `Mod+W`：macOS 的原生菜单快捷键等价物在事件到达 webview
+    // 之前就被系统吃掉了，绑在这里收不到按键（见 §3.3「M1-D 实施修正」）。不绑键与
+    // foldAll / unfoldAll 同一条理由：入口是「窗口」菜单那两项与命令面板，注册进来只为让
+    // 命令面板能列出、能调用。
+    //
+    // 🔴 两条的**名字与行为逐一对得上**，与「窗口」菜单里的两项一一对应：
+    //   「关闭分屏」= 只收掉聚焦的那一块（`ws.closePane(focused)`）；
+    //   「合并分屏」= 除聚焦那块以外一次全合掉，塌回单栏。
+    // ⚠️ 早前命令面板只有**一条**、顶着「合并分屏」的名却只关一块，与菜单里的「合并分屏」
+    //   名同实异（同一个标签两种行为）。现在拆成两条、各归各的名字，两个入口才真的对齐
     registry.register({
       id: 'editor.closePane',
-      title: '合并分屏',
+      title: '关闭分屏',
       category: '编辑器',
       run: () => hooks.closePane(),
+    }),
+    registry.register({
+      id: 'editor.mergePanes',
+      title: '合并分屏',
+      category: '编辑器',
+      run: () => hooks.mergePanes(),
     }),
 
     // 关标签两条。⛔ 刻意避开 `W` 那一族（`Mod+W` / `Mod+Shift+W` / `Mod+Alt+W`）：
@@ -561,6 +586,16 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       category: '视图',
       keybinding: 'Mod+Shift+M',
       run: () => hooks.toggleOutline(),
+    }),
+
+    // 缩略图（M4-H）。⛔ 不绑快捷键：它是「换版面」类的低频开关，与「Markdown 工具栏」
+    // 同一档（那条也没有快捷键），视图菜单与命令面板两个入口已经够着；
+    // 为一个低频开关占一个键位，代价是以后真正高频的命令没地方放
+    registry.register({
+      id: 'view.toggleMinimap',
+      title: '显示/隐藏缩略图',
+      category: '视图',
+      run: () => hooks.toggleMinimap(),
     }),
 
     // 全局搜索（M2-C）。绑 Mod+Shift+F：VS Code 与 Sublime 的既有约定。

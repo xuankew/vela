@@ -15,6 +15,7 @@ import {
   containerRel,
   displayName,
   flattenRows,
+  isMutedRow,
   keyOf,
   menuFor,
   parentRel,
@@ -240,6 +241,42 @@ describe('childRel / parentRel：rel 的拼与拆', () => {
     expect(parentRel('我的 项目/说明 文档.md')).toBe('我的 项目')
     expect(childRel('', '100% #1 draft.md')).toBe('100% #1 draft.md')
     expect(parentRel('src/100% #1 draft.md')).toBe('src')
+  })
+})
+
+describe('isMutedRow：哪些行该弱显', () => {
+  function rowOf(name: string, isDir: boolean, rel = name): TreeRow {
+    return {
+      rootIndex: 0,
+      rel,
+      name,
+      path: `/repo/${rel}`,
+      isDir,
+      depth: 1,
+      expanded: false,
+      loading: false,
+      error: null,
+    }
+  }
+
+  it('dot 目录与固定清单里的目录弱显', () => {
+    for (const name of ['.github', '.cursor', 'node_modules', 'dist', 'build', 'out', 'coverage']) {
+      expect(isMutedRow(rowOf(name, true)), name).toBe(true)
+    }
+  })
+
+  it('⚠️ dot 文件不弱显：`.gitignore` 是被跟踪的普通文件', () => {
+    expect(isMutedRow(rowOf('.gitignore', false))).toBe(false)
+    expect(isMutedRow(rowOf('.env.example', false))).toBe(false)
+  })
+
+  it('⚠️ 根行不弱显：哪怕那个根的名字以点开头', () => {
+    expect(isMutedRow(rowOf('.config', true, ''))).toBe(false)
+  })
+
+  it('普通目录不弱显', () => {
+    expect(isMutedRow(rowOf('src', true))).toBe(false)
+    expect(isMutedRow(rowOf('docs', true))).toBe(false)
   })
 })
 

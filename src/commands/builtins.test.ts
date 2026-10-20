@@ -26,11 +26,13 @@ function makeHooks(): BuiltinHooks {
     saveFile: vi.fn(),
     saveFileAs: vi.fn(),
     applyLineWrap: vi.fn(),
+    toggleMinimap: vi.fn(),
     adjustFontSize: vi.fn(),
     resetFontSize: vi.fn(),
     splitRight: vi.fn(),
     splitDown: vi.fn(),
     closePane: vi.fn(),
+    mergePanes: vi.fn(),
     focusNextPane: vi.fn(),
     focusPreviousPane: vi.fn(),
     closeOtherTabs: vi.fn(),
@@ -109,24 +111,28 @@ function makeRegistry(editor: EditorController | null) {
 }
 
 /**
- * 分屏那五条命令的 id。
+ * 分屏那六条命令的 id。
  *
  * 抽出来是因为两处要用同一份清单，而它们要钉的是**相反**的两件事：M1-D-5 那组验它们
  * 各分派到自己的 hook，M1-C-1 那条不变式则要把它们**排除**在「没有编辑器就一律置灰」
- * 之外。清单写两遍的话，哪天加第六条分屏命令只会有一处被想起来。
+ * 之外。清单写两遍的话，哪天加第七条分屏命令只会有一处被想起来。
+ *
+ * ⚠️ `closePane`（关闭分屏，只关聚焦那块）与 `mergePanes`（合并分屏，塌回单栏）是**两条**，
+ * 各分派到自己的 hook——它们名字相近而行为不同，正是这组「各分派到自己」断言要盯住的那类接错
  */
 const PANE_COMMAND_IDS: readonly string[] = [
   'editor.splitRight',
   'editor.splitDown',
   'editor.closePane',
+  'editor.mergePanes',
   'editor.focusNextPane',
   'editor.focusPreviousPane',
 ]
 
 /**
- * `editor.*` 里**刻意不设 `when`** 的那几条，共九条。
+ * `editor.*` 里**刻意不设 `when`** 的那几条，共十条。
  *
- * 前五条就是分屏那五条。中间两条（对齐表格、字数统计）理由不同、结论相同：
+ * 前六条就是分屏那六条。中间两条（对齐表格、字数统计）理由不同、结论相同：
  * `editor.alignTable`（M3-A-5）与 `editor.wordCount`（M3-A-6）都作用于**文档**而不是面板，
  * 而只读分片那块分屏里 `ctx.editor` 同样是 null——「没有编辑器」在这儿的意思可能是
  * 「聚焦的是一份只读大文件」，不是「没有表可对齐」。字数那条更是反过来的：
@@ -215,6 +221,7 @@ describe('内置命令', () => {
       'editor.focusPreviousPane',
       'editor.foldAll',
       'editor.formatJson',
+      'editor.mergePanes',
       'editor.minifyJson',
       'editor.moveLineDown',
       'editor.moveLineUp',
@@ -238,6 +245,7 @@ describe('内置命令', () => {
       'view.increaseFontSize',
       'view.resetFontSize',
       'view.toggleJsonPreview',
+      'view.toggleMinimap',
       'view.toggleOutline',
       'view.togglePreview',
       'view.toggleSidebar',
@@ -506,26 +514,30 @@ describe('M1-D-5：分屏命令的接线', () => {
     expect(registry.findForKey(event('ArrowDown', { metaKey: true, altKey: true }))?.id).toBe('editor.addCursorBelow')
   })
 
-  it('五条命令各分派到自己的 hook', async () => {
+  it('六条命令各分派到自己的 hook', async () => {
     const { registry, hooks } = makeRegistry(fakeController(false))
     await registry.execute('editor.splitRight')
     await registry.execute('editor.splitDown')
     await registry.execute('editor.closePane')
+    await registry.execute('editor.mergePanes')
     await registry.execute('editor.focusNextPane')
     await registry.execute('editor.focusPreviousPane')
     expect(hooks.splitRight).toHaveBeenCalledOnce()
     expect(hooks.splitDown).toHaveBeenCalledOnce()
     expect(hooks.closePane).toHaveBeenCalledOnce()
+    // 🔴 「关闭分屏」与「合并分屏」名字相近而行为不同，各走各的 hook：接反了不会报错，
+    // 只会「想关一块却塌回单栏」或反过来
+    expect(hooks.mergePanes).toHaveBeenCalledOnce()
     expect(hooks.focusNextPane).toHaveBeenCalledOnce()
     expect(hooks.focusPreviousPane).toHaveBeenCalledOnce()
   })
 
-  it('「合并分屏」不绑快捷键，Mod+W 也没被占用', () => {
+  it('「关闭分屏」与「合并分屏」都不绑快捷键，Mod+W 也没被占用', () => {
     const { registry } = makeRegistry(fakeController(false))
-    const info = registry.list().find((c) => c.id === 'editor.closePane')
-    expect(info?.keybindings).toEqual([])
+    expect(registry.list().find((c) => c.id === 'editor.closePane')?.keybindings).toEqual([])
+    expect(registry.list().find((c) => c.id === 'editor.mergePanes')?.keybindings).toEqual([])
     // ⛔ Mod+W 在 macOS 上被原生菜单的快捷键等价物先吃掉，绑在这里根本收不到事件。
-    // 这条断言钉住「别以为绑了就有效」——入口只有工具栏的「合并」按钮与命令面板。
+    // 这条断言钉住「别以为绑了就有效」——入口只有「窗口」菜单那两项与命令面板。
     expect(registry.findForKey(event('w', { metaKey: true }))).toBeNull()
   })
 
@@ -536,7 +548,7 @@ describe('M1-D-5：分屏命令的接线', () => {
   // 按钮的 `disabled` 只看 `MAX_PANES`，**看上去还是能点的**——点下去什么也不发生，
   // 也不报错。安全性不在这里保证，在 workspace 里：`capture` / `focusPane` /
   // `syncMetrics` 全是 `controller?.` 那一套写法，没有编辑器就是什么都不做
-  it('没有编辑器时五条照样跑（聚焦的可能是一块只读分片）', async () => {
+  it('没有编辑器时六条照样跑（聚焦的可能是一块只读分片）', async () => {
     const { registry, hooks } = makeRegistry(null)
     for (const id of PANE_COMMAND_IDS) {
       expect(registry.list().find((c) => c.id === id)?.enabled, `${id} 应当可点`).toBe(true)
@@ -545,6 +557,7 @@ describe('M1-D-5：分屏命令的接线', () => {
     expect(hooks.splitRight).toHaveBeenCalledOnce()
     expect(hooks.splitDown).toHaveBeenCalledOnce()
     expect(hooks.closePane).toHaveBeenCalledOnce()
+    expect(hooks.mergePanes).toHaveBeenCalledOnce()
     expect(hooks.focusNextPane).toHaveBeenCalledOnce()
     expect(hooks.focusPreviousPane).toHaveBeenCalledOnce()
 
@@ -568,7 +581,7 @@ describe('关标签两条命令的接线（标签右键菜单那两项的快捷�
     metaKey: true,
   })
 
-  it('两条各分派到自己的 hook，不蹭「合并分屏」也不蹭对方', async () => {
+  it('两条各分派到自己的 hook，不蹭分屏那两条也不蹭对方', async () => {
     const { registry, hooks } = makeRegistry(fakeController(false))
     expect(await registry.execute('editor.closeOtherTabs')).toBe(true)
     expect(hooks.closeOtherTabs).toHaveBeenCalledOnce()
@@ -577,9 +590,11 @@ describe('关标签两条命令的接线（标签右键菜单那两项的快捷�
     expect(await registry.execute('editor.closeAllTabs')).toBe(true)
     expect(hooks.closeAllTabs).toHaveBeenCalledOnce()
     expect(hooks.closeOtherTabs).toHaveBeenCalledOnce()
-    // ⚠️ 三条都长得像「关掉点什么」，接错人不会报错、只会关错东西：
-    // `closeOtherTabs` 接到 `closeAllTabs` 上的话用户想留一个标签，结果一个都不剩
+    // ⚠️ 四条都长得像「关掉点什么」（关其它标签、关全部标签、关闭分屏、合并分屏），
+    // 接错人不会报错、只会关错东西：`closeOtherTabs` 接到 `closeAllTabs` 上的话
+    // 用户想留一个标签，结果一个都不剩
     expect(hooks.closePane).not.toHaveBeenCalled()
+    expect(hooks.mergePanes).not.toHaveBeenCalled()
   })
 
   it('⌥⌘O 与 ⌥⌘A 各命中自己那条，同一个字母的其余组合都还是原来的样子', () => {
@@ -1064,6 +1079,21 @@ describe('M3-A：大纲命令的接线', () => {
   })
 })
 
+describe('M4-H：缩略图命令的接线', () => {
+  it('view.toggleMinimap 分派到自己的 hook', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('view.toggleMinimap')).toBe(true)
+    expect(hooks.toggleMinimap).toHaveBeenCalledOnce()
+    expect(hooks.toggleOutline).not.toHaveBeenCalled()
+  })
+
+  it('没有编辑器时照样执行成功——缩略图是工作区级的全局视图设置', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    expect(await registry.execute('view.toggleMinimap')).toBe(true)
+    expect(hooks.toggleMinimap).toHaveBeenCalledOnce()
+  })
+})
+
 describe('M3-A-5：表格对齐命令的接线', () => {
   it('editor.alignTable 分派到自己的 hook', async () => {
     const { registry, hooks } = makeRegistry(fakeController(false))
@@ -1233,19 +1263,22 @@ describe('M3-B-1：工具箱与命令面板两个入口的接线', () => {
     // 这一条钉的是 PLAN 第 77 行那笔 P0 欠账**被还掉了**：M1-A 只交了「命令面板的数据源」，
     // 而数据源本身没有入口。
     //
-    // ⚠️ 钉的是**具体那几条**而不是数量。M3-B-1 之前的账是「二十几条没有快捷键」，量下来只有 7 条
-    // （折叠/展开、选中全部匹配项、关闭分屏、项目那三条）——因为这个代码库一路都在给命令绑键，
-    // 而那几条也各有别的入口（`foldKeymap`、面板按钮、侧栏）。所以面板补上的不是「够不着」，
+    // ⚠️ 钉的是**具体那几条**而不是数量。M3-B-1 之前的账是「二十几条没有快捷键」，量下来只有 8 条
+    // （折叠/展开、选中全部匹配项、关闭分屏、合并分屏、项目那三条）——因为这个代码库一路都在给命令绑键，
+    // 而那几条也各有别的入口（`foldKeymap`、面板按钮、侧栏、「窗口」菜单）。所以面板补上的不是「够不着」，
     // 而是「一眼看全」：它是唯一一处能列出所有命令、并顺带告诉你每条绑在哪个键上的地方。
-    // 钉数量的坏处是新加一条绑了键的命令就得改这条用例，而那与本条要证明的事无关
+    // 钉数量的坏处是新加一条绑了键的命令就得改这条用例，而那与本条要证明的事无关。
+    // ⚠️ M4-H 起是 9 条：缩略图那条**刻意**不绑键（菜单 + 面板两个入口够），理由在 builtins.ts 那条注册上
     expect(unbound.map((c) => c.id).sort()).toEqual([
       'editor.closePane',
       'editor.foldAll',
+      'editor.mergePanes',
       'editor.selectAllMatches',
       'editor.unfoldAll',
       'project.addFolder',
       'project.closeFolder',
       'project.openFolder',
+      'view.toggleMinimap',
     ])
     expect(all.map((c) => c.id)).toContain('commandPalette.open')
   })

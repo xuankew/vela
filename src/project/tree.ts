@@ -121,10 +121,10 @@ export interface TreeSnapshot {
  *
  * 定高行是虚拟滚动那套 O(1) 窗口算术（`src/ui/virtual.ts` 的 `visibleWindow`）的前提，
  * 而且**只有一个真相**：`Sidebar.tsx` 把它注入成 CSS 变量 `--vela-tree-row-height`，
- * 样式表里不许出现第二个 `22px` 字面量——漂移的失败方式是「行与行之间露出一条缝」，
+ * 样式表里不许出现第二个 `24px` 字面量——漂移的失败方式是「行与行之间露出一条缝」，
  * 不报错，只是难看。
  */
-export const ROW_HEIGHT = 22
+export const ROW_HEIGHT = 24
 
 /**
  * 把**一个根**的树摊成扁平行数组。
@@ -233,6 +233,27 @@ export function childRel(parent: string, name: string): string {
 export function parentRel(rel: string): string {
   const at = rel.lastIndexOf('/')
   return at < 0 ? '' : rel.slice(0, at)
+}
+
+/**
+ * 依赖与构建产物的目录名。它们和 `src` 排在一起时抢注意力，而用户要找的东西
+ * 几乎从不在里面——弱显而不是隐藏：藏起来的话「node_modules 里那个包到底装上没有」
+ * 就无从看一眼。
+ */
+const MUTED_DIR_NAMES = new Set(['node_modules', 'dist', 'build', 'out', 'coverage'])
+
+/**
+ * 弱显行的判据：目录，且名字以 `.` 开头，或落在 `MUTED_DIR_NAMES` 里。
+ *
+ * 参照是 Sublime 的侧栏：它弱显 dot 目录与被 .gitignore 忽略的目录。这里不读
+ * .gitignore（启发式口径），所以 `data/` 那种「因忽略而弱」的目录盖不住——
+ * 盖不住的表现只是它不弱显，不会把该弱的变成不弱。
+ *
+ * ⚠️ 只判目录：`.gitignore` 是一个被跟踪的普通文件，以 `.` 开头不代表它不重要。
+ * ⚠️ 根行除外：根的名字是「我在哪个项目里」的唯一线索，把它染浅等于把项目名染浅。
+ */
+export function isMutedRow(row: TreeRow): boolean {
+  return row.isDir && row.rel !== '' && (row.name.startsWith('.') || MUTED_DIR_NAMES.has(row.name))
 }
 
 /** 右键菜单里的一项动作。七个都是 store 上已有的方法，一一对应 */

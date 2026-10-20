@@ -1,3 +1,5 @@
+import { selectAll } from '@codemirror/commands'
+import { language } from '@codemirror/language'
 import type { EditorState } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
 import { save as pickToSave } from '@tauri-apps/plugin-dialog'
@@ -30,10 +32,10 @@ import { describeStats, textStats } from './doc/stats'
 import { StatusBar } from './doc/StatusBar'
 import { TabStrip } from './doc/TabStrip'
 import { createWorkspace, type DiscardDecision, type Pane } from './doc/workspace'
+import { copySelection, cutSelection, pasteInto, writeClipboard } from './editor/clipboard'
 import { EditorPane } from './editor/EditorPane'
 import { languageFor } from './editor/language'
 import { clickAction, definitionAt } from './goto/definition'
-import { QuickOpen } from './goto/QuickOpen'
 import { createQuickOpen, type Commit } from './goto/store'
 import { symbolTable, wordUnderCaret } from './goto/syntax'
 import { attachFileDrop, handleDroppedPaths } from './ipc/dragDrop'
@@ -42,7 +44,6 @@ import { attachReplaceListeners } from './ipc/replace'
 import { attachSearchListeners } from './ipc/search'
 import { attachWindowCloseGuard } from './ipc/windowClose'
 import { acceptsPastedImage, landPastedImage } from './md/paste'
-import { OutlinePanel } from './md/OutlinePanel'
 import { MarkdownToolbar } from './md/MarkdownToolbar'
 import type { FollowedEditor } from './md/panel'
 import { nextPreviewMode, type PreviewMode } from './md/previewMode'
@@ -50,7 +51,7 @@ import { alignTableAt } from './md/table'
 import { createProjectTree } from './project/store'
 import { Sidebar, type TreeNotice } from './project/Sidebar'
 import { clampSidebarWidth, SidebarResize } from './project/SidebarResize'
-import { FindInFiles } from './search/FindInFiles'
+import { TreeMenu, type ContextMenuItem } from './project/TreeMenu'
 import { ReplaceConfirm } from './search/ReplaceConfirm'
 import { revealTarget } from './search/reveal'
 import type { HitRow } from './search/rows'
@@ -114,6 +115,23 @@ const CommandPalette = lazy(() => import('./commands/CommandPalette').then((m) =
 const ToolBox = lazy(() => import('./tools/ToolBox').then((m) => ({ default: m.ToolBox })))
 
 /**
+ * 三块**面板/浮层**的 UI 也改成按需加载（M4-I 首屏瘦身）。与上面两块同一条理由、同一套切法：
+ * 组件只有在用户打开它时才需要，而启动那一刻需要的是它们的 **store**（命令注册表与 Rust 事件
+ * 都要在 boot 时接上，见 M3-C-2 那条注释里「⛔ 不是它们身后那套状态」），于是这一刀只切组件。
+ *
+ * 🔴 三个渲染点**本来就已经**包在同条件的 `<Show>` 里（大纲那一栏、搜索面板、跳转浮层），
+ * 所以不必像 ToolBox / CommandPalette 那样再补一层外框——那两位是因为组件**内部**自带 `Show`
+ * 才需要外面再套一个。
+ *
+ * ⚠️ `<Suspense>` **不产生 DOM 节点**，于是大纲那一栏在 `.body-row` 这个横向 flex 里的
+ * **顺序**（大纲 → 正文 → 预览）与个数一个都没变；跳转浮层那条「DOM 顺序即层叠顺序」
+ * 的直觉同样照旧成立（`z-index` 相同时后出现的在上面）。
+ */
+const OutlinePanel = lazy(() => import('./md/OutlinePanel').then((m) => ({ default: m.OutlinePanel })))
+const FindInFiles = lazy(() => import('./search/FindInFiles').then((m) => ({ default: m.FindInFiles })))
+const QuickOpen = lazy(() => import('./goto/QuickOpen').then((m) => ({ default: m.QuickOpen })))
+
+/**
  * 编辑器那一层要说的话（见下面 `editorNotice` 那条注释）。
  *
  * 与 `project/Sidebar.tsx` 的 `TreeNotice` 形状一致，只多一档 `plain`——
@@ -126,29 +144,15 @@ interface EditorNotice {
 }
 
 /**
- * 把一段文字放进系统剪贴板。工具箱「复制结果」那一下走的是这条（M3-B-1）。
+ * 编辑器正文那份右键菜单里的动作（落点见下面的 `onEditorMenuPick`）。
  *
- * 🔴 用 `navigator.clipboard` 而不是 `src/ipc/project.ts` 那条 Rust `pbcopy`：那一版收的是
- * `(root, rel)`，为的是「复制一个路径」；这里要复制的是**工具刚算出来的正文**，
- * 它在内存里，压根没有文件可指。
- *
- * ⚠️ 而 `navigator.clipboard.writeText` 要求安全上下文，Tauri 在 macOS 上跑的是
- * `tauri://localhost` 这个自定义协议，算不算安全上下文取决于 WKWebView 的版本——
- * 这正是 `copy_entry_path` 当初绕开它、改走 Rust 的理由（那条注释写在 `ipc/project.ts`）。
- * 这里绕不开，所以**如实返回 false**：面板上那句话会变成
- * 「复制不了——输出格里的文字是可以自己选中的」，失败是说出来的，不是静默的。
- *
- * 🔴 真机待验：如果在 WKWebView 里它确实抛了，补一条 Rust `copy_text` 命令
- * （照 `copy_entry_path` 写）就是解法，而这一处是唯一要改的地方
+ * 🔴 剪切／复制／粘贴／全选**刻意不注册成命令**：浏览器早就把 `Mod+C/X/V/A` 这四个键
+ * 接在 contenteditable 上了，注册一遍只是往命令面板里塞四个谁都知道的条目，
+ * 而「注册表里有、行为却是浏览器给的那一份」以后还得防两边漂开。
+ * 折叠那两项相反——它们本来就已经是命令（`commands/builtins.ts` 的 `editor.foldAll` /
+ * `editor.unfoldAll`），菜单这一条是**调用**它们，不是第二份实现
  */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    await navigator.clipboard.writeText(text)
-    return true
-  } catch {
-    return false
-  }
-}
+type EditorMenuAction = 'cut' | 'copy' | 'paste' | 'selectAll' | 'foldAll' | 'unfoldAll'
 
 /**
  * 菜单事件路由：把 Rust 侧转发的菜单 ID 映射到前端的命令执行。
@@ -180,6 +184,7 @@ function routeMenuEvent(
     zoomOut: () => void
     resetZoom: () => void
     toggleLineWrap: () => void
+    toggleMinimap: () => void
     openCommandPalette: () => void
     showSettings: () => void
     toggleMdToolbar: () => void
@@ -216,6 +221,7 @@ function routeMenuEvent(
   else if (id === 'view.zoom_out') actions.zoomOut()
   else if (id === 'view.reset_zoom') actions.resetZoom()
   else if (id === 'view.toggle_line_wrap') actions.toggleLineWrap()
+  else if (id === 'view.toggle_minimap') actions.toggleMinimap()
   else if (id === 'view.command_palette') actions.openCommandPalette()
   else if (id === 'view.toggle_md_toolbar') actions.toggleMdToolbar()
   else if (id === 'view.settings') actions.showSettings()
@@ -1013,6 +1019,110 @@ export default function App() {
   }
 
   /**
+   * 正文右键菜单那一份现场。存**这块分屏**，⛔ 不存它的 controller：
+   * 菜单弹着的时候用户可能 ⌘W 把这一块关掉（`detach` 会把 `controller` 置 null
+   * 并 destroy 那个 view），而 pane 这个对象本身还活着——于是「哪一块」由它答，
+   * 「还在不在」由 `controller === null` 答，两件事分开
+   */
+  const [editorMenu, setEditorMenu] = createSignal<{ x: number; y: number; pane: Pane } | null>(null)
+
+  /**
+   * 右键编辑器正文。
+   *
+   * 🔴 只读大文件分片**不接**（`shardOf`，与下面 JSX 里那个 `<Show>` 同一条判据）：
+   * 它没有 CM6 实例，六项一项也做不成，而 macOS 那份原生菜单至少还能选中文字复制——
+   * 留原生的比弹一份全灰的好，所以那一支连 `preventDefault` 都不调
+   *
+   * ⛔ 这里**不**替分屏记焦点：浏览器真的把焦点移进来了，`EditorPane` 的 `onFocus`
+   * 会自己记（DOM 才是这件事的真相来源）；没移进来而我们记了一笔，状态栏就会开始
+   * 显示一块打不进字的分屏。所以下面所有动作一律走 `pane.controller`，
+   * ⛔ 不走 `ws.focusedEditor()`——菜单该作用在**被右键的那一块**上，与焦点在哪无关
+   */
+  function onEditorContextMenu(e: MouseEvent, pane: Pane) {
+    if (shardOf(pane) !== null) return
+    e.preventDefault()
+    setEditorMenu({ x: e.clientX, y: e.clientY, pane })
+  }
+
+  /**
+   * 菜单里那六项，与它们各自灰不灰。
+   *
+   * ⚠️ 读的是**右键那一刻**的选区与语言，不订阅：菜单是个快照，而它开着的时候选区
+   * 不会再变（任何一次 mousedown 都会先把它关掉，见 `TreeMenu` 的四条关闭路径）
+   *
+   * 🔴 剪切／复制在没有选区时灰掉，⛔ 不是「点了不说话」：那看起来像菜单坏了。
+   * 粘贴与全选**恒可用**——剪贴板里有没有东西这一层不知道（读它要一次异步 IPC），
+   * 而全选在空文档上也只是个空操作，都不值得为它去猜
+   *
+   * ⚠️ 折叠那两项的判据是「有没有语言」而不是「有没有可折叠的语法节点」：后者要扫一遍
+   * 语法树，而纯文本连语言都没有，`foldAll` 在它上面恒为空操作。判粗一点的代价是
+   * 「一份没有任何块的 JSON 上这两项是亮的、点了什么也没发生」，比每弹一次菜单扫一遍
+   * 全文便宜得多
+   */
+  function editorMenuItems(pane: Pane): ContextMenuItem<EditorMenuAction>[] {
+    const view = pane.controller?.view
+    const hasSelection = view !== undefined && view.state.selection.ranges.some((range) => !range.empty)
+    const foldable = view !== undefined && view.state.facet(language) !== null
+    return [
+      { action: 'cut', label: '剪切', disabled: !hasSelection },
+      { action: 'copy', label: '复制', disabled: !hasSelection },
+      { action: 'paste', label: '粘贴' },
+      { action: 'selectAll', label: '全选' },
+      { action: 'foldAll', label: '折叠全部', separator: true, disabled: !foldable },
+      { action: 'unfoldAll', label: '展开全部', disabled: !foldable },
+    ]
+  }
+
+  /**
+   * 剪贴板那三项做不到时说一句话。⛔ 不静默：`navigator.clipboard` 要安全上下文，
+   * 而 Tauri 跑的是 `tauri://localhost`（完整论证与补救方案写在 `editor/clipboard.ts`
+   * 的文件头）——「点了没反应」与「点了但做不到」在用户那边长得一样，只有后者能被修
+   */
+  function clipboardFailed(verb: string) {
+    setEditorNotice({ level: 'error', text: `${verb}不了——拿不到系统剪贴板，请用 Cmd+C / Cmd+X / Cmd+V` })
+  }
+
+  /**
+   * 🔴 必须有 switch：六项各有各的落点，而「加了第七项却忘了处理」的失败方式是
+   * 点下去什么也没发生（类型只在 `action` 上帮忙，不会替你写分支）
+   * ——与 `doc/TabStrip.tsx` 的 `onPick` 同一条纪律
+   */
+  function onEditorMenuPick(pane: Pane, action: EditorMenuAction) {
+    const controller = pane.controller
+    // 菜单弹着的时候这块分屏被关掉了：view 已经 destroy，往上 dispatch 是未定义行为
+    if (controller === null) return
+    const view = controller.view
+    switch (action) {
+      case 'cut':
+        void cutSelection(view).then((ok) => {
+          if (!ok) clipboardFailed('剪切')
+        })
+        return
+      case 'copy':
+        void copySelection(view).then((ok) => {
+          if (!ok) clipboardFailed('复制')
+        })
+        return
+      case 'paste':
+        void pasteInto(view).then((ok) => {
+          if (!ok) clipboardFailed('粘贴')
+        })
+        return
+      case 'selectAll':
+        selectAll(view)
+        return
+      // 折叠走注册表那两条命令，⛔ 不在这里重实现：命令面板、将来的键绑定与这个菜单
+      // 从此是同一份行为。递显式 ctx 是为了作用在**被右键的那一块**上（理由见上面）
+      case 'foldAll':
+        void registry.execute('editor.foldAll', { editor: controller })
+        return
+      case 'unfoldAll':
+        void registry.execute('editor.unfoldAll', { editor: controller })
+        return
+    }
+  }
+
+  /**
    * 命令的上下文。⚠️ 这一份被**两处**读，而它们要的求值时机不同，所以它是一个函数、
    * 不是一个存下来的快照：
    *
@@ -1074,7 +1184,7 @@ export default function App() {
         controller.view.dispatch({ changes: { from: selection.from, to: selection.to, insert: text } })
         return true
       },
-      copy: copyText,
+      copy: writeClipboard,
     },
   })
 
@@ -1086,6 +1196,16 @@ export default function App() {
     // 会 `settings.load(...)` 把持久化的值装回来并覆盖。字体注入与编辑器挂载并行：
     // 编辑器不等字体，到达后浏览器自己用 font-display: swap 重排
     settings.applyNow()
+    // 「合并分屏」= 把除聚焦那块以外的分屏一次全合掉，塌回单栏。与「关闭分屏」
+    // （只关聚焦的那一块）共用同一个 `ws.closePane`：它会先把现场 capture 回标签，
+    // 所以合掉的分屏里没存盘的正文不会丢，标签也留在条上。遍历的是快照，
+    // 而 closePane 每次读的是活的 `panes()`，于是逐块收缩、聚焦那块自始至终不动。
+    // 🔴 命令面板的 `editor.mergePanes` 与「窗口」菜单的 `window.merge_panes` 共用这一份，
+    // 于是两个入口的「合并分屏」是**同一个行为**，不会再出现同名不同事
+    const mergeAllPanes = () => {
+      const keep = ws.focusedPaneId()
+      for (const pane of [...ws.panes()]) if (pane.id !== keep) ws.closePane(pane.id)
+    }
     disposeCommands = registerBuiltinCommands(registry, {
       newDocument: () => {
         ws.newTab()
@@ -1094,6 +1214,7 @@ export default function App() {
       saveFile: ws.save,
       saveFileAs: ws.saveAs,
       applyLineWrap: (on) => ws.setLineWrap(on),
+      toggleMinimap: () => ws.setMinimap(!ws.minimap()),
       // 字号的档位夹取与写穿都在 store 里，这里只把命令接到 store 的方法上。
       // ⚠️ 递的是**裸引用**（`settings.stepFontSize` 而不是 `(d) => settings.stepFontSize(d)`）：
       // store 里这些是具名函数、不依赖 `this`，正是为了能被这样递出去
@@ -1102,6 +1223,7 @@ export default function App() {
       splitRight: () => ws.split('row'),
       splitDown: () => ws.split('column'),
       closePane: () => ws.closePane(ws.focusedPaneId()),
+      mergePanes: mergeAllPanes,
       focusNextPane: () => ws.cyclePane(1),
       focusPreviousPane: () => ws.cyclePane(-1),
       // ⚠️ 「其它」的参照物是**活动标签**（`activeTab()`），不是右键菜单里那个被点的标签：
@@ -1194,13 +1316,16 @@ export default function App() {
             zoomOut: () => settings.stepFontSize(-1),
             resetZoom: settings.resetFontSize,
             toggleLineWrap: () => ws.setLineWrap(!ws.lineWrap()),
+            // 与命令面板的 `view.toggleMinimap` 共用同一个翻转：两个入口必须是同一个行为
+            toggleMinimap: () => ws.setMinimap(!ws.minimap()),
             openCommandPalette: () => palette.show(),
             showSettings: () => setSettingsDialogVisible(true),
             toggleMdToolbar: () => setMdToolbarVisible((v) => !v),
             splitRight: () => ws.split('row'),
             splitDown: () => ws.split('column'),
-            // TODO: mergePanes 尚未实现，菜单项保留但暂不绑定
-            mergePanes: () => {},
+            // 与命令面板的 `editor.mergePanes` 共用同一份 `mergeAllPanes`（定义在 onMount 顶部）：
+            // 「合并分屏」在这两个入口必须是同一个行为，理由写在那一份定义上
+            mergePanes: mergeAllPanes,
             focusNextPane: () => ws.cyclePane(1),
             focusPrevPane: () => ws.cyclePane(-1),
             closePane: () => ws.closePane(ws.focusedPaneId()),
@@ -1273,6 +1398,17 @@ export default function App() {
 
   return (
     <div class="app">
+      {/* Sublime 排布：侧边栏是 `.app` 的**左列**（`.sidebar-col`，grid 上跨 1~4 行通顶到底），
+          标签条 / 工具栏 / 提示条 / 正文区都在右列。于是侧栏打开时标签条让到侧栏右边、
+          只盖在编辑器上方；侧栏收起时左列没有 grid item、`auto` 塌成 0，标签条回到整窗通栏。
+          把手是 `.sidebar-col` 的 flex 子项，必须紧跟侧边栏：它画的就是左列与右列之间那条线 */}
+      <Show when={sidebarVisible()}>
+        <div class="sidebar-col">
+          <Sidebar tree={tree} onNotice={setTreeNotice} width={sidebarWidth()} />
+          <SidebarResize width={sidebarWidth} onWidth={setSidebarWidth} />
+        </div>
+      </Show>
+
       {/* 工具栏已移入标准桌面菜单（File/Edit/View/Window/Help），保持界面简洁 */}
       {/* <div class="toolbar"> ... </div> */}
 
@@ -1366,30 +1502,27 @@ export default function App() {
           （工具栏/标签条/提示条/正文/状态栏），多插一行就会把 `1fr` 挤到错误的行上，
           styles.css 里那条注释正是在警告这件事。
 
-          `.body-row` 跟着降级成 `.main` 的 flex 子项：侧边栏与正文区横向并排。
+          `.body-row` 跟着降级成 `.main` 的 flex 子项：大纲 / 正文区 / 预览横向并排
+          （侧边栏不在这儿——它是 `.app` 的左列 `.sidebar-col`）。
           两层收起时都是 `<Show>` 直接不渲染，不留任何占位——没开过搜索的用户看到的
           布局与加这两层之前逐像素相同。 */}
       <div class="main">
         <div class="body-row">
-          <Show when={sidebarVisible()}>
-            <Sidebar tree={tree} onNotice={setTreeNotice} width={sidebarWidth()} />
-            {/* 把手是 `.body-row` 的 flex 子项，必须紧跟侧边栏：它画的就是这两栏之间那条线 */}
-            <SidebarResize width={sidebarWidth} onWidth={setSidebarWidth} />
-          </Show>
-
-          {/* 大纲那一栏（M3-A-4）。放在侧边栏**之后**、`.body` **之前**：
-              `.body-row` 是横向 flex，顺序就是屏幕顺序，而左边是「导航」
-              （磁盘上有什么 → 这份文档的结构），中间是「写」，右边（预览）是「结果」。
+          {/* 大纲那一栏（M3-A-4）。放在 `.body` **之前**：
+              `.body-row` 是横向 flex，顺序就是屏幕顺序，而左边是这份文档的结构（大纲），
+              中间是「写」，右边（预览）是「结果」。
               放到右边去的话它会与预览抢同一半宽，而两个同时开着是常态。
               分隔线同样沿用「gap 露出底色」，所以这一栏也**不加 border** */}
           <Show when={outlineVisible()}>
-            <OutlinePanel
-              source={followedEditor}
-              revision={ws.revision}
-              tabId={() => ws.activeTab().id}
-              onJump={outlineJump}
-              onClose={() => setOutlineVisible(false)}
-            />
+            <Suspense>
+              <OutlinePanel
+                source={followedEditor}
+                revision={ws.revision}
+                tabId={() => ws.activeTab().id}
+                onJump={outlineJump}
+                onClose={() => setOutlineVisible(false)}
+              />
+            </Suspense>
           </Show>
 
           {/* 阅读模式（`previewMode` 的 `only` 档）：`.preview-only` 把这一整块 `display: none`。
@@ -1401,7 +1534,11 @@ export default function App() {
           <div class="body" classList={{ column: ws.direction() === 'column', 'preview-only': editorHidden() }}>
             <For each={ws.panes()}>
               {(pane) => (
-                <div class="editor-host" classList={{ focused: ws.focusedPaneId() === pane.id }}>
+                <div
+                  class="editor-host"
+                  classList={{ focused: ws.focusedPaneId() === pane.id }}
+                  onContextMenu={(e) => onEditorContextMenu(e, pane)}
+                >
                   {/* 🔴 **替换**而不是在编辑器上叠一层：留着 `EditorPane` 的话
                       `ws.focusedEditor()` 照样返回那块编辑器，于是 `Mod+F`、`Alt+Z`、
                       多光标——所有 `when: (ctx) => ctx.editor !== null` 的命令全部照常可用，
@@ -1413,11 +1550,11 @@ export default function App() {
                         state={paneState(pane)}
                         onReady={(c) => ws.attach(pane.id, c)}
                         onDestroy={() => ws.detach(pane.id)}
-                        onFocus={() => ws.focusPane(pane.id)}
+                        onFocus={() => ws.notePaneFocus(pane.id)}
                       />
                     }
                   >
-                    {(shard) => <ShardPane view={shard()} onFocus={() => ws.focusPane(pane.id)} />}
+                    {(shard) => <ShardPane view={shard()} onFocus={() => ws.notePaneFocus(pane.id)} />}
                   </Show>
                 </div>
               )}
@@ -1468,7 +1605,9 @@ export default function App() {
         </div>
 
         <Show when={search.visible()}>
-          <FindInFiles panel={search} />
+          <Suspense>
+            <FindInFiles panel={search} />
+          </Suspense>
         </Show>
       </div>
 
@@ -1511,7 +1650,9 @@ export default function App() {
           它的 z-index 比上面两个模态都高（理由写在 styles.css 那一段上），
           于是「后面的在上面」这条直觉在这里也成立，读代码的人不必回头去查 z-index */}
       <Show when={goto.visible()}>
-        <QuickOpen goto={goto} />
+        <Suspense>
+          <QuickOpen goto={goto} />
+        </Suspense>
       </Show>
 
       {/* 命令面板（M3-B-1d，Cmd+Shift+P）与工具箱（M3-B-1，Cmd+Shift+T）。
@@ -1575,6 +1716,25 @@ export default function App() {
             setKbVersion((v) => v + 1)
           }}
         />
+      </Show>
+
+      {/* 正文的右键菜单。挂在 `.app` 这一层而不是 `.editor-host` 里面：`.tree-menu` 是
+          `position: fixed`（脱离文档流，不给 grid 多添一行），而挂在外面的话它就不会被
+          编辑器的 `overflow: hidden` 裁掉——菜单在窗口右下角弹出时正是这一条兜住它。
+          ⚠️ 复用文件树那一个外壳（第三个宿主，理由见 `project/TreeMenu.tsx` 的文件头），
+          `keepFocus` 是编辑器独有的要求：焦点落到菜单按钮上再还回去，那一下
+          `contentDOM.focus()` 会让浏览器按旧选区滚动，表现是「折完了，视图跳到文件开头」 */}
+      <Show when={editorMenu()}>
+        {(m) => (
+          <TreeMenu
+            x={m().x}
+            y={m().y}
+            items={editorMenuItems(m().pane)}
+            onPick={(action) => onEditorMenuPick(m().pane, action)}
+            onClose={() => setEditorMenu(null)}
+            keepFocus
+          />
+        )}
       </Show>
     </div>
   )

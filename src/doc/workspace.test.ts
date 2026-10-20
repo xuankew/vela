@@ -1317,6 +1317,37 @@ describe('M1-D-5：分屏', () => {
     expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 3 })
   })
 
+  /**
+   * 🔴 这一条钉住的是两个真出过问题的症状的**同一个根因**，不是风格偏好：
+   *
+   * `EditorPane` 的 `onFocusIn` 过去调的是 `focusPane`，而它末尾无条件 `controller.focus()`。
+   * 焦点一进查找面板就被拽回正文 —— 输入框留不住焦点（「查找替换打不进字」），
+   * 而 `focus()` 又让浏览器把几百万行的 contentDOM「滚进视口」= 回到顶部
+   * （「跳到最后一个匹配，视图却甩到文件开头」，且只在超过一页时才看得见）。
+   *
+   * 断言用 spy 而不是 `document.activeElement`：jsdom 只对带 tabindex / 可编辑表单元素
+   * 派发 focus，CM6 的 contentDOM 靠 contenteditable，在 jsdom 里聚焦是静默空操作
+   * （与 `App.test.tsx` 的 `focusHost` 同一条理由）——比 activeElement 的话这条用例是空跑。
+   */
+  it('notePaneFocus 只记账不抢焦点，focusPane 才把焦点递进去', () => {
+    const pane = mounted()
+    pane.type('AAA')
+    const right = pane.splitPane('row')
+    const leftId = pane.ws.panes()[0]!.id
+    const leftFocus = vi.spyOn(pane.controller, 'focus')
+    const rightFocus = vi.spyOn(right.controller, 'focus')
+
+    pane.ws.notePaneFocus(leftId)
+    // 记账照常：聚焦态与度量都得跟上，否则「哪块分屏是活动的」会停在旧值
+    expect(pane.ws.focusedPaneId()).toBe(leftId)
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 3 })
+    expect(leftFocus).not.toHaveBeenCalled()
+
+    pane.ws.focusPane(leftId)
+    expect(leftFocus).toHaveBeenCalledTimes(1)
+    expect(rightFocus).not.toHaveBeenCalled()
+  })
+
   it('cyclePane 两个方向都回绕', () => {
     const pane = mounted()
     const ids = [pane.ws.panes()[0]!.id]

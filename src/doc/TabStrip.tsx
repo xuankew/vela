@@ -180,22 +180,26 @@ export function TabStrip(props: TabStripProps) {
               draggedId = null
             }}
           >
-            <span class="tab-name">
-              {tab.doc.dirty() ? '● ' : ''}
-              {tab.doc.name()}
+            <span class="tab-name">{tab.doc.name()}</span>
+            {/* 脏点与 × 共用右边**同一格**（CSS 里叠在同一个 grid 位）：Sublime 的口径是
+                「脏了显示点、悬停时 × 把点换掉」——一格装两个信号，悬停时标签宽度不跳 */}
+            <span class="tab-slot">
+              <Show when={tab.doc.dirty()}>
+                <span class="tab-dot">●</span>
+              </Show>
+              <button
+                class="tab-close"
+                title="关闭标签"
+                onClick={(e) => {
+                  // 点子元素不等于点标签。眼下不拦也没事——`activateTab` 对已关闭的 id 是空操作，
+                  // 但等它以后有了「id 不存在就新建」之类的行为，漏掉这行就会变成 bug。
+                  e.stopPropagation()
+                  void ws.closeTab(tab.id)
+                }}
+              >
+                ×
+              </button>
             </span>
-            <button
-              class="tab-close"
-              title="关闭标签"
-              onClick={(e) => {
-                // 点子元素不等于点标签。眼下不拦也没事——`activateTab` 对已关闭的 id 是空操作，
-                // 但等它以后有了「id 不存在就新建」之类的行为，漏掉这行就会变成 bug。
-                e.stopPropagation()
-                void ws.closeTab(tab.id)
-              }}
-            >
-              ×
-            </button>
           </div>
         )}
       </For>

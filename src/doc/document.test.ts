@@ -85,7 +85,7 @@ const OK_REPORT: WriteReport = { bytesWritten: 6, unmappable: false }
 
 /** 假宿主：一个正文字符串 + 一个焦点计数器，不起 CM6 */
 function harness() {
-  const state = { text: '', focuses: 0, pathChanges: 0 }
+  const state = { text: '', focuses: 0, pathChanges: 0, clears: 0 }
   const host: DocumentHost = {
     getText: () => state.text,
     setText: (t) => {
@@ -96,6 +96,9 @@ function harness() {
     },
     pathChanged: () => {
       state.pathChanges += 1
+    },
+    clearChangeMarks: () => {
+      state.clears += 1
     },
   }
   return { doc: createDocumentModel(host), state, host }
@@ -161,6 +164,7 @@ describe('打开', () => {
         state.focuses += 1
       },
       pathChanged: () => {},
+      clearChangeMarks: () => {},
     }
     doc = createDocumentModel(host)
     ipc.openFile.mockResolvedValue(textFile({ text: '新正文' }))
@@ -222,6 +226,35 @@ describe('保存与另存为', () => {
     expect(ipc.saveFile).toHaveBeenCalledWith('/a/b.txt', '改了', { encoding: 'utf16_le', bom: true, eol: 'crlf' })
     expect(doc.dirty()).toBe(false)
     expect(doc.notice()).toBeNull()
+  })
+
+  // 🔴 #28：存盘是唯一「正文不动却该清空 gutter」的路（打开/reload 都重建了 state）。
+  // 漏掉它的症状是——存完盘那些「未保存改动」的竖条还赖在 gutter 上，与已经干净的脏标记自相矛盾
+  it('存盘成功清一次「未保存改动」gutter 标记', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '改了'
+    doc.markChanged()
+    expect(state.clears).toBe(0)
+
+    await doc.save()
+
+    expect(state.clears).toBe(1)
+  })
+
+  it('存盘失败时不清标记——正文还没落盘，那些改动仍然在', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '改了'
+    doc.markChanged()
+    ipc.saveFile.mockRejectedValue({ kind: 'unknown' })
+
+    await doc.save()
+
+    expect(doc.dirty()).toBe(true)
+    expect(state.clears).toBe(0)
   })
 
   it('无路径时 save 落到另存为：用对话框拿路径再写', async () => {
@@ -443,6 +476,7 @@ describe('restoreDraft（M1-F 会话恢复）', () => {
         // 记下这一刻的正文，用来验证「先换正文，再报路径变了」这个顺序
         state.textAtPathChange.push(state.text)
       },
+      clearChangeMarks: () => {},
     }
     doc = createDocumentModel(host)
     return { doc, state }
@@ -555,6 +589,7 @@ describe('discardChanges（M1-F：答了「不保存」之后）', () => {
       },
       focus: () => {},
       pathChanged: () => {},
+      clearChangeMarks: () => {},
     }
     doc = createDocumentModel(host)
     return { doc, state }
@@ -648,6 +683,7 @@ describe('reload（M2-D 全局替换之后对账）', () => {
       pathChanged: () => {
         state.pathChanges += 1
       },
+      clearChangeMarks: () => {},
     }
     doc = createDocumentModel(host)
     return { doc, state, host }

@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { undo } from '@codemirror/commands'
+import { foldedRanges, language, unfoldEffect } from '@codemirror/language'
+import { openSearchPanel } from '@codemirror/search'
 import { EditorView } from '@codemirror/view'
 import { render } from 'solid-js/web'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { detectPlatform } from './commands/keybinding'
-import type { TextFile } from './ipc/fs'
 import type { FileMatch, FileQuery, IndexStats } from './ipc/project'
 import { OUTLINE_ROW_HEIGHT } from './md/outline'
 
@@ -266,6 +267,23 @@ await Promise.all([
   import('./md/export'),
   import('./tools/ToolBox'),
   import('./commands/CommandPalette'),
+  // M4-I 起这三块面板/浮层的**组件**也走 `lazy()`（store 仍常驻，见 App.tsx 那条注释）
+  import('./md/OutlinePanel'),
+  import('./search/FindInFiles'),
+  import('./goto/QuickOpen'),
+  // M4-I 起六个工具的**实现**也从 `tools/builtin.ts` 里按需 import（描述符仍常驻）。
+  // 同一条理由：下面「在工具箱里跑一次 Base64」那几条用例等的是 `setTimeout(0)` 量级的 tick，
+  // 冷缓存时那一次 import 横跨好几个宏任务，会让它偶发红
+  import('./tools/json'),
+  import('./tools/codec'),
+  import('./tools/uuid'),
+  import('./tools/time'),
+  import('./tools/naming'),
+  import('./tools/regexRunner'),
+  // JSON 那个语法包由 `language-data` 动态 import（见 `editor/language.ts` 的 `loadSupport`）。
+  // 与上面五个同一条理由：冷缓存时那一次 import 横跨好几个宏任务，而下面等语言落地的
+  // 那个 `waitFor` 只肯等 20 趟 `setTimeout(0)`
+  import('@codemirror/lang-json'),
 ])
 
 /**
@@ -620,12 +638,6 @@ function notices(): { level: string; text: string }[] {
   }))
 }
 
-function button(text: string): HTMLButtonElement {
-  const el = [...container.querySelectorAll('button')].find((b) => b.textContent === text)
-  if (!el) throw new Error(`找不到按钮「${text}」`)
-  return el
-}
-
 /** 标签条上的标签，按屏幕顺序 */
 function tabs(): HTMLElement[] {
   return [...container.querySelectorAll<HTMLElement>('.tab-strip .tab')]
@@ -664,16 +676,15 @@ function treeRow(rel: string, root = '/repo'): HTMLElement {
   return el
 }
 
-/** 「文件夹…」→ 目录对话框选中 /repo → 侧边栏自动显示。在 App 里这是用户的一次点击 */
+/** 「文件 › 打开文件夹…」→ 目录对话框选中 /repo → 侧边栏自动显示。在 App 里这是用户的一次点击 */
 async function openProject(): Promise<void> {
   dialog.open.mockResolvedValue('/repo')
-  button('文件夹…').click()
-  await flush()
+  await menu('file.open_folder')
 }
 
 /**
  * 侧边栏头部的 ↻ / ×。只能按 title 认：`×` 这个文本在整份 DOM 里不唯一
- * （标签条的关闭按钮也是它），`button('×')` 会抓到标签上去。
+ * （标签条的关闭按钮也是它），按文本找会抓到标签上去。
  */
 function sidebarAct(titlePrefix: string): HTMLButtonElement {
   const el = [...container.querySelectorAll<HTMLButtonElement>('.sidebar-head button')].find((b) =>
@@ -719,6 +730,23 @@ async function fireEvent(name: string, payload: unknown): Promise<void> {
   await flush()
 }
 
+/**
+ * 模拟用户点了一下**原生菜单**里的某一项。
+ *
+ * 工具栏整个搬进标准桌面菜单（File/Edit/View/Window/Help）之后，那些动作在 DOM 里
+ * 已经没有按钮可点了——真正的入口是 Rust 侧把菜单点击转发成的 `menu-event` 事件，
+ * 载荷是菜单 ID（如 `"file.open_folder"`），前端在 `routeMenuEvent` 里路由到对应命令。
+ * 这个辅助函数走的就是这条生产路径，所以它验的是「菜单点下去到底通不通」，
+ * 而不是绕过去直接捅组件状态。
+ *
+ * ⚠️ 只对**没有快捷键**的动作是必需（`file.open_folder` / `window.close_pane` 等）；
+ * 有快捷键的（新建/打开/分屏/侧边栏/搜索…）优先用 `press()`，那条路更短、也更贴近
+ * 用户真实的高频入口。
+ */
+async function menu(id: string): Promise<void> {
+  await fireEvent('menu-event', id)
+}
+
 function findPanel(): HTMLElement | null {
   return container.querySelector<HTMLElement>('.find-panel')
 }
@@ -759,7 +787,7 @@ function findStatus(): string {
 /**
  * 面板头部的按钮。**找不到时返回 null 而不是抛**：
  * 「取消」只在搜索进行中才渲染，而「此刻它不该在」正是几条用例要钉的东西，
- * 用全局的 `button()`（找不到就抛）就没法表达了
+ * 一个「找不到就抛」的助手就没法表达了
  */
 function findButton(label: string): HTMLButtonElement | null {
   const all = [...(findPanel()?.querySelectorAll<HTMLButtonElement>('button') ?? [])]
@@ -819,21 +847,16 @@ function replaceSummary(overrides: Partial<ReplaceSummary> = {}): ReplaceSummary
 }
 
 /**
- * M4-B 之后字号 / 字体那三组 select 都收进了「外观」浮层，默认关着、不在 DOM 里。
- * 于是取 select 之前得先把浮层点开——`ensureAppearanceOpen` 幂等，已开着就不动。
+ * 字号 / 字体 / 行高那几组控件都住在「外观设置」对话框里（`SettingsDialog`），默认关着、
+ * 不在 DOM 里。它只有一个入口——「视图 › 设置…」菜单项（`view.settings`），没有快捷键，
+ * 所以开它是异步的：取任何 select 之前得先 `await openSettings()`。幂等，已开着就不动。
  */
-function appearanceToggle(): HTMLButtonElement {
-  const el = [...container.querySelectorAll('button')].find((b) => b.textContent === '外观')
-  if (!el) throw new Error('找不到「外观」按钮')
-  return el
+async function openSettings(): Promise<void> {
+  if (!container.querySelector('.settings-dialog')) await menu('view.settings')
 }
 
-function ensureAppearanceOpen(): void {
-  if (!container.querySelector('.appearance-pop')) appearanceToggle().click()
-}
-
-function fontSizeSelect(): HTMLSelectElement {
-  ensureAppearanceOpen()
+async function fontSizeSelect(): Promise<HTMLSelectElement> {
+  await openSettings()
   const el = [...container.querySelectorAll('select')].find((s) => s.title.startsWith('字号'))
   if (!el) throw new Error('找不到字号 select')
   return el
@@ -885,28 +908,28 @@ describe('App 接线', () => {
     expect(statusCounts()).toBe('3 行 · 11 字符')
   })
 
-  it('Alt+Z 经命令中心切换换行，按钮标签与编辑器状态同时更新', () => {
-    const wrapButton = [...container.querySelectorAll('button')].find((b) => b.title === 'Alt+Z')
-    expect(wrapButton?.textContent).toBe('开')
-
-    press('z', { altKey: true })
-    expect(wrapButton?.textContent).toBe('关')
-    expect(
+  it('Alt+Z 经命令中心切换编辑器换行', () => {
+    const wrapping = () =>
       view()
         .state.facet(EditorView.contentAttributes)
-        .some((a) => typeof a !== 'function' && a.class === 'cm-lineWrapping'),
-    ).toBe(false)
+        .some((a) => typeof a !== 'function' && a.class === 'cm-lineWrapping')
+
+    // 默认开着换行
+    expect(wrapping()).toBe(true)
 
     press('z', { altKey: true })
-    expect(wrapButton?.textContent).toBe('开')
+    expect(wrapping()).toBe(false)
+
+    press('z', { altKey: true })
+    expect(wrapping()).toBe(true)
   })
 
-  it('Mod+= / Mod+- / Mod+0 改字号，CSS 变量与 select 同步', () => {
+  it('Mod+= / Mod+- / Mod+0 改字号，CSS 变量与 select 同步', async () => {
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
 
     press('=', modInit())
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('15px')
-    expect(fontSizeSelect().value).toBe('15')
+    expect((await fontSizeSelect()).value).toBe('15')
 
     press('-', modInit())
     press('-', modInit())
@@ -916,21 +939,21 @@ describe('App 接线', () => {
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
   })
 
-  it('字号只在预设档位间走，不会冒出 select 显示不了的档外值', () => {
+  it('字号只在预设档位间走，不会冒出 select 显示不了的档外值', async () => {
     // 从最小档继续缩小应当停在 12px
     press('0', modInit())
     press('-', modInit())
     press('-', modInit())
     press('-', modInit())
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('12px')
-    expect(fontSizeSelect().value).toBe('12')
+    expect((await fontSizeSelect()).value).toBe('12')
   })
 
   it('「新建」另开一个空标签，状态栏与编辑器都跟着换过去', () => {
     typeText('a\nb\nc\nd')
     expect(statusCounts()).toBe('4 行 · 7 字符')
 
-    button('新建').click()
+    press('n', modInit())
 
     expect(tabs()).toHaveLength(2)
     expect(view().state.doc.toString()).toBe('')
@@ -949,7 +972,7 @@ describe('App 接线', () => {
     const before = container.querySelector('.cm-editor')
     typeText('第一份')
 
-    button('新建').click()
+    press('n', modInit())
     typeText('第二份')
     tabs()[0]!.click()
 
@@ -972,7 +995,7 @@ describe('文件生命周期接线', () => {
     dialog.open.mockResolvedValue('/Users/x/notes/win.txt')
     ipc.openFile.mockResolvedValue(textFile({ text: '第一行\n第二行\n' }))
 
-    button('打开…').click()
+    press('o', modInit())
     await flush()
 
     expect(dialog.open).toHaveBeenCalledWith({ multiple: false, directory: false })
@@ -987,7 +1010,7 @@ describe('文件生命周期接线', () => {
   it('打开后立刻输入才置脏，Mod+S 保存后脏标记消失', async () => {
     dialog.open.mockResolvedValue('/a.txt')
     ipc.openFile.mockResolvedValue(textFile({ text: '原文' }))
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     // 整篇替换正文不算用户改动——这条是 `replacing` 标志存在的全部理由
     expect(statusName()).toBe('a.txt')
@@ -1035,7 +1058,7 @@ describe('文件生命周期接线', () => {
 
   it('对话框取消时什么都不动', async () => {
     dialog.open.mockResolvedValue(null)
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     expect(ipc.openFile).not.toHaveBeenCalled()
     expect(statusName()).toBe('空文档')
@@ -1049,7 +1072,7 @@ describe('文件生命周期接线', () => {
     // 会让这条用例在分片那条路修好之前就红，而红的原因与它要钉的东西无关
     ipc.openFile.mockRejectedValue({ kind: 'io', reason: 'NotFound', message: '文件没了' })
 
-    button('打开…').click()
+    press('o', modInit())
     await flush()
 
     // 草稿标签是脏的，所以 openAt 不复用它：错误落在新开的空标签上
@@ -1074,7 +1097,7 @@ describe('文件生命周期接线', () => {
     dialog.open.mockResolvedValue('/broken.bin')
     ipc.openFile.mockResolvedValue(textFile({ text: 'a\uFFFDb', lossy: true }))
 
-    button('打开…').click()
+    press('o', modInit())
     await flush()
 
     expect(notices()).toHaveLength(1)
@@ -1092,7 +1115,7 @@ describe('文件生命周期接线', () => {
       lossy: false,
       bytes: 4,
     })
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     typeText('😀')
     ipc.saveFile.mockResolvedValue({ bytesWritten: 12, unmappable: true })
@@ -1105,23 +1128,6 @@ describe('文件生命周期接线', () => {
     expect(list[0]!.level).toBe('warning')
     expect(list[0]!.text).toContain('GBK')
     expect(statusName()).toBe('gbk.txt')
-  })
-
-  it('IO 进行中四个文档按钮都是 disabled 的', async () => {
-    let release!: (v: TextFile) => void
-    dialog.open.mockResolvedValue('/a.txt')
-    ipc.openFile.mockReturnValue(new Promise((resolve) => (release = resolve)))
-
-    button('打开…').click()
-    await flush()
-
-    for (const label of ['新建', '打开…', '保存', '另存为…']) {
-      expect(button(label).disabled, `${label} 在 IO 期间应当禁用`).toBe(true)
-    }
-
-    release(textFile())
-    await flush()
-    expect(button('保存').disabled).toBe(false)
   })
 })
 
@@ -1136,7 +1142,7 @@ describe('关闭确认接线', () => {
   async function dirtyFileTab(path = '/a.txt', extra = '改') {
     dialog.open.mockResolvedValue(path)
     ipc.openFile.mockResolvedValue(textFile({ text: '正文' }))
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     typeText(extra)
   }
@@ -1255,7 +1261,7 @@ describe('关闭确认接线', () => {
 
   it('多个脏标签时一次列出全部文件名，而不是一个一个弹', async () => {
     await dirtyFileTab('/a.txt', '改')
-    button('新建').click()
+    press('n', modInit())
     await dirtyFileTab('/b.txt', '也改')
 
     await rustRequestsClose()
@@ -1276,11 +1282,10 @@ describe('分屏接线', () => {
   /** 聚焦标记。用 class 而不是 document.activeElement：jsdom 里 CM6 的聚焦是无效操作 */
   const focused = () => hosts().findIndex((h) => h.classList.contains('focused'))
 
-  it('点「右分屏」多出一块编辑区，焦点交给新的那块，标签条也多一个标签', () => {
+  it('Mod+\\ 右分屏多出一块编辑区，焦点交给新的那块，标签条也多一个标签', () => {
     expect(hosts()).toHaveLength(1)
-    expect(button('合并').disabled).toBe(true) // 只剩一块时没得合
 
-    button('右分屏').click()
+    press('\\', modInit())
 
     expect(hosts()).toHaveLength(2)
     expect(views()).toHaveLength(2)
@@ -1289,31 +1294,28 @@ describe('分屏接线', () => {
     expect(focused()).toBe(1)
     expect(tabs()).toHaveLength(2)
     expect(statusName()).toBe('空文档')
-    expect(button('合并').disabled).toBe(false)
     expect(container.querySelector('.body')?.classList.contains('column')).toBe(false)
   })
 
-  it('点「下分屏」把整排改成竖着排', () => {
-    button('下分屏').click()
+  it('Mod+Shift+\\ 下分屏把整排改成竖着排', () => {
+    press('\\', { ...modInit(), shiftKey: true })
     expect(hosts()).toHaveLength(2)
     expect(container.querySelector('.body')?.classList.contains('column')).toBe(true)
   })
 
-  it('到 MAX_PANES 之后两个分屏按钮都 disabled，再点也不会多出一块', () => {
+  it('到 MAX_PANES 之后再分屏不会多出一块', () => {
     for (let n = 2; n <= MAX_PANES; n++) {
-      button('右分屏').click()
+      press('\\', modInit())
       expect(hosts()).toHaveLength(n)
     }
-    expect(button('右分屏').disabled).toBe(true)
-    expect(button('下分屏').disabled).toBe(true)
 
-    button('右分屏').click()
+    press('\\', modInit())
     expect(hosts()).toHaveLength(MAX_PANES)
   })
 
   it('两块分屏各敲各的，状态栏只报聚焦的那块', () => {
     typeInto(0, 'AAAA')
-    button('右分屏').click()
+    press('\\', modInit())
     typeInto(1, 'BBBBBBB')
 
     expect(views()[0]!.state.doc.toString()).toBe('AAAA')
@@ -1340,7 +1342,7 @@ describe('分屏接线', () => {
   })
 
   it('Mod+Alt+→ 把焦点交给下一块分屏，并回绕', () => {
-    button('右分屏').click()
+    press('\\', modInit())
     expect(focused()).toBe(1)
 
     press('ArrowRight', { ...modInit(), altKey: true })
@@ -1351,7 +1353,7 @@ describe('分屏接线', () => {
   })
 
   it('编辑器里聚焦会把那块分屏标成 focused，度量也跟着回去', () => {
-    button('右分屏').click()
+    press('\\', modInit())
     typeInto(1, 'BBBBBBB')
     expect(focused()).toBe(1)
     expect(statusCounts()).toBe('1 行 · 7 字符')
@@ -1362,27 +1364,85 @@ describe('分屏接线', () => {
     expect(statusCounts()).toBe('1 行 · 0 字符')
   })
 
-  it('合并掉带未保存改动的分屏不丢稿子：标签留在条上，点回去正文还在', () => {
+  it('合并掉带未保存改动的分屏不丢稿子：标签留在条上，点回去正文还在', async () => {
     typeInto(0, '左边')
-    button('右分屏').click()
+    press('\\', modInit())
     typeInto(1, '草稿')
 
-    button('合并').click()
+    // 「关闭分屏」没有快捷键（Mod+W 在 macOS 上被系统吃掉），入口是「窗口」菜单那一项，
+    // 它路由到 `window.close_pane` → `ws.closePane(聚焦的那块)`。⚠️ 这与「合并分屏」
+    // （`window.merge_panes`，一次塌回单栏）是两件事，本例只关聚焦的那一块
+    await menu('window.close_pane')
 
     expect(hosts()).toHaveLength(1)
     expect(tabs()).toHaveLength(2)
-    expect(tabs()[1]!.textContent).toContain('●')
+    expect(tabs()[1]!.querySelector('.tab-dot')?.textContent).toBe('●')
 
     tabs()[1]!.click()
     expect(views()[0]!.state.doc.toString()).toBe('草稿')
     expect(statusCounts()).toBe('1 行 · 2 字符')
   })
 
-  it('合并到只剩一块之后「合并」按钮重新 disabled', () => {
-    button('右分屏').click()
-    button('合并').click()
+  it('只剩一块时再合并是空操作：closePane 不会把最后一块也关掉', async () => {
+    press('\\', modInit())
+    await menu('window.close_pane')
     expect(hosts()).toHaveLength(1)
-    expect(button('合并').disabled).toBe(true)
+
+    // 老工具栏上这一步表现为「合并」按钮重新 disabled；没有按钮之后，等价的保证是
+    // `closePane` 在只剩一块时直接 return（见 workspace.ts），菜单点下去也不该关掉最后一块
+    await menu('window.close_pane')
+    expect(hosts()).toHaveLength(1)
+    expect(tabs()).toHaveLength(2)
+  })
+
+  it('「合并分屏」把三块一次塌回单栏，标签一个不少、聚焦那块留在原地', async () => {
+    typeInto(0, '甲')
+    press('\\', modInit())
+    typeInto(1, '乙')
+    press('\\', modInit())
+    typeInto(2, '丙')
+    expect(hosts()).toHaveLength(3)
+
+    // 焦点此刻在最后一块（split 会把焦点交给新分屏），合并应当保留它、合掉另外两块
+    await menu('window.merge_panes')
+
+    expect(hosts()).toHaveLength(1)
+    expect(focused()).toBe(0)
+    // 合并分屏不是关标签：三个标签都还在条上，各自的正文也都 capture 了回去。
+    // 而**留下来的那一块正是聚焦的那块**：它显示的还是聚焦分屏里的「丙」，不是先合掉后剩下的
+    expect(tabs()).toHaveLength(3)
+    expect(views()[0]!.state.doc.toString()).toBe('丙')
+  })
+
+  it('只剩一块时「合并分屏」是空操作', async () => {
+    typeInto(0, '甲')
+    await menu('window.merge_panes')
+    expect(hosts()).toHaveLength(1)
+    expect(tabs()).toHaveLength(1)
+    expect(views()[0]!.state.doc.toString()).toBe('甲')
+  })
+
+  /**
+   * 🔴 两个真出过问题的症状的回归钉子：「查找替换打不进字」与「跳到最后一个匹配，
+   * 视图却甩到文件开头」。同一个根因——焦点一进面板控件，`onFocusIn` 就会把
+   * `controller.focus()` 跑一遍，把焦点拽回正文：输入框留不住焦点；而 `focus()` 让浏览器
+   * 把几百万行的 contentDOM「滚进视口」= 回到顶部（不足一页时那次滚动是空操作，
+   * 所以症状是「超过一页才出现」）。现在这条链路只记账。
+   *
+   * 断言用 spy 而不是 `document.activeElement`：jsdom 里 CM6 的聚焦是无效操作
+   * （见 `focusHost` 上那条注释），比 activeElement 的话这条用例是空跑。
+   */
+  it('焦点落进查找面板：记下聚焦的分屏，但不把焦点抢回正文', () => {
+    expect(openSearchPanel(view())).toBe(true)
+    const field = container.querySelector<HTMLInputElement>('.cm-search [name=search]')
+    expect(field, '面板应当已经挂进 DOM').not.toBeNull()
+    const focus = vi.spyOn(EditorView.prototype, 'focus')
+
+    field!.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+
+    expect(focused()).toBe(0)
+    expect(focus).not.toHaveBeenCalled()
+    focus.mockRestore()
   })
 })
 
@@ -1444,7 +1504,7 @@ describe('会话恢复接线（M1-F）', () => {
   async function dirtyFileTab(path = '/a.txt', extra = '改') {
     dialog.open.mockResolvedValue(path)
     ipc.openFile.mockResolvedValue(textFile({ text: '正文' }))
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     typeText(extra)
   }
@@ -1461,7 +1521,10 @@ describe('会话恢复接线（M1-F）', () => {
 
     expect(tabs()).toHaveLength(2)
     expect(tabs()[0]!.textContent).toContain('a.txt')
-    expect(tabs()[1]!.textContent).toContain('● 空文档')
+    // 脏点挪到了标题**右边**（Sublime 口径：脏了显示点，悬停时 × 顶替它），
+    // 所以标签的文本不再是「● 空文档」而是名字 + 末尾一个独立的点；分开断言这两处
+    expect(tabs()[1]!.querySelector('.tab-name')!.textContent).toBe('空文档')
+    expect(tabs()[1]!.querySelector('.tab-dot')!.textContent).toBe('●')
     expect(hosts()).toHaveLength(2)
     // 干净又有路径的那个是**重新读盘**的：Vela 关着的时候文件可能被别的程序改过
     expect(views()[0]!.state.doc.toString()).toBe('磁盘上的样子')
@@ -1486,7 +1549,7 @@ describe('会话恢复接线（M1-F）', () => {
   })
 
   it('关窗放行后把会话写下去：分屏布局与聚焦的分屏都进存档', async () => {
-    button('右分屏').click()
+    press('\\', modInit())
     expect(hosts()).toHaveLength(2)
 
     await rustRequestsClose()
@@ -1550,7 +1613,7 @@ describe('会话恢复接线（M1-F）', () => {
 
   it('草稿超预算被丢掉时说出来，而且可以关掉', async () => {
     sessionCmd.droppedDrafts = 2
-    button('右分屏').click()
+    press('\\', modInit())
 
     await rustRequestsClose()
 
@@ -1590,34 +1653,29 @@ describe('侧边栏接线（M2-B）', () => {
     expect(container.querySelectorAll('.body > .editor-host')).toHaveLength(1)
   })
 
-  it('⚠️ .app 的 grid 子元素仍然是五个，搜索面板不算第六个', () => {
+  it('⚠️ .app 的 grid 子元素是固定的四个，搜索面板不算第五个', () => {
     // styles.css 里那条注释警告的正是这件事：`.app` 是行数固定的 grid，
     // 多出来的东西一旦成了 grid item，`1fr` 就会落到错误的行上，正文区被挤掉。
-    // 所以面板必须住在 `.main` 里面，而不是直接当 `.app` 的孩子
+    // 所以面板必须住在 `.main` 里面，而不是直接当 `.app` 的孩子。
+    // 工具栏移入桌面菜单后，默认（侧栏收起、Markdown 工具栏关着）只剩这四格。
     const app = container.querySelector('.app')!
-    expect([...app.children].map((el) => el.className)).toEqual([
-      'toolbar',
-      'tab-strip',
-      'notices',
-      'main',
-      'statusbar',
-    ])
+    expect([...app.children].map((el) => el.className)).toEqual(['tab-strip', 'notices', 'main', 'statusbar'])
     // 默认没搜过，面板整个不渲染：没开过搜索的用户看到的布局与加这两层之前逐像素相同
     expect(container.querySelector('.find-panel')).toBeNull()
   })
 
-  it('Mod+B 与工具栏按钮走同一条路，按钮标签跟着翻', () => {
+  it('Mod+B 与「视图 › 切换侧边栏」菜单是同一条路，都能开合侧边栏', async () => {
     expect(sidebar()).toBeNull()
-    // button() 找不到就抛，所以这一句同时钉住了「标签写的是关」
-    expect(button('侧边栏关').title).toBe('Mod+B')
 
     press('b', modInit())
     expect(sidebar()).not.toBeNull()
-    expect(button('侧边栏开')).toBeDefined()
 
-    button('侧边栏开').click()
+    // 菜单那一项路由到 `view.toggle_sidebar`，与快捷键落到同一个 setSidebarVisible
+    await menu('view.toggle_sidebar')
     expect(sidebar()).toBeNull()
-    expect(button('侧边栏关')).toBeDefined()
+
+    await menu('view.toggle_sidebar')
+    expect(sidebar()).not.toBeNull()
   })
 
   it('点「文件夹…」弹原生目录对话框，选中之后侧边栏自动显示、树长出根与孩子', async () => {
@@ -1625,15 +1683,14 @@ describe('侧边栏接线（M2-B）', () => {
 
     expect(dialog.open).toHaveBeenCalledWith({ multiple: false, directory: true })
     expect(sidebar()).not.toBeNull()
-    expect(container.querySelector('.sidebar-title')?.textContent).toBe('repo')
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('文件夹')
     expect(treeNames()).toEqual(['repo', 'src', 'README.md', 'docs'])
     expect(projectCmd.calls).toEqual([''])
   })
 
   it('目录对话框取消时侧边栏不显示：用户什么都没选，不该凭空弹出一条空栏', async () => {
     dialog.open.mockResolvedValue(null)
-    button('文件夹…').click()
-    await flush()
+    await menu('file.open_folder')
 
     expect(sidebar()).toBeNull()
     expect(projectCmd.calls).toEqual([])
@@ -1641,7 +1698,7 @@ describe('侧边栏接线（M2-B）', () => {
 
   it('点 + 把一个文件夹追加到工作区：头部改口报「2 个文件夹」，两个根各读各的盘', async () => {
     await openProject()
-    expect(container.querySelector('.sidebar-title')?.textContent).toBe('repo')
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('文件夹')
 
     // 一次可以多选：真实对话框收的是 `multiple: true`，挑中的按顺序追加到后面
     dialog.open.mockResolvedValue(['/notes'])
@@ -1666,7 +1723,7 @@ describe('侧边栏接线（M2-B）', () => {
     sidebarAct('添加文件夹').click()
     await flush()
 
-    expect(container.querySelector('.sidebar-title')?.textContent).toBe('repo')
+    expect(container.querySelector('.sidebar-title')?.textContent).toBe('文件夹')
     expect(treeNames()).toEqual(['repo', 'src', 'README.md', 'docs'])
     // 只读过最初那一个根的根层：取消之后不该有任何一次「补读」
     expect(projectCmd.calls).toEqual([''])
@@ -1793,7 +1850,6 @@ describe('侧边栏接线（M2-B）', () => {
 
     // 树恢复好了却看不见，等于没恢复——所以侧边栏要跟着存档一起回来
     expect(sidebar()).not.toBeNull()
-    expect(button('侧边栏开')).toBeDefined()
     expect(treeNames()).toEqual(['repo', 'src', 'a.ts', 'b.ts', 'README.md', 'docs'])
     // 只读存档里摊开的那两层，`docs` 一次都没读（懒加载在恢复路径上照样成立）
     expect([...projectCmd.calls].sort()).toEqual(['', 'src'])
@@ -1840,7 +1896,6 @@ describe('侧边栏接线（M2-B）', () => {
     await restartWith(archiveWith(null))
 
     expect(sidebar()).toBeNull()
-    expect(button('侧边栏关')).toBeDefined()
     expect(projectCmd.calls).toEqual([])
     expect(statusName()).toBe('a.txt')
   })
@@ -1849,7 +1904,7 @@ describe('侧边栏接线（M2-B）', () => {
     // 这条走的是「写」的方向：用户开着项目、然后关掉了文件夹，
     // 关窗补存的那一份必须把 project 写成 null，否则下次启动又把他关掉的东西弹回来
     await openProject()
-    expect(button('侧边栏开')).toBeDefined()
+    expect(sidebar()).not.toBeNull()
 
     sidebarAct('关闭所有文件夹').click()
     await flush()
@@ -1883,9 +1938,7 @@ describe('全局搜索接线（M2-C）', () => {
     expect([...main.children].map((el) => el.className)).toEqual(['body-row'])
   })
 
-  it('Mod+Shift+F 与工具栏那个「搜索…」按钮是两个入口、同一条路', async () => {
-    expect(button('搜索…').title).toBe('Mod+Shift+F')
-
+  it('Mod+Shift+F 与「编辑 › 在文件中查找」菜单是两个入口、同一条路', async () => {
     press('F', { ...modInit(), shiftKey: true })
     await flush()
     // ⚠️ 面板必须是 `.main` 的**第二个孩子**，与 `.body-row` 平级：
@@ -1901,8 +1954,7 @@ describe('全局搜索接线（M2-C）', () => {
     await flush()
     expect(findPanel()).toBeNull()
 
-    button('搜索…').click()
-    await flush()
+    await menu('edit.find_in_files')
     expect(findPanel()).not.toBeNull()
     // 面板本来就展开着时再按一次也要能把焦点抢回来，所以 store 里那个是自增计数不是布尔
     press('F', { ...modInit(), shiftKey: true })
@@ -2094,10 +2146,10 @@ describe('全局替换接线（M2-D）', () => {
     // 第一次「打开…」落在启动那个干净的空白标签上（复用它，不新建），
     // 第二次因为活动标签已经有路径了，才另开一个。于是 tabs() = [README.md, a.ts]
     dialog.open.mockResolvedValue('/repo/README.md')
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     dialog.open.mockResolvedValue('/repo/src/a.ts')
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     // ⚠️ 必须真的敲字把它改脏：`skip` 清单来自 `dirtyPaths()`，
     // 一个干净标签压根不在里面，那条「保护未保存的稿子」的断言就会绿得毫无意义
@@ -2402,7 +2454,7 @@ describe('跳转浮层接线（M2-E）', () => {
 
     const app = container.querySelector('.app')!
     expect([...app.children].map((el) => el.className)).toEqual([
-      'toolbar',
+      'sidebar-col',
       'tab-strip',
       'notices',
       'main',
@@ -2611,11 +2663,18 @@ describe('最近项目接线（M2-F）', () => {
     return container.querySelector('.sidebar-title')?.textContent ?? ''
   }
 
+  /**
+   * 题头 title 上挂的全部根路径（单根就是那一个路径）。
+   * 题头文案是栏目题头（单根恒为「文件夹」），「现在开着哪个根」只能从 title 上认
+   */
+  function sidebarRoots(): string {
+    return container.querySelector('.sidebar-title')?.getAttribute('title') ?? ''
+  }
+
   /** 用工具栏的「文件夹…」把整个工作区换成 `path`。在 App 里这是用户的一次点击 */
   async function switchTo(path: string): Promise<void> {
     dialog.open.mockResolvedValue(path)
-    button('文件夹…').click()
-    await flush()
+    await menu('file.open_folder')
   }
 
   it('空窗口里按 Mod+Shift+O：浮层展开、一个 IPC 都不发，状态行说清楚怎么才会有东西', async () => {
@@ -2633,10 +2692,10 @@ describe('最近项目接线（M2-F）', () => {
 
   it('换过一次工作区之后，刚离开的那一个就出现在 Mod+Shift+O 里，点它把整棵树装回来', async () => {
     await openProject()
-    expect(sidebarTitle()).toBe('repo')
+    expect(sidebarRoots()).toBe('/repo')
 
     await switchTo('/notes')
-    expect(sidebarTitle()).toBe('notes')
+    expect(sidebarRoots()).toBe('/notes')
 
     press('O', { ...modInit(), shiftKey: true })
     await flush()
@@ -2657,7 +2716,7 @@ describe('最近项目接线（M2-F）', () => {
     await flush()
 
     expect(palette()).toBeNull()
-    expect(sidebarTitle()).toBe('repo')
+    expect(sidebarRoots()).toBe('/repo')
     expect(projectCmd.calls.length).toBeGreaterThan(before)
     // 切项目不动任何标签：那半份现场与树是两套独立状态（M2-B-4 的前提）。
     // 起始那个未保存的空标签还在原位，一次 openFile 都没被顺手发出去
@@ -2740,7 +2799,7 @@ describe('文件监听接线（M2-G）', () => {
   /** 「打开…」→ 目录对话框选中 path。在 App 里这是用户的一次点击 */
   async function openFromDialog(path: string): Promise<void> {
     dialog.open.mockResolvedValue(path)
-    button('打开…').click()
+    press('o', modInit())
     await flush()
   }
 
@@ -2934,7 +2993,7 @@ describe('只读分片接线（M2-H）', () => {
   /** 打开那个大文件并等两趟：`open_large` 一趟，建好视图之后要第一页又一趟 */
   async function openHuge(path = '/var/log/huge.log'): Promise<void> {
     hugeFile(path)
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     await flush()
   }
@@ -2976,7 +3035,7 @@ describe('只读分片接线（M2-H）', () => {
     await openHuge()
     expect(container.querySelectorAll('.shard-pane')).toHaveLength(1)
 
-    button('右分屏').click()
+    press('\\', modInit())
     await flush()
 
     // 新那块分屏显示一个新的空标签，于是它必须是编辑器。写成「全局判断」
@@ -2996,7 +3055,7 @@ describe('只读分片接线（M2-H）', () => {
     await openHuge()
     expect(shardCmd.closed).toEqual([])
 
-    button('右分屏').click()
+    press('\\', modInit())
     await flush()
     tabs()[0]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
     await flush()
@@ -3027,16 +3086,6 @@ describe('只读分片接线（M2-H）', () => {
 })
 
 describe('Markdown 预览接线（M3-A-3）', () => {
-  /**
-   * 预览那一栏的工具栏按钮。**只能按 title 认**：它的文本是「开」/「关」，
-   * 而上面「换行」那一组的按钮文本逐字相同，`button('开')` 拿到的是文档序里先出现的那一个
-   */
-  function previewButton(): HTMLButtonElement {
-    const el = [...container.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.title === 'Mod+Shift+V')
-    if (!el) throw new Error('工具栏上找不到预览按钮')
-    return el
-  }
-
   function preview(): HTMLElement | null {
     return container.querySelector<HTMLElement>('.md-preview')
   }
@@ -3067,18 +3116,17 @@ describe('Markdown 预览接线（M3-A-3）', () => {
    */
   const settle = () => flush()
 
-  it('默认不渲染预览那一栏，按钮写的是「关」', () => {
+  it('默认不渲染预览那一栏', () => {
     expect(preview()).toBeNull()
-    expect(previewButton().textContent).toBe('关')
     // 侧边栏也默认收着，所以 `.body-row` 里此刻只有正文区一个孩子
     expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual(['body'])
   })
 
-  it('Mod+Shift+V 与工具栏按钮走同一条路，而 Mod+V 仍然是空的', async () => {
+  it('Mod+Shift+V 与「视图 › 切换预览」菜单是两个入口、同一条路，而 Mod+V 仍然是空的', async () => {
+    // 三档循环：关 → 并排 → 只预览 → 关（`md/previewMode.ts`），所以从「并排」回到「关」要再按两下
     toggle()
     await settle()
     expect(preview()).not.toBeNull()
-    expect(previewButton().textContent).toBe('开')
 
     // 🔴 `Mod+V` 刻意不绑：它是系统粘贴，webview 之前就把那一下吃掉了，绑了也拦不到，
     // 而万一在某些输入法下拦到了，症状是「按 Cmd+V 粘贴，预览跟着关了」——用户看不见原因
@@ -3086,17 +3134,19 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     await settle()
     expect(preview()).not.toBeNull()
 
-    toggle()
+    toggle() // 并排 → 只预览
+    await settle()
+    toggle() // 只预览 → 关
     await settle()
     expect(preview()).toBeNull()
-    expect(previewButton().textContent).toBe('关')
 
-    previewButton().click()
+    // 菜单那一项路由到 `view.toggle_preview`，与快捷键落到同一个 setPreviewMode
+    await menu('view.toggle_preview')
     await settle()
     expect(preview()).not.toBeNull()
   })
 
-  it('那一栏挂在 .body-row 的最后（左边写、右边看），而 .app 的 grid 子元素仍然是五个', async () => {
+  it('那一栏挂在 .body-row 的最后（左边写、右边看），而 .app 的 grid 子元素是固定的四个', async () => {
     toggle()
     await settle()
 
@@ -3105,10 +3155,9 @@ describe('Markdown 预览接线（M3-A-3）', () => {
       'body',
       'md-preview',
     ])
-    // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定为五，
+    // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定，
     // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那一组用例钉过同一件事）
     expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
-      'toolbar',
       'tab-strip',
       'notices',
       'main',
@@ -3116,7 +3165,7 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     ])
   })
 
-  it('点头上的 × 收起那一栏，工具栏按钮跟着翻回「关」', async () => {
+  it('点头上的 × 收起那一栏', async () => {
     toggle()
     await settle()
 
@@ -3124,7 +3173,6 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     await settle()
 
     expect(preview()).toBeNull()
-    expect(previewButton().textContent).toBe('关')
   })
 
   it('未命名文档按 Markdown 处理：空的说一句空状态，写了内容就渲染出带 data-line 的 HTML', async () => {
@@ -3149,7 +3197,7 @@ describe('Markdown 预览接线（M3-A-3）', () => {
   it('非 Markdown 文档：面板照样开，里面如实说这个语言没有预览', async () => {
     dialog.open.mockResolvedValue('/a.ts')
     ipc.openFile.mockResolvedValue(textFile({ text: 'const x = 1' }))
-    button('打开…').click()
+    press('o', modInit())
     await settle()
 
     toggle()
@@ -3169,7 +3217,7 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     await settle()
     expect(previewBody()).toContain('甲')
 
-    button('新建').click()
+    press('n', modInit())
     await settle()
     expect(previewNote()).toBe('这份文档还是空的')
     expect(previewBody()).toBe('')
@@ -3186,7 +3234,7 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     await settle()
     expect(previewBody()).toContain('甲')
 
-    button('右分屏').click()
+    press('\\', modInit())
     await settle()
 
     expect(hosts()).toHaveLength(2)
@@ -3203,7 +3251,7 @@ describe('Markdown 预览接线（M3-A-3）', () => {
 
   it('预览跟着聚焦的那块分屏走：焦点换过去它就换文档', async () => {
     typeInto(0, '# 甲\n')
-    button('右分屏').click()
+    press('\\', modInit())
     await settle()
     typeInto(1, '# 乙\n')
 
@@ -3220,17 +3268,6 @@ describe('Markdown 预览接线（M3-A-3）', () => {
 })
 
 describe('大纲接线（M3-A-4）', () => {
-  /**
-   * 大纲那一栏的工具栏按钮。**只能按 title 认**：它的文本是「开」/「关」，
-   * 而上面「换行」与「预览」两组的按钮文本逐字相同，`button('开')` 拿到的是
-   * 文档序里先出现的那一个
-   */
-  function outlineButton(): HTMLButtonElement {
-    const el = [...container.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.title === 'Mod+Shift+M')
-    if (!el) throw new Error('工具栏上找不到大纲按钮')
-    return el
-  }
-
   function outline(): HTMLElement | null {
     return container.querySelector<HTMLElement>('.outline')
   }
@@ -3287,18 +3324,16 @@ describe('大纲接线（M3-A-4）', () => {
    */
   const settle = () => flush()
 
-  it('默认不渲染大纲那一栏，按钮写的是「关」', () => {
+  it('默认不渲染大纲那一栏', () => {
     expect(outline()).toBeNull()
-    expect(outlineButton().textContent).toBe('关')
     // 侧边栏与预览也默认收着，所以 `.body-row` 里此刻只有正文区一个孩子
     expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual(['body'])
   })
 
-  it('Mod+Shift+M 与工具栏按钮走同一条路，而 Mod+M 仍然是空的', async () => {
+  it('Mod+Shift+M 与「视图 › 切换大纲」菜单是两个入口、同一条路，而 Mod+M 仍然是空的', async () => {
     toggle()
     await settle()
     expect(outline()).not.toBeNull()
-    expect(outlineButton().textContent).toBe('开')
 
     // 🔴 `Mod+M` 刻意不绑，而它与 `Mod+V` **不是同一条理由**：`Mod+V` 是系统粘贴，
     // `Mod+M` 在 macOS 上是「最小化窗口」——两者都在事件到达 webview 之前就被吃掉了，
@@ -3310,32 +3345,33 @@ describe('大纲接线（M3-A-4）', () => {
     toggle()
     await settle()
     expect(outline()).toBeNull()
-    expect(outlineButton().textContent).toBe('关')
 
-    outlineButton().click()
+    // 菜单那一项路由到 `view.toggle_outline`，与快捷键落到同一个 setOutlineVisible
+    await menu('view.toggle_outline')
     await settle()
     expect(outline()).not.toBeNull()
   })
 
-  it('那一栏挂在侧边栏之后、.body 之前，而 .app 的 grid 子元素仍然是五个', async () => {
+  it('那一栏挂在 .body 之前，而侧边栏是 .app 的左列、不在 .body-row 里', async () => {
     await openProject()
     toggle()
     press('v', { ...modInit(), shiftKey: true })
     await settle()
 
-    // `.body-row` 是横向 flex，孩子的顺序就是屏幕上的顺序：左边是「导航」
-    // （磁盘上有什么 → 这份文档的结构），中间是「写」，右边是「结果」。
-    // 大纲放到右边去的话它会与预览抢同一半宽，而两个同时开着是常态
+    // `.body-row` 是横向 flex，孩子的顺序就是屏幕上的顺序：左边是这份文档的结构（大纲），
+    // 中间是「写」，右边是「结果」（预览）。大纲放到右边去的话它会与预览抢同一半宽，
+    // 而两个同时开着是常态。
+    // ⚠️ 侧边栏**不在这里**：Sublime 排布把它提成了 `.app` 的左列 `.sidebar-col`（通顶到底），
+    // `.body-row` 里只剩「大纲 / 正文 / 预览」这三栏
     expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual([
-      'sidebar',
       'outline',
       'body',
       'md-preview',
     ])
-    // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定为五，
+    // ⚠️ 大纲必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定，
     // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那组用例钉过同一件事）
     expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
-      'toolbar',
+      'sidebar-col',
       'tab-strip',
       'notices',
       'main',
@@ -3400,7 +3436,7 @@ describe('大纲接线（M3-A-4）', () => {
     expect(outlineNames()).toEqual(['甲', '乙', '丙', '丁'])
   })
 
-  it('点头上的 × 收起那一栏，工具栏按钮跟着翻回「关」', async () => {
+  it('点头上的 × 收起那一栏', async () => {
     toggle()
     await settle()
 
@@ -3408,7 +3444,6 @@ describe('大纲接线（M3-A-4）', () => {
     await settle()
 
     expect(outline()).toBeNull()
-    expect(outlineButton().textContent).toBe('关')
   })
 
   it('🔴 大纲与预览的可见性是独立的：关掉一个不该顺手关掉另一个', async () => {
@@ -3424,7 +3459,6 @@ describe('大纲接线（M3-A-4）', () => {
     // 两个开关各管一栏。顺手一起关的话「一边看结构一边看渲染」这个常态就不存在了，
     // 而用户找不到是哪一下把它们绑在一起的
     expect(container.querySelector('.md-preview')).not.toBeNull()
-    expect(outlineButton().textContent).toBe('关')
   })
 
   it('未命名文档按 Markdown 处理：空的说一句空状态，写了标题就列出来', async () => {
@@ -3442,20 +3476,21 @@ describe('大纲接线（M3-A-4）', () => {
     expect(outlineNames()).toEqual(['甲'])
   })
 
-  it('非 Markdown 文档：面板照样开，里面如实说这个语言没有符号表', async () => {
+  it('非 Markdown 文档：面板照样开，里面如实说这个语言的符号去哪看', async () => {
     dialog.open.mockResolvedValue('/a.ts')
     ipc.openFile.mockResolvedValue(textFile({ text: 'const x = 1' }))
-    button('打开…').click()
+    press('o', modInit())
     await settle()
 
     toggle()
     await settle()
 
-    // 🔴 命令层刻意**不判语言**（理由写在 `builtins.ts` 的 `BuiltinHooks.toggleOutline` 上），
-    // 而这句措辞与 `Cmd+R` 浮层那一句**逐字相同**（`goto/store.ts:452`）：
-    // 同一个事实两种说法的话，用户会以为浮层与面板答的是两个问题
+    // 🔴 命令层刻意**不判语言**（理由写在 `builtins.ts` 的 `BuiltinHooks.toggleOutline` 上）：
+    // 设 `when` 的话快捷键按下去什么也不发生，用户得到的信息是零。面板开出来，如实说一句。
+    // TypeScript 是**有**符号表的（`Cmd+R` 能列），只是那是一张平铺清单、不是有层级的标题树，
+    // 所以大纲这一栏不硬塞，而是把用户指去 `Cmd+R`（`OutlinePanel.tsx` 的 `code` 那一支）
     expect(outline()).not.toBeNull()
-    expect(outlineNote()).toBe('TypeScript 还没有符号表')
+    expect(outlineNote()).toBe('大纲只列 Markdown 标题；代码符号请用 Cmd+R 看')
     expect(outlineNames()).toEqual([])
   })
 
@@ -3465,7 +3500,7 @@ describe('大纲接线（M3-A-4）', () => {
     await settle()
     expect(outlineNames()).toEqual(['甲'])
 
-    button('新建').click()
+    press('n', modInit())
     await settle()
     expect(outlineNote()).toBe('这份文档还没有标题')
     expect(outlineNames()).toEqual([])
@@ -3482,7 +3517,7 @@ describe('大纲接线（M3-A-4）', () => {
     await settle()
     expect(outlineNames()).toEqual(['甲'])
 
-    button('右分屏').click()
+    press('\\', modInit())
     await settle()
 
     expect(hosts()).toHaveLength(2)
@@ -3498,7 +3533,7 @@ describe('大纲接线（M3-A-4）', () => {
 
   it('大纲跟着聚焦的那块分屏走：焦点换过去它就换文档', async () => {
     typeInto(0, '# 甲\n')
-    button('右分屏').click()
+    press('\\', modInit())
     await settle()
     typeInto(1, '# 乙\n')
 
@@ -3551,7 +3586,7 @@ describe('表格对齐接线（M3-A-5）', () => {
   async function openMd(text: string, path = '/notes/t.md'): Promise<void> {
     dialog.open.mockResolvedValue(path)
     ipc.openFile.mockResolvedValue(textFile({ text }))
-    button('打开…').click()
+    press('o', modInit())
     await flush()
   }
 
@@ -3559,7 +3594,7 @@ describe('表格对齐接线（M3-A-5）', () => {
   async function openShard(): Promise<void> {
     dialog.open.mockResolvedValue('/var/log/huge.log')
     ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     await flush()
   }
@@ -3630,7 +3665,7 @@ describe('表格对齐接线（M3-A-5）', () => {
 
   it('分屏时只改**聚焦**那一块，另一块一个字节不动', async () => {
     typeTable(0, '| a | bb |\n|---|---|\n| ccc | d |')
-    button('右分屏').click()
+    press('\\', modInit())
     await flush()
     typeTable(1, '| x | y |\n|---|---|\n| 1 | 2 |')
 
@@ -3679,7 +3714,7 @@ describe('字数统计与导出 HTML 接线（M3-A-6）', () => {
   async function openFrom(text: string, path: string): Promise<void> {
     dialog.open.mockResolvedValue(path)
     ipc.openFile.mockResolvedValue(textFile({ text }))
-    button('打开…').click()
+    press('o', modInit())
     await flush()
   }
 
@@ -3687,7 +3722,7 @@ describe('字数统计与导出 HTML 接线（M3-A-6）', () => {
   async function openShard(): Promise<void> {
     dialog.open.mockResolvedValue('/var/log/huge.log')
     ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
-    button('打开…').click()
+    press('o', modInit())
     await flush()
     await flush()
   }
@@ -3902,7 +3937,7 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
   async function openFrom(text: string, path: string): Promise<void> {
     dialog.open.mockResolvedValue(path)
     ipc.openFile.mockResolvedValue(textFile({ text }))
-    button('打开…').click()
+    press('o', modInit())
     await flush()
   }
 
@@ -3960,7 +3995,7 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
 
   it('🔴 分屏之下跟着**收到事件的那块**走，不是跟着焦点走', async () => {
     await openFrom('let a = 1', '/repo/src/a.ts')
-    button('右分屏').click()
+    press('\\', modInit())
     await flush()
     await openFrom('# 笔记\n', '/repo/docs/intro.md')
     // 焦点留在第 0 块（一个 `.ts`）：要是接线读的是 `activeTab()`，这次粘贴会被判成
@@ -4318,6 +4353,64 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
     expect(toolboxEl()).not.toBeNull()
   })
 
+  it('面板里挑「合并分屏」把三块塌回单栏——与「窗口」菜单那一项是同一个行为', async () => {
+    typeInto(0, '甲')
+    press('\\', modInit())
+    typeInto(1, '乙')
+    press('\\', modInit())
+    typeInto(2, '丙')
+    expect(hosts()).toHaveLength(3)
+
+    press('p', shiftMod())
+    await flush()
+    typeCommand('合并分屏')
+    expect(commandRowIds()).toEqual(['editor.mergePanes'])
+    pressInCommandPalette('Enter')
+    await flush()
+
+    expect(commandPaletteEl()).toBeNull()
+    // 🔴 命令面板的 `editor.mergePanes` 与菜单的 `window.merge_panes` 共用同一份 `mergeAllPanes`，
+    // 所以塌回单栏、聚焦那块（丙）留在原地。这一条钉的是 App 把 hook 接到了 mergeAllPanes，
+    // 而不是接错成「只关一块」——那正是本组要修的名同实异
+    expect(hosts()).toHaveLength(1)
+    expect(views()[0]!.state.doc.toString()).toBe('丙')
+  })
+
+  it('面板里挑「显示/隐藏缩略图」把 canvas 摘掉——与「视图」菜单那一项是同一个翻转', async () => {
+    // 默认开着（M4-H）：jsdom 里没有布局，canvas 只挂不画，但挂没挂正是这一层要钉的
+    expect(container.querySelectorAll('.cm-minimap')).toHaveLength(1)
+
+    press('p', shiftMod())
+    await flush()
+    typeCommand('缩略图')
+    expect(commandRowIds()).toEqual(['view.toggleMinimap'])
+    pressInCommandPalette('Enter')
+    await flush()
+
+    // 关是整组扩展出槽位：插件 destroy 会把 canvas 从 DOM 里摘掉，不是盖一层透明壳
+    expect(container.querySelectorAll('.cm-minimap')).toHaveLength(0)
+  })
+
+  it('面板里挑「关闭分屏」只收掉聚焦那一块——与「合并分屏」名近而实不同', async () => {
+    typeInto(0, '甲')
+    press('\\', modInit())
+    typeInto(1, '乙')
+    press('\\', modInit())
+    typeInto(2, '丙')
+    expect(hosts()).toHaveLength(3)
+
+    press('p', shiftMod())
+    await flush()
+    typeCommand('关闭分屏')
+    expect(commandRowIds()).toEqual(['editor.closePane'])
+    pressInCommandPalette('Enter')
+    await flush()
+
+    // 🔴 只关掉聚焦的那一块（3 → 2），不是塌回单栏（那会是 1）。与上一条对着看，
+    // 才证明这两条名字相近的命令在 App 里确实各接各的 hook
+    expect(hosts()).toHaveLength(2)
+  })
+
   it('面板里的置灰读的是聚焦的那块分屏，不是建面板那一刻的快照', async () => {
     // `App.tsx` 里那条挂了三个里程碑的 TODO 说的就是这件事：`registry` 的 `getContext`
     // 是「被调用时求值」的，而面板要的是「订阅」。验收的办法是把**同一个** `appContext`
@@ -4338,9 +4431,9 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
 })
 
 describe('分层配置接线（M4-A）', () => {
-  function selectByTitle(prefix: string): HTMLSelectElement {
-    // M4-B：字体 select 收进了「外观」浮层，取之前先把它点开
-    ensureAppearanceOpen()
+  async function selectByTitle(prefix: string): Promise<HTMLSelectElement> {
+    // 字体 select 住在「外观设置」对话框里，默认关着、不在 DOM，取之前先把它打开
+    await openSettings()
     const el = [...container.querySelectorAll('select')].find((s) => s.title.startsWith(prefix))
     if (!el) throw new Error(`找不到 title 以「${prefix}」开头的 select`)
     return el
@@ -4370,10 +4463,10 @@ describe('分层配置接线（M4-A）', () => {
     await flush()
   }
 
-  it('挂载后应用的是内置默认配置，CSS 变量与两个字体 select 同步', () => {
+  it('挂载后应用的是内置默认配置，CSS 变量与两个字体 select 同步', async () => {
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
-    expect(fontSelect().value).toBe('screen-gb')
-    expect(codeFontSelect().value).toBe('maple-cn')
+    expect((await fontSelect()).value).toBe('screen-gb')
+    expect((await codeFontSelect()).value).toBe('maple-cn')
     // 装回默认不写盘：load 只读，不该在启动时就产生一次 save_settings
     expect(settingsCmd.saved).toEqual([])
   })
@@ -4395,7 +4488,7 @@ describe('分层配置接线（M4-A）', () => {
   })
 
   it('字号 select 改动同时更新 CSS 变量并写穿', async () => {
-    changeSelect(fontSizeSelect(), '18')
+    changeSelect(await fontSizeSelect(), '18')
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
     await flush()
     expect(settingsCmd.saved.at(-1)).toEqual({
@@ -4409,7 +4502,7 @@ describe('分层配置接线（M4-A）', () => {
   })
 
   it('正文字体 select 改动写穿到 save_settings', async () => {
-    changeSelect(fontSelect(), 'screen-r')
+    changeSelect(await fontSelect(), 'screen-r')
     await flush()
     expect(settingsCmd.saved.at(-1)).toEqual({
       fontSize: 14,
@@ -4422,7 +4515,7 @@ describe('分层配置接线（M4-A）', () => {
   })
 
   it('代码区字体 select 改动写穿到 save_settings', async () => {
-    changeSelect(codeFontSelect(), 'inherit')
+    changeSelect(await codeFontSelect(), 'inherit')
     await flush()
     expect(settingsCmd.saved.at(-1)).toEqual({
       fontSize: 14,
@@ -4434,33 +4527,33 @@ describe('分层配置接线（M4-A）', () => {
     })
   })
 
-  /** 外观浮层里那一行步进器（行高 / 字间距）：[−, +] 两个按钮 */
-  function stepperButtons(label: string): NodeListOf<HTMLButtonElement> {
-    ensureAppearanceOpen()
-    const rows = [...container.querySelectorAll<HTMLElement>('.appearance-row')]
-    const rowEl = rows.find((r) => r.querySelector('.appearance-label')?.textContent === label)
+  /** 外观设置对话框里那一行步进器（行高 / 字间距）：[−, +] 两个按钮 */
+  async function stepperButtons(label: string): Promise<NodeListOf<HTMLButtonElement>> {
+    await openSettings()
+    const rows = [...container.querySelectorAll<HTMLElement>('.settings-row')]
+    const rowEl = rows.find((r) => r.querySelector('.settings-label')?.textContent === label)
     if (!rowEl) throw new Error(`找不到「${label}」那一行`)
-    return rowEl.querySelectorAll<HTMLButtonElement>('.appearance-stepper button')
+    return rowEl.querySelectorAll<HTMLButtonElement>('.settings-stepper button')
   }
 
   it('行高步进器改动更新 CSS 变量并写穿（浮点尾巴被归一化掉）', async () => {
-    stepperButtons('行高')[1]!.click()
+    ;(await stepperButtons('行高'))[1]!.click()
     expect(document.documentElement.style.getPropertyValue('--vela-line-height')).toBe('1.8')
     await flush()
     expect(settingsCmd.saved.at(-1)).toMatchObject({ lineHeight: 1.8 })
   })
 
   it('字间距步进器改动写穿：CSS 落成 em，存的是数字', async () => {
-    stepperButtons('字间距')[1]!.click()
+    ;(await stepperButtons('字间距'))[1]!.click()
     expect(document.documentElement.style.getPropertyValue('--vela-letter-spacing')).toBe('0.01em')
     await flush()
     expect(settingsCmd.saved.at(-1)).toMatchObject({ letterSpacing: 0.01 })
   })
 
   it('「恢复默认」把六项一起打回内置默认并写穿', async () => {
-    changeSelect(fontSizeSelect(), '20')
-    stepperButtons('行高')[1]!.click()
-    const reset = [...container.querySelectorAll<HTMLButtonElement>('.appearance-reset')][0]!
+    changeSelect(await fontSizeSelect(), '20')
+    ;(await stepperButtons('行高'))[1]!.click()
+    const reset = [...container.querySelectorAll<HTMLButtonElement>('.settings-reset')][0]!
     reset.click()
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
     expect(document.documentElement.style.getPropertyValue('--vela-line-height')).toBe('1.75')
@@ -4490,8 +4583,8 @@ describe('分层配置接线（M4-A）', () => {
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
     expect(document.documentElement.style.getPropertyValue('--vela-line-height')).toBe('2')
     expect(document.documentElement.style.getPropertyValue('--vela-letter-spacing')).toBe('0.05em')
-    expect(fontSelect().value).toBe('system-mono')
-    expect(codeFontSelect().value).toBe('inherit')
+    expect((await fontSelect()).value).toBe('system-mono')
+    expect((await codeFontSelect()).value).toBe('inherit')
     // 装回只读、不写穿：一次启动不该因为「读到了盘上的值」再存一遍
     expect(settingsCmd.saved).toEqual([])
   })
@@ -4509,8 +4602,8 @@ describe('分层配置接线（M4-A）', () => {
     })
     // 17 不在 FONT_SIZES 里、'toString' 命中的是原型链而不是注册表：三个都被 sanitize 打回默认
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
-    expect(fontSelect().value).toBe('screen-gb')
-    expect(codeFontSelect().value).toBe('maple-cn')
+    expect((await fontSelect()).value).toBe('screen-gb')
+    expect((await codeFontSelect()).value).toBe('maple-cn')
   })
 
   it('load_settings 出错时提示条报出来，字体退回内置默认而不拦启动', async () => {
@@ -4532,5 +4625,255 @@ describe('分层配置接线（M4-A）', () => {
     expect(notices().map((n) => n.level)).toContain('warning')
     expect(notices().some((n) => n.text.includes('读不了配置'))).toBe(true)
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
+  })
+})
+
+describe('正文的右键菜单', () => {
+  /**
+   * 假剪贴板。jsdom 压根没有 `navigator.clipboard`，而菜单里剪切／复制／粘贴三项全指着它
+   * （`editor/clipboard.ts`）。`fail` 打开就是 WKWebView 在非安全上下文里的那个形状：
+   * 两个方法一律拒绝——于是「失败是说出来的，不是静默的」这一条才测得起。
+   */
+  let clip: { text: string; fail: boolean; written: string[] }
+
+  beforeEach(() => {
+    clip = { text: '', fail: false, written: [] }
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          if (clip.fail) throw new Error('NotAllowedError')
+          clip.text = text
+          clip.written.push(text)
+        },
+        readText: async () => {
+          if (clip.fail) throw new Error('NotAllowedError')
+          return clip.text
+        },
+      },
+    })
+  })
+
+  afterEach(() => {
+    // ⛔ 不留着：别的 describe 里「复制不了」那类断言指的正是「这个环境下没有剪贴板」
+    delete (navigator as unknown as { clipboard?: unknown }).clipboard
+  })
+
+  /** 右键正文。挂在 `.editor-host` 上的那个处理器靠冒泡收到，与真窗口同一条路 */
+  function rightClick(index = 0): void {
+    const host = hosts()[index]
+    if (!host) throw new Error(`没有第 ${index} 块分屏`)
+    const target = host.querySelector('.cm-content') ?? host
+    target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }))
+  }
+
+  function menu(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('.tree-menu')
+  }
+
+  function menuItems(): HTMLButtonElement[] {
+    return [...container.querySelectorAll<HTMLButtonElement>('.tree-menu-item')]
+  }
+
+  /** 灰掉的那几项的标签——用例里说的是人话，不是下标 */
+  function greyed(): string[] {
+    return menuItems()
+      .filter((b) => b.disabled)
+      .map((b) => b.textContent ?? '')
+  }
+
+  function item(label: string): HTMLButtonElement {
+    const found = menuItems().find((b) => b.textContent === label)
+    if (!found)
+      throw new Error(
+        `菜单里没有「${label}」（渲染出来的有：${menuItems()
+          .map((b) => b.textContent ?? '')
+          .join('、')}）`,
+      )
+    return found
+  }
+
+  /** 折起来的区间数。「折叠全部」是逐层折的（最外层 + 每一层嵌套），所以不止一条 */
+  function folded(v: EditorView): number {
+    let count = 0
+    for (const cursor = foldedRanges(v.state).iter(); cursor.value; cursor.next()) count++
+    return count
+  }
+
+  /** 已折叠区间里跨度最大的那一条 = 最外层 */
+  function widest(v: EditorView): { from: number; to: number } {
+    let best = { from: 0, to: 0 }
+    for (const cursor = foldedRanges(v.state).iter(); cursor.value; cursor.next()) {
+      if (cursor.to - cursor.from > best.to - best.from) best = { from: cursor.from, to: cursor.to }
+    }
+    return best
+  }
+
+  /**
+   * 等一个条件成立，每趟一个宏任务。
+   *
+   * ⛔ 不用「多 flush 几次」蒙过去：条件不成立时要红得说明白是哪一步没等到，
+   * 而不是留一句「expected 0 to be 1」让人回头去猜是语言没加载还是折叠没跑
+   */
+  async function waitFor(what: string, test: () => boolean, ticks = 20): Promise<void> {
+    for (let i = 0; i < ticks; i++) {
+      if (test()) return
+      await flush()
+    }
+    throw new Error(`等不到：${what}`)
+  }
+
+  /**
+   * 打开一个文件。「打开…」那条路是异步的（invoke → document → workspace），两趟冲干净。
+   *
+   * ⚠️ 走 `Mod+O` 而不是找那个按钮：工具栏已经整个搬进标准桌面菜单（File/Edit/…），
+   * 正文区没有「打开…」这个 button 了——按文本找按钮的那批用例正是存量红灯的大头
+   */
+  async function openDoc(path: string, text: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text }))
+    press('o', modInit())
+    await flush()
+    await flush()
+  }
+
+  it('右键正文弹出六项，剪贴板那四项在前、折叠那两项在后且上面有分隔线', () => {
+    typeText('# 标题\n\n正文')
+    rightClick()
+
+    expect(menu()).not.toBeNull()
+    expect(menuItems().map((b) => b.textContent)).toEqual(['剪切', '复制', '粘贴', '全选', '折叠全部', '展开全部'])
+    expect(container.querySelectorAll('.tree-menu-sep')).toHaveLength(1)
+  })
+
+  it('没有选区时剪切与复制灰掉，粘贴与全选恒亮', () => {
+    // 未命名草稿是 Markdown（`languageFor(null)`），语言在，所以折叠那两项是亮的
+    rightClick()
+    expect(greyed()).toEqual(['剪切', '复制'])
+  })
+
+  it('选中一段之后剪切与复制都亮，剪切把它写进剪贴板并从正文里删掉', async () => {
+    typeText('删掉这段留下来')
+    view().dispatch({ selection: { anchor: 0, head: 4 } })
+    rightClick()
+    expect(greyed()).toEqual([])
+
+    item('剪切').click()
+    await flush()
+
+    expect(clip.written).toEqual(['删掉这段'])
+    expect(view().state.doc.toString()).toBe('留下来')
+    // 🔴 菜单关掉了：「选了一项」是 TreeMenu 那四条关闭路径之一，留着的话它挡在正文上
+    expect(menu()).toBeNull()
+  })
+
+  it('全选把整篇选起来', () => {
+    typeText('三行\n正文\n在这')
+    rightClick()
+    item('全选').click()
+
+    const { main } = view().state.selection
+    expect([main.from, main.to]).toEqual([0, view().state.doc.length])
+  })
+
+  it('粘贴把剪贴板里的文字插到光标处', async () => {
+    clip.text = '贴进来的'
+    typeText('原文')
+    // 光标摆在两个字**中间**：摆在末尾的话「插到光标处」与「追加到文末」分不出来
+    view().dispatch({ selection: { anchor: 1 } })
+    rightClick()
+    item('粘贴').click()
+    await flush()
+
+    expect(view().state.doc.toString()).toBe('原贴进来的文')
+  })
+
+  it('拿不到系统剪贴板时把失败说出来，⛔ 不静默', async () => {
+    typeText('四个字符')
+    view().dispatch({ selection: { anchor: 0, head: 4 } })
+    clip.fail = true
+    rightClick()
+
+    item('复制').click()
+    await flush()
+
+    expect(clip.written).toEqual([])
+    expect(notices().some((n) => n.level === 'error' && n.text.includes('复制不了'))).toBe(true)
+  })
+
+  it('JSON 上「折叠全部」逐层折：展开最外层里面还折着，「展开全部」一次摊回', async () => {
+    await openDoc('/a.json', '{\n  "a": {\n    "x": 1\n  },\n  "b": 2\n}')
+    // 语言是 language-data 动态 import 回来的，落地之前折叠那两项是灰的
+    await waitFor('JSON 语言落地', () => view().state.facet(language) !== null)
+
+    rightClick()
+    expect(greyed()).toEqual(['剪切', '复制'])
+    item('折叠全部').click()
+    // 两层：最外层的对象 + 里面那个嵌套对象
+    await waitFor('整篇逐层折起来', () => folded(view()) === 2)
+    // 折叠不改正文：折完再展开必须一字不差
+    expect(view().state.doc.toString()).toBe('{\n  "a": {\n    "x": 1\n  },\n  "b": 2\n}')
+
+    // 展开最外层（与点折叠槽那支箭头同一条 dispatch）：里面那层应当还折着
+    view().dispatch({ effects: unfoldEffect.of(widest(view())) })
+    expect(folded(view())).toBe(1)
+
+    rightClick()
+    item('展开全部').click()
+    expect(folded(view())).toBe(0)
+  })
+
+  it('纯文本（没挂语言）时折叠那两项灰掉', async () => {
+    await openDoc('/var/log/a.log', '一行\n两行')
+    rightClick()
+
+    expect(greyed()).toEqual(['剪切', '复制', '折叠全部', '展开全部'])
+    // 灰项按不动（浏览器与 jsdom 都不给 disabled 的按钮派发 click），正文一个字不动
+    item('折叠全部').click()
+    expect(view().state.doc.toString()).toBe('一行\n两行')
+  })
+
+  it('菜单作用在**被右键的那一块**分屏上，不是聚焦的那一块', () => {
+    typeInto(0, '左边')
+    // `Mod+\` = 右分屏（`editor.splitRight`）。与 `openDoc` 同一条理由：按钮已经不在正文区了
+    press('\\', modInit())
+    typeInto(1, '右边')
+    focusHost(0)
+
+    rightClick(1)
+    item('全选').click()
+
+    expect([views()[1]!.state.selection.main.from, views()[1]!.state.selection.main.to]).toEqual([0, 2])
+    expect(views()[0]!.state.selection.main.empty).toBe(true)
+  })
+
+  it('只读大文件分片不接这个菜单：留下 macOS 原生的那一份', async () => {
+    dialog.open.mockResolvedValue('/var/log/huge.log')
+    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
+    press('o', modInit())
+    await flush()
+    await flush()
+
+    const shard = container.querySelector<HTMLElement>('.shard-pane')
+    expect(shard, '正文区应当已经换成只读分片').not.toBeNull()
+    const e = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    shard!.dispatchEvent(e)
+
+    // 🔴 连 preventDefault 都不调：拦下来又不弹自己的，等于把右键整个废掉
+    expect(e.defaultPrevented).toBe(false)
+    expect(menu()).toBeNull()
+  })
+})
+
+describe('缩略图（M4-H）', () => {
+  it('默认开着：编辑器里挂着一块 canvas', () => {
+    expect(container.querySelectorAll('.cm-minimap')).toHaveLength(1)
+  })
+
+  it('视图菜单的「缩略图」摘掉它，再点一次装回来', async () => {
+    await menu('view.toggle_minimap')
+    expect(container.querySelectorAll('.cm-minimap')).toHaveLength(0)
+    await menu('view.toggle_minimap')
+    expect(container.querySelectorAll('.cm-minimap')).toHaveLength(1)
   })
 })

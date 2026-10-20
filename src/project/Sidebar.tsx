@@ -9,6 +9,7 @@ import {
   actionForKey,
   containerRel,
   displayName,
+  isMutedRow,
   isTreeKey,
   keyOf,
   menuFor,
@@ -120,15 +121,15 @@ export function Sidebar(props: SidebarProps) {
   /**
    * 头部那一格显示什么。
    *
-   * ⚠️ 多根时**不能**只显示第 0 个根的名字：那一格是「我现在在哪个项目里」的唯一线索，
+   * 它是**栏目题头**（「文件夹」），不是根的名字：根名在它自己那条根行上已经写了一遍，
+   * 题头再重复一次只是让同一屏上出现两个一模一样的词。多根时报个数——
    * 写着 `vela` 而工作区里还有 `notes` 的话，用户在 `notes` 里搜不到东西只会以为搜索坏了。
-   * 一个根就是它的名字，多个根就报个数——每个根自己的名字在它自己那条根行上，
-   * 头部这一格不重复。
+   * 每个根自己的名字在它自己那条根行上，头部这一格不重复。
    */
   const headLabel = createMemo(() => {
     const list = tree.roots()
     if (list.length === 0) return ''
-    if (list.length === 1) return tree.rootName(0)
+    if (list.length === 1) return '文件夹'
     return `${list.length} 个文件夹`
   })
 
@@ -347,13 +348,14 @@ export function Sidebar(props: SidebarProps) {
                     classList={{
                       selected: selected(),
                       failed: row.error !== null,
+                      muted: isMutedRow(row),
                     }}
                     role="treeitem"
                     aria-level={row.depth + 1}
                     aria-expanded={row.isDir ? row.expanded : undefined}
                     aria-selected={selected()}
                     title={row.path}
-                    style={{ 'padding-left': `${row.depth * 12 + 6}px` }}
+                    style={{ 'padding-left': `${row.depth * 14 + 8}px` }}
                     onClick={() => onRowClick(row)}
                     onContextMenu={(e) => onRowContextMenu(e, row)}
                   >

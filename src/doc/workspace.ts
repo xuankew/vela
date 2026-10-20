@@ -4,7 +4,9 @@ import { indentUnit, type LanguageSupport } from '@codemirror/language'
 import { batch, createSignal, type Accessor, type Setter } from 'solid-js'
 import { open as pickToOpen } from '@tauri-apps/plugin-dialog'
 import type { DefinitionClickHook } from '../editor/clickJump'
+import { minimapExtension } from '../editor/minimap'
 import type { EditorController } from '../editor/controller'
+import { resetChanges } from '../editor/changeGutter'
 import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../editor/language'
 import type { PasteImageHook } from '../editor/paste'
 import { INDENT_UNIT, indentLabel, languageExtensions } from '../editor/setup'
@@ -135,6 +137,8 @@ export interface Workspace {
   readonly lineWrap: Accessor<boolean>
   /** 当前 CM6 是不是暗色（M4-C）。与 `lineWrap` 同为全局视图设置的响应式镜像 */
   readonly dark: Accessor<boolean>
+  /** 缩略图开不开（M4-H）。与 `lineWrap` / `dark` 同一条路的全局视图设置镜像 */
+  readonly minimap: Accessor<boolean>
   /** 状态栏要的度量。只反映**聚焦分屏**显示的那个标签 */
   readonly metrics: Accessor<DocMetrics>
   /**
@@ -202,7 +206,16 @@ export interface Workspace {
   /** 编辑器实例挂上来时由 `EditorPane` 的 onReady 调用 */
   attach: (paneId: number, controller: EditorController) => void
   detach: (paneId: number) => void
+  /** 把焦点**递给**这块分屏：程序化换焦点（循环／加／关分屏、点标签）用 */
   focusPane: (paneId: number) => void
+  /**
+   * 记下「焦点现在在这块分屏里」，但**不动焦点**。DOM 的 `focusin` 走这一条。
+   *
+   * ⛔ 别图省事在 `onFocusIn` 里调 `focusPane`。理由写在实现处，
+   * 一句话版本：焦点本来就已经在里面了，再 `focus()` 一次是**抢**，
+   * 抢的表现是查找面板的输入框留不住焦点、以及正文被滚回顶部。
+   */
+  notePaneFocus: (paneId: number) => void
   /** 加一块分屏并把整排的方向定成 `direction`。已到上限时只改方向 */
   split: (direction: SplitDirection) => void
   /** 合并掉一块分屏。它显示的标签留在标签条上，只是不再被任何分屏显示 */
@@ -239,6 +252,8 @@ export interface Workspace {
   toggleLineWrap: () => void
   /** 切换 CM6 的深/浅色 facet（M4-C）。颜色的 `data-theme` 由 store 负责，两者要一起做 */
   setDarkTheme: (on: boolean) => void
+  /** 切换缩略图（M4-H）。与 `setDarkTheme` 同一个模子：共享槽位一次拨动所有标签 */
+  setMinimap: (on: boolean) => void
   /** Cmd+滚轮缩放后通知所有显示中的 view dispatch 空 transaction，触发 measure 对齐行号 */
   notifyFontSizeChanged: () => void
   /** 有没有任何标签还没落盘 */
@@ -280,6 +295,8 @@ export interface WorkspaceOptions {
   lineWrap?: boolean
   /** 初始是不是暗色（M4-C）。缺省 `true` = 与 M4-C 之前逐像素一致 */
   dark?: boolean
+  /** 初始是否显示缩略图（M4-H）。缺省 `true` */
+  minimap?: boolean
   /**
    * 缺省时一律答「取消」。
    *
@@ -328,6 +345,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     options.dark ?? true,
     options.onFontSizeZoom,
     options.clickDefinition,
+    options.minimap ?? true,
   )
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
@@ -337,6 +355,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   const [direction, setDirection] = createSignal<SplitDirection>('row')
   const [wrap, setWrap] = createSignal(config.lineWrap)
   const [dark, setDark] = createSignal(config.dark)
+  const [minimapOn, setMinimapOn] = createSignal(config.minimap)
   const [metrics, setMetrics] = createSignal<DocMetrics>(EMPTY_METRICS)
   const [revision, setRevision] = createSignal(0)
   /**
@@ -479,6 +498,14 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     pathChanged: (tab) => {
       syncLanguage(tab)
     },
+    // 存盘之后清掉「未保存改动」gutter 的行标记。显示中的走 dispatch、没显示的走
+    // state.update——与 `installLanguage` / `setLineWrap` 同一套路（见上面那条注释）
+    clearChangeMarks: (tab) => {
+      const effects = resetChanges.of(null)
+      const view = viewOf(tab)
+      if (view) view.view.dispatch({ effects })
+      else tab.snapshot = { ...tab.snapshot, state: tab.snapshot.state.update({ effects }).state }
+    },
   }
 
   function makeTab(text = ''): Tab {
@@ -575,15 +602,31 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     setAttachedAt((n) => n + 1)
   }
 
-  function focusPane(paneId: number) {
-    const pane = paneById(paneId)
-    if (!pane) return
+  /**
+   * 记下「焦点现在在这块分屏里」。**只记账，不动焦点。**
+   *
+   * 给 `EditorPane` / `ShardPane` 的 `onFocusIn` 用——焦点本来就已经在里面，这时候再
+   * `controller.focus()` 就是抢，而且抢出来的两个症状都很难往这里想：
+   *
+   * 1. 焦点刚落到查找面板的输入框上就被拽回正文，那个输入框永远留不住焦点，
+   *    表现是「查找替换打不进字」（四个复选框看着正常，因为它们靠 click 切换，
+   *    不需要持续聚焦）。
+   * 2. `focus()` 会让浏览器把被聚焦的元素滚进视口，而正文那个 contentDOM 有几百万行，
+   *    把它「滚进视口」= 回到顶部。表现是「跳到最后一个匹配，视图却甩到文件开头」，
+   *    且只在目标超过一页时才看得见——在一页内时这次滚动是空操作，什么都不会发生。
+   */
+  function notePaneFocus(paneId: number) {
+    if (!paneById(paneId)) return
     // 幂等：点一下已经聚焦的分屏也会走到这里（DOM 的 focusin），不该白刷一遍度量
     if (paneId !== focusedPaneId()) {
       setFocusedPaneId(paneId)
       syncMetrics(activeTab())
     }
-    pane.controller?.focus()
+  }
+
+  function focusPane(paneId: number) {
+    notePaneFocus(paneId)
+    paneById(paneId)?.controller?.focus()
   }
 
   function cyclePane(step: number) {
@@ -881,6 +924,24 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
+   * 切换缩略图（M4-H）。与 `setDarkTheme` 是同一个模子：改 `config.minimap`、拨共享的
+   * `minimapSlot`、显示中的分屏走 dispatch、没在显示的标签就地 update。
+   *
+   * ⚠️ 开关整组扩展进/出槽位，于是「关」会把 canvas 从 DOM 里摘掉（插件的 destroy），
+   * 不是盖一层透明壳子留着——缩略图关着时不该还付每帧重画的成本。
+   */
+  function setMinimap(on: boolean) {
+    if (on === config.minimap) return
+    config.minimap = on
+    setMinimapOn(on)
+    const effects = config.minimapSlot.reconfigure(on ? minimapExtension() : [])
+    for (const pane of panes()) pane.controller?.view.dispatch({ effects })
+    for (const tab of tabs()) {
+      if (!viewOf(tab)) applyViewConfig(tab, config)
+    }
+  }
+
+  /**
    * Cmd+滚轮缩放后通知所有显示中的 view 重新测量行号 gutter。
    *
    * CSS 变量已更新，但 CM6 的行号 gutter 插件只在 lineNumberConfig facet 变化时才重测。
@@ -1122,6 +1183,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     activeIndex: () => tabs().findIndex((t) => t.id === activeTab().id),
     lineWrap: wrap,
     dark,
+    minimap: minimapOn,
     metrics,
     revision,
     recent,
@@ -1141,6 +1203,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     attach,
     detach,
     focusPane,
+    notePaneFocus,
     split,
     closePane,
     cyclePane,
@@ -1168,6 +1231,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     setLineWrap,
     toggleLineWrap: () => setLineWrap(!config.lineWrap),
     setDarkTheme,
+    setMinimap,
     notifyFontSizeChanged,
     anyDirty: () => tabs().some((t) => t.doc.dirty()),
     dirtyPaths: () =>

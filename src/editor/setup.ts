@@ -34,6 +34,8 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
 import { createFindReplacePanel, preserveCase } from './findReplace'
+import { changeGutter } from './changeGutter'
+import { minimapExtension } from './minimap'
 import { definitionClick, type DefinitionClickHook } from './clickJump'
 import { fontSizeZoom } from './fontSizeZoom'
 import { indentGuides } from './indentGuides'
@@ -313,6 +315,15 @@ export interface EditorSetupOptions {
   /** 初始是否暗色。缺省 `true` = 与 M4-C 之前逐像素一致（应用一直是暗色的） */
   dark?: boolean
   /**
+   * 缩略图的开关槽位（M4-H），装的是 `minimapExtension()` 整组扩展。
+   *
+   * 与 `darkSlot` 同一类：全局视图设置、共享一个实例、一次 reconfigure 拨动所有标签。
+   * 关着时装空数组而不是把槽位摘掉——槽位不存在就无处 reconfigure，与换行槽位逐字同一条理由。
+   */
+  minimapSlot: Compartment
+  /** 初始是否显示缩略图。缺省 `true` */
+  minimap?: boolean
+  /**
    * 语言的开关槽位，**每标签一个实例**。
    *
    * 与 `lineWrapSlot` 正好相反：换行是全局视图设置，共享一个实例才能一次 reconfigure
@@ -397,9 +408,11 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   const {
     lineWrap = true,
     dark = true,
+    minimap = true,
     language,
     lineWrapSlot,
     darkSlot,
+    minimapSlot,
     languageSlot,
     peerStates,
     pasteImage,
@@ -409,6 +422,10 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
 
   const exts: Extension[] = [
     lineNumbers(),
+    // 「未保存改动」gutter（#28）。挂在行号右边、折叠槽左边——顺序由扩展在数组里的位置决定。
+    // 它累积「自上次与磁盘一致以来被碰过的行」，语义与 `doc/document.ts` 的单调脏标记一致，
+    // 存盘时由 workspace dispatch `resetChanges` 清空（见 `editor/changeGutter.ts` 文件头）
+    changeGutter(),
     highlightActiveLineGutter(),
     highlightSpecialChars(),
     history(),
@@ -469,6 +486,8 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   // 与换行槽位同一条理由——槽位不存在就无处 reconfigure，切主题时对显示中的 view 那一下
   // dispatch 会静默落空。切换由 workspace 的 `setDarkTheme` 拨动（见 `doc/workspace.ts`）
   exts.push(darkSlot.of(EditorView.darkTheme.of(dark)))
+  // 缩略图槽位（M4-H）：始终在扩展集里，关着时装空数组。切换由 workspace 的 `setMinimap` 拨动
+  exts.push(minimapSlot.of(minimap ? minimapExtension() : []))
   // 词补全的「其他文档」。没传就不装：facet 缺省是空的，词典退化成只有当前文档那一份
   if (peerStates !== undefined) exts.push(wordPeers.of(peerStates))
   // 粘贴图片。没传就不装：CM6 内置的 paste 处理器照旧跑，行为与 M3-A-7 之前一模一样
@@ -549,3 +568,11 @@ export function lineWrapEnabled(state: EditorState): boolean {
 export function darkThemeEnabled(state: EditorState): boolean {
   return state.facet(EditorView.darkTheme)
 }
+
+/**
+ * 这套 state 当前装没装缩略图（M4-H）。
+ *
+ * 与 `lineWrapEnabled` 同一个用途：`applyViewConfig` 靠它做早退比对。槽位装空数组时
+ * 没有 provider，`state.facet(minimapFacet)` 回空表，于是「关着」不需要另存一个布尔。
+ */
+export { minimapEnabled } from './minimap'

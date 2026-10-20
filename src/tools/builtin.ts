@@ -61,13 +61,26 @@
  * 🔴 六个都落地了，这一张表到此为止：⛔ 别拿它的平均值去估 M4 那些还没定的工具
  */
 
-import { base64Decode, base64Encode, urlDecode, urlEncode } from './codec'
-import { blankJsonComments, scanJson, sortKeysDeep } from './json'
-import { namingReport } from './naming'
-import { regexReport } from './regex'
-import { timeReport } from './time'
+import type { RegexJob } from './regexRunner'
 import { describeErrorAt, type ToolDefinition, type ToolOptions, type ToolResult } from './tool'
-import { uuidList } from './uuid'
+
+/**
+ * 🔴 六个工具的**实现**一律 `await import(...)`，⛔ 不在这一层静态 import。
+ *
+ * 首屏那笔账（PLAN §2.9 的 300KB 预算）里，`src/tools` 是最大的一块可挪重量：
+ * `time.ts` / `regex.ts` / `json.ts` / `codec.ts` / `naming.ts` / `uuid.ts` 全是纯活，
+ * 而**没有一个在启动那一刻用得上**——它们只在用户点开工具箱、或按下某条工具命令时才跑。
+ *
+ * ⚠️ 但**描述符必须留在首屏**（这一层因此仍是静态 import 进 entry 的）：
+ * `tools/registry.ts` 的 `installTools` 在启动那一刻就要把六个工具投影成命令塞进注册表，
+ * 而键绑定挂在 `window` 的捕获阶段——「按 `Mod+Shift+J` 就有东西可跑」这件事不能等一个 chunk 回来。
+ * 于是切法就是这一条缝：**元数据（id / 名字 / 分类 / 选项 / 快捷键）常驻，`run` 按需**。
+ *
+ * 🔴 这一改之所以几乎不要钱，是因为 `ToolDefinition.run` 的签名**本来就**允许返回 Promise
+ * （`side: 'rust'` 的工具必然是），而 `store.ts` 那边一律按异步处理并带请求序号
+ * （见它的模块文档「`run` 一律按异步处理」那一节）。所以工具箱那半边一个字都不用动。
+ * 在 Tauri 里那一跳是读一个本地文件，量级在毫秒以下（与 `MarkdownPreview` 那条懒加载同一笔账）。
+ */
 
 /**
  * 「缩进」那一格里代表**压缩**的那个候选。
@@ -105,8 +118,9 @@ function indentOf(options: ToolOptions): string | number | undefined {
  * 会让输出格在用户还没粘东西之前就红一次。返回空串之后输出格显示的是
  * `OUTPUT_PLACEHOLDER`（「输出会出现在这里」），那正是「还没东西可跑」该有的样子
  */
-function runJson(input: string, options: ToolOptions): ToolResult {
+async function runJson(input: string, options: ToolOptions): Promise<ToolResult> {
   if (input.trim() === '') return { kind: 'ok', text: '' }
+  const { blankJsonComments, scanJson, sortKeysDeep } = await import('./json')
 
   // 🔴 抹注释那一步是**等长**的（连 `\n` 的位置都保住），所以 `source` 与 `input`
   // 逐下标对齐。这一点撑着下面两件事：报出去的 `at` 能直接用来选输入格里的那一行，
@@ -186,7 +200,8 @@ const CODEC_MODES = [MODE_B64_ENCODE, MODE_B64_DECODE, MODE_URL_ENCODE_VALUE, MO
  * （`btoa('')`、`atob('')`、`encodeURIComponent('')`、`decodeURIComponent('')` 全是 `''`），
  * 于是输出格显示的还是 `OUTPUT_PLACEHOLDER`，不需要额外拦一道
  */
-function runCodec(input: string, options: ToolOptions): ToolResult {
+async function runCodec(input: string, options: ToolOptions): Promise<ToolResult> {
+  const { base64Decode, base64Encode, urlDecode, urlEncode } = await import('./codec')
   switch (options.mode) {
     case MODE_B64_ENCODE:
       return base64Encode(input)
@@ -259,7 +274,8 @@ const UUID_MAX_COUNT = 1000
  * 🔴 而 `hyphens` 用 `!== false` 而不是 `=== true`，是为了让「到不了的那一支」
  * 落到默认值 `true` 上——`uppercase` 的默认值是 `false`，所以它用 `=== true`
  */
-function runUuid(_input: string, options: ToolOptions): ToolResult {
+async function runUuid(_input: string, options: ToolOptions): Promise<ToolResult> {
+  const { uuidList } = await import('./uuid')
   const count = typeof options.count === 'number' ? options.count : 1
   return { kind: 'ok', text: uuidList(count, options.uppercase === true, options.hyphens !== false) }
 }
@@ -300,8 +316,12 @@ export const UUID_TOOL: ToolDefinition = {
  * 用例能把 `now` 钉成一个确定的数。这一层是整个工具箱里唯一一处
  * 「不纯的东西留在描述符这一侧」的地方，而它也正是描述符这一层该干的活
  */
-function runTime(input: string): ToolResult {
-  return timeReport(input, Date.now())
+async function runTime(input: string): Promise<ToolResult> {
+  // 🔴 `now` 在 `await` **之前**读：动态 import 那一跳虽然只有几毫秒，但把它算进时间戳
+  // 就等于「转换结果随首跑/复跑而差几毫秒」——一个没人会想到去查的漂移
+  const now = Date.now()
+  const { timeReport } = await import('./time')
+  return timeReport(input, now)
 }
 
 /**
@@ -338,6 +358,11 @@ const REGEX_MODE_REPLACE = '替换结果'
 /**
  * 正则测试器的 `run`。
  *
+ * 🔴 **异步**：它把活交给 `regexRunner`——后者在一个 worker 上跑 `regexReport` 并带一个截止时间，
+ * 于是灾难性回溯（`(a+)+$` 撞上一长串相同字符）不再能把整个窗口冻死（理由详见 `regexRunner.ts`）。
+ * `ToolDefinition.run` 的签名一直允许返回 Promise，`store.ts` 也一律按异步处理，所以这一改
+ * 不需要动工具箱那半边的一个字
+ *
  * ⚠️ 三个文字格各自收窄成 `''` 而不是抛错，理由与 `runUuid` 相同：`defaultOptions`
  * 与 `coerceOption` 两边都保证 `kind: 'text'` 的值是字符串，所以这三支结构上到不了。
  * 🔴 落到 `''` 尤其安全——`regexReport` 对空模式返回 `ok` + 空串，也就是「还没东西可跑」
@@ -345,14 +370,15 @@ const REGEX_MODE_REPLACE = '替换结果'
  * ⚠️ `mode` 用 `=== REGEX_MODE_REPLACE` 判，于是「到不了的那一支」落到 `list` 上：
  * 清单是缺省的那一档，也是**不会改用户文字**的那一档
  */
-function runRegex(input: string, options: ToolOptions): ToolResult {
-  return regexReport(
+function runRegex(input: string, options: ToolOptions): Promise<ToolResult> {
+  const job: RegexJob = {
     input,
-    typeof options.pattern === 'string' ? options.pattern : '',
-    typeof options.flags === 'string' ? options.flags : '',
-    typeof options.replacement === 'string' ? options.replacement : '',
-    options.mode === REGEX_MODE_REPLACE ? 'replace' : 'list',
-  )
+    pattern: typeof options.pattern === 'string' ? options.pattern : '',
+    flags: typeof options.flags === 'string' ? options.flags : '',
+    replacement: typeof options.replacement === 'string' ? options.replacement : '',
+    mode: options.mode === REGEX_MODE_REPLACE ? 'replace' : 'list',
+  }
+  return import('./regexRunner').then(({ regexRunner }) => regexRunner().run(job))
 }
 
 /**
@@ -373,9 +399,12 @@ function runRegex(input: string, options: ToolOptions): ToolResult {
  * 「正则替换」两个工具的话，`pattern` 与 `flags` 两格要在两份描述符里各写一遍，
  * 而「在这一个里调好的模式，切到那一个又得重打」正是这类工具最烦人的地方
  *
- * ⚠️ **没有超时中断**：一个灾难性回溯的模式（`(a+)+$` 撞上 `aaaaaaaaaaaaaaaaaaaaX`）
- * 会把整个窗口冻住，因为 `run` 跑在 UI 线程上。真正的解法是 Worker + deadline，
- * `ToolDefinition.run` 的签名已经允许返回 Promise，所以那条路没堵死（见 `regex.ts`）
+ * 🔴 **跑在 worker 上，带一个截止时间**：`run` 交给 `regexRunner`，于是灾难性回溯的模式
+ * （`(a+)+$` 撞上 `aaaaaaaaaaaaaaaaaaaaX`）不再能把整个窗口冻住——到点（`REGEX_DEADLINE_MS`）
+ * 就掐掉那个 worker 并如实报一句「很可能是灾难性回溯」。
+ * ⚠️ 它曾经是六个里唯一异步的那个，理由是「同步会卡死」；**现在六个全都异步**（实现按需 import，
+ * 见本文件顶部那条注释），于是「异步」不再是它独有的那一条——它特别的地方是
+ * 「活在另一个**线程**上，还带一个到点就掐掉的时刻」，`side` 仍是 `'js'`（不是 Rust 那一边）
  *
  * ⚠️ 导出来只是为了让用例能直接拿这一份描述符；`App.tsx` 读的是下面那个 `BUILTIN_TOOLS`
  */
@@ -423,7 +452,7 @@ export const NAMING_TOOL: ToolDefinition = {
   category: 'text',
   input: 'text',
   side: 'js',
-  run: (input) => namingReport(input),
+  run: async (input) => (await import('./naming')).namingReport(input),
 }
 
 /** v1 的内置工具。顺序无所谓：左栏按分类分组、组内按名字排（见 `./tool.ts` 的 `groupTools`） */

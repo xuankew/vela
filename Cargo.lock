@@ -4476,7 +4476,7 @@ dependencies = [
 
 [[package]]
 name = "vela"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "notify",
@@ -4494,7 +4494,7 @@ dependencies = [
 
 [[package]]
 name = "vela-core"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "encoding_rs",
  "globset",

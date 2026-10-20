@@ -20,6 +20,7 @@ function stateFor(lineWrap = true) {
       lineWrap,
       lineWrapSlot: new Compartment(),
       darkSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     }),
   })
@@ -71,6 +72,7 @@ describe('M1-E-3：词补全的接线', () => {
         lineWrap: true,
         lineWrapSlot: new Compartment(),
         darkSlot: new Compartment(),
+        minimapSlot: new Compartment(),
         languageSlot: new Compartment(),
         ...(peerStates === undefined ? {} : { peerStates }),
       }),
@@ -120,6 +122,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       lineWrap: true,
       lineWrapSlot: slot,
       darkSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
     expect(state.doc.toString()).toBe('正文')
@@ -137,6 +140,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       lineWrap: true,
       lineWrapSlot: slot,
       darkSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
     expect(wrapEnabled(on)).toBe(true)
@@ -158,6 +162,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       doc: 'x',
       darkSlot: slot,
       lineWrapSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
     expect(dark.facet(EditorView.darkTheme)).toBe(true)
@@ -176,6 +181,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       dark: false,
       darkSlot: new Compartment(),
       lineWrapSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
     expect(state.facet(EditorView.darkTheme)).toBe(false)
@@ -189,6 +195,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       lineWrap: true,
       lineWrapSlot: slotA,
       darkSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
     const b = createEditorState({
@@ -196,6 +203,7 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
       lineWrap: true,
       lineWrapSlot: slotB,
       darkSlot: new Compartment(),
+      minimapSlot: new Compartment(),
       languageSlot: new Compartment(),
     })
 

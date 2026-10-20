@@ -126,11 +126,15 @@ describe('渲染', () => {
     expect(tabs()[0]!.title).toBe('/Users/x/notes/win.txt')
   })
 
-  it('脏标签的名字前面带 ●，干净的没有', () => {
+  it('脏标签在名字右边多一个 ●，干净的没有', () => {
     const ws = mount(createWorkspace())
     ws.newTab()
     ws.tabs()[0]!.doc.markChanged()
-    expect(names()).toEqual(['● 空文档', '空文档'])
+    // Sublime 口径：脏点是标题**右边**独立的一格（`.tab-dot`），不是名字的前缀——
+    // 悬停时 × 会顶替它，所以它不能混在 `.tab-name` 里跟着名字一起被省略号截断
+    expect(names()).toEqual(['空文档', '空文档'])
+    expect(tabs()[0]!.querySelector('.tab-dot')?.textContent).toBe('●')
+    expect(tabs()[1]!.querySelector('.tab-dot')).toBeNull()
   })
 
   it('每个标签都 draggable，否则 HTML5 拖放压根不启动', () => {

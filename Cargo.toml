@@ -3,7 +3,7 @@ members = ["src-tauri", "crates/vela-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.77.2"
 license = "UNLICENSED"
