@@ -4978,3 +4978,152 @@ describe('缩略图（M4-H）', () => {
     expect(container.querySelectorAll('.cm-minimap')).toHaveLength(1)
   })
 })
+
+/**
+ * 编辑区实例的释放（M4-L）。PLAN §3.6「性能调优」里那条「内存泄漏排查（EditorView 释放）」的落点。
+ *
+ * 🔴 **为什么必须钉在 App 这一层**：`EditorView.destroy()` 是 CM6 交回 ResizeObserver、DOM 事件
+ * 监听与 docView 的**唯一**出口，而全仓库只有一处会调它——`EditorPane` 的 `onCleanup`
+ * （`src/editor/EditorPane.tsx:49` → `src/editor/controller.ts:120`）。组件级用例
+ * （`EditorPane.test.tsx` 的「卸载即销毁」）钉住了这一处，但**「哪条路径会让 EditorPane 卸载」
+ * 是 App 与 workspace 的事**：关分屏、合并分屏、内联↔只读分片切换、卸载整棵树。这四条里
+ * 任何一条漏掉卸载，组件级用例照样全绿。
+ *
+ * ⚠️ **数 DOM 节点抓不到这个泄漏**：`destroy()` 里有一句 `this.dom.remove()`，而 Solid 卸载
+ * `EditorPane` 时宿主 `.editor-container` 也一并从文档上摘走——没被 destroy 的实例同样会从
+ * `querySelectorAll` 的视野里消失。它的 DOM 会跟着一起被 GC，但 ResizeObserver 与那些监听**不会**，
+ * 而那才是泄漏本体。所以判据只能是「`destroy()` 到底有没有被调到」。
+ */
+describe('编辑区实例的释放（M4-L）', () => {
+  /** 挂载过的每一块编辑区 */
+  let seen: Set<EditorView>
+  /** `destroy()` 真的被调过的那一些 */
+  let destroyed: Set<EditorView>
+  let unspy: () => void
+
+  /**
+   * 攒 `seen` 的办法是「每走完一步就扫一遍界面上还剩哪些」。
+   *
+   * ⚠️ 这漏得掉「在同一步里建出来又摘掉」的实例。所以下面每个动作都单独走一步（`tick`），
+   * 而且每一步都断言 `seen.size` / `destroyed.size` 的**具体数字**而不只是「没泄漏」——
+   * 数字对不上就说明有实例压根没被扫到，那种绿是假的
+   */
+  function noteViews() {
+    for (const v of views()) seen.add(v)
+  }
+
+  /** 走完一步：冲干净异步，再把这一步里出现过的实例记进账 */
+  async function tick() {
+    await flush()
+    noteViews()
+  }
+
+  /** 已经不在界面上、却从没被 `destroy()` 过的那一些。非空就是泄漏 */
+  function leaked(): EditorView[] {
+    const mounted = new Set(views())
+    return [...seen].filter((v) => !mounted.has(v) && !destroyed.has(v))
+  }
+
+  function closeTabButton(index: number): HTMLButtonElement {
+    const el = tabs()[index]!.querySelector<HTMLButtonElement>('.tab-close')
+    if (!el) throw new Error('标签上找不到关闭按钮')
+    return el
+  }
+
+  beforeEach(() => {
+    seen = new Set()
+    destroyed = new Set()
+    // 探针钉在原型上，⛔ 不动产品代码。先把原实现摘下来存着，spy 只负责记一笔再转调它
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- 这儿正是要摘下方法再用 call 绑回去
+    const original = EditorView.prototype.destroy
+    const spy = vi.spyOn(EditorView.prototype, 'destroy').mockImplementation(function (this: EditorView) {
+      destroyed.add(this)
+      original.call(this)
+    })
+    unspy = () => spy.mockRestore()
+    // 挂载发生在模块级 beforeEach 里、跑在这个钩子之前，所以起始那一块要在这儿补记进账
+    noteViews()
+  })
+
+  // 内层的 afterEach 先跑：探针还原之后，模块级 afterEach 里那次 dispose() 走的是真的 destroy
+  afterEach(() => {
+    unspy()
+  })
+
+  it('合并分屏把多出来的两块真的销毁了，不是只从 DOM 上摘掉', async () => {
+    press('\\', modInit())
+    await tick()
+    press('\\', modInit())
+    await tick()
+    expect(views()).toHaveLength(3)
+    expect(seen.size).toBe(3)
+
+    await menu('window.merge_panes')
+    await tick()
+
+    expect(hosts()).toHaveLength(1)
+    expect(views()).toHaveLength(1)
+    expect(leaked()).toEqual([])
+    // 🔴 这一条才是重点：少了它，「零泄漏」可能只是「一个都没销毁过」的另一种说法
+    expect(destroyed.size).toBe(2)
+  })
+
+  it('开/关标签复用同一块编辑区：四个标签只用一个实例，一个都不多建', async () => {
+    for (let i = 0; i < 3; i++) {
+      press('n', modInit())
+      await tick()
+    }
+    expect(tabs()).toHaveLength(4)
+    expect(views()).toHaveLength(1)
+    // 🔴 「一个标签一个 EditorView」才是最贵的那种泄漏：一个实例带着一整套 docView、
+    // DOM 监听与 ResizeObserver，开二十个标签就是二十份。这条钉的是那句不变量——
+    // 换标签换的是里面的 state（`EditorController.restore`），⛔ 不是外面的实例
+    expect(seen.size).toBe(1)
+    expect(destroyed.size).toBe(0)
+
+    // 从右往左关：关掉的都不是当前显示着的那个，走的还是同一条 `removeFromList`
+    for (let i = 3; i >= 1; i--) {
+      closeTabButton(i).click()
+      await tick()
+    }
+    expect(tabs()).toHaveLength(1)
+    expect(views()).toHaveLength(1)
+    expect(seen.size, '关标签既不该新建实例，也不该销毁掉正在用的那块').toBe(1)
+    expect(destroyed.size).toBe(0)
+    expect(leaked()).toEqual([])
+  })
+
+  it('正文换成只读分片时，被 `<Show>` 顶掉的那块编辑区销毁了', async () => {
+    dialog.open.mockResolvedValue('/var/log/huge.log')
+    ipc.openFile.mockRejectedValue({ kind: 'too_large', bytes: shardCmd.header.bytes, limit: 4_194_304 })
+    press('o', modInit())
+    await flush()
+    await tick()
+
+    expect(container.querySelector('.shard-pane'), '正文区应当已经换成只读分片').not.toBeNull()
+    expect(views()).toHaveLength(0)
+    expect(leaked()).toEqual([])
+    // 内联 → 分片是 `<Show>` 从 fallback 翻过去，那一下必须卸载 EditorPane。
+    // 反方向（分片 → 内联，文件在 Vela 开着的时候缩回 4 MiB 以内）走的是同一条卸载路径
+    expect(destroyed.size).toBe(1)
+  })
+
+  it('卸载整棵 App 时把每一块编辑区都带走', async () => {
+    press('\\', modInit())
+    await tick()
+    press('\\', modInit())
+    await tick()
+    expect(views()).toHaveLength(3)
+
+    dispose()
+    // afterEach 还会再 dispose 一次，而 Solid 的 dispose 不保证可以重入
+    dispose = () => {}
+    container.remove()
+    noteViews()
+
+    expect(views()).toHaveLength(0)
+    expect(leaked()).toEqual([])
+    expect(seen.size).toBe(3)
+    expect(destroyed.size).toBe(seen.size)
+  })
+})
