@@ -119,8 +119,8 @@ export const changeMarks = StateField.define<RangeSet<GutterMarker>>({
 })
 
 /**
- * 把字段与 gutter 捆成一个扩展。挂在 `setup.ts` 的 `lineNumbers()` 之后——
- * 顺序决定它在行号右边、折叠槽左边。
+ * 把字段与 gutter 捆成一个扩展。挂在 `setup.ts` 的 `bookmarkGutter()` 之后——
+ * 顺序决定它在书签那列右边、折叠槽左边。
  */
 export function changeGutter(): Extension {
   return [

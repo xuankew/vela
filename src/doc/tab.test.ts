@@ -1,9 +1,15 @@
+import { CompletionContext, type CompletionSource } from '@codemirror/autocomplete'
+import { Compartment, type EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
 import { describe, expect, it, vi } from 'vitest'
 import type { EditorSnapshot } from '../editor/controller'
-import { darkThemeEnabled, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
+import type { LinkFilesHook } from '../editor/linkSource'
+import { languageFor } from '../editor/language'
+import { darkThemeEnabled, languageExtensions, lineWrapEnabled, type EditorUpdateInfo } from '../editor/setup'
+import { DEFAULT_FORMAT } from './document'
 import {
   applyViewConfig,
+  buildState,
   createTab,
   createViewConfig,
   replaceTabText,
@@ -226,5 +232,127 @@ describe('applyViewConfig（未显示的标签也要跟着全局设置走）', (
 
     expect(tab.snapshot.state).not.toBe(before)
     expect(darkThemeEnabled(tab.snapshot.state)).toBe(false)
+  })
+})
+
+/**
+ * M3-A-6 链接补全的注入链：`ViewConfig.linkFiles`（工作区一份）+ `buildState` 的
+ * `docPath`（每标签一份）→ `EditorSetupOptions.completeLinks`。
+ *
+ * 🔴 这一条链上任何一环漏掉，症状都是**Markdown 里打 `](` 什么都不弹**，控制台干干净净。
+ * 尤其是 `replaceTabText`：它换文档时重建 state，少传一个参数就等于「打开文件之后功能没了」，
+ * 而新建空标签时是好的——那种只在特定操作顺序下复现的失效最难查。
+ */
+describe('M3-A-6：链接补全的注入链', () => {
+  const DOC = '[图]('
+
+  function configWith(linkFiles?: LinkFilesHook): ViewConfig {
+    return createViewConfig(true, () => [], undefined, true, undefined, undefined, true, linkFiles)
+  }
+
+  /**
+   * 把 markdown 装进语言槽位，再取光标末尾那一位的补全源。
+   *
+   * 装语言这一步在真机上是 workspace 的 `syncLanguage` 干的（按路径认出 `.md`）；
+   * 这里手工做同样的 reconfigure，因为链接补全注册在 `markdownLanguage` 的数据里，
+   * 槽位空着就取不到——那正是「作用域跟着语言走」的落点。
+   */
+  function linkSources(state: EditorState, slot: Compartment) {
+    const md = state.update({
+      effects: slot.reconfigure(languageExtensions(languageFor('/repo/doc/a.md', ''), null)),
+    }).state
+    return md.languageDataAt<CompletionSource>('autocomplete', md.doc.length)
+  }
+
+  async function runLinkCompletion(state: EditorState, slot: Compartment) {
+    const md = state.update({
+      effects: slot.reconfigure(languageExtensions(languageFor('/repo/doc/a.md', ''), null)),
+    }).state
+    const context = new CompletionContext(md, md.doc.length, false)
+    for (const source of linkSources(state, slot)) {
+      if (typeof source === 'function') await source(context)
+    }
+  }
+
+  it('createViewConfig：传了就原样存着，缺省连这个键都不带', () => {
+    expect('linkFiles' in createViewConfig()).toBe(false)
+    const hook: LinkFilesHook = async () => null
+    expect(configWith(hook).linkFiles).toBe(hook)
+  })
+
+  it('buildState 把两者闭包成每标签一份的钩子，路径每次调用都重新取', async () => {
+    const seen: (string | null)[] = []
+    const slot = new Compartment()
+    let path: string | null = '/repo/doc/a.md'
+    const state = buildState(
+      DOC,
+      configWith(async (_typed, docPath) => {
+        seen.push(docPath)
+        return null
+      }),
+      slot,
+      undefined,
+      () => path,
+    )
+
+    await runLinkCompletion(state, slot)
+    // 另存为之后同一个标签的路径变了：闭包读的是取值器，所以必须看到新的那个
+    path = '/repo/doc/b.md'
+    await runLinkCompletion(state, slot)
+
+    expect(seen).toEqual(['/repo/doc/a.md', '/repo/doc/b.md'])
+  })
+
+  /*
+   * ⚠️ 这两条断言的是**差值**而不是绝对数量：`buildExtensions` 还全局装了词补全，
+   * `lang-markdown` 自己也带一个 htmlTagCompletion，那两个数字会跟着扩展集一起变。
+   * 每份 state 各用一个槽位——共享一个 Compartment 实例时 reconfigure 会一次拨动全部，
+   * 那正是 `ViewConfig` 文件头警告过的坑。
+   */
+  it('缺省 linkFiles 时这一组压根不装', () => {
+    const bareSlot = new Compartment()
+    const bare = buildState(DOC, configWith(), bareSlot, undefined, () => '/repo/doc/a.md')
+
+    const wiredSlot = new Compartment()
+    const wired = buildState(
+      DOC,
+      configWith(async () => null),
+      wiredSlot,
+      undefined,
+      () => '/repo/doc/a.md',
+    )
+
+    expect(linkSources(wired, wiredSlot).length).toBe(linkSources(bare, bareSlot).length + 1)
+  })
+
+  it('没给 docPath 时也不装：算不出相对路径，插进去的会是换台机器就断的绝对路径', () => {
+    const bareSlot = new Compartment()
+    const bare = buildState(DOC, configWith(), bareSlot)
+
+    const wiredSlot = new Compartment()
+    const wired = buildState(
+      DOC,
+      configWith(async () => null),
+      wiredSlot,
+    )
+
+    expect(linkSources(wired, wiredSlot).length).toBe(linkSources(bare, bareSlot).length)
+  })
+
+  it('换文档之后，新 state 仍带着这个标签的路径', async () => {
+    const seen: (string | null)[] = []
+    const tab = makeTab(
+      '',
+      configWith(async (_typed, docPath) => {
+        seen.push(docPath)
+        return null
+      }),
+    )
+    // restoreDraft 不碰磁盘，走的正是 replaceTabText 那条重建 state 的路
+    tab.doc.restoreDraft({ path: '/repo/doc/a.md', text: DOC, format: DEFAULT_FORMAT, dirty: false, lossy: false })
+    expect(tab.doc.path()).toBe('/repo/doc/a.md')
+
+    await runLinkCompletion(tab.snapshot.state, tab.languageSlot)
+    expect(seen).toEqual(['/repo/doc/a.md'])
   })
 })

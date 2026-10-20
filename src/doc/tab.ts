@@ -3,6 +3,7 @@ import { EditorView } from '@codemirror/view'
 import type { EditorSnapshot } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
 import type { DefinitionClickHook } from '../editor/clickJump'
+import type { LinkFilesHook } from '../editor/linkSource'
 import type { PasteImageHook } from '../editor/paste'
 import {
   createEditorState,
@@ -88,6 +89,18 @@ export interface ViewConfig {
    * 缺省 = 不装，那一下仍然是「加一个光标」（见 `editor/clickJump.ts`）。
    */
   readonly clickDefinition?: DefinitionClickHook
+  /**
+   * Markdown 链接补全的取候选者，工作区内所有标签共用同一个（M3-A-6）。
+   *
+   * 与 `pasteImage` 同一条理由放在这儿：「项目里有哪些文件」是工作区的知识（要问
+   * `tree.roots()` 与 `query_project`），一个标签自己答不上来。但钩子的第二个参数
+   * ——**当前文档的路径**——是标签的知识，所以 `buildState` 会把它闭包成每标签一份的
+   * `completeLinks`（见下面那个函数）。补全源只拿到 `CompletionContext`，那里有 state
+   * 没有 view，问不出「这份文档在磁盘的哪个目录」。
+   *
+   * 缺省 = 不装，Markdown 里打 `](` 什么也不会发生（见 `editor/linkSource.ts`）。
+   */
+  readonly linkFiles?: LinkFilesHook
 }
 
 export function createViewConfig(
@@ -98,6 +111,7 @@ export function createViewConfig(
   onFontSizeZoom?: (delta: number) => void,
   clickDefinition?: DefinitionClickHook,
   minimap = true,
+  linkFiles?: LinkFilesHook,
 ): ViewConfig {
   // `pasteImage` 是可选的，所以只能条件展开：`exactOptionalPropertyTypes` 虽然没开，
   // 但显式写一个 `pasteImage: undefined` 会让「缺省」与「传了个 undefined」在
@@ -113,6 +127,7 @@ export function createViewConfig(
     ...(pasteImage ? { pasteImage } : {}),
     ...(onFontSizeZoom ? { onFontSizeZoom } : {}),
     ...(clickDefinition ? { clickDefinition } : {}),
+    ...(linkFiles ? { linkFiles } : {}),
   }
 }
 
@@ -166,6 +181,11 @@ export function buildState(
   config: ViewConfig,
   languageSlot: Compartment,
   onUpdate?: (info: EditorUpdateInfo) => void,
+  /**
+   * 这份 state 属于哪个标签的路径。只被 `config.linkFiles` 用到（M3-A-6），
+   * 在这里被闭包成每标签一份的补全钩子——理由写在 `ViewConfig.linkFiles` 上。
+   */
+  docPath?: () => string | null,
 ): EditorState {
   // 刻意不传 language：建出来的槽位是空的，语言一律由 workspace 的 syncLanguage 装。
   // 留两条安装路径的话，子语言懒加载回来的那一刻就得再判断一次「这个 state 是哪条路建的」
@@ -182,6 +202,8 @@ export function buildState(
     ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
     ...(config.onFontSizeZoom ? { onFontSizeZoom: config.onFontSizeZoom } : {}),
     ...(config.clickDefinition ? { clickDefinition: config.clickDefinition } : {}),
+    // 两个都到位才装：缺了路径就只能算绝对路径，而绝对路径链接换台机器就全断
+    ...(config.linkFiles && docPath ? { completeLinks: (typed: string) => config.linkFiles!(typed, docPath()) } : {}),
     onUpdate,
   })
 }
@@ -194,7 +216,7 @@ export function createTab(init: CreateTabInit): Tab {
   const tab: Tab = {
     id: init.id,
     snapshot: {
-      state: buildState(init.text ?? '', init.config, languageSlot, init.onUpdate),
+      state: buildState(init.text ?? '', init.config, languageSlot, init.onUpdate, () => tab.doc.path()),
       scrollTop: 0,
       scrollLeft: 0,
     },
@@ -234,7 +256,9 @@ export function tabChars(tab: Tab): number {
  */
 export function replaceTabText(tab: Tab, text: string, config: ViewConfig) {
   tab.snapshot = {
-    state: buildState(text, config, tab.languageSlot, tab.onUpdate),
+    // 🔴 路径要一并传：换文档常常同时换文件（打开文件、另存为），少传的话链接补全会
+    // 拿**上一个文件**所在目录去算相对路径，插进去的链接当时看着对，跳到别处就断
+    state: buildState(text, config, tab.languageSlot, tab.onUpdate, () => tab.doc.path()),
     scrollTop: 0,
     scrollLeft: 0,
   }

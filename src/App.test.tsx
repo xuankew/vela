@@ -3922,6 +3922,107 @@ describe('字数统计与导出 HTML 接线（M3-A-6）', () => {
   // 自己的用例钉住（那边能造出超时），这里不假装覆盖了
 })
 
+/**
+ * M3-A-6 链接补全的接线。这一组钉的只有一件事：**`App.tsx` 有没有把 `linkFiles` 递进
+ * `createWorkspace`**——那个选项是可选的，漏递 TypeScript 一声不响，症状是「Markdown 里
+ * 敲 `](` 什么都不弹」，而且没有任何报错可查。
+ *
+ * 链条上其余各跳各有各的用例：相对化在 `md/linkPath.test.ts`，补全源在
+ * `editor/linkSource.test.ts`，注入链在 `doc/tab.test.ts` / `doc/workspace.test.ts`。
+ */
+describe('链接补全接线（M3-A-6）', () => {
+  /** 从「磁盘」打开一份 Markdown。草稿的 path 是 null，而 null 一律静默不查（见 App.tsx） */
+  async function openMarkdown(text: string, path: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text }))
+    press('o', modInit())
+    await flush()
+  }
+
+  /**
+   * 在光标处敲字。⚠️ 与 `typeText` 有两处不同，少一处这一组用例就全绿得毫无意义：
+   *
+   * - `userEvent: 'input.type'`：CM6 的补全插件只认这个事件（`activateOnTyping` 那一支
+   *   判的是 `tr.isUserEvent("input.type")`），一次普通的事务改动压根不会去问补全源；
+   * - 带上 `selection`：`typeText` 只往文档末尾插字、光标留在原地，而 `matchBefore`
+   *   找的是**光标前**那 250 个字符——光标在第 0 位时永远匹配不到 `](`。
+   */
+  function typeAtCursor(text: string) {
+    const v = view()
+    const at = v.state.selection.main.head
+    v.dispatch({
+      changes: { from: at, insert: text },
+      selection: { anchor: at + text.length },
+      userEvent: 'input.type',
+    })
+  }
+
+  /**
+   * 等补全落定。CM6 这条路上有两级真定时器：100ms 的 `activateOnTypingDelay`
+   * （敲字到发起查询）与 50ms 的 `updateSyncTime`（查询回来到底展开浮层）。
+   *
+   * ⚠️ 刻意用真等待而不是假时钟：假时钟下 `setTimeout` 不推进，而查询本身是 promise，
+   * 两者交错之后用例实际在测「定时器实现的细节」，一改 CM6 版本就红得莫名其妙。
+   */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 250))
+
+  /** 补全浮层里的候选文字，按屏幕顺序 */
+  function popupLabels(): string[] {
+    return [...container.querySelectorAll('.cm-tooltip-autocomplete .cm-completionLabel')].map(
+      (el) => el.textContent ?? '',
+    )
+  }
+
+  it('敲 ]( 就去查**已有的** query_project，候选是相对本文档重算过的链接目标', async () => {
+    await openProject()
+    await openMarkdown('# 标题\n', '/repo/docs/intro.md')
+    // 索引回的是**项目根相对**的绝对路径；插进正文的必须是从 `docs/` 看过去的相对目标
+    projectCmd.result = { matches: [matchOf('docs/img/a.png'), matchOf('README.md')], total: 2 }
+    projectCmd.queries.length = 0
+
+    typeAtCursor('[图](im')
+    await settle()
+
+    // 🔴 走的是 `Cmd+P` 同一条命令，⛔ 没有为补全新建命令、也没有第二份索引
+    expect(projectCmd.queries.at(-1)).toEqual({
+      roots: ['/repo'],
+      needle: 'im',
+      recent: ['/repo/docs/intro.md'],
+    })
+    // 第一个在 `docs/` 底下，于是相对目标里那一层被吃掉；第二个要爬一层出去
+    expect(popupLabels()).toEqual(['img/a.png', '../README.md'])
+  })
+
+  it('🔴 `../` 前缀不进 needle：索引里存的是项目根相对路径，那里永远不会有 `..`', async () => {
+    await openProject()
+    await openMarkdown('正文\n', '/repo/docs/intro.md')
+    projectCmd.queries.length = 0
+
+    // `](../im` 是最常见的起手式（想链到上一层的图），照着原样查会一条都查不到，
+    // 而「什么都查不到」在用户看来就是这功能坏了
+    typeAtCursor('[图](../im')
+    await settle()
+
+    expect(projectCmd.queries.at(-1)?.needle).toBe('im')
+  })
+
+  it('一个 IPC 都不发：文档还是没存过的草稿', async () => {
+    // 草稿：path 是 null，没有基准可推。语言上它**是** Markdown（`languageFor(null)`
+    // 一律当 Markdown），所以补全源会被问到——问到了也不该发一次 IPC
+    typeAtCursor('[图](im')
+    await settle()
+    expect(projectCmd.queries).toEqual([])
+
+    await openProject()
+    projectCmd.queries.length = 0
+    // 有根了，但当前标签仍是那份草稿。⚠️ 这里另起一个 `](` 而不是接着敲：
+    // 前一个结果被 `validFor` 认下来时 CM6 只在本地过滤，压根不会再问一次源
+    typeAtCursor('[另一处](')
+    await settle()
+    expect(projectCmd.queries).toEqual([])
+  })
+})
+
 describe('图片粘贴落地接线（M3-A-7）', () => {
   /** 提示条那一个节点。`notices()` 的 `level` 分不出「无色」与 `ok`，所以要自己读 className */
   const noticeEl = () => container.querySelector('.notices .notice')

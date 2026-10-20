@@ -12,6 +12,7 @@ import { unfoldAll } from '@codemirror/language'
 // selectNextOccurrence 与查找替换那几个都住在 search 包里，不在 commands 包
 import { findNext, findPrevious, openSearchPanel, selectMatches, selectNextOccurrence } from '@codemirror/search'
 import type { Command } from '@codemirror/view'
+import { clearBookmarks, nextBookmark, prevBookmark, toggleBookmark } from '../editor/bookmarks'
 import { replaceAllCommand, replaceNextCommand } from '../editor/findReplace'
 import { foldWholeDocument } from '../editor/fold'
 import { removeDuplicateLines, sortLinesAscending, sortLinesDescending } from '../editor/lineOps'
@@ -761,6 +762,33 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     registry.register(cmCommand('editor.sortLinesAsc', '升序排序行', sortLinesAscending, 'Alt+Shift+A')),
     registry.register(cmCommand('editor.sortLinesDesc', '降序排序行', sortLinesDescending, 'Alt+Shift+D')),
     registry.register(cmCommand('editor.removeDuplicateLines', '删除重复行', removeDuplicateLines, 'Alt+Shift+U')),
+
+    // 书签（PLAN §1.4 的 P1「书签与断点式标记」）。四条全走 `editor/bookmarks.ts`，
+    // 那儿也写着这一版的口径：**内存态**（不进 session、不动 Rust）、交互面是
+    // **可点的 gutter 圆点 + 这四条命令**（⛔ 没有书签列表面板）。
+    //
+    // `Mod+Alt+B`：B = Bookmark。这个键此前是空的——`@codemirror` 与 `@lezer` 的 dist 里
+    // `Mod-Alt-` 只有 `ArrowUp` / `ArrowDown` / `\`（commands）与 `g`（search 的 gotoLine）；
+    // 本项目注册表已占的 `Mod+Alt-` 是 `←→↑↓` / `Enter` / `O` / `A` / `F` / `D` / `V` / `J`，
+    // Rust 侧原生菜单占的是 `⌥⌘J` / `⌥⌘V` / `Alt+Z` / `⌥⌘←→`（`src-tauri/src/menu.rs`）。
+    // ⛔ 不是 `Mod+B`：那个已经是「显示/隐藏侧边栏」（VS Code 的既有约定）。
+    // 参照物也帮不上忙——VS Code 的 Toggle Bookmark 是 `Cmd+K Cmd+K` 和弦，Sublime 是 `Cmd+F2`，
+    // 而本项目的快捷键 DSL 压根没有「和弦」这个概念（见 `commands/keybinding.ts`）。
+    //
+    // `Mod+Alt+]` / `Mod+Alt+[`：方向沿用本项目既有的一条——`]` 向后、`[` 向前，
+    // 与 `Mod+Alt+→/←` 切分屏焦点、`Mod+Shift+G` / `Shift+F3` 查上一个同一个方向。
+    // 加 Alt 是为了让开两个已经占着的键：CM6 `defaultKeymap` 的 `Mod-[` / `Mod-]`
+    // 是增减缩进（`node_modules/@codemirror/commands/dist/index.js`），`foldKeymap` 的
+    // `Mod+Shift+[` / `Mod+Shift+]` 是折叠/展开当前区块。`[` 与 `]` 能被解析是因为
+    // `keybinding.ts` 走的是 `event.code` 的物理键位表（`BracketLeft` → `[`）——
+    // macOS 上 Option+括号的 `event.key` 是 `“` / `‘`，靠 `key` 匹配在这里必然落空。
+    //
+    // 「清除全部书签」刻意**不绑键**：它是不可逆的一次性动作，而逐个 toggle 与
+    // gutter 上点一下都够得着。入口是命令面板，与 foldAll / unfoldAll 同一条理由。
+    registry.register(cmCommand('editor.toggleBookmark', '切换当前行书签', toggleBookmark, 'Mod+Alt+B')),
+    registry.register(cmCommand('editor.nextBookmark', '跳到下一个书签', nextBookmark, 'Mod+Alt+]')),
+    registry.register(cmCommand('editor.prevBookmark', '跳到上一个书签', prevBookmark, 'Mod+Alt+[')),
+    registry.register(cmCommand('editor.clearBookmarks', '清除全部书签', clearBookmarks)),
 
     // JSON 格式化 / 压缩（M3-B-2）。直接操作编辑器内容，不打开工具箱面板。
     registry.register({

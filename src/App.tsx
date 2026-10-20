@@ -40,9 +40,11 @@ import { createQuickOpen, type Commit } from './goto/store'
 import { symbolTable, wordUnderCaret } from './goto/syntax'
 import { attachFileDrop, handleDroppedPaths } from './ipc/dragDrop'
 import { describeFsError, saveFile } from './ipc/fs'
+import { queryProject } from './ipc/project'
 import { attachReplaceListeners } from './ipc/replace'
 import { attachSearchListeners } from './ipc/search'
 import { attachWindowCloseGuard } from './ipc/windowClose'
+import { linkNeedle, linkTargets } from './md/linkPath'
 import { acceptsPastedImage, landPastedImage } from './md/paste'
 import { MarkdownToolbar } from './md/MarkdownToolbar'
 import type { FollowedEditor } from './md/panel'
@@ -317,6 +319,7 @@ export default function App() {
     pasteImage: pasteImageInto,
     clickDefinition: definitionFromClick,
     onFontSizeZoom: settings.stepZoomedFontSize,
+    linkFiles: linkFilesFor,
   })
   const activeDoc = () => ws.activeTab().doc
 
@@ -904,6 +907,36 @@ export default function App() {
       notify: (text, level) => setEditorNotice({ level, text }),
     })
     return true
+  }
+
+  /**
+   * Markdown 里打完 `](` 之后要的那批候选（M3-A-6）。
+   *
+   * 🔴 走的是 `Cmd+P` 同一个 `query_project`，⛔ 没有新建一条命令、也没有新索引：
+   * 那条命令在缓存是空的时候**自己会建**（`commands.rs` 的 `query_cached`），
+   * 所以这里不需要先 `indexProject` 预热。第一次触发要付一次建索引的钱
+   * （两万文件 40ms、十万文件 205ms，数字取自那条命令的注释），之后命中缓存。
+   *
+   * ⚠️ 慢与失败都不用在这一层兜：慢由 CM6 自己处理（结果落地前查 `context.aborted`，
+   * 没作废的再拿 `validFor` 对当前那段文字重过一遍）；失败由 `editor/linkSource.ts`
+   * 那个源吃掉——reject 冒到 CM6 的后果是「浮层被关掉 + 控制台一条异常」。
+   *
+   * ⚠️ 与 `pasteImageInto` / `definitionFromClick` 不同，这里**不需要** `tabOfView`：
+   * 补全源拿到的只有 `CompletionContext`（有 state、没有 view），所以「相对哪份文档算路径」
+   * 是 `doc/tab.ts` 在建 state 时按标签闭包好递进来的，没有「焦点还没跟上」那条竞态。
+   *
+   * 两种情况回 `null`（= 这一轮不参与，浮层里只剩词补全）：文档还没存过（没有基准可推），
+   * 以及还没打开文件夹（没有项目可查）。都不说出口——补全浮层不是一个能挂通知的地方，
+   * 而这两种情况用户自己看得见（标签上写着「空文档」、侧栏是空的）。
+   */
+  async function linkFilesFor(typed: string, docPath: string | null): Promise<string[] | null> {
+    const roots = tree.roots()
+    if (docPath === null || roots.length === 0) return null
+    const found = await queryProject(roots, linkNeedle(typed), ws.recent())
+    return linkTargets(
+      docPath,
+      found.matches.map((match) => match.path),
+    )
   }
 
   /**

@@ -8,6 +8,7 @@ import { minimapExtension } from '../editor/minimap'
 import type { EditorController } from '../editor/controller'
 import { resetChanges } from '../editor/changeGutter'
 import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../editor/language'
+import type { LinkFilesHook } from '../editor/linkSource'
 import type { PasteImageHook } from '../editor/paste'
 import { INDENT_UNIT, indentLabel, languageExtensions } from '../editor/setup'
 import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
@@ -333,6 +334,16 @@ export interface WorkspaceOptions {
    * ——那等于把加光标那次点击污染成报错。
    */
   clickDefinition?: DefinitionClickHook
+  /**
+   * Markdown 里打完 `](` 之后向谁要候选文件（M3-A-6）。
+   *
+   * 第二个参数是**发起补全那份文档**的路径。⚠️ 这里与上面几个钩子不同：它拿到的不是 view，
+   * 而是 `doc/tab.ts` 在建 state 时闭包好的每标签一份的取值器，所以**没有**
+   * `tabOfView` / `activeTab()` 那条时序竞态——「相对谁算路径」在建 state 的那一刻就定了。
+   *
+   * 缺省 = 不装这条补全，Markdown 里打 `](` 什么也不会发生。
+   */
+  linkFiles?: LinkFilesHook
 }
 
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
@@ -346,6 +357,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     options.onFontSizeZoom,
     options.clickDefinition,
     options.minimap ?? true,
+    options.linkFiles,
   )
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 

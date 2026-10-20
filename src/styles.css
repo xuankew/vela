@@ -3496,6 +3496,38 @@ select {
   background: #f1e1ba;
 }
 
+/* ──────────── 书签 gutter（PLAN §1.4 的 P1「书签与断点式标记」）────────────
+   标记的类名由 `editor/bookmarks.ts` 的 `GutterMarker.elementClass` 打在
+   `.cm-gutterElement` 上。这一列在行号右边、「未保存改动」竖条左边
+   （顺序由 `setup.ts` 里扩展的位置决定）。
+   ⚠️ 整列**一直占着** 12px，哪怕一个书签都没有——否则第一个书签出现时正文会横跳一下。
+   代价是左边距永久宽 12px，取舍写在 `editor/bookmarks.ts` 的 `bookmarkGutter` 上。
+   ⚠️ 颜色用 `--vela-warn`（琥珀）：`--vela-ok/accent/bad` 三个已经被改动 gutter 的
+   三种标记占满了，同一个语义色出现在相邻两列会让人以为是同一件事。
+   ⚠️ `cursor: pointer` 是给「这一列可以点」的唯一提示——点了就切书签，
+   与 Sublime / VS Code 的 glyph margin 一致。
+   ⚠️ 真机未验：node/jsdom 没有真实布局，圆点的居中与这一列的宽度得在 `pnpm tauri dev` 里看。 */
+.cm-bookmarkGutter {
+  min-width: 12px;
+  cursor: pointer;
+}
+
+.cm-bookmarkGutter .cm-gutterElement {
+  position: relative;
+}
+
+.cm-bookmarkGutter .vela-bookmark::before {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--vela-warn);
+}
+
 /* ────────────「未保存改动」gutter（#28，累积改动路线）────────────
    标记的类名由 `editor/changeGutter.ts` 的 `GutterMarker.elementClass` 打在
    `.cm-gutterElement` 上。颜色沿用八套主题都有的语义 token：

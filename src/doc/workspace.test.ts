@@ -54,7 +54,7 @@ vi.mock('../editor/language', async (importOriginal) => {
 })
 
 import { EditorSelection, type EditorState } from '@codemirror/state'
-import { CompletionContext } from '@codemirror/autocomplete'
+import { CompletionContext, type CompletionSource } from '@codemirror/autocomplete'
 import { indentUnit, language, type LanguageSupport } from '@codemirror/language'
 import { EditorController } from '../editor/controller'
 import type { LanguageChoice } from '../editor/language'
@@ -65,7 +65,7 @@ import type { ShardHeader } from '../ipc/shard'
 import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
 import type { ShardView } from './shardView'
 import { tabText } from './tab'
-import { UNTITLED_LABEL } from './document'
+import { DEFAULT_FORMAT, UNTITLED_LABEL } from './document'
 import {
   createWorkspace,
   MAX_PANES,
@@ -107,6 +107,21 @@ function languageName(state: EditorState): string | null {
 function completionLabels(state: EditorState, explicit = false): string[] {
   const result = completeWords(new CompletionContext(state, state.doc.length, explicit))
   return result?.options.map((o) => o.label) ?? []
+}
+
+/**
+ * 把文档末尾那一位的补全源全跑一遍。
+ *
+ * 与上面的 `completionLabels` 不同：那个直接点名词源，而这个走 `languageDataAt`，
+ * 因为链接补全注册在 `markdownLanguage` 的数据里，只有「语言装上了」才取得到——
+ * 那正是被测的那条链的末端。源是异步的，必须 await。
+ */
+async function runCompletions(state: EditorState): Promise<void> {
+  const pos = state.doc.length
+  const context = new CompletionContext(state, pos, false)
+  for (const source of state.languageDataAt<CompletionSource>('autocomplete', pos)) {
+    if (typeof source === 'function') await source(context)
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -250,6 +265,36 @@ describe('起始状态', () => {
   it('换行偏好取自构造参数，并且真的落进了 state', () => {
     expect(lineWrapEnabled(createWorkspace({ lineWrap: true }).activeTab().snapshot.state)).toBe(true)
     expect(lineWrapEnabled(createWorkspace({ lineWrap: false }).activeTab().snapshot.state)).toBe(false)
+  })
+
+  /*
+   * 🔴 这一条钉的是「构造参数 → ViewConfig → buildState → 扩展集」整条链（M3-A-6）。
+   * 链上任何一环漏传，症状都是 Markdown 里打 `](` 什么都不弹、控制台干干净净，
+   * 而且**新建空标签时是好的、打开文件之后就没了**（漏的是 `replaceTabText` 那一环）。
+   * 各环自己的单测在 `tab.test.ts` 与 `editor/setup.test.ts`，这里只验「接上了」。
+   */
+  it('linkFiles 会一路接到标签的 state 上，钩子拿到的是这个标签自己的路径', async () => {
+    const seen: (string | null)[] = []
+    const ws = createWorkspace({
+      linkFiles: async (_typed, docPath) => {
+        seen.push(docPath)
+        return null
+      },
+    })
+    const tab = ws.activeTab()
+    // restoreDraft 不碰磁盘，但它会走 host.setText → replaceTabText → syncLanguage，
+    // 于是 `.md` 的 markdown 扩展跟着装上，补全源才取得到
+    tab.doc.restoreDraft({
+      path: '/repo/doc/a.md',
+      text: '[图](',
+      format: DEFAULT_FORMAT,
+      dirty: false,
+      lossy: false,
+    })
+
+    await runCompletions(tab.snapshot.state)
+
+    expect(seen).toEqual(['/repo/doc/a.md'])
   })
 })
 

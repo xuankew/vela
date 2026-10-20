@@ -35,12 +35,14 @@ import { languages } from '@codemirror/language-data'
 import { tags } from '@lezer/highlight'
 import { createFindReplacePanel, preserveCase } from './findReplace'
 import { changeGutter } from './changeGutter'
+import { bookmarkGutter } from './bookmarks'
 import { minimapExtension } from './minimap'
 import { definitionClick, type DefinitionClickHook } from './clickJump'
 import { fontSizeZoom } from './fontSizeZoom'
 import { indentGuides } from './indentGuides'
 import { jsonLint } from './jsonLint'
 import { isJsonLanguage, type LanguageChoice } from './language'
+import { linkCompletions, type LinkCompletionHook } from './linkSource'
 import { mouseGestures } from './multiCursor'
 import { imagePaste, type PasteImageHook } from './paste'
 import { coveredRange, escapesCoverage } from './viewport'
@@ -368,6 +370,18 @@ export interface EditorSetupOptions {
    * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
    */
   onFontSizeZoom?: (delta: number) => void
+  /**
+   * Markdown 里打完 `](` 之后问谁要候选（M3-A-6）。缺省 = 不装这条扩展，
+   * 补全就只剩词补全与语言包自带的那些。
+   *
+   * ⚠️ 与上面三个钩子不同，这个是**异步**的：它背后是一次 `query_project` IPC。
+   * 慢与失败都由源自己兜（reject 必须被吃掉，否则 CM6 会关掉浮层并在控制台记一条异常），
+   * 理由写在 `./linkSource` 的模块文档里。
+   *
+   * 传进来的必须是**每标签一份**的闭包——它得知道「相对哪份文档算路径」，
+   * 而那是标签的知识，`CompletionContext` 只给 state、不给 view，问不出来。
+   */
+  completeLinks?: LinkCompletionHook
 }
 
 /**
@@ -418,11 +432,16 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     pasteImage,
     clickDefinition,
     onFontSizeZoom,
+    completeLinks,
   } = options
 
   const exts: Extension[] = [
     lineNumbers(),
-    // 「未保存改动」gutter（#28）。挂在行号右边、折叠槽左边——顺序由扩展在数组里的位置决定。
+    // 书签 gutter（M4-J，PLAN §1.4 的 P1）。挂在行号右边、「未保存改动」竖条左边——
+    // 顺序由扩展在数组里的位置决定。它是**内存态**的、而且整列一直占着宽度，
+    // 两条取舍的理由都写在 `editor/bookmarks.ts` 文件头
+    bookmarkGutter(),
+    // 「未保存改动」gutter（#28）。挂在书签右边、折叠槽左边——顺序由扩展在数组里的位置决定。
     // 它累积「自上次与磁盘一致以来被碰过的行」，语义与 `doc/document.ts` 的单调脏标记一致，
     // 存盘时由 workspace dispatch `resetChanges` 清空（见 `editor/changeGutter.ts` 文件头）
     changeGutter(),
@@ -498,6 +517,9 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   if (clickDefinition !== undefined) exts.push(definitionClick(clickDefinition))
   // Cmd/Ctrl+鼠标滚轮调整字号。没传就不装：保持与 Mod+=/- 同一套步进逻辑
   if (onFontSizeZoom !== undefined) exts.push(fontSizeZoom(onFontSizeZoom))
+  // Markdown 链接补全（M3-A-6）。没传就不装：这一组扩展只注册进 markdownLanguage 的数据里，
+  // 装了也不影响别的语言，但仍按「宿主没接就一个字都不装」的口径来，与其他钩子一致
+  if (completeLinks !== undefined) exts.push(linkCompletions(completeLinks))
 
   return exts
 }

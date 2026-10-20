@@ -1,9 +1,12 @@
 import { Compartment, EditorState } from '@codemirror/state'
+import { CompletionContext, type CompletionSource } from '@codemirror/autocomplete'
 import { indentUnit } from '@codemirror/language'
 import { getSearchQuery } from '@codemirror/search'
 import { EditorView } from '@codemirror/view'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { buildExtensions, createEditorState, INDENT_UNIT, indentLabel } from './setup'
+import { languageFor, type LanguageChoice } from './language'
+import type { LinkCompletionHook } from './linkSource'
 import { completeWords, wordDict, wordPeers } from './wordSource'
 
 /**
@@ -218,5 +221,58 @@ describe('createEditorState（M1-D：state 要能脱离 view 独立存活）', (
     // 各自还能独立打开
     expect(wrapEnabled(aOff.update({ effects: slotA.reconfigure([EditorView.lineWrapping]) }).state)).toBe(true)
     expect(wrapEnabled(bOff)).toBe(false)
+  })
+})
+
+/**
+ * M3-A-6 链接补全的接线。与词补全那条同一类风险：**错了不报错，只是浮层永远不弹**。
+ *
+ * 源本身的行为在 `linkSource.test.ts`；这里只钉「`buildExtensions` 有没有把它装上」，
+ * 以及「装的位置对不对」——注册进的是 `markdownLanguage` 的数据，所以它只在
+ * Markdown 文档里取得到，别的语言压根看不见这一组。
+ */
+describe('M3-A-6：链接补全的接线', () => {
+  const LINK_DOC = '[图](im'
+  /** 语言选择由路径算，与真机同一条路（`languageFor` 认出 `.md` → markdown） */
+  const MARKDOWN = languageFor('/repo/doc/a.md', '')
+
+  /** `language` 传 null = 语言槽位留空（与 tab.ts 刚建完 state 那一态一致） */
+  function stateWith(completeLinks?: LinkCompletionHook, language: LanguageChoice | null = MARKDOWN) {
+    return EditorState.create({
+      doc: LINK_DOC,
+      extensions: buildExtensions({
+        lineWrap: true,
+        lineWrapSlot: new Compartment(),
+        darkSlot: new Compartment(),
+        minimapSlot: new Compartment(),
+        languageSlot: new Compartment(),
+        ...(language === null ? {} : { language }),
+        ...(completeLinks === undefined ? {} : { completeLinks }),
+      }),
+    })
+  }
+
+  /** 把光标末尾那一位的补全源全跑一遍（源是异步的，要 await） */
+  async function runSources(state: EditorState) {
+    const context = new CompletionContext(state, state.doc.length, false)
+    for (const source of state.languageDataAt<CompletionSource>('autocomplete', state.doc.length)) {
+      if (typeof source === 'function') await source(context)
+    }
+  }
+
+  it('传了 completeLinks 才装，装上之后钩子会在 Markdown 文档里被调到', async () => {
+    const hook = vi.fn(async () => ['img/a.png'])
+    await runSources(stateWith(hook))
+    expect(hook).toHaveBeenCalledWith('im')
+
+    // 缺省不装：跑同一份文档，钩子一次都不该被叫到（浮层里只有 lang-markdown 自带那个源）
+    await runSources(stateWith())
+    expect(hook).toHaveBeenCalledTimes(1)
+  })
+
+  it('不是 Markdown 的文档里这一组取不到——语言槽位是空的也一样', async () => {
+    const hook = vi.fn(async () => ['img/a.png'])
+    await runSources(stateWith(hook, null))
+    expect(hook).not.toHaveBeenCalled()
   })
 })

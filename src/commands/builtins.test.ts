@@ -185,7 +185,7 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('五十七条命令全部注册成功，且互不抢占快捷键', () => {
+  it('六十一条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按 id 前缀分组的：
     // 「工具」(U+5DE5) < 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」(U+7F16)
@@ -208,6 +208,8 @@ describe('内置命令', () => {
       'editor.addCursorAbove',
       'editor.addCursorBelow',
       'editor.alignTable',
+      // 'cle' < 'clo'，所以书签那条排在关标签三条前面
+      'editor.clearBookmarks',
       'editor.closeAllTabs',
       'editor.closeOtherTabs',
       'editor.closePane',
@@ -225,6 +227,8 @@ describe('内置命令', () => {
       'editor.minifyJson',
       'editor.moveLineDown',
       'editor.moveLineUp',
+      'editor.nextBookmark',
+      'editor.prevBookmark',
       'editor.removeDuplicateLines',
       'editor.replaceAll',
       'editor.replaceNext',
@@ -236,6 +240,8 @@ describe('内置命令', () => {
       'editor.splitDown',
       'editor.splitRight',
       'editor.startCompletion',
+      // 'B' < 'L'，所以书签那条排在自动换行前面
+      'editor.toggleBookmark',
       'editor.toggleLineWrap',
       'editor.unfoldAll',
       'editor.wordCount',
@@ -1269,7 +1275,10 @@ describe('M3-B-1：工具箱与命令面板两个入口的接线', () => {
     // 而是「一眼看全」：它是唯一一处能列出所有命令、并顺带告诉你每条绑在哪个键上的地方。
     // 钉数量的坏处是新加一条绑了键的命令就得改这条用例，而那与本条要证明的事无关。
     // ⚠️ M4-H 起是 9 条：缩略图那条**刻意**不绑键（菜单 + 面板两个入口够），理由在 builtins.ts 那条注册上
+    // ⚠️ 书签那版起是 10 条：「清除全部书签」也不绑键（不可逆的一次性动作，
+    // 逐个 toggle 与 gutter 上点一下都够得着），理由同样写在 builtins.ts 那条注册上
     expect(unbound.map((c) => c.id).sort()).toEqual([
+      'editor.clearBookmarks',
       'editor.closePane',
       'editor.foldAll',
       'editor.mergePanes',
@@ -1281,5 +1290,69 @@ describe('M3-B-1：工具箱与命令面板两个入口的接线', () => {
       'view.toggleMinimap',
     ])
     expect(all.map((c) => c.id)).toContain('commandPalette.open')
+  })
+})
+
+describe('书签四条命令（PLAN §1.4 的 P1）', () => {
+  /**
+   * ⌥⌘ 加主键的合成事件。
+   *
+   * 🔴 必须带 `code`：真机上按 ⌥⌘B 浏览器给的 `key` 是 Option 转出来的 `∫`、
+   * ⌥⌘[ 给的是 `“`，命中靠的是 `event.code` 那个物理键位（见 keybinding.ts 的 CODE_ALIASES）。
+   * 现成的 `macOptionEvent` 把 `metaKey` 写死成 false，服务的是不带 ⌘ 的 Alt+ 那一族，
+   * 所以这里另造一个——与上面 `Mod+Alt+D` / `Mod+Alt+F` 那条同一条理由
+   */
+  const cmdOption = (key: string, code: string): KeyEventLike => ({
+    key,
+    code,
+    ctrlKey: false,
+    altKey: true,
+    shiftKey: false,
+    metaKey: true,
+  })
+
+  it('三个键各命中自己那条；少一个 Alt 就让回给 CM6（缩进）与侧边栏', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.findForKey(cmdOption('∫', 'KeyB'))?.id).toBe('editor.toggleBookmark')
+    expect(registry.findForKey(cmdOption('“', 'BracketLeft'))?.id).toBe('editor.prevBookmark')
+    expect(registry.findForKey(cmdOption('‘', 'BracketRight'))?.id).toBe('editor.nextBookmark')
+    // `Mod+B` 仍然是侧边栏（VS Code 的既有约定），没被书签顺手占走
+    expect(registry.findForKey(event('b', { metaKey: true }))?.id).toBe('view.toggleSidebar')
+    // `Mod+[` / `Mod-]` 是 CM6 defaultKeymap 的增减缩进，注册表压根没接管它们
+    expect(registry.findForKey(event('[', { metaKey: true }))).toBeNull()
+    expect(registry.findForKey(event(']', { metaKey: true }))).toBeNull()
+  })
+
+  it('⌥⇧⌘ 那一族没被占：加 Shift 之后三个键都空着', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    const cmdOptionShift = (key: string, code: string): KeyEventLike => ({
+      ...cmdOption(key, code),
+      shiftKey: true,
+    })
+    expect(registry.findForKey(cmdOptionShift('‰', 'BracketLeft'))).toBeNull()
+    expect(registry.findForKey(cmdOptionShift('’', 'BracketRight'))).toBeNull()
+    expect(registry.findForKey(cmdOptionShift('˘', 'KeyB'))).toBeNull()
+  })
+
+  it('四条都在「编辑器」分类下，且只有「清除全部书签」不绑键', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    const bindings = (id: string) => registry.list().find((c) => c.id === id)
+    expect(bindings('editor.toggleBookmark')?.keybindings).toEqual(['⌥⌘B'])
+    expect(bindings('editor.nextBookmark')?.keybindings).toEqual(['⌥⌘]'])
+    expect(bindings('editor.prevBookmark')?.keybindings).toEqual(['⌥⌘['])
+    expect(bindings('editor.clearBookmarks')?.keybindings).toEqual([])
+    for (const id of ['editor.toggleBookmark', 'editor.nextBookmark', 'editor.prevBookmark', 'editor.clearBookmarks']) {
+      expect(bindings(id)?.category, id).toBe('编辑器')
+    }
+  })
+
+  it('四条都 gate 在「有编辑器」上：只读分片里按下去是返回 false，不是抛错', async () => {
+    // 与分屏那六条**相反**：书签是 CM6 的字段，只读分片那块分屏里没有 `EditorController`，
+    // 于是「没有编辑器」在这儿就是字面意思上的「没东西可标」——gate 上去是对的
+    const { registry } = makeRegistry(null)
+    for (const id of ['editor.toggleBookmark', 'editor.nextBookmark', 'editor.prevBookmark', 'editor.clearBookmarks']) {
+      expect(registry.list().find((c) => c.id === id)?.enabled, id).toBe(false)
+      await expect(registry.execute(id), id).resolves.toBe(false)
+    }
   })
 })
