@@ -1001,6 +1001,48 @@ describe('虚拟滚动', () => {
 
     expect(scrollEl().scrollTop).toBe(RESULT_ROW_HEIGHT * 2)
   })
+
+  /**
+   * 心跳批的**观感**那一半（M4-M 修正 15③ 里那条「要在真机上看」的债）。
+   *
+   * `Collector::heartbeat` 修好之后，压着结果时也会每 256 个文件推一个**空批次**：
+   * 病态树下 2 秒里会涌进 78 个。这一条钉的是「涌进来的这些不会把面板搅动」——
+   * 而它其实是 jsdom 能答的（PLAN 里写的「jsdom 与命令行都答不了」这句是过头了）：
+   * `store.ts` 的 `onBatch` 在 `files.length === 0` 时只写 `filesScanned` 就 return，
+   * 压根不碰 `setRows`，于是 `<For>` 的输入引用没变；窗口 memo 只依赖
+   * scrollTop / 视口高 / rows 长度，也一个都没变；那个「清空时把 scrollTop 归零」的
+   * effect 只读 `panel.rows()`，同样不会被心跳批重新触发。
+   *
+   * ⛔ jsdom 答不了的只剩最后一小截：状态行那个数字在病态树下每秒刷约 37 次，
+   * **看起来**会不会抖。那要眼睛，代码与测试都替不了。
+   */
+  it('心跳批只动状态行那个数字：行节点与滚动位置一动不动', async () => {
+    mount()
+    await searchOnce()
+    await deliver(manyFiles())
+    await fakeViewport(RESULT_ROW_HEIGHT * 5)
+
+    scrollTo(RESULT_ROW_HEIGHT * 30)
+    await flush()
+    expect(scrollEl().scrollTop).toBe(600)
+
+    const before = rowEls()
+    const statusBefore = statusText()
+    expect(before.length).toBeGreaterThan(0)
+
+    // 两个心跳批：files 为空，只有累计扫描数在往前走
+    await deliver([], 512)
+    await deliver([], 768)
+
+    expect(panel.filesScanned(), '心跳批连进度都没推上去，那它就白来了').toBe(768)
+    expect(statusText(), '用户看得见的那一行必须跟着变，否则修心跳没有意义').not.toBe(statusBefore)
+    expect(scrollEl().scrollTop, '心跳批把用户正在看的那一段顶走了').toBe(600)
+
+    const after = rowEls()
+    expect(after.length, '心跳批不该增删任何一行').toBe(before.length)
+    // 逐个比引用而不只比长度：长度一样但节点全换了，在用户眼里就是一次闪
+    after.forEach((el, i) => expect(el, `第 ${i} 行被重建了`).toBe(before[i]))
+  })
 })
 
 describe('焦点', () => {
