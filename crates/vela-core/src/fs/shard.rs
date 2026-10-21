@@ -60,27 +60,57 @@ use super::read::ReadError;
 /// |---|---|---|---|---|
 /// | 256 MiB | 2684 万 | 2.6 万 | **205 KB** | 1023 行 ≈ 10 KB |
 ///
+/// ✅ 这一行是纸面算的，2026-10-20 造了真文件量过：26,215 个锚点、
+/// 索引堆 **204.8 KiB**——与「205 KB」对上。
+///
 /// 调小（比如 64）索引会大 16 倍而跳行只快 16 倍——**两边都不是瓶颈**，
 /// 所以按「索引内存留在几百 KB 量级」这一头定，1024 是个顺手的 2 的幂。
 ///
 /// ⚠️ 顺序滚动（唯一常见的用法）压根不走顺扫：连续的两页几乎总是落在同一个锚点段里，
 /// 而 `read_page` 每次都从锚点重新 seek，所以「顺扫」的成本只在**跳行**时才付。
+///
+/// 「跳行」那一头也量了（256 MiB / 64B 行，release，页缓存热）：`read_page` 在文件
+/// **头 / 中 / 尾**分别是 26 / 27 / 28 µs——**平的**，锚点让位置不再影响成本，
+/// 这正是它存在的理由。拖滚动条那种最坏的用法（60 次等距跳）总共 **3.2 ms**，
+/// 逐页翻完整份 256 MiB（4096 页）是 **0.15 s**。
+/// 复测同一条：`cargo test -p vela-core --release -- --ignored --nocapture 大文件实测量`。
 pub const ANCHOR_STRIDE: u64 = 1024;
 
 /// 只读分片模式能接住的文件上限。
 ///
 /// ⚠️ **这个数字是量出来的，不是拍的。** 上限的真正约束是「打开一个文件要扫一整遍建索引」，
-/// 而 §2.9 给「打开 10 万行文件」的预算是 **< 2s**。实测（Apple Silicon，32 MiB / 52 万行）：
+/// 而 §2.9 给「打开 10 万行文件」的预算是 **< 2s**。
 ///
-/// | 构建 | 吞吐 | 折算 256 MiB |
-/// |---|---|---|
-/// | release（连跑三次） | **4478 / 4614 / 4922 MiB/s** | **≈ 0.06s** |
-/// | debug | 246 MiB/s | ≈ 1.04s |
+/// 第一版只有 32 MiB 的外推。2026-10-20 直接造了 256 MiB 的文件量了一遍
+/// （Apple Silicon，release，每档预热一次再连开三次取范围）：
 ///
-/// 🔴 **两个数都是文件已经在 page cache 里的**（测试自己刚写完那一份），也就是量的是
+/// | 行宽 | 吞吐 | 256 MiB 建索引 | 索引内存（实测） |
+/// |---|---|---|---|
+/// | 1000 B | 9,576–12,705 MiB/s | **0.020–0.027 s** | 263 锚点 / 2.1 KiB |
+/// | 64 B | 2,967–6,918 MiB/s | **0.037–0.086 s** | 4,097 锚点 / 32 KiB |
+/// | 10 B | 1,783–1,798 MiB/s | **0.142–0.144 s** | 26,215 锚点 / **204.8 KiB** |
+/// | debug（64 B） | 246 MiB/s | ≈ 1.04 s | — |
+///
+/// 🔴 **吞吐跟行密度走，不跟字节走**：`LineIndex::build` 的每行成本是「数一个换行 +
+/// 一次 `% ANCHOR_STRIDE`」，与行长无关，于是行越密、每字节的成本越高。
+/// 看 10B 那一档的**区间有多窄**（1783–1798，差 0.8%）就知道它是被行数而非
+/// 机器状态决定的；64B 那档差 2.3 倍，因为那时行数已经少到噪声占了上风。
+/// 第一版那个「≈0.06s」是 64B 行外推的，落在乐观端；最坏那档（10B 行，
+/// 压缩日志与 minified 文件的真实形状）是 **0.144s**。
+/// ⛔ 但它离 2s 预算还有 **14 倍**，所以那个逐字符取模**不值得优化**——
+/// 要动就得把「数换行」换成 `memchr`，而收益是一个已经看不见的数字。
+///
+/// ✅ 顺带把 [`ANCHOR_STRIDE`] 那张表的纸面数钉实了：10B 行 / 256 MiB 实测
+/// **204.8 KiB**，与「205 KB」完全对上——索引内存确实与文件大小脱钩了。
+///
+/// 🔴 **所有数都是文件已经在 page cache 里的**（测试自己刚写完那一份），也就是量的是
 /// **扫描本身**、不含磁盘。冷读是磁盘限速的：内置 SSD 上大概还是零点几秒，
 /// 而**网络卷上 256 MiB 会直接超预算**——那一段**没有实测数据**，是这个上限真正的软处。
-/// 复测：`cargo test -p vela-core --release 扫描吞吐 -- --nocapture`。
+/// ⚠️ 而且「预热」不是可选的：写完立刻扫，脏页回写会跟扫描抢带宽，
+/// 同一个实现能量出 1595 / 3906 / 6869 MiB/s 三个数——那条用例里那次
+/// 白开的 `open_shard` 就是为这件事存在的。
+/// 复测这两张表：`cargo test -p vela-core --release -- --ignored --nocapture 大文件实测量`
+/// （要写 ~770 MiB）；只要 32 MiB 那一档的便宜下界就用 `扫描吞吐`。
 ///
 /// 再往上抬要付的不是内存（索引与文件大小脱钩了，见模块文档），也不是 CPU，
 /// 而是**打开那一下的等待**：索引必须建完才知道总行数，而总行数是滚动条高度的依据，
@@ -106,6 +136,25 @@ pub const MAX_PAGE_LINES: u64 = 1024;
 ///
 /// 撞上时 [`ShardPage::truncated`] 为真，`lines` 的最后一条是**不完整的**——
 /// UI 要说一句，不能假装那是整行。
+///
+/// ## 这个洞有多大：2026-10-20 首次量化
+///
+/// 一行超过 `MAX_PAGE_BYTES` 时，受影响的**不只是那一行**：`read_page` 从最近的锚点
+/// 顺扫数换行，而那条巨型行把 1 MiB 的读取预算全吃掉却贡献 0 个换行，于是排在它
+/// 后面的行号一个都够不着，夹取之后拿到的是**空页**（`lines` 为空、`truncated` 为真）。
+///
+/// 边界是清楚的，钉在 `超长行只污染它所在的那个锚点段` 那条测试里：
+///
+/// - 受污染的是**巨型行所在的那一个 [`ANCHOR_STRIDE`] 段**里、排在它之后的行号，
+///   最多 1023 个（巨型行正好落在段首时是 1024 个），按每屏 50 行算 ≈ **20 屏**
+/// - 到**下一个锚点自愈**，其后所有行号照常——⚠️ 这一条是那个洞还能接受的全部理由
+/// - 洞内那次 `read_page` 照样读满 1 MiB 才收手，所以它不便宜，但也不贵
+///
+/// ⛔ **不修**：20 屏是一段而不会扩散，而真正的修法（锚点记「行号 → 字节」的双向映射，
+/// 或让顺扫能跨过截断点续读）都要动索引结构本身——为一个自愈的、只影响
+/// 「一行超过 1 MB 的文件」的现象付这个代价不值。触发它的文件形状已经在模块文档
+/// 口径 2 里点名过（裸 `\r` 的老 Mac 文件、`tr '\n' ' '` 的产物、压缩 JSON），
+/// 全都不是分片视图要照顾的主场景。
 pub const MAX_PAGE_BYTES: u64 = 1024 * 1024;
 
 /// 建索引时一次读多少。1 MiB：小于它就多 syscall，大于它就白占一块只用一次的缓冲。
@@ -574,6 +623,58 @@ mod tests {
         assert!(page.lines.iter().map(String::len).sum::<usize>() <= MAX_PAGE_BYTES as usize);
     }
 
+    /// 那个洞的**边界**：一行超过 [`MAX_PAGE_BYTES`] 时，受污染的起始行号最多是
+    /// 它所在的**那一个** [`ANCHOR_STRIDE`] 段，到下一个锚点自愈。
+    ///
+    /// 洞本身不修（理由记在 `MAX_PAGE_BYTES` 上），但「它不会扩散」这句话得有测试守着：
+    /// 扩散到整份文件的话就不是一个洞，而是滚动条后半截全瞎——而这两者在
+    /// 「用户看到一页空白」这个症状上长得一模一样，靠肉眼分不出来。
+    ///
+    /// 机制：`read_page` 从最近的锚点顺扫数换行，而巨型行把 1 MiB 的读取预算
+    /// 全吃掉却贡献 0 个换行，于是 `skip` 之后的行号一个都够不着——
+    /// `all.len()` 是 1 而 `skip >= 1`，夹取之后 `all[skip..to]` 是空的。
+    #[test]
+    fn 超长行只污染它所在的那个锚点段() {
+        let mut text = String::new();
+        // 段 0：正好 ANCHOR_STRIDE 行正常的，把 anchors[1] 顶到巨型行那一行的开头
+        for i in 0..ANCHOR_STRIDE {
+            text.push_str(&format!("l{i}\n"));
+        }
+        // 行号 ANCHOR_STRIDE 就是那条巨型行：比字节上限还长，于是它自己就吃不满一页
+        text.push_str(&"x".repeat(MAX_PAGE_BYTES as usize + 8));
+        text.push('\n');
+        // 段 1 剩下的行，以及段 2 的头几行（`anchors[2]` 落在巨型行**之后**）
+        for i in 0..(ANCHOR_STRIDE - 1 + 10) {
+            text.push_str(&format!("m{i}\n"));
+        }
+        let bytes = text.as_bytes();
+        let index = index_of(bytes);
+        assert_eq!(index.total_lines(), ANCHOR_STRIDE * 2 + 10);
+
+        let read = |start: u64| index.read_page(Cursor::new(bytes), start, 4).unwrap();
+
+        // 巨型行自己：给了（不完整的）一条，如实报截断
+        let giant = read(ANCHOR_STRIDE);
+        assert!(giant.truncated);
+        assert_eq!(giant.lines.len(), 1);
+        assert_eq!(giant.lines[0].len(), MAX_PAGE_BYTES as usize);
+
+        // 洞：同一个锚点段里、排在巨型行之后的行号拿到的是**空页**
+        for start in [ANCHOR_STRIDE + 1, ANCHOR_STRIDE + 500, ANCHOR_STRIDE * 2 - 1] {
+            let page = read(start);
+            assert!(page.lines.is_empty(), "第 {start} 行本该落在洞里：{page:?}");
+            assert!(page.truncated, "第 {start} 行是空页却没报截断，UI 就没法说一句话");
+        }
+
+        // 自愈：下一个锚点开始一切照常，洞没有扩散
+        for start in [ANCHOR_STRIDE * 2, ANCHOR_STRIDE * 2 + 5] {
+            let page = read(start);
+            assert!(!page.truncated, "第 {start} 行已经过了洞，不该再报截断");
+            assert_eq!(page.lines.len(), 4, "第 {start} 行：{page:?}");
+            assert!(page.lines[0].starts_with('m'), "第 {start} 行给的不是它该有的内容：{page:?}");
+        }
+    }
+
     #[test]
     fn 行数上限把_count_夹住() {
         let total = (MAX_PAGE_LINES + 50) as usize;
@@ -850,5 +951,117 @@ mod tests {
         // 「每行都 push 一个锚点」这类算法级退步（那会让吞吐掉到个位数），
         // ⛔ 不是用来挡机器慢的。CI 的 ubuntu runner 负载高时也不该红
         assert!(mib / secs > 25.0, "扫描吞吐 {:.0} MiB/s 低于 25 MiB/s 的下界", mib / secs);
+    }
+
+    /// 256 MiB 的三档行宽，外加 `read_page` 的位置无关性。**默认不跑。**
+    ///
+    /// [`MAX_SHARD_BYTES`] 与 [`ANCHOR_STRIDE`] 文档里那两张实测表出自这里——
+    /// 上面那条 `扫描吞吐` 只有 32 MiB / 64B 行一档，而「吞吐跟行密度走、不跟字节走」
+    /// 这个结论**必须有三档才看得出来**，一档是推不出来的。
+    ///
+    /// 复测：`cargo test -p vela-core --release -- --ignored --nocapture 大文件实测量`
+    /// （要写 ~770 MiB 到磁盘，debug 下会慢到没法看，所以务必带 `--release`）
+    #[test]
+    #[ignore = "要写 ~770 MiB 到磁盘，只在复测 MAX_SHARD_BYTES 那两张实测表时跑"]
+    fn 大文件实测量() {
+        use std::time::Instant;
+
+        const SIZE: u64 = MAX_SHARD_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+
+        // 三档行宽。1000B 是普通源码/散文，64B 是日志，10B 是最坏情况
+        //（压缩日志、minified 产物、以及口径 2 里那种裸 `\r` 文件的一半）
+        let mut kept: Option<(std::path::PathBuf, Shard)> = None;
+        for line_len in [1000usize, 64, 10] {
+            let path = dir.path().join(format!("log-{line_len}b.txt"));
+            // ⚠️ `MAX_SHARD_BYTES` 是**严格** `>`，写满整块会超出去几 KiB 而被 `TooLarge` 拒。
+            // 先写能放下的整块，再补一个尾巴
+            let line = format!("{}\n", "y".repeat(line_len - 1));
+            let block = line.repeat(1024);
+            {
+                let mut file = fs::File::create(&path).unwrap();
+                let mut written: u64 = 0;
+                while written + block.len() as u64 <= SIZE {
+                    io::Write::write_all(&mut file, block.as_bytes()).unwrap();
+                    written += block.len() as u64;
+                }
+                if written < SIZE {
+                    io::Write::write_all(&mut file, line.as_bytes()).unwrap();
+                }
+            }
+            let bytes = fs::metadata(&path).unwrap().len();
+
+            // ⚠️ 先开一次丢掉，再连开三次计时。第一次那一下**不能算**：文件是刚刚写完的，
+            // 脏页还在回写，它会跟扫描抢带宽——不预热的话同一个实现能量出 4 倍的差距
+            //（实测 64B 那一档：1595 / 3906 / 6869 MiB/s，三次的唯一区别是回写进度）。
+            // 而文档里那个口径写的就是「文件已经在 page cache 里」，量法得跟口径对齐
+            let _ = open_shard(&path).unwrap();
+            let mut times = Vec::new();
+            let mut last = None;
+            for _ in 0..3 {
+                let started = Instant::now();
+                last = Some(open_shard(&path).unwrap());
+                times.push(started.elapsed().as_secs_f64());
+            }
+            let shard = last.unwrap();
+            let secs = times.iter().fold(f64::MAX, |a, &b| a.min(b));
+            let worst = times.iter().fold(0.0f64, |a, &b| a.max(b));
+
+            let mib = bytes as f64 / (1024.0 * 1024.0);
+            let anchors = shard.index.anchor_count();
+            println!(
+                "行宽 {line_len:>4}B：{mib:.1} MiB / {secs:.3}–{worst:.3}s = {:.0}–{:.0} MiB/s，{} 行 / {} 个锚点 / 索引 {:.1} KiB",
+                mib / worst,
+                mib / secs,
+                shard.index.total_lines(),
+                anchors,
+                anchors as f64 * std::mem::size_of::<u64>() as f64 / 1024.0
+            );
+            // 同一条宽松下界：挡的是算法级退步，不是机器慢
+            assert!(mib / worst > 25.0, "行宽 {line_len}B 的吞吐 {:.0} MiB/s 低于下界", mib / worst);
+
+            if line_len == 64 {
+                kept = Some((path, shard));
+            }
+        }
+
+        // ── read_page 的成本与位置无关（锚点存在的理由）────────────────────
+        let (path, mut shard) = kept.expect("64B 那一档应该留着");
+        let total = shard.index.total_lines();
+        for (label, start) in [("头", 0), ("中", total / 2), ("尾", total.saturating_sub(MAX_PAGE_LINES))] {
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let started = Instant::now();
+                let page = shard.read_page(start, MAX_PAGE_LINES).unwrap();
+                let secs = started.elapsed().as_secs_f64();
+                best = best.min(secs);
+                assert!(!page.lines.is_empty(), "{label} 那一页是空的");
+            }
+            println!("read_page {label}（第 {start} 行）：最快 {:.0} µs", best * 1e6);
+            assert!(best < 0.05, "read_page {label} 花了 {:.1} ms，锚点没起作用", best * 1000.0);
+        }
+
+        // 拖滚动条那种最坏的用法：60 次等距随机跳
+        let started = Instant::now();
+        for i in 0..60 {
+            let page = shard.read_page(total * i / 60, MAX_PAGE_LINES).unwrap();
+            assert!(!page.lines.is_empty());
+        }
+        println!("拖滚动条 60 次等距跳：{:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+
+        // 逐页翻完整份文件（每次跳 MAX_PAGE_LINES 行）
+        let started = Instant::now();
+        let mut pages = 0u64;
+        let mut at = 0u64;
+        while at < total {
+            let page = shard.read_page(at, MAX_PAGE_LINES).unwrap();
+            pages += 1;
+            at += page.lines.len() as u64;
+        }
+        println!(
+            "逐页翻完整份 {:.0} MiB：{pages} 页 / {:.2}s",
+            fs::metadata(&path).unwrap().len() as f64 / (1024.0 * 1024.0),
+            started.elapsed().as_secs_f64()
+        );
     }
 }
