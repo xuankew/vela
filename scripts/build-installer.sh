@@ -32,15 +32,42 @@ case "$OS" in
     # ⚠️ 产物在仓库根的 target/ 而不是 src-tauri/target/：Cargo workspace 声明在
     # 根 Cargo.toml（members 含 src-tauri 与 crates/vela-core），target 目录归 workspace
     OUT=target/release/bundle
+    APP=$OUT/macos/Vela.app
+
+    # 装到 /Applications，然后删掉 target 下的构建副本：磁盘上只留一个 Vela.app。
+    # 不这么做的话 Spotlight 搜 "vela" 会同时搜出 /Applications 一份、target/release 一份、
+    # 外加挂载中的 dmg 里一份——三个图标，分不清哪个是刚构建的（2026-10-20 用户定的口径）。
+    #
+    # ⚠️ 只替换 .app 本体，**绝不碰** ~/Library/Application Support/app.vela.m1/：
+    # 那里放着会话存档（含未保存草稿）。重装丢配置是这类脚本最容易被骂的一种失手。
+    echo ""
+    echo "▶ 安装到 /Applications"
+    if pgrep -x vela >/dev/null 2>&1; then
+      osascript -e 'quit app "Vela"' >/dev/null 2>&1 || true
+      # 关窗握手可能要点时间（有未保存改动时前端会弹确认），最多等 10s
+      for _ in $(seq 1 50); do pgrep -x vela >/dev/null 2>&1 || break; sleep 0.2; done
+      if pgrep -x vela >/dev/null 2>&1; then
+        echo "✘ Vela 还在跑（可能有未保存改动挡着关窗），请先自己退出再重跑本脚本" >&2
+        exit 1
+      fi
+    fi
+    rm -rf /Applications/Vela.app
+    # ditto 而不是 cp -R：它保留签名与扩展属性，cp 会让 ad-hoc 签名失效
+    ditto "$APP" /Applications/Vela.app
+    rm -rf "$APP"
+
     echo ""
     echo "✔ 产物："
-    ls -d "$OUT"/macos/*.app "$OUT"/dmg/*.dmg
+    echo "  /Applications/Vela.app（已安装，target 下的副本已删）"
+    ls -d "$OUT"/dmg/*.dmg 2>/dev/null
     cat <<'EOF'
 
-内部分发提示（ad-hoc 签名，无 Apple 证书）：
+内部分发提示（ad-hoc 签名，无 Apple 开发者证书）：
   同事首次打开会被 Gatekeeper 拦，二选一：
     1. 右键 App → 打开 → 确认（一次性）
     2. xattr -cr /Applications/Vela.app
+  ⛔ macOS 没有「允许未知来源」这个全局开关，别照着那句话找。
+  走 AirDrop / 内网 scp 传包不带 quarantine 标记，比网盘下载少一道提示。
 EOF
     ;;
   *)
