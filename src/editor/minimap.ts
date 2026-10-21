@@ -29,8 +29,9 @@
 import { Facet, type EditorState, type Extension } from '@codemirror/state'
 import { EditorView, ViewPlugin, type ViewUpdate } from '@codemirror/view'
 
-/** 缩略图占的宽度（CSS px）。styles.css 里 `.cm-minimap` 与正文的让位都用它 */
-export const MINIMAP_WIDTH = 90
+/** 缩略图占的宽度（CSS px）。styles.css 里 `.cm-minimap` 与正文的让位都用它。
+ * 条形比例尺由 `MINIMAP_COLS` 与 `clientWidth` 现算，改这个数不需要动绘制逻辑 */
+export const MINIMAP_WIDTH = 64
 
 /** 一条条形最多代表多少个字符：再长的行也画满格，免得超长行把比例尺压扁 */
 const MINIMAP_COLS = 100

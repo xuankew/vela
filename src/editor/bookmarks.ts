@@ -283,7 +283,7 @@ export const clearBookmarks: Command = (view) => {
  * 把字段与 gutter 捆成一个扩展。挂在 `setup.ts` 的 `lineNumbers()` 之后、`changeGutter()` 之前——
  * 顺序决定它在行号右边、「未保存改动」竖条左边。
  *
- * 🔴 整列**一直占着** 12px，哪怕一个书签都没有。做到「有才出现」需要一个 Compartment 加上
+ * 🔴 整列**一直占着** 10px，哪怕一个书签都没有。做到「有才出现」需要一个 Compartment 加上
  * 「书签数从 0 变 1」时的重配，而那要把状态抬到 workspace 去——为一个 P1 的观感问题不值当。
  */
 export function bookmarkGutter(): Extension {

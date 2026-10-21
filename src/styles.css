@@ -1066,15 +1066,15 @@ select {
 }
 
 /* ---------- 缩略图（M4-H，editor/minimap.ts）----------
-   宽度与 `minimap.ts` 的 `MINIMAP_WIDTH` 是同一个数（90）：正文的让位由插件那边的
-   `EditorView.theme` 写 `padding-right: 98px`，这一条只管 canvas 自己占多宽。
+   宽度与 `minimap.ts` 的 `MINIMAP_WIDTH` 是同一个数（64）：正文的让位由插件那边的
+   `EditorView.theme` 写 `padding-right: 72px`，这一条只管 canvas 自己占多宽。
    条形与视口矩形的透明度在插件里用 globalAlpha 设，背景因此保持全透 */
 .cm-minimap {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
-  width: 90px;
+  width: 64px;
   background: transparent;
   cursor: pointer;
   /* 拖拽滚动时不让浏览器把手势判成滚动/缩放 */
@@ -3480,6 +3480,15 @@ select {
   font-size: var(--vela-font-size, 14px) !important;
 }
 
+/* 左侧留白收窄：CM6 base theme 里只有行号那列带 padding（`0 3px 0 5px`，见
+   @codemirror/view 的 baseTheme），书签/改动/折叠三列的宽度全靠各自段里的 min-width。
+   靠「我们的样式表排在 CM6 注入那份后面」+ 多一类前缀压住（见查找面板那段的两条事实）。
+   ⚠️ 只压 padding 与 min-width 的数值，不动「一直占着宽度」的语义：书签列与改动列
+   常驻是刻意的（第一个标记出现时正文不横跳），理由在各自己的段落里 */
+.cm-editor .cm-lineNumbers .cm-gutterElement {
+  padding: 0 2px 0 3px;
+}
+
 /* 护眼模式下让行号区域背景与编辑器一致，避免割裂感 */
 :root[data-theme='eye-care'] .cm-gutters,
 :root[data-theme='warm-beige'] .cm-gutters {
@@ -3500,15 +3509,15 @@ select {
    标记的类名由 `editor/bookmarks.ts` 的 `GutterMarker.elementClass` 打在
    `.cm-gutterElement` 上。这一列在行号右边、「未保存改动」竖条左边
    （顺序由 `setup.ts` 里扩展的位置决定）。
-   ⚠️ 整列**一直占着** 12px，哪怕一个书签都没有——否则第一个书签出现时正文会横跳一下。
-   代价是左边距永久宽 12px，取舍写在 `editor/bookmarks.ts` 的 `bookmarkGutter` 上。
+   ⚠️ 整列**一直占着** 10px，哪怕一个书签都没有——否则第一个书签出现时正文会横跳一下。
+   代价是左边距永久宽 10px，取舍写在 `editor/bookmarks.ts` 的 `bookmarkGutter` 上。
    ⚠️ 颜色用 `--vela-warn`（琥珀）：`--vela-ok/accent/bad` 三个已经被改动 gutter 的
    三种标记占满了，同一个语义色出现在相邻两列会让人以为是同一件事。
    ⚠️ `cursor: pointer` 是给「这一列可以点」的唯一提示——点了就切书签，
    与 Sublime / VS Code 的 glyph margin 一致。
    ⚠️ 真机未验：node/jsdom 没有真实布局，圆点的居中与这一列的宽度得在 `pnpm tauri dev` 里看。 */
 .cm-bookmarkGutter {
-  min-width: 12px;
+  min-width: 10px;
   cursor: pointer;
 }
 
@@ -3519,7 +3528,7 @@ select {
 .cm-bookmarkGutter .vela-bookmark::before {
   content: '';
   position: absolute;
-  left: 3px;
+  left: 2px;
   top: 50%;
   width: 6px;
   height: 6px;
