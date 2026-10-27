@@ -1114,14 +1114,14 @@ export default function App() {
   /**
    * 一块分屏挂载时用的初始 state。
    *
-   * `untrack` 是必要的：`<For>` 的回调跑在 owner 的 computation 里，直接读 `pane.tabId()`
+   * `untrack` 是必要的：`<For>` 的回调跑在 owner 的 computation 里，直接读 `pane.activeTabId()`
    * 会把这段 JSX 订阅到它上面——而 `EditorPane` 的规矩是「props 只在 onMount 读一次」，
    * 两者一撞就会变成「换标签时重建整个编辑器」，正是 ⛔ 那条规则要防的事。
    *
-   * 分屏新建时它的标签一定已经在 `tabs()` 里（见 workspace 的 `split`），所以 `!` 是安全的。
+   * 分屏新建时它至少有一个标签（workspace 的不变量 1），所以 `!` 是安全的。
    */
   function paneState(pane: Pane): EditorState {
-    return untrack(() => ws.tabs().find((t) => t.id === pane.tabId())!.snapshot.state)
+    return untrack(() => pane.tabs().find((t) => t.id === pane.activeTabId())!.snapshot.state)
   }
 
   /**
@@ -1134,7 +1134,7 @@ export default function App() {
    * 报错报到 `view={…}` 那一行上去，离真正的错处隔了一层
    *
    * JSX 编译器把 `when={…}` 包成 getter，所以当场调**就是**响应式的：
-   * 它读的 `pane.tabId()`（这块分屏换了标签）与 `doc.shard()`（同一个标签从内联变成了
+   * 它读的 `pane.activeTabId()`（这块分屏换了标签）与 `doc.shard()`（同一个标签从内联变成了
    * 分片——文件在 Vela 开着的时候长过了 4 MiB）任一变化都会重跑这个 getter，
    * 把 `<EditorPane>` 换成 `<ShardPane>`。少了订阅的症状是「内容明明是新的，编辑器却还空着」
    *
@@ -1142,9 +1142,9 @@ export default function App() {
    */
   function shardOf(pane: Pane): ShardView | null {
     return (
-      ws
+      pane
         .tabs()
-        .find((t) => t.id === pane.tabId())
+        .find((t) => t.id === pane.activeTabId())
         ?.doc.shard() ?? null
     )
   }
@@ -1327,15 +1327,16 @@ export default function App() {
     // 会 `settings.load(...)` 把持久化的值装回来并覆盖。字体注入与编辑器挂载并行：
     // 编辑器不等字体，到达后浏览器自己用 font-display: swap 重排
     settings.applyNow()
-    // 「合并分屏」= 把除聚焦那块以外的分屏一次全合掉，塌回单栏。与「关闭分屏」
-    // （只关聚焦的那一块）共用同一个 `ws.closePane`：它会先把现场 capture 回标签，
-    // 所以合掉的分屏里没存盘的正文不会丢，标签也留在条上。遍历的是快照，
-    // 而 closePane 每次读的是活的 `panes()`，于是逐块收缩、聚焦那块自始至终不动。
+    // 「合并分屏」= 把除聚焦那块以外的分屏一次全合掉，塌回单栏。走的是 `ws.mergePane`
+    // 而**不是** `ws.closePane`：后者连那块分屏显示的标签一起关，而「合并」要的是版面
+    // 收拢、文档一个都不少——十几个标签一次弹一轮「保存／不保存／取消」也不是合并该有的
+    // 副作用。合掉的分屏里没存盘的正文由 `mergePane` 先 capture 回标签，不会丢。
+    // 遍历的是快照，而 mergePane 每次读的是活的 `panes()`，于是逐块收缩、聚焦那块自始至终不动。
     // 🔴 命令面板的 `editor.mergePanes` 与「窗口」菜单的 `window.merge_panes` 共用这一份，
     // 于是两个入口的「合并分屏」是**同一个行为**，不会再出现同名不同事
     const mergeAllPanes = () => {
       const keep = ws.focusedPaneId()
-      for (const pane of [...ws.panes()]) if (pane.id !== keep) ws.closePane(pane.id)
+      for (const pane of [...ws.panes()]) if (pane.id !== keep) ws.mergePane(pane.id)
     }
     disposeCommands = registerBuiltinCommands(registry, {
       newDocument: () => {
@@ -1354,15 +1355,21 @@ export default function App() {
       // store 里这些是具名函数、不依赖 `this`，正是为了能被这样递出去
       adjustFontSize: settings.stepZoomedFontSize,
       resetFontSize: settings.resetFontSize,
-      splitRight: () => ws.split('row'),
-      splitDown: () => ws.split('column'),
-      closePane: () => ws.closePane(ws.focusedPaneId()),
+      // 「右分屏／下分屏」把**活动标签**搬进新分屏（它原来那块改显示右邻居），与标签
+      // 右键菜单里同名那两项是同一个 `ws.split(direction, tabId)`，只是搬谁不同。
+      // ⛔ 不是 VS Code 的「同一份文件两边各显示一次」——那要一个标签同时挂在两块分屏上，
+      // 而 `workspace.ts` 文件头的不变量 2 排除这一档（撤销历史会分叉）。理由写在 `split` 上
+      splitRight: () => ws.split('row', ws.activeTab().id),
+      splitDown: () => ws.split('column', ws.activeTab().id),
+      closePane: () => void ws.closePane(ws.focusedPaneId()),
       mergePanes: mergeAllPanes,
       focusNextPane: () => ws.cyclePane(1),
       focusPreviousPane: () => ws.cyclePane(-1),
       // ⚠️ 「其它」的参照物是**活动标签**（`activeTab()`），不是右键菜单里那个被点的标签：
       // 按键时用户看着的就是活动的那个。语义差一个字，理由写在 `BuiltinHooks.closeOtherTabs` 上
       closeOtherTabs: () => void ws.closeOtherTabs(ws.activeTab().id),
+      // 作用域是**聚焦那一屏**（`closeAllTabs` 缺省就是这个），不是全窗口：M4-R 起
+      // 每屏一条标签条，「关闭所有标签」跟着键盘焦点走，与「关闭其它标签」同一个口径
       closeAllTabs: () => void ws.closeAllTabs(),
       openFolder,
       addFolder,
@@ -1462,14 +1469,16 @@ export default function App() {
             openCommandPalette: () => palette.show(),
             showSettings: () => setSettingsDialogVisible(true),
             toggleMdToolbar: () => setMdToolbarVisible((v) => !v),
-            splitRight: () => ws.split('row'),
-            splitDown: () => ws.split('column'),
+            // 与命令面板的 `editor.splitRight` / `editor.splitDown` 共用同一个搬法
+            // （把活动标签搬进新分屏），理由写在那一份接线上
+            splitRight: () => ws.split('row', ws.activeTab().id),
+            splitDown: () => ws.split('column', ws.activeTab().id),
             // 与命令面板的 `editor.mergePanes` 共用同一份 `mergeAllPanes`（定义在 onMount 顶部）：
             // 「合并分屏」在这两个入口必须是同一个行为，理由写在那一份定义上
             mergePanes: mergeAllPanes,
             focusNextPane: () => ws.cyclePane(1),
             focusPrevPane: () => ws.cyclePane(-1),
-            closePane: () => ws.closePane(ws.focusedPaneId()),
+            closePane: () => void ws.closePane(ws.focusedPaneId()),
           },
           ctx,
         )
@@ -1553,10 +1562,9 @@ export default function App() {
       {/* 工具栏已移入标准桌面菜单（File/Edit/View/Window/Help），保持界面简洁 */}
       {/* <div class="toolbar"> ... </div> */}
 
-      {/* 标签右键菜单的失败一句话接到 `treeNotice` 那一条上：提示条是横贯窗口的，
-          而「在 Finder 里显示不出来」既不专属某一块分屏（那是 `editorNotice`，切分屏就清），
-          也不是设置对话框的事。成功不说话，理由在 TabStripProps.onError 上 */}
-      <TabStrip workspace={ws} onError={(text) => setTreeNotice({ level: 'error', text })} />
+      {/* 标签条已下移到每块分屏里（M4-R 分组模型），`.app` 的这一行因此空着：
+          grid 的行数必须固定，所以**不删这一行**，只是没有 item 落在上面（`auto` 塌成 0）。
+          理由见 styles.css 里 `.app` 那条注释 */}
 
       {/* Markdown 工具栏（M4-F）*/}
       <Show when={mdToolbarVisible()}>
@@ -1680,6 +1688,17 @@ export default function App() {
                   classList={{ focused: ws.focusedPaneId() === pane.id }}
                   onContextMenu={(e) => onEditorContextMenu(e, pane)}
                 >
+                  {/* 每屏一条标签条（M4-R）。`.editor-host` 是纵向 flex，于是它就是
+                      编辑器上面的第一行。
+                      标签右键菜单的失败一句话接到 `treeNotice` 那一条上：提示条是横贯窗口的，
+                      而「在 Finder 里显示不出来」既不专属某一块分屏（那是 `editorNotice`，
+                      切分屏就清），也不是设置对话框的事。成功不说话，理由在
+                      TabStripProps.onError 上 */}
+                  <TabStrip
+                    workspace={ws}
+                    paneId={pane.id}
+                    onError={(text) => setTreeNotice({ level: 'error', text })}
+                  />
                   {/* 🔴 **替换**而不是在编辑器上叠一层：留着 `EditorPane` 的话
                       `ws.focusedEditor()` 照样返回那块编辑器，于是 `Mod+F`、`Alt+Z`、
                       多光标——所有 `when: (ctx) => ctx.editor !== null` 的命令全部照常可用，

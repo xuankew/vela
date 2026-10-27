@@ -143,7 +143,7 @@ export function createFileWatch(options: FileWatchOptions): FileWatch {
   /**
    * 现在打开着的文件路径，去重 + 排序。
    *
-   * 排序是为了让 `sameList` 能逐位比：拖拽重排标签会换掉 `tabs()` 的数组身份、
+   * 排序是为了让 `sameList` 能逐位比：拖拽重排标签会换掉「打开了哪些文档」的**顺序**、
    * 却一点没改「盯着哪些文件」，不排的话每次重排都白跑一趟 IPC。
    *
    * 去重是因为同一个文件可以在两个标签里出现（两个原样字符串指向同一个 canonical，
@@ -213,7 +213,8 @@ export function createFileWatch(options: FileWatchOptions): FileWatch {
 
   createEffect(() => {
     if (!ready()) return
-    // 依赖是 `tabs()` 的数组身份 + 每个标签的 `doc.path()` 与 `doc.shard()`，
+    // 依赖是各屏的标签清单（`ws.tabs()` 就是把它们摊平，读它等于订阅了这几份）
+    // + 每个标签的 `doc.path()` 与 `doc.shard()`，
     // **没有** `doc.dirty()`：
     // 这份清单说的是「该盯哪些文件」，与文件脏不脏无关——脏文件恰恰是最需要被盯着的，
     // 因为「盘上被别人改了」这件事只有知道才问得出口。读进来了也不至于多送一次 IPC

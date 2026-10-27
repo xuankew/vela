@@ -29,8 +29,8 @@ use vela_core::search::{
     SearchSummary,
 };
 use vela_core::session::{
-    load_session, save_session, PaneDirection, Session, SessionError, SessionProject, SessionReport, SessionRoot,
-    SessionTab, MAX_SESSION_BYTES, SESSION_FILE_NAME, SESSION_VERSION,
+    load_session, save_session, PaneDirection, Session, SessionError, SessionPane, SessionProject, SessionReport,
+    SessionRoot, SessionTab, MAX_SESSION_BYTES, SESSION_FILE_NAME, SESSION_VERSION,
 };
 use vela_core::settings::{
     load as load_settings, save as save_settings, user_settings_path, LayerStatus, LoadedSettings, SaveReport,
@@ -269,7 +269,10 @@ fn sample_session() -> Session {
         direction: PaneDirection::Column,
         focused: 1,
         tabs: vec![sample_tab(), draft_tab()],
-        panes: vec![0, 1],
+        // 两块分屏各揣一个标签，第 1 屏显示的是全局下标 1（`focused: 1` 指的是**屏**，
+        // 不是标签——两者在只有一屏一标签时数值相同，是最容易写错又最难发现的地方）。
+        // 「一屏揣多个标签」那一档由下面的 `session_pane_的线上形状` 单独钉
+        panes: vec![SessionPane { tabs: vec![0], active: 0 }, SessionPane { tabs: vec![1], active: 1 }],
         // 空字符串是**根**那一层的 rel，不是「没有值」。它必须在契约里出现：
         // 前端 `src/project/store.ts` 用它索引缓存与展开集合，两边对「根怎么表示」
         // 的理解一旦分叉，恢复出来的树就是收起的，而且不报错
@@ -308,8 +311,28 @@ fn session_的线上形状() {
     // 理由见字段文档），空的时候分别是 `"project":null`、`"recent":[]`、`"recentProjects":[]`
     assert_eq!(
         json,
-        r#"{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}"#
+        r#"{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[{"tabs":[0],"active":0},{"tabs":[1],"active":1}],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}"#
     );
+}
+
+/// `SessionPane` 单独钉一份（M4-R）：它是**唯一一个「一屏揣多个标签」这件事只能在数组
+/// 顺序里看出来**的结构。`tabs` 的顺序就是标签条上从左到右的顺序，`active` 是全局下标
+/// 而不是屏内编号——两件事写错的失败方式都是静默的（恢复出来标签换了序、或者那一屏
+/// 显示的不是用户上次看的那份文档）。
+///
+/// ⚠️ 这一条**只钉新形状**。旧的 `panes:[0,1]` 能不能读回来钉在
+/// `crates/vela-core/src/session/mod.rs` 的 `旧存档的数字数组_panes_读成分组形状` 里：
+/// 那是「上一版的格式」，不属于线上契约——线上契约只有当前版本会写的这一种。
+#[test]
+fn session_pane_的线上形状() {
+    let sample = SessionPane { tabs: vec![3, 0, 1], active: 0 };
+    let json = serde_json::to_string(&sample).unwrap();
+    assert_eq!(json, r#"{"tabs":[3,0,1],"active":0}"#);
+    assert_eq!(serde_json::from_str::<SessionPane>(&json).unwrap(), sample);
+
+    // 字段名是 camelCase，但 `tabs` 与 `active` 都是单个单词，所以这一条真正钉住的是
+    // 「`active` 不是 `activeTab`／`activeIndex`」——前端 `SessionPane` 是手写的
+    assert!(serde_json::from_str::<SessionPane>(r#"{"tabs":[0],"activeIndex":0}"#).is_err());
 }
 
 /// `SessionProject` 单独钉一份：它是**唯一一个两边都可能写错、而错法又完全静默**的
@@ -389,9 +412,9 @@ fn pane_direction_的枚举值() {
 /// 下标越界的会话必须在 Rust 侧被拒，不能送到前端去崩。
 #[test]
 fn 越界的分屏下标在解析阶段就被拒() {
-    let bad = r#"{"version":1,"direction":"row","focused":0,"tabs":[{"path":null,"format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}],"panes":[3]}"#;
+    let bad = r#"{"version":1,"direction":"row","focused":0,"tabs":[{"path":null,"format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}],"panes":[{"tabs":[3],"active":3}]}"#;
     let err = serde_json::from_str::<Session>(bad).unwrap_err().to_string();
-    assert!(err.contains("panes[0]=3"), "{err}");
+    assert!(err.contains("panes[0].tabs 里有 3"), "{err}");
 
     // 文件形态也要走同一条路：load_session 把它翻译成 Corrupt
     let dir = tempfile::tempdir().unwrap();

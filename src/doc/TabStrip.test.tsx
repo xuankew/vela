@@ -41,7 +41,7 @@ vi.mock('../ipc/project', () => project)
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }))
 
 import { TabStrip } from './TabStrip'
-import { createWorkspace } from './workspace'
+import { createWorkspace, MAX_PANES } from './workspace'
 // ⚠️ `?raw` 而不是 `node:fs`：tsconfig 的 `types` 只有 `vite/client`，没有 node 的类型
 // （与 `md/render.test.ts` 同一路子）。拿到的是**源码文本**，不是生效的样式——
 // jsdom 不做布局，叠放只能靠人眼在真窗口里看，这里钉的是它的前提
@@ -52,22 +52,64 @@ let dispose: () => void
 /** `onError` 收到的话。App 那边把它接到窗口顶部的提示条上，这里只需要看它说了什么 */
 let errors: string[]
 
-function mount(ws: ReturnType<typeof createWorkspace>) {
+/**
+ * 挂**一条**标签条（第 `paneIndex` 块分屏的那一条）。
+ *
+ * M4-R 起每屏一条，于是「标签条」这个概念必须带一个 paneId：`paneId` 是普通 prop
+ * 而不是响应式的，所以要先 `split` 再挂第二条（见 `mountPair`）
+ */
+function mount(ws: ReturnType<typeof createWorkspace>, paneIndex = 0) {
   errors = []
-  dispose = render(() => <TabStrip workspace={ws} onError={(text) => errors.push(text)} />, container)
+  const paneId = ws.panes()[paneIndex]!.id
+  dispose = render(() => <TabStrip workspace={ws} paneId={paneId} onError={(text) => errors.push(text)} />, container)
   return ws
 }
 
-function tabs(): HTMLElement[] {
-  return [...container.querySelectorAll<HTMLElement>('.tab-strip .tab')]
+/**
+ * 两块分屏各挂一条：跨屏拖拽与「每屏只展示自己的标签」这两件事要同时看得见两条。
+ *
+ * ⚠️ 传进来的 `ws` **必须已经有两块分屏**：`paneId` 是普通 prop，挂上去之后再 `split`
+ * 出来的那一屏不会有条（真窗口里那一条由 App 的 `<For each={ws.panes()}>` 建）
+ */
+function mountPair(ws: ReturnType<typeof createWorkspace>) {
+  errors = []
+  const [a, b] = [ws.panes()[0]!.id, ws.panes()[1]!.id]
+  dispose = render(
+    () => (
+      <>
+        <TabStrip workspace={ws} paneId={a} onError={(text) => errors.push(text)} />
+        <TabStrip workspace={ws} paneId={b} onError={(text) => errors.push(text)} />
+      </>
+    ),
+    container,
+  )
+  return ws
 }
 
-function names(): string[] {
-  return tabs().map((t) => t.querySelector('.tab-name')?.textContent ?? '')
+/** 第 n 条标签条 */
+function strip(n = 0): HTMLElement {
+  const el = container.querySelectorAll<HTMLElement>('.tab-strip')[n]
+  if (!el) throw new Error(`找不到第 ${n} 条标签条`)
+  return el
 }
 
-function newTabButton(): HTMLButtonElement {
-  const el = container.querySelector<HTMLButtonElement>('.tab-new')
+/**
+ * 第 n 条标签条里的标签。
+ *
+ * ⚠️ 必须从**那一条**里查，不能从 `container` 里查：两条标签条同时在 DOM 里的时候，
+ * `container.querySelectorAll('.tab')` 会把两屏的标签混成一排，
+ * 于是「每屏只展示自己的标签」这条断言会自己骗自己
+ */
+function tabs(n = 0): HTMLElement[] {
+  return [...strip(n).querySelectorAll<HTMLElement>('.tab')]
+}
+
+function names(n = 0): string[] {
+  return tabs(n).map((t) => t.querySelector('.tab-name')?.textContent ?? '')
+}
+
+function newTabButton(n = 0): HTMLButtonElement {
+  const el = strip(n).querySelector<HTMLButtonElement>('.tab-new')
   if (!el) throw new Error('找不到新建标签按钮')
   return el
 }
@@ -78,11 +120,24 @@ function fire(el: Element, type: string): Event {
   return event
 }
 
-/** 拖拽重排：dragstart 在源上，dragover + drop 在目标上 */
-function drag(from: number, to: number): Event {
-  fire(tabs()[from]!, 'dragstart')
-  fire(tabs()[to]!, 'dragover')
-  return fire(tabs()[to]!, 'drop')
+/** 同一屏里重排：dragstart 在源上，dragover + drop 在目标上 */
+function drag(from: number, to: number, pane = 0): Event {
+  fire(tabs(pane)[from]!, 'dragstart')
+  fire(tabs(pane)[to]!, 'dragover')
+  return fire(tabs(pane)[to]!, 'drop')
+}
+
+/**
+ * 跨屏搬：源与目标在**不同的组件实例**里。
+ *
+ * 🔴 这正是 `draggedTabId` 必须是模块级变量的原因：放在组件内的话，目标那一屏的
+ * `onDrop` 读到的永远是它自己那一份 `null`，手势就成了「拖过去什么也没发生」
+ */
+function dragAcross(fromPane: number, fromIndex: number, toPane: number, toIndex: number | 'blank'): Event {
+  fire(tabs(fromPane)[fromIndex]!, 'dragstart')
+  const target = toIndex === 'blank' ? strip(toPane) : tabs(toPane)[toIndex]!
+  fire(target, 'dragover')
+  return fire(target, 'drop')
 }
 
 beforeEach(() => {
@@ -209,55 +264,142 @@ describe('交互', () => {
   })
 })
 
-describe('分屏在标签条上的反映', () => {
-  it('显示在别的分屏里的标签带 shown，聚焦那块的是 active，两者互斥', () => {
-    const ws = mount(createWorkspace())
-    ws.split('row')
+describe('每屏一条标签条（M4-R）', () => {
+  /**
+   * 2026-10-27 用户报的现场就是这一条：分屏之后右边那一屏头顶上什么标签都没有。
+   * 旧模型只有一条全局标签条，`.shown` 那个类是「它显示在别的分屏里」的唯一提示，
+   * 而右边那一屏自己有哪些标签、正看着哪一个，界面上无处可看
+   */
+  it('两块分屏 = 两条标签条，各自只显示自己那一屏的标签', () => {
+    const ws = createWorkspace()
+    ws.newTab() // 左边那屏两个标签
+    ws.split('row') // 右边那屏一个新空标签
+    mountPair(ws)
 
-    expect(tabs()).toHaveLength(2)
-    expect(tabs()[0]!.classList.contains('shown')).toBe(true)
-    expect(tabs()[0]!.classList.contains('active')).toBe(false)
-    expect(tabs()[1]!.classList.contains('active')).toBe(true)
-    expect(tabs()[1]!.classList.contains('shown')).toBe(false)
-    // aria-selected 只认聚焦那块：读屏的人一次只该听到一个「已选中」
-    expect(tabs().map((t) => t.getAttribute('aria-selected'))).toEqual(['false', 'true'])
+    expect(container.querySelectorAll('.tab-strip')).toHaveLength(2)
+    expect(names(0)).toEqual(['空文档', '空文档'])
+    expect(names(1)).toEqual(['空文档'])
+    // 每条标签条各有**一个** active：自己那一屏正在显示的那一个
+    expect(tabs(0).map((t) => t.classList.contains('active'))).toEqual([false, true])
+    expect(tabs(1).map((t) => t.classList.contains('active'))).toEqual([true])
+    // aria-selected 在每条标签条内部自洽：读屏的人听到的是「这一屏里选中的是哪一个」
+    expect(tabs(0).map((t) => t.getAttribute('aria-selected'))).toEqual(['false', 'true'])
   })
 
-  it('换焦点时两个标记对调', () => {
-    const ws = mount(createWorkspace())
+  it('换焦点不改每条标签条显示的标签，只改哪一条是聚焦的（那条由 CSS 弱显）', () => {
+    const ws = createWorkspace()
     ws.split('row')
+    mountPair(ws)
+    const [leftTab, rightTab] = [ws.panes()[0]!.activeTabId(), ws.panes()[1]!.activeTabId()]
 
     ws.focusPane(ws.panes()[0]!.id)
 
-    expect(tabs()[0]!.classList.contains('active')).toBe(true)
-    expect(tabs()[0]!.classList.contains('shown')).toBe(false)
-    expect(tabs()[1]!.classList.contains('shown')).toBe(true)
-    expect(tabs()[1]!.classList.contains('active')).toBe(false)
+    // 两条标签条的内容一个字都没变——「哪一屏是活动的」不靠标签条上的类来表达，
+    // 而靠 `.editor-host:not(.focused) .tab.active` 把没聚焦那一屏的活动标签弱显一档
+    expect(ws.panes()[0]!.activeTabId()).toBe(leftTab)
+    expect(ws.panes()[1]!.activeTabId()).toBe(rightTab)
+    expect(tabs(0)[0]!.classList.contains('active')).toBe(true)
+    expect(tabs(1)[0]!.classList.contains('active')).toBe(true)
   })
 
-  it('合并掉分屏之后 shown 标记消失，但标签还在条上', () => {
-    const ws = mount(createWorkspace())
-    ws.split('row')
-    ws.closePane(ws.panes()[1]!.id)
-
-    expect(tabs()).toHaveLength(2)
-    expect(tabs().map((t) => t.classList.contains('shown'))).toEqual([false, false])
-    expect(tabs()[0]!.classList.contains('active')).toBe(true)
+  it('哨兵：没聚焦那一屏的活动标签弱显一档——不然用户看不出焦点在哪一屏', () => {
+    // `.shown` 那个类随着「每屏一条标签条」一起删掉了：它表达的是「这个标签显示在
+    // 别的分屏里」，而现在别的分屏有它自己的标签条。可焦点总得看得出来，
+    // 于是换成「没聚焦那一屏的活动标签弱一档」。jsdom 不做布局、测试也不加载
+    // `styles.css`，能钉的只有源码里那条规则（与下面 z-index 那条哨兵同一路子）
+    expect(stylesSource).toMatch(/\.editor-host:not\(\.focused\)\s+\.tab\.active\s*\{/)
   })
 
-  it('点 shown 标签是把焦点交给那块分屏，不是把它搬过来', () => {
-    const ws = mount(createWorkspace())
+  it('点另一屏的标签是把焦点交给那一屏，不是把它搬过来', () => {
+    const ws = createWorkspace()
     ws.split('row')
+    mountPair(ws)
     const left = ws.panes()[0]!
     const rightTab = ws.tabs()[1]!
     ws.focusPane(left.id)
 
-    tabs()[1]!.click()
+    tabs(1)[0]!.click()
 
     expect(ws.focusedPaneId()).toBe(ws.panes()[1]!.id)
     expect(ws.activeTab()).toBe(rightTab)
-    // 左边那块还显示着它原来的标签：搬走会让它空掉
-    expect(left.tabId()).toBe(ws.tabs()[0]!.id)
+    // 左边那一屏还显示着它自己的标签：搬走会让它空掉（不变量 1）
+    expect(left.activeTabId()).toBe(ws.tabs()[0]!.id)
+    expect(left.tabs()).toHaveLength(1)
+  })
+
+  it('合并掉一块分屏之后，那一条标签条空了（分屏没了它也就没了）', () => {
+    const ws = createWorkspace()
+    ws.split('row')
+    mountPair(ws)
+
+    ws.mergePane(ws.panes()[1]!.id)
+
+    // 标签一个都没少：合并是版面收拢，不是关文档
+    expect(ws.tabs()).toHaveLength(2)
+    expect(names(0)).toEqual(['空文档', '空文档'])
+    // 第二条标签条所属的分屏已经不在了。`<For>` 会把它卸载，而卸载前的那一次渲染
+    // 读到的是 `undefined`——组件必须自己兜住（`pane()?.`），否则这里会抛
+    expect(tabs(1)).toHaveLength(0)
+  })
+
+  it('关掉一块分屏则连它那一排标签一起没了——「关闭就是关掉了」', async () => {
+    const ws = createWorkspace()
+    ws.split('row')
+    mountPair(ws)
+
+    await ws.closePane(ws.panes()[1]!.id)
+
+    expect(ws.tabs()).toHaveLength(1)
+    expect(names(0)).toEqual(['空文档'])
+    expect(tabs(0)[0]!.classList.contains('active')).toBe(true)
+    expect(tabs(1)).toHaveLength(0)
+  })
+
+  it('「+」与双击空白处都只作用在自己那一屏', () => {
+    const ws = createWorkspace()
+    ws.split('row') // 聚焦在右边那屏
+    mountPair(ws)
+
+    newTabButton(0).click()
+    expect(ws.panes()[0]!.tabs()).toHaveLength(2)
+    expect(ws.panes()[1]!.tabs()).toHaveLength(1)
+    // 新标签成了左边那屏显示着的那个，而**焦点不动**：用户点的是左边那屏的「+」，
+    // 不是「把焦点搬过来」
+    expect(ws.panes()[0]!.activeTabId()).toBe(ws.panes()[0]!.tabs()[1]!.id)
+    expect(ws.focusedPaneId()).toBe(ws.panes()[1]!.id)
+
+    strip(1).dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    expect(ws.panes()[1]!.tabs()).toHaveLength(2)
+    expect(ws.panes()[0]!.tabs()).toHaveLength(2)
+  })
+
+  it('右键标签条不往上冒：`.editor-host` 那一层的正文菜单不会跟着弹', () => {
+    const ws = createWorkspace()
+    // App 把「正文右键菜单」挂在 `.editor-host` 上，而标签条现在住在它**里面**。
+    // 不拦的话右键一个标签会同时弹出两份菜单，而编辑器那一份的六个动作作用在正文上
+    const reached: string[] = []
+    const paneId = ws.panes()[0]!.id
+    dispose = render(
+      () => (
+        <div class="editor-host" onContextMenu={() => reached.push('host')}>
+          <TabStrip workspace={ws} paneId={paneId} onError={(text) => errors.push(text)} />
+        </div>
+      ),
+      container,
+    )
+
+    const onBlank = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+    strip().dispatchEvent(onBlank)
+    const onTab = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 12 })
+    tabs()[0]!.dispatchEvent(onTab)
+
+    expect(onBlank.defaultPrevented).toBe(true)
+    expect(onTab.defaultPrevented).toBe(true)
+    // 🔴 外层那一份必须写成 JSX 里的 `onContextMenu` 而不是 `container.addEventListener`：
+    // Solid 把 `contextmenu` 收进了委托事件表，`stopPropagation` 拦住的是**委托链**，
+    // 而原生冒泡早在事件到 document 之前就走过 container 了——挂 addEventListener 的话
+    // 这条断言恒红，红的原因与被测的那件事无关
+    expect(reached).toEqual([])
   })
 })
 
@@ -308,6 +450,112 @@ describe('拖拽重排', () => {
   })
 })
 
+describe('跨屏拖拽（M4-R）', () => {
+  /**
+   * 用户要的第三条：「两边的文件可以拖动到对方屏幕中，但是屏幕上面要展示各自的标签页」。
+   *
+   * ⚠️ jsdom 里这些是**合成事件**：`dragstart`/`dragover`/`drop` 三下都是手派的，
+   * 而真窗口里那三下由系统的拖拽会话驱动（还带 dataTransfer、自动滚动、拖出窗口取消）。
+   * 这里钉的是接线（哪个 handler 调到哪个 workspace 方法），真手势要在真窗口里看
+   */
+  it('放到另一屏的空白处 = 搬进那一屏的末尾', () => {
+    const ws = createWorkspace()
+    const a = ws.activeTab()
+    ws.newTab()
+    const b = ws.activeTab()
+    ws.split('row')
+    const c = ws.activeTab()
+    mountPair(ws)
+    expect(names(0)).toEqual(['空文档', '空文档'])
+
+    dragAcross(0, 0, 1, 'blank')
+
+    // 搬过去的是**同一个标签**，不是复制一份：左边少一格、右边多一格，总数不变
+    expect(ws.tabs()).toHaveLength(3)
+    expect(
+      ws
+        .panes()[0]!
+        .tabs()
+        .map((t) => t.id),
+    ).toEqual([b.id])
+    expect(
+      ws
+        .panes()[1]!
+        .tabs()
+        .map((t) => t.id),
+    ).toEqual([c.id, a.id])
+    expect(names(0)).toEqual(['空文档'])
+    expect(names(1)).toEqual(['空文档', '空文档'])
+    // 焦点跟着搬过去的标签走：用户把它扔进那一屏，下一步就是要在那儿打字
+    expect(ws.focusedPaneId()).toBe(ws.panes()[1]!.id)
+    expect(ws.activeTab()).toBe(a)
+    expect(tabs(1)[1]!.classList.contains('active')).toBe(true)
+  })
+
+  it('放到另一屏的某个标签上 = 搬进那一屏、落在被压住的那一格', () => {
+    const ws = createWorkspace()
+    const a = ws.activeTab()
+    ws.split('row')
+    ws.newTab() // 右边那屏两格
+    const target = ws.panes()[1]!
+    const right = target.tabs().map((t) => t.id)
+    mountPair(ws)
+
+    dragAcross(0, 0, 1, 0)
+
+    // ⚠️ 拿**分屏对象**而不是 `ws.panes()[1]`：左边那屏唯一的标签被搬走之后就空了，
+    // 而空屏会被收掉（`detachFromPane` 的 `'close'`），下标于是整体前移一位
+    expect(target.tabs().map((t) => t.id)).toEqual([a.id, right[0]!, right[1]!])
+    expect(target.activeTabId()).toBe(a.id)
+  })
+
+  it('把一屏里唯一的标签拖走：那一屏跟着收掉，它的标签条也就空了', () => {
+    const ws = createWorkspace()
+    const a = ws.activeTab()
+    ws.split('row')
+    const survivor = ws.panes()[1]!
+    mountPair(ws)
+
+    dragAcross(0, 0, 1, 'blank')
+
+    expect(ws.panes()).toHaveLength(1)
+    expect(ws.panes()[0]!.id).toBe(survivor.id)
+    expect(ws.tabs().map((t) => t.id)).toEqual([survivor.tabs()[0]!.id, a.id])
+    // 第一条标签条所属的分屏没了：真窗口里 `<For>` 会把它整个卸载，而卸载前的那一次
+    // 渲染读到的是 `undefined`——组件必须自己兜住（`ownTabs()` 回空数组），否则这里会抛
+    expect(tabs(0)).toHaveLength(0)
+    expect(names(1)).toEqual(['空文档', '空文档'])
+    expect(ws.focusedPaneId()).toBe(survivor.id)
+    expect(ws.activeTab()).toBe(a)
+  })
+
+  it('dragover 在标签条空白处也被 preventDefault——不然放到空白处 drop 压根不触发', () => {
+    const ws = createWorkspace()
+    ws.split('row')
+    mountPair(ws)
+    fire(tabs(0)[0]!, 'dragstart')
+    expect(fire(strip(1), 'dragover').defaultPrevented).toBe(true)
+  })
+
+  it('落到某个标签上时不会再冒到标签条那一份：落点不会被改成「末尾」', () => {
+    const ws = createWorkspace()
+    const a = ws.activeTab()
+    ws.split('row')
+    ws.newTab()
+    const target = ws.panes()[1]!
+    const right = target.tabs().map((t) => t.id)
+    mountPair(ws)
+
+    const e = dragAcross(0, 0, 1, 0)
+
+    // 🔴 标签自己的 `onDrop` 必须 `stopPropagation()`：不拦的话同一次 drop 还会走到
+    // 标签条那一份上去，于是「放到第一格」变成「搬过来又挪到末尾」——落点被悄悄改掉，
+    // 而用户看到的是标签总是落在最后
+    expect(e.defaultPrevented).toBe(true)
+    expect(target.tabs().map((t) => t.id)).toEqual([a.id, right[0]!, right[1]!])
+  })
+})
+
 describe('右键菜单', () => {
   /** 右键。必须是 `MouseEvent`：组件要读 `clientX/clientY` 当菜单的落点 */
   function rightClick(el: Element, x = 40, y = 12): MouseEvent {
@@ -333,7 +581,7 @@ describe('右键菜单', () => {
     return container.querySelectorAll<HTMLButtonElement>('.tree-menu-item')[el]!
   }
 
-  it('右键一个打开了文件的标签 → 三项：打开所在目录、关闭其它、关闭所有', async () => {
+  it('右键一个打开了文件的标签 → 六项：所在目录、分屏三项、关闭两项', async () => {
     const ws = mount(createWorkspace())
     await ws.openAt('/Users/x/notes/win.txt')
 
@@ -342,7 +590,127 @@ describe('右键菜单', () => {
     // 拦下来是必须的：不拦的话 macOS 会在我们的菜单旁边再弹一个原生的，两个叠在一起
     expect(e.defaultPrevented).toBe(true)
     expect(menu()).not.toBeNull()
-    expect(menuItems()).toEqual(['打开文件所在目录', '关闭其它标签', '关闭所有标签'])
+    expect(menuItems()).toEqual(['打开文件所在目录', '右分屏', '下分屏', '关闭分屏', '关闭其它标签', '关闭所有标签'])
+  })
+
+  it('选「右分屏」→ 把活动标签搬进新分屏，原来那块改显示右邻居', async () => {
+    const ws = mount(createWorkspace())
+    await ws.openAt('/repo/a.txt')
+    await ws.openAt('/repo/b.txt')
+    expect(names()).toEqual(['a.txt', 'b.txt'])
+
+    rightClick(tabs()[1]!) // b 是活动的那个
+    item('右分屏').click()
+
+    expect(ws.panes()).toHaveLength(2)
+    expect(ws.direction()).toBe('row')
+    // 搬过去的是**同一个标签**（不是复制一份）：焦点跟着它到新分屏上
+    expect(ws.activeTab().doc.name()).toBe('b.txt')
+    // 原来那一屏改显示右邻居 a——⛔ 不是「两块分屏显示同一个标签」，那会让撤销历史分叉
+    expect(ws.panes()[0]!.activeTabId()).toBe(ws.tabs()[0]!.id)
+    expect(ws.panes()[1]!.activeTabId()).toBe(ws.tabs()[1]!.id)
+    // 标签总数一个都没多：搬走 + 原地换一个，而不是新开一份。
+    // ⚠️ 这一条只挂了左边那一条标签条，所以看到的只有留在左屏的 a——b 在右边那条上，
+    // 而它没被渲染。要看两条并排的效果去「每屏一条标签条」那一组
+    expect(ws.tabs()).toHaveLength(2)
+    expect(names()).toEqual(['a.txt'])
+    expect(menu()).toBeNull()
+  })
+
+  it('右键的那一屏只有这一个标签时，「右分屏」把它搬走、原地补一个空标签', () => {
+    const ws = mount(createWorkspace())
+    ws.split('row') // 第二块分屏装一个新空标签
+    const first = ws.panes()[0]!.tabs()[0]!
+    const second = ws.panes()[1]!.tabs()[0]!
+
+    rightClick(tabs()[0]!)
+    item('右分屏').click()
+
+    expect(ws.panes()).toHaveLength(3)
+    // 搬进新分屏的是它本人，焦点也跟过去
+    expect(
+      ws
+        .panes()[2]!
+        .tabs()
+        .map((t) => t.id),
+    ).toEqual([first.id])
+    expect(ws.panes()[2]!.activeTabId()).toBe(first.id)
+    expect(ws.activeTab()).toBe(first)
+    // 原来那一屏（左边）空了，而「零标签的一屏」不允许存在（不变量 1），于是补一个空标签。
+    // ⛔ 不是把右边那一屏的标签抢过来：一屏只能显示一屏自己的标签
+    expect(ws.tabs()).toHaveLength(3)
+    expect(ws.panes()[0]!.tabs()).toHaveLength(1)
+    expect(ws.panes()[0]!.tabs()[0]!.id).not.toBe(first.id)
+    expect(ws.panes()[0]!.activeTabId()).toBe(ws.panes()[0]!.tabs()[0]!.id)
+    // 中间那一屏与它的标签一动不动
+    expect(
+      ws
+        .panes()[1]!
+        .tabs()
+        .map((t) => t.id),
+    ).toEqual([second.id])
+    expect(ws.panes()[1]!.activeTabId()).toBe(second.id)
+  })
+
+  it('选「下分屏」→ 同一个搬法，只是整排改成竖着', () => {
+    const ws = mount(createWorkspace())
+    rightClick(tabs()[0]!)
+
+    item('下分屏').click()
+
+    expect(ws.panes()).toHaveLength(2)
+    expect(ws.direction()).toBe('column')
+  })
+
+  it('选「关闭分屏」→ 菜单所在那一屏与它自己的标签一起没了，别屏一个不碰', async () => {
+    const ws = createWorkspace()
+    await ws.openAt('/repo/a.txt') // 左屏
+    ws.split('row') // 焦点跟着到新分屏上，后面两个都落在右屏
+    mountPair(ws)
+    await ws.openAt('/repo/b.txt')
+    await ws.openAt('/repo/c.txt')
+    expect(names(0)).toEqual(['a.txt'])
+    expect(names(1)).toEqual(['b.txt', 'c.txt'])
+
+    // 🔴 关的是**这一条标签条所属的那一屏**，不是「右键的那个标签」：同屏里的 c 也一起走。
+    // 与「关闭其它标签」的区别就落在这里，两项挨着放容易被读成一回事
+    rightClick(tabs(1)[0]!)
+    item('关闭分屏').click()
+    await flush()
+
+    expect(ws.panes()).toHaveLength(1)
+    expect(names(0)).toEqual(['a.txt'])
+    // 真窗口里那一条标签条会被 App 的 `<For each={ws.panes()}>` 整个卸载；这个夹具是自己
+    // 挂的两条，所以它还在 DOM 里，只是空了——⛔ 别去数 `.tab-strip` 的个数，那数的是夹具
+    expect(tabs(1)).toHaveLength(0)
+    expect(menu()).toBeNull()
+  })
+
+  it('做不成的分屏项置灰而不是摘掉：只剩一块时关不了，到上限时加不了', () => {
+    const ws = mount(createWorkspace())
+    rightClick(tabs()[0]!)
+    // 只有一块分屏：「关闭分屏」是空操作（`closePane` 的第一道守卫），灰掉比点了不说话好
+    expect(item('关闭分屏').disabled).toBe(true)
+    expect(item('右分屏').disabled).toBe(false)
+
+    for (let i = 1; i < MAX_PANES; i++) ws.split('row')
+    rightClick(tabs()[0]!)
+    expect(item('右分屏').disabled).toBe(true)
+    expect(item('下分屏').disabled).toBe(true)
+    expect(item('关闭分屏').disabled).toBe(false)
+  })
+
+  it('右键的是同屏里的后台标签时，「关闭分屏」照样可用——它关的是整屏，不是这一个标签', () => {
+    const ws = mount(createWorkspace())
+    ws.split('row') // 两屏，焦点在右边那一屏
+    ws.newTab(ws.panes()[0]!.id) // 左屏多一个后台标签；焦点不动
+    expect(names()).toHaveLength(2)
+
+    // ⛔ 别把这一项写成「右键的不是显示中的标签就灰掉」：菜单是从**左屏那一条**弹出来的，
+    // `closePane` 关的是那一屏，与右键的是不是它的活动标签无关
+    rightClick(tabs()[1]!)
+    expect(item('关闭分屏').disabled).toBe(false)
+    expect(item('关闭其它标签').disabled).toBe(false)
   })
 
   it('选「打开文件所在目录」→ 递出去的是这个标签的完整路径，菜单随即关掉', async () => {
@@ -356,14 +724,14 @@ describe('右键菜单', () => {
     expect(menu()).toBeNull()
   })
 
-  it('右键未命名文档也弹菜单：少了「打开所在目录」，两项关闭照常可用', () => {
+  it('右键未命名文档也弹菜单：少了「打开所在目录」，其余五项照常可用', () => {
     mount(createWorkspace())
 
     // 原来这一档连菜单都不弹——那时菜单里只有「打开文件所在目录」一项，而它对未命名文档
-    // 无从谈起。多了两项关闭动作之后这个前提没了：关标签与它在不在磁盘上无关
+    // 无从谈起。多了分屏与关闭那五项之后这个前提没了：它们与这个文档在不在磁盘上无关
     const e = rightClick(tabs()[0]!)
     expect(e.defaultPrevented).toBe(true)
-    expect(menuItems()).toEqual(['关闭其它标签', '关闭所有标签'])
+    expect(menuItems()).toEqual(['右分屏', '下分屏', '关闭分屏', '关闭其它标签', '关闭所有标签'])
   })
 
   it('选「关闭其它标签」→ 只留右键的那一个', async () => {
@@ -390,6 +758,27 @@ describe('右键菜单', () => {
     await flush()
 
     expect(names()).toEqual(['空文档'])
+  })
+
+  it('选「关闭所有标签」只清这一屏：别屏的一个都不碰', async () => {
+    const ws = createWorkspace()
+    await ws.openAt('/repo/a.txt') // 左屏
+    ws.split('row') // 焦点跟着到新分屏上，后面两个都落在右屏
+    mountPair(ws)
+    await ws.openAt('/repo/b.txt')
+    await ws.openAt('/repo/c.txt')
+    expect(names(0)).toEqual(['a.txt'])
+    expect(names(1)).toEqual(['b.txt', 'c.txt'])
+
+    rightClick(tabs(1)[0]!)
+    item('关闭所有标签').click()
+    await flush()
+
+    // 「所有」= 这一屏的所有。清空之后那一屏自己也没了（与 VS Code 的
+    // 「关闭组内所有编辑器」同一条：还剩别的组就把这组收掉），左边一动不动
+    expect(ws.panes()).toHaveLength(1)
+    expect(names(0)).toEqual(['a.txt'])
+    expect(tabs(1)).toHaveLength(0)
   })
 
   it('菜单弹着的时候关掉那个标签，选下去仍然是原来那条路径', async () => {

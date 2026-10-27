@@ -5,9 +5,9 @@
  * （Rust 在 `crates/vela-core/tests/wire_contract.rs`，前端在 `./session.test.ts`），
  * 改一边必须改另一边。
  *
- * 会话比 fs 更需要这道保险：`Session` 与 `SessionTab` 加起来 16 个字段、一个枚举、
- * 一个嵌套元组数组、一个嵌套结构，而任何一个名字写错的失败方式都是
- * **「重启后什么都没恢复」**——不崩、不报错，用户只会觉得这功能没做。
+ * 会话比 fs 更需要这道保险：`Session`、`SessionTab`、`SessionRoot`、`SessionProject`、
+ * `SessionPane` 加起来 22 个字段、一个枚举、一个嵌套元组数组，而任何一个名字写错的失败
+ * 方式都是 **「重启后什么都没恢复」**——不崩、不报错，用户只会觉得这功能没做。
  *
  * ⚠️ 那个数字是手工维护的，加字段时记得跟着改。它不是修辞：它说的是「这份契约里
  * 有多少处能静默写错」。上一次加 `project` 时忘了改，于是它在 14 上停了两个里程碑。
@@ -127,6 +127,30 @@ export interface SessionProject {
   roots: SessionRoot[]
 }
 
+/**
+ * 一块分屏的现场（M4-R 分组模型）。与 Rust `session::SessionPane` 一一对应。
+ *
+ * ## 为什么下标是**全局**的（指向 `Session.tabs`）而不是屏内的
+ *
+ * `tabs` 仍然是一份**扁平**的清单，`SessionPane.tabs` 里存的是它在其中的下标。
+ * 屏内编号（每屏从 0 起）会让「`focused` 是第几屏」与「那屏显示第几个」变成两套坐标系，
+ * 而校验时要多一层间接；扁平下标 + 每屏一份清单，`validate` 只需要一个 `seen` 位图。
+ *
+ * 顺序是契约的一部分：`tabs[i]` 就是那一屏标签条上从左到右的第 `i` 格。
+ *
+ * ## `active` 是下标，不是标签 id
+ *
+ * 同 `tabs`：id 是前端运行期递增分配的，重启后对不上。它**必须**落在 `tabs` 里，
+ * 否则 Rust 侧 `validate` 拒掉整份存档（那一屏没有「正在显示的文档」，恢复出来就是一块
+ * 空白分屏，而空白分屏违反 workspace 的不变量 1）。
+ */
+export interface SessionPane {
+  /** 这一屏有哪些标签，按屏幕顺序，存的是 `Session.tabs` 的下标。**不许为空、不许重复** */
+  tabs: number[]
+  /** 这一屏正在显示的那一个，同样是 `Session.tabs` 的下标 */
+  active: number
+}
+
 /** 一次完整的会话快照 */
 export interface Session {
   /**
@@ -139,13 +163,30 @@ export interface Session {
   focused: number
   tabs: SessionTab[]
   /**
-   * 每块分屏显示哪个标签，存的是 `tabs` 的下标。
+   * 每块分屏的现场：它有哪些标签、正在显示哪一个。存的都是 `tabs` 的下标。
    *
    * 用下标而不是标签 id：id 是前端运行期递增分配的，重启后对不上。
-   * **不允许重复**——`workspace.ts` 的不变量 2 规定一个标签同时只显示在一个分屏里，
-   * Rust 侧的 `validate` 会直接拒掉重复的下标。
+   *
+   * **同一个下标不许出现在两块分屏里**——`workspace.ts` 的不变量 2 规定「一个标签属于
+   * 且只属于一块分屏」，Rust 侧的 `validate` 会直接拒掉重复的下标。
+   *
+   * ## ⚠️ M4-R 改了它的形状，但**没有** bump `SESSION_VERSION`
+   *
+   * 此前是 `panes: number[]`（「每块分屏显示哪一个标签」），现在是 `SessionPane[]`。
+   * 这与 M2-F 把 `SessionProject` 从 `{root, expanded}` 改成 `{roots:[…]}` 是同一类改动：
+   * 不是新增可选字段，而是改了已有字段的形状，所以「两个方向都优雅降级」这件事做不到。
+   * 取舍逐字沿用 M2-F（完整推理见 Rust 侧 `Session::project` 的字段文档）：
+   *
+   * - **新版读旧档**：Rust 侧 `RawPanes` 认旧形状（`Vec<usize>`），把它读成
+   *   「每个下标自成一屏」，于是升级上来的人看到的是「原来那几块分屏，各显示原来那个
+   *   标签」。这一条必须做到——升级不该赔掉用户的会话连未保存的草稿。
+   * - **旧版读新档**：M4-Q 及以前的 `panes` 要求 `Vec<usize>`，新档里是对象数组，
+   *   于是整份存档解析失败，旧版报一句「上次的会话没能读回来」然后空着启动。
+   *
+   * 明知如此还是不 bump：bump 的代价是「新版读到旧档就整份作废」，那会让每个升级上来的
+   * 用户都丢一次会话；而降级远比升级罕见，且它的失败方式是一句人话，不是半对半错的现场。
    */
-  panes: number[]
+  panes: SessionPane[]
   /**
    * 项目树。`null` = 上次没打开任何文件夹。
    *

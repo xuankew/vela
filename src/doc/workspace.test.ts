@@ -64,7 +64,7 @@ import type { TextFile, WriteReport } from '../ipc/fs'
 import type { ShardHeader } from '../ipc/shard'
 import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
 import type { ShardView } from './shardView'
-import { tabText } from './tab'
+import { tabText, type Tab } from './tab'
 import { DEFAULT_FORMAT, UNTITLED_LABEL } from './document'
 import {
   createWorkspace,
@@ -148,6 +148,28 @@ function releaseSupportLoads() {
 const liveEditors: { controller: EditorController; host: HTMLElement }[] = []
 
 /**
+ * 各屏「有哪几格、显示哪一格」的快照，断言用。
+ *
+ * M4-R 起标签归分屏所有，于是「现场是什么样」这个问题要答两件事：全局那排摊平后的
+ * 顺序，以及每一屏自己那一排。只断言 `tabs()` 的话，「标签跑到隔壁屏去了」与
+ * 「标签还在原地」看起来一模一样
+ */
+function layout(ws: Workspace): { tabs: number[]; active: number }[] {
+  return ws.panes().map((p) => ({ tabs: p.tabs().map((t) => t.id), active: p.activeTabId() }))
+}
+
+/**
+ * 两份清单是不是**同一批标签对象**：逐个比引用。
+ *
+ * ⚠️ 不能写 `expect(ws.tabs()).toBe(before)`：`tabs()` 是读的时候现摊平的派生值，
+ * 每次调用都是一个新数组，`===` 恒假。要钉的其实从来不是「数组没换」，
+ * 而是「标签没被重建」——那是逐元素的引用相等
+ */
+function sameTabs(a: readonly Tab[], b: readonly Tab[]): boolean {
+  return a.length === b.length && a.every((t, i) => t === b[i])
+}
+
+/**
  * 一块分屏的夹具。
  *
  * 分屏测试必须挂**真的** controller：`setLineWrap` 要 dispatch 到每块分屏的 view、
@@ -201,13 +223,18 @@ function mounted(options: { lineWrap?: boolean; promptDiscard?: DiscardPrompt } 
       controller.view.scrollDOM.scrollTop = top
       controller.view.scrollDOM.scrollLeft = left
     },
-    /** 加一块分屏并给它挂上真编辑器。已到 `MAX_PANES` 时 `split` 只改方向，这里会抛 */
-    splitPane(direction: SplitDirection = 'row'): PaneFixture {
+    /**
+     * 加一块分屏并给它挂上真编辑器。已到 `MAX_PANES` 时 `split` 只改方向，这里会抛。
+     *
+     * `moveTabId` 直通 `ws.split`：给了就是把那个标签搬进新分屏（新分屏挂的是它自己的
+     * snapshot），不给就是新空标签
+     */
+    splitPane(direction: SplitDirection = 'row', moveTabId?: number): PaneFixture {
       const before = new Set(ws.panes().map((p) => p.id))
-      ws.split(direction)
+      ws.split(direction, moveTabId)
       const fresh = ws.panes().find((p) => !before.has(p.id))
       if (!fresh) throw new Error('分屏数已到上限，没有新分屏可挂')
-      const next = spawn(fresh.id, ws.tabs().find((t) => t.id === fresh.tabId())!.snapshot.state)
+      const next = spawn(fresh.id, fresh.tabs().find((t) => t.id === fresh.activeTabId())!.snapshot.state)
       return {
         id: fresh.id,
         controller: next,
@@ -250,7 +277,11 @@ describe('起始状态', () => {
     const ws = createWorkspace()
     expect(ws.tabs()).toHaveLength(1)
     expect(ws.activeTab()).toBe(ws.tabs()[0])
-    expect(ws.activeIndex()).toBe(0)
+    // M4-R：标签不再挂在全局，而是「一屏一排」。开局那一屏就揣着那个标签——
+    // 全局 `tabs()` 是各屏拼出来的（不变量 2：没有谁都不属于的孤儿）
+    expect(ws.panes()).toHaveLength(1)
+    expect(ws.panes()[0]!.tabs()).toEqual(ws.tabs())
+    expect(ws.panes()[0]!.activeTabId()).toBe(ws.activeTab().id)
     expect(ws.activeTab().doc.name()).toBe('空文档')
   })
 
@@ -977,9 +1008,10 @@ describe('M1-E-3：词补全跨标签', () => {
     const right = pane.splitPane()
     right.type('quartz')
     // 合并掉右边那块分屏：标签留在标签条上，只是不再被任何分屏显示。
+    // （⛔ 这里用 `mergePane` 而不是 `closePane`：后者连标签一起关，就没有孤儿标签可读了）
     // liveStates 的口径与 syncMetrics / host.getText 是同一条——显示中读 view.state，
     // 没显示读 snapshot.state；读错来源的话这里的词就补不出来了
-    pane.ws.closePane(right.id)
+    pane.ws.mergePane(right.id)
     expect(pane.ws.panes()).toHaveLength(1)
     expect(pane.ws.tabs()).toHaveLength(2)
 
@@ -1260,7 +1292,7 @@ describe('未挂编辑器时也能工作（挂载前的那一小段时间）', (
     expect(ws.metrics()).toMatchObject({ lines: 1, chars: 6 })
   })
 
-  it('分屏的增删与聚焦也不需要 controller 在场', () => {
+  it('分屏的增删与聚焦也不需要 controller 在场', async () => {
     const ws: Workspace = createWorkspace()
     const first = ws.panes()[0]!
 
@@ -1271,7 +1303,7 @@ describe('未挂编辑器时也能工作（挂载前的那一小段时间）', (
     ws.cyclePane(-1)
     expect(ws.focusedPaneId()).toBe(first.id)
 
-    ws.closePane(ws.panes()[1]!.id)
+    await ws.closePane(ws.panes()[1]!.id)
     expect(ws.panes()).toEqual([first])
     expect(ws.focusedPaneId()).toBe(first.id)
     expect(ws.focusedEditor()).toBeNull()
@@ -1285,7 +1317,7 @@ describe('M1-D-5：分屏', () => {
     expect(pane.ws.direction()).toBe('row')
     expect(pane.ws.focusedPaneId()).toBe(pane.ws.panes()[0]!.id)
     expect(pane.ws.focusedEditor()).toBe(pane.controller)
-    expect(pane.ws.panes()[0]!.tabId()).toBe(pane.ws.activeTab().id)
+    expect(pane.ws.panes()[0]!.activeTabId()).toBe(pane.ws.activeTab().id)
   })
 
   it('split 加一块分屏、装一个新空标签，并把焦点交给它', () => {
@@ -1306,6 +1338,90 @@ describe('M1-D-5：分屏', () => {
     expect(pane.controller.doc).toBe('左边')
     // 度量跟着焦点走，焦点在新分屏上，所以是空文档的度量
     expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 0 })
+  })
+
+  /**
+   * `split(direction, tabId)` = 把那个标签**搬**进新分屏（2026-10-27 用户定的口径）。
+   *
+   * ⛔ 不是 VS Code 的「同一份文件两边各显示一次」：那要一个标签同时挂在两块分屏上，
+   * 而文件头的不变量 2 排除这一档（`snapshot` 不再是唯一真相，撤销历史与滚动位置会分叉）。
+   * 于是「搬走 + 原地换一个」是扁平模型下唯一能同时满足两边的做法，这三条钉的就是
+   * 「原地换谁」的三种现场。
+   */
+  it('split 给了 tabId：把活动标签搬进新分屏，原来那块补一个空标签', () => {
+    const pane = mounted()
+    pane.type('正文')
+    const moved = pane.ws.activeTab()
+
+    const right = pane.splitPane('row', moved.id)
+
+    expect(pane.ws.panes()).toHaveLength(2)
+    expect(pane.ws.focusedPaneId()).toBe(right.id)
+    // 搬过去的是**同一份文档**：正文与脏标记都跟着走
+    expect(right.text).toBe('正文')
+    expect(right.controller.view.state.selection.main.head).toBe(2)
+    expect(pane.ws.activeTab()).toBe(moved)
+    // 原来那块没有别的标签可换（标签条上只有它一个），于是补一个空标签——
+    // 宁可标签条上多一个「空文档」，也不能让两块分屏显示同一个标签
+    expect(pane.ws.tabs()).toHaveLength(2)
+    expect(pane.controller.doc).toBe('')
+    expect(pane.ws.panes()[0]!.activeTabId()).not.toBe(pane.ws.panes()[1]!.activeTabId())
+  })
+
+  it('split 搬走一块分屏正显示着的标签时，那块改显示右邻居（不是补空标签）', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const right = pane.splitPane('row')
+    right.type('乙')
+    const b = pane.ws.activeTab()
+    // 右边那块改显示一个新标签，`b` 就成了谁都不显示的后台标签 = 可用的右邻居
+    pane.ws.newTab()
+    right.type('丙')
+    const c = pane.ws.activeTab()
+
+    const third = pane.splitPane('column', c.id)
+
+    expect(pane.ws.direction()).toBe('column')
+    expect(third.text).toBe('丙')
+    // 原来那块（右边）换回了 b，正文也从 b 的 snapshot 装回来了
+    expect(pane.ws.panes()[1]!.activeTabId()).toBe(b.id)
+    expect(right.text).toBe('乙')
+    // 一个标签都没多、也没少
+    expect(pane.ws.tabs()).toHaveLength(3)
+    expect(pane.ws.focusedPaneId()).toBe(third.id)
+  })
+
+  it('split 搬一个谁都不显示的标签时不碰别的分屏', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const right = pane.splitPane('row')
+    right.type('乙')
+    const hidden = pane.ws.activeTab()
+    pane.ws.mergePane(right.id) // 标签留下、分屏没了 = 谁都不显示
+    expect(pane.ws.tabs()).toHaveLength(2)
+
+    const revived = pane.splitPane('row', hidden.id)
+
+    expect(revived.text).toBe('乙')
+    expect(pane.ws.tabs()).toHaveLength(2)
+    // 左边那块一动没动：它显示的标签没被搬走，也就没有「换谁」这件事
+    expect(pane.ws.panes()[0]!.activeTabId()).not.toBe(hidden.id)
+    expect(pane.controller.doc).toBe('甲')
+  })
+
+  it('到 MAX_PANES 之后即使给了 tabId 也只改方向，标签一动不动', () => {
+    const pane = mounted()
+    for (let i = 1; i < MAX_PANES; i++) pane.splitPane('column')
+    const before = pane.ws.tabs()
+    pane.ws.focusPane(pane.ws.panes()[0]!.id)
+    const first = pane.ws.activeTab()
+
+    pane.ws.split('row', first.id)
+
+    expect(pane.ws.panes()).toHaveLength(MAX_PANES)
+    expect(pane.ws.direction()).toBe('row')
+    expect(pane.ws.tabs()).toEqual(before)
+    expect(pane.ws.panes()[0]!.activeTabId()).toBe(first.id)
   })
 
   it('direction 由最后一次 split 决定，且到 MAX_PANES 之后只改方向不再加分屏', () => {
@@ -1418,7 +1534,7 @@ describe('M1-D-5：分屏', () => {
     expect(pane.ws.focusedPaneId()).toBe(only)
   })
 
-  it('closePane 合掉分屏，它显示的标签留在标签条上、现场也存了回去', () => {
+  it('mergePane 合掉分屏，它显示的标签留在标签条上、现场也存了回去', () => {
     const pane = mounted()
     pane.type('左边')
     const leftTab = pane.ws.activeTab()
@@ -1427,7 +1543,7 @@ describe('M1-D-5：分屏', () => {
     const rightTab = pane.ws.activeTab()
     const leftId = pane.ws.panes()[0]!.id
 
-    pane.ws.closePane(right.id)
+    pane.ws.mergePane(right.id)
 
     expect(pane.ws.panes()).toHaveLength(1)
     // 合并分屏不是关标签：两个标签都还在条上
@@ -1441,6 +1557,55 @@ describe('M1-D-5：分屏', () => {
     expect(pane.ws.focusedEditor()).toBe(pane.controller)
   })
 
+  /**
+   * 「关闭分屏」与「合并分屏」的差别就是这一个标签。
+   *
+   * 2026-10-27 用户报的现场：开了右分屏、在里面开过 R／G／H 三个标签，关掉分屏再打开，
+   * 那三个还赖在标签条上——「关闭就是关掉了」。留着它们的话用户看不出哪个标签跟哪块分屏
+   * 有过关系，标签条只会越用越长。
+   */
+  it('closePane 关掉分屏，连带关掉它显示的那个标签', async () => {
+    const pane = mounted()
+    pane.type('左边')
+    const leftTab = pane.ws.activeTab()
+    const right = pane.splitPane('row')
+    right.type('右边')
+    const leftId = pane.ws.panes()[0]!.id
+
+    // 右边那个标签是脏的，而 `mounted()` 默认答「不保存」：这一趟顺带钉住了
+    // 「关分屏走的是与关标签同一条 `settle` 路径」
+    await pane.ws.closePane(right.id)
+
+    expect(pane.ws.panes()).toHaveLength(1)
+    expect(pane.ws.tabs()).toEqual([leftTab])
+    // ⛔ 既不留「谁都不显示」的孤儿标签，也**不补**一个新空标签：补了就是关掉一块分屏
+    // 反而在标签条上多出一个空文档（顺序反了就会这样，理由写在 `closePane` 的实现处）
+    expect(pane.ws.focusedPaneId()).toBe(leftId)
+    expect(pane.ws.activeTab()).toBe(leftTab)
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 2 })
+    expect(pane.ws.focusedEditor()).toBe(pane.controller)
+  })
+
+  it('closePane 撞上脏文档时先问一句，答「取消」就分屏与标签都不动', async () => {
+    const asked: string[] = []
+    const pane = mounted({
+      promptDiscard: async (names) => {
+        asked.push(...names)
+        return 'cancel'
+      },
+    })
+    const right = pane.splitPane('row')
+    right.type('没存盘的正文')
+
+    await pane.ws.closePane(right.id)
+
+    expect(asked).toEqual(['空文档'])
+    expect(pane.ws.panes()).toHaveLength(2)
+    expect(pane.ws.tabs()).toHaveLength(2)
+    // 现场一个字都没动
+    expect(right.text).toBe('没存盘的正文')
+  })
+
   it('合掉聚焦的分屏之后焦点落到剩下的最后一块；只剩一块时是空操作', () => {
     const pane = mounted()
     const a = pane.ws.panes()[0]!.id
@@ -1448,13 +1613,13 @@ describe('M1-D-5：分屏', () => {
     const c = pane.splitPane('row').id
     expect(pane.ws.focusedPaneId()).toBe(c)
 
-    pane.ws.closePane(c)
+    pane.ws.mergePane(c)
     expect(pane.ws.focusedPaneId()).toBe(b)
 
-    pane.ws.closePane(b)
+    pane.ws.mergePane(b)
     expect(pane.ws.panes().map((p) => p.id)).toEqual([a])
 
-    pane.ws.closePane(a)
+    pane.ws.mergePane(a)
     expect(pane.ws.panes()).toHaveLength(1)
     expect(pane.ws.focusedPaneId()).toBe(a)
   })
@@ -1471,7 +1636,7 @@ describe('M1-D-5：分屏', () => {
     expect(pane.ws.focusedPaneId()).toBe(right.id)
     expect(pane.ws.activeTab()).toBe(rightTab)
     // 左边那块还显示着 third：搬走会让它空掉，而一个标签也不能同时显示在两处
-    expect(pane.ws.panes()[0]!.tabId()).toBe(third.id)
+    expect(pane.ws.panes()[0]!.activeTabId()).toBe(third.id)
   })
 
   it('activateTab 命中谁都没显示的标签时，把它装进聚焦的那块分屏', () => {
@@ -1479,12 +1644,12 @@ describe('M1-D-5：分屏', () => {
     const right = pane.splitPane('row')
     right.type('孤儿')
     const orphan = pane.ws.activeTab()
-    pane.ws.closePane(right.id) // 标签留下，分屏没了
-    expect(pane.ws.panes()[0]!.tabId()).not.toBe(orphan.id)
+    pane.ws.mergePane(right.id) // 标签留下，分屏没了（closePane 会连标签一起关）
+    expect(pane.ws.panes()[0]!.activeTabId()).not.toBe(orphan.id)
 
     pane.ws.activateTab(orphan.id)
 
-    expect(pane.ws.panes()[0]!.tabId()).toBe(orphan.id)
+    expect(pane.ws.panes()[0]!.activeTabId()).toBe(orphan.id)
     expect(pane.controller.doc).toBe('孤儿')
     expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 2 })
   })
@@ -1531,39 +1696,319 @@ describe('M1-D-5：分屏', () => {
     expect(right.controller.doc).toBe('正文追加')
   })
 
-  it('closeTab 不会让两块分屏显示同一个标签', async () => {
+  /**
+   * M4-R 起标签归分屏所有，于是「这一屏空了」就是「这一屏没用了」。
+   *
+   * ⛔ 不补一个空标签把那一屏留着：只剩一格空文档的分屏不是用户要的东西，
+   * 而「关闭就是关掉了」是同一条口径（`closePane` 那一条用例）。与 VS Code 一致——
+   * 关掉分组里最后一个标签，分组跟着消失。只剩一块分屏时例外（不变量 1 不许零分屏）
+   */
+  it('关掉一块分屏里唯一的标签：那一屏跟着收掉，焦点交给活下来的那一屏', async () => {
     const pane = mounted()
     pane.type('左边')
     const leftTab = pane.ws.activeTab()
     const right = pane.splitPane('row')
     right.type('右边')
+    const rightTab = pane.ws.activeTab()
 
     pane.ws.focusPane(pane.ws.panes()[0]!.id)
     await pane.ws.closeTab(leftTab.id)
 
-    // 右邻居（右边那个标签）正在另一块分屏里显示着，不能搬过来——补一个空标签
-    expect(pane.ws.tabs()).toHaveLength(2)
-    expect(pane.ws.tabs()).not.toContain(leftTab)
-    expect(pane.ws.panes()[0]!.tabId()).not.toBe(pane.ws.panes()[1]!.tabId())
-    expect(pane.controller.doc).toBe('')
+    expect(pane.ws.tabs()).toEqual([rightTab])
+    expect(pane.ws.panes()).toHaveLength(1)
+    expect(pane.ws.panes()[0]!.id).toBe(right.id)
+    // 焦点跟着走，而不是指着一块已经不在 `panes()` 里的分屏
+    expect(pane.ws.focusedPaneId()).toBe(right.id)
+    expect(pane.ws.activeTab()).toBe(rightTab)
     expect(right.controller.doc).toBe('右边')
+    expect(pane.ws.metrics()).toMatchObject({ lines: 1, chars: 2 })
   })
 
-  it('关掉没被任何分屏显示的标签，只是从条上摘掉', async () => {
+  it('关掉同一屏里的一个后台标签：那一屏与它显示着的那个都不动', async () => {
+    const pane = mounted()
+    pane.type('甲')
+    const first = pane.ws.activeTab()
+    pane.ws.newTab() // 新标签成为显示中的那个，`first` 退到后台
+    pane.type('乙')
+    const shown = pane.ws.activeTab()
+
+    await pane.ws.closeTab(first.id)
+
+    // 与上一条的对照：这一屏还有别的标签，于是它不收掉，显示着的也没被换走
+    expect(pane.ws.tabs()).toEqual([shown])
+    expect(pane.ws.panes()).toHaveLength(1)
+    expect(pane.ws.panes()[0]!.activeTabId()).toBe(shown.id)
+    expect(pane.controller.doc).toBe('乙')
+  })
+
+  it('关掉一个后台标签（同一屏里没显示着的那个），只是从条上摘掉', async () => {
     const pane = mounted()
     const right = pane.splitPane('row')
     right.type('孤儿')
     const orphan = pane.ws.activeTab()
-    pane.ws.closePane(right.id)
+    pane.ws.mergePane(right.id)
     const leftId = pane.ws.panes()[0]!.id
-    const shownBefore = pane.ws.panes()[0]!.tabId()
+    const shownBefore = pane.ws.panes()[0]!.activeTabId()
 
     await pane.ws.closeTab(orphan.id)
 
     expect(pane.ws.tabs()).not.toContain(orphan)
     expect(pane.ws.panes()).toHaveLength(1)
-    expect(pane.ws.panes()[0]!.tabId()).toBe(shownBefore)
+    expect(pane.ws.panes()[0]!.activeTabId()).toBe(shownBefore)
     expect(pane.ws.focusedPaneId()).toBe(leftId)
+  })
+})
+
+/**
+ * M4-R：分组模型。
+ *
+ * 2026-10-27 用户报的现场是「分屏后，右侧的分屏上没显示标签页」——旧模型只有一条
+ * 全局标签条，`panes[i]` 记的是「那一屏显示第几个标签」，于是右边那屏头顶上什么都没有。
+ * 用户要的三条：
+ *
+ * 1. 光标在哪一屏，新打开的文件就落在哪一屏；
+ * 2. 两边的文件可以拖到对方屏幕里去；
+ * 3. 每一屏头顶上展示自己的那一排标签。
+ *
+ * 三条都要求「标签归分屏所有」，所以 `Pane` 上现在是 `tabs()` + `activeTabId()`，
+ * 而全局 `tabs()` 只是各屏拼出来的一个 memo。下面每一条用例都在钉这三条里的一条，
+ * 外加两条不变量：①`panes()` 非空且每屏的 `tabs()` 非空；②一个标签只属于一屏
+ */
+describe('M4-R：每屏一排标签（分组模型）', () => {
+  it('标签归分屏所有：全局 tabs() 就是各屏按顺序拼出来的', () => {
+    const pane = mounted()
+    const a = pane.ws.activeTab()
+    const b = pane.ws.newTab()
+    const right = pane.splitPane('row')
+    const c = pane.ws.activeTab()
+
+    expect(layout(pane.ws)).toEqual([
+      { tabs: [a.id, b.id], active: b.id },
+      { tabs: [c.id], active: c.id },
+    ])
+    expect(pane.ws.tabs()).toEqual([...pane.ws.panes()[0]!.tabs(), ...pane.ws.panes()[1]!.tabs()])
+    expect(right.id).toBe(pane.ws.panes()[1]!.id)
+  })
+
+  it('新建标签落进聚焦的那一屏；给了 paneId 就落进那一屏', () => {
+    const pane = mounted()
+    const a = pane.ws.activeTab()
+    const right = pane.splitPane('row') // split 之后聚焦在新那屏，而它自带一个空标签
+    const fresh = pane.ws.activeTab()
+    const leftId = pane.ws.panes()[0]!.id
+
+    const b = pane.ws.newTab()
+    expect(layout(pane.ws)).toEqual([
+      { tabs: [a.id], active: a.id },
+      { tabs: [fresh.id, b.id], active: b.id },
+    ])
+
+    // 明确指定左边那一屏：新标签进去并成为它显示的那个，而**焦点不动**
+    const c = pane.ws.newTab(leftId)
+    expect(layout(pane.ws)).toEqual([
+      { tabs: [a.id, c.id], active: c.id },
+      { tabs: [fresh.id, b.id], active: b.id },
+    ])
+    expect(pane.ws.focusedPaneId()).toBe(right.id)
+    expect(pane.ws.activeTab()).toBe(b)
+  })
+
+  it('openAt 落进聚焦的那一屏：光标在哪屏，打开的文件就在哪屏', async () => {
+    const pane = mounted()
+    const right = pane.splitPane('row')
+    const leftId = pane.ws.panes()[0]!.id
+
+    await pane.ws.openAt('/r.txt')
+    expect(pane.ws.panes()[1]!.tabs()[0]!.doc.path()).toBe('/r.txt')
+    expect(pane.ws.panes()[0]!.tabs()[0]!.doc.path()).toBeNull()
+    expect(right.controller.doc).toBe('正文')
+
+    pane.ws.focusPane(leftId)
+    await pane.ws.openAt('/l.txt')
+    expect(pane.ws.panes()[0]!.tabs()[0]!.doc.path()).toBe('/l.txt')
+    expect(pane.ws.panes()[1]!.tabs()[0]!.doc.path()).toBe('/r.txt')
+    expect(pane.controller.doc).toBe('正文')
+  })
+
+  it('moveTab 把一屏里唯一的标签搬走：那一屏跟着收掉，正文与脏标记都在', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const a = pane.ws.activeTab()
+    const right = pane.splitPane('row')
+    right.type('乙')
+    const c = pane.ws.activeTab()
+    const leftId = pane.ws.panes()[0]!.id
+
+    pane.ws.focusPane(leftId)
+    pane.ws.moveTab(c.id, leftId)
+
+    // 「拖到对方屏幕里」= 那个标签从此归对方那一屏，源那一屏空了就收掉（与关掉它唯一的
+    // 标签同一条口径）。⛔ 不是「两边各显示一份」：那要一个标签同时挂在两屏上，
+    // 撤销历史与滚动位置会分叉（不变量 2、3）
+    expect(pane.ws.panes()).toHaveLength(1)
+    expect(layout(pane.ws)).toEqual([{ tabs: [a.id, c.id], active: c.id }])
+    expect(pane.ws.focusedPaneId()).toBe(leftId)
+    // 🔴 现场是**先摘后插**才搬得对的：摘的那一下把右边 view 上最后那几个字 capture 进
+    // snapshot，左边随后 restore 的就是这一份。反过来先插后摘，用户会发现刚敲的字没了
+    expect(pane.controller.doc).toBe('乙')
+    expect(tabText(c)).toBe('乙')
+    expect(c.doc.dirty()).toBe(true)
+  })
+
+  it('moveTab 搬一个后台标签：源那一屏改显示右邻居，目标那一屏接在末尾', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const a = pane.ws.activeTab()
+    const right = pane.splitPane('row')
+    right.type('乙')
+    const c = pane.ws.activeTab()
+    const d = pane.ws.newTab(right.id)
+    right.type('丙')
+    const leftId = pane.ws.panes()[0]!.id
+
+    pane.ws.moveTab(c.id, leftId)
+
+    expect(layout(pane.ws)).toEqual([
+      { tabs: [a.id, c.id], active: c.id },
+      { tabs: [d.id], active: d.id },
+    ])
+    expect(pane.controller.doc).toBe('乙')
+    expect(right.controller.doc).toBe('丙')
+  })
+
+  it('moveTab 给了 index 就插在那一格，越界的 index 被夹住', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const a = pane.ws.activeTab()
+    const b = pane.ws.newTab()
+    pane.type('乙')
+    const right = pane.splitPane('row')
+    right.type('丙')
+    const c = pane.ws.activeTab()
+    const leftId = pane.ws.panes()[0]!.id
+
+    pane.ws.moveTab(c.id, leftId, 0)
+    expect(
+      pane.ws
+        .panes()[0]!
+        .tabs()
+        .map((t) => t.id),
+    ).toEqual([c.id, a.id, b.id])
+
+    pane.ws.moveTab(c.id, leftId, 99)
+    expect(
+      pane.ws
+        .panes()[0]!
+        .tabs()
+        .map((t) => t.id),
+    ).toEqual([a.id, b.id, c.id])
+  })
+
+  it('拖到别屏的标签上 = 搬进那一屏，落点是被压住的那一格（reorder 跨屏）', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const a = pane.ws.activeTab()
+    const b = pane.ws.newTab()
+    pane.type('乙')
+    const right = pane.splitPane('row')
+    right.type('丙')
+    const c = pane.ws.activeTab()
+
+    // 手势只有一个（拖着标签放到另一个标签上），用户不知道也不该需要知道两者是否同屏
+    pane.ws.reorder(a.id, c.id)
+
+    expect(layout(pane.ws)).toEqual([
+      { tabs: [b.id], active: b.id },
+      { tabs: [a.id, c.id], active: a.id },
+    ])
+    expect(right.controller.doc).toBe('甲')
+    expect(pane.controller.doc).toBe('乙')
+    expect(pane.ws.focusedPaneId()).toBe(right.id)
+  })
+
+  it('同一屏里重排照旧：换顺序不换显示着的那个', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const a = pane.ws.activeTab()
+    const b = pane.ws.newTab()
+    pane.type('乙')
+
+    pane.ws.reorder(a.id, b.id)
+
+    expect(layout(pane.ws)).toEqual([{ tabs: [b.id, a.id], active: b.id }])
+    expect(pane.controller.doc).toBe('乙')
+  })
+
+  it('「关闭其它标签」只关同一屏的，别屏的一个都不碰', async () => {
+    const pane = mounted()
+    pane.type('甲')
+    const b = pane.ws.newTab()
+    pane.type('乙')
+    const right = pane.splitPane('row')
+    right.type('丙')
+    const c = pane.ws.activeTab()
+
+    await pane.ws.closeOtherTabs(b.id)
+
+    expect(layout(pane.ws)).toEqual([
+      { tabs: [b.id], active: b.id },
+      { tabs: [c.id], active: c.id },
+    ])
+    expect(right.controller.doc).toBe('丙')
+    expect(pane.controller.doc).toBe('乙')
+  })
+
+  it('「关闭所有标签」只清自己那一屏：那一屏空了就跟着收掉，焦点交给活下来的', async () => {
+    const pane = mounted()
+    pane.type('甲')
+    pane.ws.newTab()
+    pane.type('乙')
+    const right = pane.splitPane('row')
+    right.type('丙')
+    const c = pane.ws.activeTab()
+    const leftId = pane.ws.panes()[0]!.id
+
+    pane.ws.focusPane(leftId)
+    await pane.ws.closeAllTabs(leftId)
+
+    expect(pane.ws.tabs()).toEqual([c])
+    expect(layout(pane.ws)).toEqual([{ tabs: [c.id], active: c.id }])
+    expect(pane.ws.focusedPaneId()).toBe(right.id)
+    expect(right.controller.doc).toBe('丙')
+  })
+
+  it('只剩一块分屏时「关闭所有标签」补一个空标签，而不是把整个现场收掉', async () => {
+    const pane = mounted()
+    pane.type('甲')
+    const leftId = pane.ws.panes()[0]!.id
+
+    await pane.ws.closeAllTabs(leftId)
+
+    expect(pane.ws.panes()).toHaveLength(1)
+    expect(pane.ws.tabs()).toHaveLength(1)
+    expect(pane.ws.activeTab().doc.dirty()).toBe(false)
+    expect(pane.controller.doc).toBe('')
+  })
+
+  it('mergePane 把整排标签并进另一屏，屏幕顺序接在后面', () => {
+    const pane = mounted()
+    pane.type('甲')
+    const a = pane.ws.activeTab()
+    const right = pane.splitPane('row')
+    right.type('乙')
+    const c = pane.ws.activeTab()
+    const d = pane.ws.newTab(right.id)
+    right.type('丙')
+    const leftId = pane.ws.panes()[0]!.id
+
+    pane.ws.mergePane(right.id)
+
+    expect(layout(pane.ws)).toEqual([{ tabs: [a.id, c.id, d.id], active: a.id }])
+    expect(pane.ws.focusedPaneId()).toBe(leftId)
+    expect(pane.controller.doc).toBe('甲')
+    // 并进来的两个都还在，正文也没丢
+    expect(tabText(c)).toBe('乙')
+    expect(tabText(d)).toBe('丙')
   })
 })
 
@@ -1599,7 +2044,7 @@ describe('从事件目标反查：tabOfView 与 controllerOfView（M5-2）', () 
     const controller = pane.ws.controllerOfView(view)
     expect(tab).not.toBeNull()
     expect(controller).not.toBeNull()
-    expect(pane.ws.panes().find((p) => p.tabId() === tab!.id)!.controller).toBe(controller)
+    expect(pane.ws.panes().find((p) => p.activeTabId() === tab!.id)!.controller).toBe(controller)
     expect(controller!.doc).toBe('右边')
     // 左边那一份没有被串进来
     expect(pane.ws.tabOfView(pane.controller.view)!.id).not.toBe(tab!.id)
@@ -1817,7 +2262,10 @@ describe('M1-F-4：会话序列化与恢复', () => {
       direction: 'row',
       focused: 0,
       tabs,
-      panes: [0],
+      // 默认「一块分屏揣着全部标签、显示头一个」。M4-R 起 `panes` 是分组形状，
+      // 而不变量 2 要求每个标签都被某一屏认领（没人认领的由 `panesFromSession` 收编，
+      // 那条兜底有它自己的用例，这里写得明白比依赖它好）
+      panes: [{ tabs: tabs.map((_, i) => i), active: 0 }],
       project: null,
       recent: [],
       recentProjects: [],
@@ -1836,7 +2284,7 @@ describe('M1-F-4：会话序列化与恢复', () => {
       if (p.controller) continue
       const host = document.createElement('div')
       document.body.appendChild(host)
-      const tab = ws.tabs().find((t) => t.id === p.tabId())!
+      const tab = p.tabs().find((t) => t.id === p.activeTabId())!
       const controller = new EditorController(host, tab.snapshot.state)
       liveEditors.push({ controller, host })
       ws.attach(p.id, controller)
@@ -1854,7 +2302,7 @@ describe('M1-F-4：会话序列化与恢复', () => {
     pane.ws.serializeSession()
 
     expect(pane.state).toBe(stateBefore)
-    expect(pane.ws.tabs()).toBe(tabsBefore)
+    expect(sameTabs(pane.ws.tabs(), tabsBefore)).toBe(true)
     expect(pane.ws.panes()).toBe(panesBefore)
   })
 
@@ -1916,7 +2364,14 @@ describe('M1-F-4：会话序列化与恢复', () => {
     await pane.ws.openAt('/b.txt')
     right.type('右边的草稿')
     const saved = pane.ws.serializeSession()
-    expect(saved).toMatchObject({ direction: 'column', focused: 1, panes: [0, 1] })
+    expect(saved).toMatchObject({
+      direction: 'column',
+      focused: 1,
+      panes: [
+        { tabs: [0], active: 0 },
+        { tabs: [1], active: 1 },
+      ],
+    })
 
     const fresh = mounted()
     await fresh.ws.restoreSession(saved)
@@ -1978,8 +2433,8 @@ describe('M1-F-4：会话序列化与恢复', () => {
         sessionTab({ path: '/gone.txt', dirty: false, draft: null }),
         sessionTab({ path: '/ok.txt', dirty: false, draft: null }),
       ],
-      // 一块分屏显示第二个标签：panes 不需要覆盖所有标签
-      { panes: [1] },
+      // 一块分屏揣着两个标签、显示第二个：坏掉的那个是后台标签，它的提示条也得落地
+      { panes: [{ tabs: [0, 1], active: 1 }] },
     )
 
     const fresh = mounted()
@@ -2062,10 +2517,95 @@ describe('M1-F-4：会话序列化与恢复', () => {
     const saved = ws.serializeSession()
 
     expect(saved.tabs).toHaveLength(MAX_SESSION_TABS)
-    // 最后那个标签被留下来了，而且落在末尾——panes 指得过去
-    expect(saved.panes).toEqual([MAX_SESSION_TABS - 1])
+    // 最后那个标签被留下来了，而且落在末尾——`active` 指得过去。中间那几个被砍掉，
+    // 于是这一屏存下来的下标是连续的 0..MAX-1（砍掉的不占位）
+    expect(saved.panes).toEqual([
+      { tabs: Array.from({ length: MAX_SESSION_TABS }, (_, i) => i), active: MAX_SESSION_TABS - 1 },
+    ])
     expect(saved.tabs[MAX_SESSION_TABS - 1]!.path).toBe('/last.txt')
     expect(saved.focused).toBe(0)
+  })
+
+  it('预算用完时后面的分屏整块不存，focused 退到留下的最后一屏', () => {
+    const ws = createWorkspace()
+    for (let i = 0; i < MAX_SESSION_TABS - 1; i++) ws.newTab()
+    expect(ws.panes()[0]!.tabs()).toHaveLength(MAX_SESSION_TABS)
+    ws.split('row') // 第二屏只有一个新空标签，而预算已经被第一屏吃光
+    expect(ws.focusedPaneId()).toBe(ws.panes()[1]!.id)
+
+    const saved = ws.serializeSession()
+
+    expect(saved.tabs).toHaveLength(MAX_SESSION_TABS)
+    // 一屏里的 `active` 那一格是硬要求：塞不进去就只能整屏不存，
+    // 存半屏的话恢复出来的那一屏与用户记忆里的对不上，而对不上是静默的
+    expect(saved.panes).toHaveLength(1)
+    expect(saved.panes[0]!.tabs).toHaveLength(MAX_SESSION_TABS)
+    expect(saved.focused).toBe(0)
+  })
+
+  /**
+   * Rust 的 `validate` 对「空分屏／下标越界／重复认领／`active` 不在自己的 `tabs` 里」
+   * 一律整份作废，**只放过没人认领的孤儿**——那一种的正确处置是「标签还在，只是挤在
+   * 同一屏里」，为它赔上所有草稿（连未保存的）不划算。收编的活儿于是落在前端这里
+   */
+  it('存档里谁都没认领的标签被收编进聚焦那一屏的末尾，而不是丢掉', async () => {
+    const saved = sessionOf(
+      [sessionTab({ draft: '甲' }), sessionTab({ draft: '乙' }), sessionTab({ draft: '丙' })],
+      // 下标 1 没人认领（旧模型里 `mergePane` 就会造出这种孤儿）
+      { panes: [{ tabs: [0, 2], active: 2 }], focused: 0 },
+    )
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    expect(fresh.ws.panes()).toHaveLength(1)
+    expect(fresh.ws.tabs()).toHaveLength(3)
+    expect(
+      fresh.ws
+        .panes()[0]!
+        .tabs()
+        .map((t) => tabText(t)),
+    ).toEqual(['甲', '丙', '乙'])
+    expect(fresh.ws.activeTab()).toBe(fresh.ws.panes()[0]!.tabs()[1])
+  })
+
+  it('存档里越界的下标被跳过，其余标签照常恢复（不崩在这一格）', async () => {
+    const saved = sessionOf([sessionTab({ draft: '甲' }), sessionTab({ draft: '乙' })], {
+      panes: [{ tabs: [0, 7], active: 0 }],
+    })
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    expect(
+      fresh.ws
+        .panes()[0]!
+        .tabs()
+        .map((t) => tabText(t)),
+    ).toEqual(['甲', '乙'])
+    expect(fresh.ws.activeTab()).toBe(fresh.ws.panes()[0]!.tabs()[0])
+  })
+
+  it('整屏的下标都越界时不建那一屏，而所有标签挤进一屏——总比整份作废好', async () => {
+    const saved = sessionOf([sessionTab({ draft: '甲' }), sessionTab({ draft: '乙' })], {
+      panes: [
+        { tabs: [9], active: 9 },
+        { tabs: [0, 1], active: 1 },
+      ],
+      focused: 1,
+    })
+
+    const fresh = mounted()
+    await fresh.ws.restoreSession(saved)
+
+    expect(fresh.ws.panes()).toHaveLength(1)
+    expect(
+      fresh.ws
+        .panes()[0]!
+        .tabs()
+        .map((t) => tabText(t)),
+    ).toEqual(['甲', '乙'])
+    expect(fresh.ws.activeTab()).toBe(fresh.ws.panes()[0]!.tabs()[1])
   })
 
   it('关窗时答「不保存」：被扔掉的草稿不会从存档里回来', async () => {
@@ -2204,7 +2744,7 @@ describe('M2-D-4c：全局替换之后的对账', () => {
     expect(tabText(a!)).toBe('换过了')
     expect(tabText(b!)).toBe('正文')
     // 对账不重建标签：重建的话每块分屏记着的 tabId 会全部失配
-    expect(ws.tabs()).toBe(before)
+    expect(sameTabs(ws.tabs(), before)).toBe(true)
   })
 
   it('reloadUnder：显示中的那个标签走真编辑器，正文与度量都跟着换，而且不算用户改动', async () => {
@@ -2307,7 +2847,7 @@ describe('M2-H：只读分片标签', () => {
     let stillShown = true
     fake.dispose.mockImplementation(() => {
       stillListed = pane.ws.tabs().some((t) => t.id === id)
-      stillShown = pane.ws.panes().some((p) => p.tabId() === id)
+      stillShown = pane.ws.panes().some((p) => p.activeTabId() === id)
     })
 
     await pane.ws.closeTab(id)

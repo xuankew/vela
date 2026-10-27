@@ -1323,8 +1323,10 @@ describe('分屏接线', () => {
   })
 
   it('两块分屏各敲各的，状态栏只报聚焦的那块', () => {
-    typeInto(0, 'AAAA')
+    // ⚠️ 先分屏再敲字：`Mod+\` 会把**当前这份文档搬进新分屏**（左边补一个空标签），
+    // 分屏之前敲的字会跟着搬到右边去，两块就不是「各敲各的」了
     press('\\', modInit())
+    typeInto(0, 'AAAA')
     typeInto(1, 'BBBBBBB')
 
     expect(views()[0]!.state.doc.toString()).toBe('AAAA')
@@ -1375,17 +1377,56 @@ describe('分屏接线', () => {
     expect(statusCounts()).toBe('1 行 · 0 字符')
   })
 
-  it('合并掉带未保存改动的分屏不丢稿子：标签留在条上，点回去正文还在', async () => {
-    typeInto(0, '左边')
+  /**
+   * 「关闭分屏」与「合并分屏」的分水岭就是**一个标签**（2026-10-27 用户报的现场：
+   * 关掉分屏之后里面那几个标签还赖在条上，「关闭就是关掉了」）。
+   *
+   * ⚠️ 「关闭分屏」没有快捷键（`Mod+W` 在 macOS 上被系统吃掉），入口是「窗口」菜单那一项，
+   * 它路由到 `window.close_pane` → `ws.closePane(聚焦的那块)`；「合并分屏」是
+   * `window.merge_panes` → 一次塌回单栏、标签一个不关。两条各有各的落点。
+   */
+  it('「关闭分屏」撞上没存盘的正文：先问一句，答「不保存」才连标签一起关掉', async () => {
     press('\\', modInit())
     typeInto(1, '草稿')
 
-    // 「关闭分屏」没有快捷键（Mod+W 在 macOS 上被系统吃掉），入口是「窗口」菜单那一项，
-    // 它路由到 `window.close_pane` → `ws.closePane(聚焦的那块)`。⚠️ 这与「合并分屏」
-    // （`window.merge_panes`，一次塌回单栏）是两件事，本例只关聚焦的那一块
     await menu('window.close_pane')
 
+    // 关分屏走的是与关标签**同一条** `settle` 路径：没答之前一个字节都不动
+    expect(hosts()).toHaveLength(2)
+    expect(tabs()).toHaveLength(2)
+    modalButton('不保存').click()
+    await flush()
+
     expect(hosts()).toHaveLength(1)
+    expect(tabs()).toHaveLength(1)
+    // 剩下的是左边那块（分屏时补的空标签），稿子被用户明确扔掉了
+    expect(views()[0]!.state.doc.toString()).toBe('')
+  })
+
+  it('「关闭分屏」答「取消」：分屏与标签都不动，正文一个字没丢', async () => {
+    press('\\', modInit())
+    typeInto(1, '草稿')
+
+    await menu('window.close_pane')
+    modalButton('取消').click()
+    await flush()
+
+    expect(hosts()).toHaveLength(2)
+    expect(tabs()).toHaveLength(2)
+    expect(views()[1]!.state.doc.toString()).toBe('草稿')
+  })
+
+  it('「合并分屏」不丢稿子：带草稿的那块被合掉，标签留在条上，点回去正文还在', async () => {
+    press('\\', modInit())
+    typeInto(1, '草稿')
+    focusHost(0)
+
+    await menu('window.merge_panes')
+
+    expect(hosts()).toHaveLength(1)
+    // 合并分屏不是关标签：两个标签都还在条上，草稿也 capture 了回去。
+    // ⚠️ 顺序是「留下来的那一屏在前」：`focusHost(0)` 把焦点交给了左边那块，于是被合掉的
+    // 右边那排接在它后面（`mergePane` 是 `[...target.tabs(), ...victim.tabs()]`）
     expect(tabs()).toHaveLength(2)
     expect(tabs()[1]!.querySelector('.tab-dot')?.textContent).toBe('●')
 
@@ -1394,23 +1435,24 @@ describe('分屏接线', () => {
     expect(statusCounts()).toBe('1 行 · 2 字符')
   })
 
-  it('只剩一块时再合并是空操作：closePane 不会把最后一块也关掉', async () => {
+  it('只剩一块时再关是空操作：最后一块分屏与最后一个标签都关不掉', async () => {
     press('\\', modInit())
     await menu('window.close_pane')
     expect(hosts()).toHaveLength(1)
+    expect(tabs()).toHaveLength(1)
 
     // 老工具栏上这一步表现为「合并」按钮重新 disabled；没有按钮之后，等价的保证是
     // `closePane` 在只剩一块时直接 return（见 workspace.ts），菜单点下去也不该关掉最后一块
     await menu('window.close_pane')
     expect(hosts()).toHaveLength(1)
-    expect(tabs()).toHaveLength(2)
+    expect(tabs()).toHaveLength(1)
   })
 
   it('「合并分屏」把三块一次塌回单栏，标签一个不少、聚焦那块留在原地', async () => {
+    press('\\', modInit())
+    press('\\', modInit())
     typeInto(0, '甲')
-    press('\\', modInit())
     typeInto(1, '乙')
-    press('\\', modInit())
     typeInto(2, '丙')
     expect(hosts()).toHaveLength(3)
 
@@ -1488,7 +1530,10 @@ describe('会话恢复接线（M1-F）', () => {
       direction: 'row',
       focused: 0,
       tabs,
-      panes: [0],
+      // 🔴 M4-R 起是**每屏一份**的分组形状。旧的 `number[]`（一屏一个下标）由 Rust 的
+      // `migrate_legacy_panes` 在读档时就地翻新，而这一层的 `loadSession` 是假的、压根不过
+      // Rust——所以夹具必须写翻新之后的那一份，写旧形状前端会当成脏数据整屏跳过
+      panes: [{ tabs: tabs.map((_, i) => i), active: 0 }],
       project: null,
       recent: [],
       recentProjects: [],
@@ -1499,14 +1544,14 @@ describe('会话恢复接线（M1-F）', () => {
   /** 最近一次写出去的存档 */
   function lastArchive(): {
     tabs: { path: string | null; draft: string | null; dirty: boolean }[]
-    panes: number[]
+    panes: { tabs: number[]; active: number }[]
     focused: number
   } {
     const last = sessionCmd.saved[sessionCmd.saved.length - 1]
     if (!last) throw new Error('还没有写过存档')
     return last as {
       tabs: { path: string | null; draft: string | null; dirty: boolean }[]
-      panes: number[]
+      panes: { tabs: number[]; active: number }[]
       focused: number
     }
   }
@@ -1526,7 +1571,11 @@ describe('会话恢复接线（M1-F）', () => {
     await restartWith(
       savedSession([savedTab({ path: '/a.txt' }), savedTab({ draft: '没存过的稿子', dirty: true })], {
         focused: 1,
-        panes: [0, 1],
+        // 两块分屏，各显示一个标签
+        panes: [
+          { tabs: [0], active: 0 },
+          { tabs: [1], active: 1 },
+        ],
       }),
     )
 
@@ -1568,7 +1617,13 @@ describe('会话恢复接线（M1-F）', () => {
     expect(tauriCore.invoke).toHaveBeenCalledWith('close_window')
     expect(sessionCmd.saved).toHaveLength(1)
     expect(lastArchive().tabs).toHaveLength(2)
-    expect(lastArchive().panes).toEqual([0, 1])
+    // ⚠️ `tabs` 的下标跟着**分屏顺序**走（全局那份清单是 `panes().flatMap(p => p.tabs())` 推出来的）：
+    // 「右分屏」把原来那个标签搬进了新分屏，左边那一屏补的是新空标签，
+    // 于是左屏那个（新补的）反而是下标 0
+    expect(lastArchive().panes).toEqual([
+      { tabs: [0], active: 0 },
+      { tabs: [1], active: 1 },
+    ])
     expect(lastArchive().focused).toBe(1)
   })
 
@@ -1662,15 +1717,18 @@ describe('侧边栏接线（M2-B）', () => {
     expect(body.parentElement?.parentElement?.classList.contains('main')).toBe(true)
     expect(body.parentElement?.parentElement?.parentElement?.classList.contains('app')).toBe(true)
     expect(container.querySelectorAll('.body > .editor-host')).toHaveLength(1)
+    // M4-R：标签条搬进了 `.editor-host` 里面（每屏一条），于是它不再是 `.app` 的 grid item
+    expect(container.querySelectorAll('.editor-host > .tab-strip')).toHaveLength(1)
   })
 
-  it('⚠️ .app 的 grid 子元素是固定的四个，搜索面板不算第五个', () => {
+  it('⚠️ .app 的 grid 子元素是固定的三个，搜索面板不算第四个', () => {
     // styles.css 里那条注释警告的正是这件事：`.app` 是行数固定的 grid，
     // 多出来的东西一旦成了 grid item，`1fr` 就会落到错误的行上，正文区被挤掉。
     // 所以面板必须住在 `.main` 里面，而不是直接当 `.app` 的孩子。
-    // 工具栏移入桌面菜单后，默认（侧栏收起、Markdown 工具栏关着）只剩这四格。
+    // 工具栏移入桌面菜单后，默认（侧栏收起、Markdown 工具栏关着）只剩这三格。
+    // ⚠️ 标签条不在其中：M4-R 起它每屏一条、住在 `.editor-host` 里面（上一条钉了它的位置）
     const app = container.querySelector('.app')!
-    expect([...app.children].map((el) => el.className)).toEqual(['tab-strip', 'notices', 'main', 'statusbar'])
+    expect([...app.children].map((el) => el.className)).toEqual(['notices', 'main', 'statusbar'])
     // 默认没搜过，面板整个不渲染：没开过搜索的用户看到的布局与加这两层之前逐像素相同
     expect(container.querySelector('.find-panel')).toBeNull()
   })
@@ -1842,7 +1900,7 @@ describe('侧边栏接线（M2-B）', () => {
           scrollLeft: 0,
         },
       ],
-      panes: [0],
+      panes: [{ tabs: [0], active: 0 }],
       project,
       // 与上面 `savedSession` 同一条理由：线上这两个键永远在，缺了恢复只会失败一半
       recent: [],
@@ -2464,9 +2522,10 @@ describe('跳转浮层接线（M2-E）', () => {
     await flush()
 
     const app = container.querySelector('.app')!
+    // ⚠️ 没有 `tab-strip`：M4-R 起标签条每屏一条、住在 `.editor-host` 里面，
+    // 于是它不再是 `.app` 的 grid item（侧边栏接线那一组钉了它的新位置）
     expect([...app.children].map((el) => el.className)).toEqual([
       'sidebar-col',
-      'tab-strip',
       'notices',
       'main',
       'statusbar',
@@ -3198,13 +3257,13 @@ describe('只读分片接线（M2-H）', () => {
     press('\\', modInit())
     await flush()
 
-    // 新那块分屏显示一个新的空标签，于是它必须是编辑器。写成「全局判断」
-    // （`ws.tabs().some(t => t.doc.shard())`）或者把 Accessor 本身递给 `<Show when>`
-    // （一个函数引用永远为真）都会让**两块**变成只读分片
+    // 分片那个标签被「右分屏」**搬**进了新分屏，左边那一屏补的是新空标签、显示的是编辑器。
+    // 写成「全局判断」（`ws.tabs().some(t => t.doc.shard())`）或者把 Accessor 本身递给
+    // `<Show when>`（一个函数引用永远为真）都会让**两块**变成只读分片
     expect(container.querySelectorAll('.shard-pane')).toHaveLength(1)
     expect(container.querySelectorAll('.cm-editor')).toHaveLength(1)
 
-    // 点回第一块：分片还在，而它没有被卸载过一次（`dispose` 只在关标签时调）
+    // 点左边那一屏的标签：右边那一屏的分片还在，而它没有被卸载过一次（`dispose` 只在关标签时调）
     tabs()[0]!.click()
     await flush()
     expect(container.querySelectorAll('.shard-pane')).toHaveLength(1)
@@ -3217,17 +3276,21 @@ describe('只读分片接线（M2-H）', () => {
 
     press('\\', modInit())
     await flush()
-    tabs()[0]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
+    // ⚠️ 「右分屏」把**活动标签**（也就是那个分片）搬进了新分屏，左边那一屏补的是新空标签。
+    // 于是要关的是右边那一条上的它——`tabs()` 按 DOM 顺序把两屏的标签混在一排，
+    // 下标 0 是左屏那个空标签（关掉它一个 fd 都不还，那正是这条用例要区分的两种关法）
+    expect(tabs()[1]!.querySelector('.tab-name')!.textContent).toBe('huge.log')
+    tabs()[1]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
     await flush()
 
     expect(shardCmd.closed).toEqual([1])
     expect(shardPane()).toBeNull()
-    // 🔴 这里必须是 2 而不是 1：关掉的是**标签**，不是分屏，两块分屏都还在。
-    // 而空出来的那块不能没东西显示——`removeFromList` 挑不出一个「没在别的分屏里
-    // 显示着的」标签（剩下那个已经被新分屏占了），于是补一个「空文档」进来。
-    // 这条对分片和普通标签是同一条路，不是分片特有的例外
-    expect(container.querySelectorAll('.cm-editor')).toHaveLength(2)
-    expect(tabs()).toHaveLength(2)
+    // 🔴 关掉的是右边那一屏**唯一**的标签，于是那一屏跟着收掉（还剩左边那一屏，
+    // 现场没有空掉）。左边补的那个空标签与它的编辑器都还在
+    expect(hosts()).toHaveLength(1)
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(1)
+    expect(tabs()).toHaveLength(1)
+    expect(tabs()[0]!.querySelector('.tab-name')!.textContent).toBe('空文档')
   })
 
   it('⛔ 分片路径不进监听清单，外部改动的事件也不处理', async () => {
@@ -3306,7 +3369,7 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     expect(preview()).not.toBeNull()
   })
 
-  it('那一栏挂在 .body-row 的最后（左边写、右边看），而 .app 的 grid 子元素是固定的四个', async () => {
+  it('那一栏挂在 .body-row 的最后（左边写、右边看），而 .app 的 grid 子元素是固定的三个', async () => {
     toggle()
     await settle()
 
@@ -3318,7 +3381,6 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定，
     // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那一组用例钉过同一件事）
     expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
-      'tab-strip',
       'notices',
       'main',
       'statusbar',
@@ -3398,21 +3460,28 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     await settle()
 
     expect(hosts()).toHaveLength(2)
-    // 新分屏里是一个空文档，所以该说的是这一句
+    // 分屏把这份 markdown **搬**进了新分屏（左边补一个空标签），而焦点跟着搬过去的那块：
+    // 预览必须立刻跟上，⛔ 不能停在「这块分屏里没有可预览的正文」——走到那一句意味着
+    // `previewSource()` 读到的是 null：新分屏的 `EditorController` 是在 `EditorPane` 的
+    // `onMount` 里 `attach` 上来的，而那一下写的是 `PaneRecord` 上一个普通可变字段，
+    // 不触发任何信号。所以 `previewSource` 必须走 `ws.focusedView()`（它额外读了
+    // `attachedAt`）而不是 `ws.focusedEditor()`——写成后者的话预览会**一直停在**那句上，
+    // 直到用户在编辑器里敲一个字（`docChanged` → `revision` → effect 重跑），
+    // 而「敲一个字就好了」正是最难报的 bug 形状
+    expect(previewBody()).toContain('甲')
+    expect(previewNote()).not.toBe('这块分屏里没有可预览的正文')
+
+    // 焦点切回左边那块（分屏补的空标签）：同一个访问器，这次该说「还是空的」
+    focusHost(0)
+    await settle()
     expect(previewNote()).toBe('这份文档还是空的')
-    // ⛔ 而**不是**这一句。走到它意味着 `previewSource()` 读到的是 null：新分屏的
-    // `EditorController` 是在 `EditorPane` 的 `onMount` 里 `attach` 上来的，而那一下写的是
-    // `PaneRecord` 上一个普通可变字段，不触发任何信号。所以 `previewSource` 必须走
-    // `ws.focusedView()`（它额外读了 `attachedAt`）而不是 `ws.focusedEditor()`——
-    // 写成后者的话预览会**一直停在**这句上，直到用户在编辑器里敲一个字
-    // （`docChanged` → `revision` → effect 重跑），而「敲一个字就好了」正是最难报的 bug 形状
     expect(previewNote()).not.toBe('这块分屏里没有可预览的正文')
   })
 
   it('预览跟着聚焦的那块分屏走：焦点换过去它就换文档', async () => {
-    typeInto(0, '# 甲\n')
     press('\\', modInit())
     await settle()
+    typeInto(0, '# 甲\n')
     typeInto(1, '# 乙\n')
 
     toggle()
@@ -3532,7 +3601,6 @@ describe('大纲接线（M3-A-4）', () => {
     // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那组用例钉过同一件事）
     expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
       'sidebar-col',
-      'tab-strip',
       'notices',
       'main',
       'statusbar',
@@ -3681,20 +3749,28 @@ describe('大纲接线（M3-A-4）', () => {
     await settle()
 
     expect(hosts()).toHaveLength(2)
-    // 新分屏里是一个空文档，所以该说的是这一句
-    expect(outlineNote()).toBe('这份文档还没有标题')
-    // ⛔ 而**不是**这一句。走到它意味着 `followedEditor()` 读到的是 null：新分屏的
+    // 「右分屏」把当前这个标签**搬**到新分屏里，所以聚焦的那一块显示的仍然是甲
+    expect(outlineNames()).toEqual(['甲'])
+    expect(outlineNote()).toBeNull()
+    // ⛔ 而**不是**下面这句。走到它意味着 `followedEditor()` 读到的是 null：新分屏的
     // `EditorController` 是在 `EditorPane` 的 `onMount` 里 `attach` 上来的，而那一下写的是
     // `PaneRecord` 上一个普通可变字段，不触发任何信号。所以那个访问器必须走
     // `ws.focusedView()`（它额外读了 `attachedAt`）而不是 `ws.focusedEditor()`——
     // 写成后者的话大纲会**一直停在**这句上，直到用户在编辑器里敲一个字
     expect(outlineNote()).not.toBe('这块分屏里没有可列的标题')
+
+    // 原分屏补了一个新的空标签：焦点换回去，大纲说的是「还没有标题」，同一条 ⛔ 也守得住
+    focusHost(0)
+    await settle()
+    expect(outlineNote()).toBe('这份文档还没有标题')
+    expect(outlineNote()).not.toBe('这块分屏里没有可列的标题')
   })
 
   it('大纲跟着聚焦的那块分屏走：焦点换过去它就换文档', async () => {
-    typeInto(0, '# 甲\n')
+    // ⚠️ 先分屏再敲字：`Mod+\` 把当前标签搬进新分屏，先敲的字会跟着搬走，两块分屏就不是各一份了
     press('\\', modInit())
     await settle()
+    typeInto(0, '# 甲\n')
     typeInto(1, '# 乙\n')
 
     toggle()
@@ -3824,9 +3900,10 @@ describe('表格对齐接线（M3-A-5）', () => {
   })
 
   it('分屏时只改**聚焦**那一块，另一块一个字节不动', async () => {
-    typeTable(0, '| a | bb |\n|---|---|\n| ccc | d |')
+    // ⚠️ 先分屏再敲字：`Mod+\` 把当前标签搬进新分屏，先敲的表会跟着搬走
     press('\\', modInit())
     await flush()
+    typeTable(0, '| a | bb |\n|---|---|\n| ccc | d |')
     typeTable(1, '| x | y |\n|---|---|\n| 1 | 2 |')
 
     focusHost(0)
@@ -4256,21 +4333,23 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
 
   it('🔴 分屏之下跟着**收到事件的那块**走，不是跟着焦点走', async () => {
     await openFrom('let a = 1', '/repo/src/a.ts')
+    // 「右分屏」把 `a.ts` 搬进新分屏、原分屏补一个空标签；再把那个空标签换成 Markdown
     press('\\', modInit())
     await flush()
-    await openFrom('# 笔记\n', '/repo/docs/intro.md')
-    // 焦点留在第 0 块（一个 `.ts`）：要是接线读的是 `activeTab()`，这次粘贴会被判成
-    // 「不是 Markdown」而整个拒绝，图片一张都落不了地
     focusHost(0)
+    await openFrom('# 笔记\n', '/repo/docs/intro.md')
+    // 焦点回到第 1 块（一个 `.ts`）：要是接线读的是 `activeTab()`，这次粘贴会被判成
+    // 「不是 Markdown」而整个拒绝，图片一张都落不了地
+    focusHost(1)
 
-    toEnd(1)
-    paste({ files: [shot()] }, 1)
+    toEnd(0)
+    paste({ files: [shot()] }, 0)
     await flush()
     await flush()
 
     expect(assetCmd.calls.map((c) => c.docPath)).toEqual(['/repo/docs/intro.md'])
-    expect(views()[1]!.state.doc.toString()).toBe('# 笔记\n![](assets/pasted-ad48c1765eb1b87d.png)')
-    expect(views()[0]!.state.doc.toString()).toBe('let a = 1')
+    expect(views()[0]!.state.doc.toString()).toBe('# 笔记\n![](assets/pasted-ad48c1765eb1b87d.png)')
+    expect(views()[1]!.state.doc.toString()).toBe('let a = 1')
   })
 
   it('不是 Markdown 的文档不接：不发命令、正文不动，但要说清为什么', async () => {
@@ -4615,10 +4694,11 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
   })
 
   it('面板里挑「合并分屏」把三块塌回单栏——与「窗口」菜单那一项是同一个行为', async () => {
+    // ⚠️ 先分屏再敲字：`Mod+\` 搬的是当前标签，先敲的字会跟着搬进新分屏
+    press('\\', modInit())
+    press('\\', modInit())
     typeInto(0, '甲')
-    press('\\', modInit())
     typeInto(1, '乙')
-    press('\\', modInit())
     typeInto(2, '丙')
     expect(hosts()).toHaveLength(3)
 
@@ -4653,10 +4733,10 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
   })
 
   it('面板里挑「关闭分屏」只收掉聚焦那一块——与「合并分屏」名近而实不同', async () => {
+    press('\\', modInit())
+    press('\\', modInit())
     typeInto(0, '甲')
-    press('\\', modInit())
     typeInto(1, '乙')
-    press('\\', modInit())
     typeInto(2, '丙')
     expect(hosts()).toHaveLength(3)
 
@@ -4667,9 +4747,16 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
     pressInCommandPalette('Enter')
     await flush()
 
+    // 「关闭分屏」连带关掉它显示的那个标签，而那个标签是脏的（刚敲了「丙」），
+    // 所以先弹一句「保存/不保存/取消」——这正是它与「合并分屏」的实质差别之一
+    modalButton('不保存').click()
+    await flush()
+
     // 🔴 只关掉聚焦的那一块（3 → 2），不是塌回单栏（那会是 1）。与上一条对着看，
     // 才证明这两条名字相近的命令在 App 里确实各接各的 hook
     expect(hosts()).toHaveLength(2)
+    // 那个标签也没了：标签条上剩两个
+    expect(tabs()).toHaveLength(2)
   })
 
   it('面板里的置灰读的是聚焦的那块分屏，不是建面板那一刻的快照', async () => {
@@ -5100,9 +5187,10 @@ describe('正文的右键菜单', () => {
   })
 
   it('菜单作用在**被右键的那一块**分屏上，不是聚焦的那一块', () => {
-    typeInto(0, '左边')
     // `Mod+\` = 右分屏（`editor.splitRight`）。与 `openDoc` 同一条理由：按钮已经不在正文区了
+    // ⚠️ 先分屏再敲字：它把当前标签搬进新分屏，先敲的字会跟着搬走
     press('\\', modInit())
+    typeInto(0, '左边')
     typeInto(1, '右边')
     focusHost(0)
 

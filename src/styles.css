@@ -268,50 +268,48 @@ body {
 
 .app {
   display: grid;
-  /* 两列 × 五行（Sublime 排布）。左列是侧边栏，右列是「标签条 / Markdown 工具栏 / 提示条 /
+  /* 两列 × 四行（Sublime 排布）。左列是侧边栏，右列是「Markdown 工具栏 / 提示条 /
      正文区」这一摞，状态栏沉底跨两列。
-     侧边栏跨 1~4 行**通顶到底**，于是它打开时标签条让到它右边、只盖在编辑器上方；
-     侧边栏收起时左列没有 grid item，`auto` 塌成 0，右列吃满整窗、标签条回到通栏——
+     侧边栏跨 1~3 行**通顶到底**，于是它打开时右列的内容让到它右边；
+     侧边栏收起时左列没有 grid item，`auto` 塌成 0，右列吃满整窗——
      两种排布不需要任何分支，全靠 `auto` 列「没内容就是 0」这一条。
-     五行：标签条 / Markdown 工具栏 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
+     四行：Markdown 工具栏 / 提示条容器 / 正文区 / 状态栏。提示容器是常驻的（空时高度 0），
      行数必须固定，否则 <Show> 条件渲染出的 1~2 条提示会把 1fr 挤到错误的行上。
-     标签条放在提示条**上面**：提示条出现或消失时只推动正文区，标签条不跟着跳。
-     状态栏在最后，高度由自己定（22px），不参与 1fr 的分配 */
+     状态栏在最后，高度由自己定（22px），不参与 1fr 的分配。
+     ⚠️ 标签条**不在这里**：M4-R 起它每屏一条，住在 `.editor-host` 里面（见下面那一节）。
+     原来它占的第一行因此整个删掉了，而不是留一行空的——留着的失败方式是
+     「以后有人往第一行塞东西，却发现侧边栏不跨它」 */
   grid-template-columns: auto 1fr;
-  grid-template-rows: auto auto auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto;
   height: 100%;
 }
 
 /* 🔴 流内子元素**逐个钉死行列号**，不靠自动放置：工具栏移进原生菜单之后流内子元素
-   从五个变成了四个（Markdown 工具栏还是 <Show> 条件渲染的，时有时无），自动放置会把
-   `.main` 挤到第三行的 auto 上、把状态栏挤到 1fr 上——正文区按内容高、状态栏悬在窗口当中，
+   只剩三个（Markdown 工具栏还是 <Show> 条件渲染的，时有时无），自动放置会把
+   `.main` 挤到 auto 行上、把状态栏挤到 1fr 上——正文区按内容高、状态栏悬在窗口当中，
    底下整片露底。钉住行号之后「少一个子元素」只是空着一行（auto 行高 0），不会再错位。
-   侧边栏那一列跨 1~4 行、状态栏跨两列，是这套排布里唯一两处跨格 */
+   侧边栏那一列跨 1~3 行、状态栏跨两列，是这套排布里唯一两处跨格 */
 .app > .sidebar-col {
   grid-column: 1;
-  grid-row: 1 / 5;
+  grid-row: 1 / 4;
   display: flex;
   min-height: 0;
 }
-.app > .tab-strip {
+.app > .md-toolbar {
   grid-column: 2;
   grid-row: 1;
 }
-.app > .md-toolbar {
+.app > .notices {
   grid-column: 2;
   grid-row: 2;
 }
-.app > .notices {
+.app > .main {
   grid-column: 2;
   grid-row: 3;
 }
-.app > .main {
-  grid-column: 2;
-  grid-row: 4;
-}
 .app > .statusbar {
   grid-column: 1 / -1;
-  grid-row: 5;
+  grid-row: 4;
 }
 
 /* ---------- 工具栏 ---------- */
@@ -838,13 +836,17 @@ select {
 
 /* ---------- 标签条 ---------- */
 
+/* 每块分屏自己的标签条（M4-R 起住在 `.editor-host` 里面，不再横贯窗口）。
+   `.editor-host` 是纵向 flex，所以这里要 `flex: 0 0 auto`：不给的话默认的
+   `flex-shrink: 1` 会在窗口很矮时把标签条压扁，而正文区（`flex: 1`）本来就该先让位 */
 .tab-strip {
   display: flex;
   align-items: stretch;
+  flex: 0 0 auto;
   background: var(--vela-bg-alt);
   border-bottom: 1px solid var(--vela-border);
   /* 标签多到放不下时横向滚，而不是把正文区挤窄。刻意不换行：换行会让标签条高度不定，
-     而 .app 的 grid 行数固定、每行 auto，高度一跳正文区就跟着跳 */
+     而它是 flex 子项、高度一跳正文区就跟着跳 */
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
@@ -885,13 +887,15 @@ select {
   background: var(--vela-bg-panel);
 }
 
-/* 显示在**别的**分屏里的标签，与 .active 互斥。
-   点它是把焦点交给那块分屏，而不是把它搬到当前分屏来（见 workspace.activateTab）——
-   长得和后台标签一样的话，这次点击看着就像随机行为 */
-.tab.shown {
-  color: var(--vela-fg);
-  /* inset 阴影不参与布局：换成 border 会让它比邻居宽 2px */
-  box-shadow: inset 0 2px 0 var(--vela-fg-dim);
+/* 焦点不在这一屏时，它那格活动标签**降一档亮度**。
+   M4-R 之前标签条只有一条，「哪个标签是活的」靠 `.tab.shown` 那个 inset 阴影来区分
+   「显示在别的分屏里」；现在每屏一条，同一件事变成了「这一屏有没有焦点」——
+   而它必须看得出来，否则两块分屏各有一格亮着的标签，用户无从判断光标在哪一屏
+   （`.editor-host.focused` 那圈 outline 只在正文区边上，眼睛在标签条上时看不见）。
+   ⚠️ 只改颜色，⛔ 不改尺寸：`.tab.active` 与邻居同宽同高是上面那套「平块」排布的前提 */
+.editor-host:not(.focused) .tab.active {
+  color: var(--vela-fg-dim);
+  background: var(--vela-bg-alt);
 }
 
 .tab-name {

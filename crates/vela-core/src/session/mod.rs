@@ -188,6 +188,83 @@ impl<'de> Deserialize<'de> for SessionProject {
     }
 }
 
+/// 一块分屏的现场（M4-R 分组模型：每屏自己揣一排标签）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPane {
+    /// 这一屏有哪些标签，按屏幕顺序，存的是 `Session::tabs` 的下标。
+    ///
+    /// 用**全局**下标而不是屏内编号：`focused` 已经是「第几屏」，再来一套「那屏里第几个」
+    /// 就是两套坐标系，校验时得多一层间接；扁平下标 + 每屏一份清单，`validate`
+    /// 只需要一个 `seen` 位图就能同时查出「屏内重复」与「跨屏重复」。
+    ///
+    /// ⚠️ **不许为空**：一屏没有标签就是「空白分屏」，而前端 workspace 的不变量 1
+    /// 要求每屏至少有一个标签（否则 `activeTab()` 变 nullable 并传染给每个调用点）。
+    pub tabs: Vec<usize>,
+    /// 这一屏正在显示的那一个，同样是 `Session::tabs` 的下标，**必须落在 `tabs` 里**。
+    pub active: usize,
+}
+
+/// `panes` 字段的两种线上形状。
+///
+/// M4-R 把 `panes` 从 `Vec<usize>`（「每块分屏显示哪一个标签」）改成了
+/// `Vec<SessionPane>`（每屏一整排标签）。这不是新增可选字段，是改了已有字段的形状，
+/// 于是「两个方向都优雅降级」做不到，只能各选一边——取舍与 M2-F 改 `SessionProject`
+/// 时逐字相同（完整推理见 `Session::project` 的字段文档）：
+///
+/// - **新版读旧档**：认旧形状，读成「每个下标自成一屏」。必须做到——升级不该赔掉
+///   用户的会话连未保存的草稿。
+/// - **旧版读新档**：整份解析失败，旧版报一句「上次的会话没能读回来」然后空着启动。
+///   降级远比升级罕见，且失败方式是一句人话，不是半对半错的现场。
+///
+/// ⛔ 因此**没有** bump `SESSION_VERSION`：bump 的代价是「新版读到旧档就整份作废」，
+/// 那会让每个升级上来的用户都丢一次会话。
+///
+/// ⚠️ `untagged` 的判据是「能不能解析成前一个变体」，所以**顺序要紧**：新形状在前。
+/// 一个对象数组解析不成 `Vec<usize>`，一个数字数组也解析不成 `Vec<SessionPane>`，
+/// 两种形状在线上没有交集，不存在「都能解析、于是选错」的一档。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPanes {
+    Grouped(Vec<SessionPane>),
+    Legacy(Vec<usize>),
+}
+
+/// 把 M4-R 之前的旧形状（每屏一个标签下标）迁移成新形状。
+///
+/// 旧模型允许「谁都不显示的孤儿标签」（`mergePane` 就会造出来），而新模型的不变量 2
+/// 要求「一个标签属于且只属于一屏」，所以这里顺带把孤儿收编进 `focused` 那一屏——
+/// 用户看到的是「标签还在，只是挤在同一屏里」，不是「标签没了」。
+///
+/// 🔴 这里**治而不拒**：越界与重复的下标一律跳过。`validate` 只有整份作废一招，
+/// 而作废的代价是所有标签连草稿一起赔进去，为一个只是不好看的下标付这个价不划算。
+fn migrate_legacy_panes(shown: Vec<usize>, focused: usize, len: usize) -> Vec<SessionPane> {
+    let mut seen = vec![false; len];
+    let mut panes: Vec<SessionPane> = Vec::new();
+    for index in shown {
+        // 越界的、已经被前面某一屏认领的，都跳过
+        if index >= len || seen[index] {
+            continue;
+        }
+        seen[index] = true;
+        panes.push(SessionPane { tabs: vec![index], active: index });
+    }
+    let orphans: Vec<usize> = (0..len).filter(|i| !seen[*i]).collect();
+    if panes.is_empty() {
+        // 旧存档里一块分屏都没有（`panes: []`），或者下标全越界。
+        // 全部标签挤进一屏——总比整份作废好，而 `validate` 随后会放行这一档
+        if !orphans.is_empty() {
+            panes.push(SessionPane { tabs: orphans.clone(), active: orphans[0] });
+        }
+        return panes;
+    }
+    if !orphans.is_empty() {
+        let at = focused.min(panes.len() - 1);
+        panes[at].tabs.extend(orphans);
+    }
+    panes
+}
+
 /// 一次完整的会话快照。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -197,15 +274,21 @@ pub struct Session {
     /// 聚焦的分屏在 `panes` 里的下标
     pub focused: usize,
     pub tabs: Vec<SessionTab>,
-    /// 每块分屏显示哪个标签，存的是 `tabs` 的下标。
+    /// 每块分屏的现场：它有哪些标签、正在显示哪一个。存的都是 `tabs` 的下标。
     ///
     /// 用下标而不是标签 id：id 是前端运行期递增分配的，重启后对不上；
     /// 恢复时前端会分配新 id 并把旧下标映射过去。
     ///
-    /// **不允许重复**：`src/doc/workspace.ts` 的不变量 2 规定「一个标签同时只显示在一个
-    /// 分屏里」。放开的话 `Tab.snapshot` 就不再是「没显示时的唯一真相」，
-    /// 撤销历史与滚动位置会分叉成两份——所以这里直接拒。
-    pub panes: Vec<usize>,
+    /// **同一个下标不许出现在两块分屏里**：`src/doc/workspace.ts` 的不变量 2 规定
+    /// 「一个标签属于且只属于一块分屏」。放开的话 `Tab.snapshot` 就不再是
+    /// 「没显示时的唯一真相」，撤销历史与滚动位置会分叉成两份——所以这里直接拒。
+    ///
+    /// ## ⚠️ M4-R 改了它的形状（`Vec<usize>` → `Vec<SessionPane>`），但**没有** bump 版本号
+    ///
+    /// 旧档由 `RawPanes::Legacy` 认出来、经 `migrate_legacy_panes` 读成
+    /// 「每个下标自成一屏，孤儿并进 `focused` 那一屏」。取舍与 M2-F 改 `SessionProject`
+    /// 时逐字相同，完整推理见 `RawPanes` 的文档与下面 `project` 那一节。
+    pub panes: Vec<SessionPane>,
     /// 项目树。`None` = 上次没打开任何文件夹。
     ///
     /// ## 为什么加了它 `SESSION_VERSION` 还是 1
@@ -309,7 +392,7 @@ impl<'de> Deserialize<'de> for Session {
             direction: PaneDirection,
             focused: usize,
             tabs: Vec<SessionTab>,
-            panes: Vec<usize>,
+            panes: RawPanes,
             /// 带 `default` 的三个字段，也就是**后加的**那三个（`project` 是 M2-B-4，
             /// `recent` 是 M2-E，`recent_projects` 是 M2-F-6）。更早的存档里没有它们：
             /// 缺 key 时 `project` 解析成 `None`（= 上次没打开文件夹）、两个清单解析成空
@@ -324,12 +407,18 @@ impl<'de> Deserialize<'de> for Session {
         }
 
         let raw = Raw::deserialize(deserializer)?;
+        // 旧档（M4-Q 及以前）的 `panes` 是一串「每屏显示哪一个」的下标，在这里就地
+        // 迁移成新形状，于是 `validate` 与前端都只会看见一种写法（理由见 `RawPanes`）
+        let panes = match raw.panes {
+            RawPanes::Grouped(panes) => panes,
+            RawPanes::Legacy(shown) => migrate_legacy_panes(shown, raw.focused, raw.tabs.len()),
+        };
         let session = Session {
             version: raw.version,
             direction: raw.direction,
             focused: raw.focused,
             tabs: raw.tabs,
-            panes: raw.panes,
+            panes,
             project: raw.project,
             recent: raw.recent,
             recent_projects: raw.recent_projects,
@@ -356,14 +445,29 @@ impl Session {
         }
         let mut seen = vec![false; len];
         for (i, pane) in self.panes.iter().enumerate() {
-            if *pane >= len {
-                return Err(format!("panes[{i}]={pane} 越界（只有 {len} 个标签）"));
+            // 一屏没有标签就是「空白分屏」，而前端 workspace 的不变量 1 不许它存在
+            if pane.tabs.is_empty() {
+                return Err(format!("panes[{i}].tabs 是空数组（一块分屏至少有一个标签）"));
             }
-            if seen[*pane] {
-                return Err(format!("panes[{i}]={pane}：标签 {pane} 已经显示在另一块分屏里"));
+            for index in &pane.tabs {
+                if *index >= len {
+                    return Err(format!("panes[{i}].tabs 里有 {index}，越界（只有 {len} 个标签）"));
+                }
+                if seen[*index] {
+                    return Err(format!("panes[{i}].tabs 里的 {index}：这个标签已经在另一块分屏里"));
+                }
+                seen[*index] = true;
             }
-            seen[*pane] = true;
+            if !pane.tabs.contains(&pane.active) {
+                return Err(format!("panes[{i}].active={} 不在它自己的 tabs 里", pane.active));
+            }
         }
+        // 刻意**不**要求「每个标签都被某一屏认领」：没人认领的孤儿由前端
+        // `panesFromSession` 收编进 `focused` 那一屏（旧模型允许孤儿，`mergePane`
+        // 就会造出来）。在这里拒掉的代价是整份作废，而孤儿的正确处置是「标签还在，
+        // 只是挤在同一屏里」——为一个不影响正确性的形状问题赔上所有草稿不划算。
+        // 与上面「下标越界也照拒」的差别在于：越界会让前端 `fresh[i]` 拿到 `undefined`，
+        // 那是崩溃；孤儿不会。
         for (i, tab) in self.tabs.iter().enumerate() {
             if tab.selection.is_empty() {
                 return Err(format!("tabs[{i}] 没有选区"));
@@ -587,13 +691,15 @@ mod tests {
         }
     }
 
+    /// 每个标签自成一屏（旧模型的形状，也是最好写的一种）。
+    /// 要测「一屏揣多个标签」的用例自己覆写 `panes`
     fn session(tabs: Vec<SessionTab>) -> Session {
         Session {
             version: SESSION_VERSION,
             direction: PaneDirection::Row,
             focused: 0,
             tabs: tabs.clone(),
-            panes: (0..tabs.len()).collect(),
+            panes: (0..tabs.len()).map(|i| SessionPane { tabs: vec![i], active: i }).collect(),
             // 与项目树无关的用例占绝大多数，所以默认不开文件夹；
             // 要测项目的那几条自己覆写这个字段
             project: None,
@@ -647,7 +753,10 @@ mod tests {
                     scroll_left: 8.0,
                 },
             ],
-            panes: vec![1, 0],
+            // 两块分屏各揣一个标签，且**顺序是反的**（第 0 屏显示标签 1）：
+            // 屏与标签的对应关系被排过一次的话，恢复出来两屏的内容会互换，
+            // 而每一屏自己看起来都完好无损
+            panes: vec![SessionPane { tabs: vec![1], active: 1 }, SessionPane { tabs: vec![0], active: 0 }],
             // 空字符串 `""` 是**根**那一层的 rel，不是「没有值」。它在 `expanded` 里
             // 必须能原样往返：丢了它，恢复出来的树是收起的，用户点开过的文件夹全缩回去了，
             // 而这件事没有任何报错——正是本模块最怕的那一类失败。
@@ -762,17 +871,25 @@ mod tests {
         let session_json = |tabs: &str, focused: usize, panes: &str| {
             format!(r#"{{"version":1,"direction":"row","focused":{focused},"tabs":[{tabs}],"panes":[{panes}]}}"#)
         };
+        // 一块合法的分屏。每条用例只改它要测的那一个字段，其余保持合法
+        let pane_json = |tabs: &str, active: usize| format!(r#"{{"tabs":[{tabs}],"active":{active}}}"#);
         let ok_tab = tab_json(r#""selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0"#);
+        let ok_pane = pane_json("0", 0);
 
-        // focused 越界、panes 越界、main 越界、空选区、空标签、空分屏：
-        // 每一条的失败方式都是前端启动时一个 undefined 崩溃，所以必须在这里拦掉
+        // focused 越界、标签下标越界、main 越界、空选区、空标签、空分屏、
+        // 空的一屏、active 不在自己那屏里、屏内重复：
+        // 每一条的失败方式都是前端启动时一个 undefined 崩溃（或者一块空白分屏），
+        // 所以必须在这里拦掉
         for raw in [
-            session_json(&ok_tab, 3, "0"),
-            session_json(&ok_tab, 0, "7"),
-            session_json(&tab_json(r#""selection":[[0,0]],"main":4,"scrollTop":0,"scrollLeft":0"#), 0, "0"),
-            session_json(&tab_json(r#""selection":[],"main":0,"scrollTop":0,"scrollLeft":0"#), 0, "0"),
+            session_json(&ok_tab, 3, &ok_pane),
+            session_json(&ok_tab, 0, &pane_json("7", 7)),
+            session_json(&tab_json(r#""selection":[[0,0]],"main":4,"scrollTop":0,"scrollLeft":0"#), 0, &ok_pane),
+            session_json(&tab_json(r#""selection":[],"main":0,"scrollTop":0,"scrollLeft":0"#), 0, &ok_pane),
             session_json("", 0, ""),
             session_json(&ok_tab, 0, ""),
+            session_json(&ok_tab, 0, &pane_json("", 0)),
+            session_json(&ok_tab, 0, &pane_json("0", 1)),
+            session_json(&ok_tab, 0, &pane_json("0,0", 0)),
         ] {
             fs::write(&path, &raw).unwrap();
             assert!(matches!(load_session(&path), Err(SessionError::Corrupt { .. })), "这份越界会话被接受了：{raw}");
@@ -811,14 +928,14 @@ mod tests {
             direction: PaneDirection::Row,
             focused: 0,
             tabs: vec![tab(Some("/a"), None)],
-            panes: vec![0, 0],
+            panes: vec![SessionPane { tabs: vec![0], active: 0 }, SessionPane { tabs: vec![0], active: 0 }],
             project: None,
             recent: Vec::new(),
             recent_projects: Vec::new(),
         };
 
         match save_session(&path, duplicated.clone()) {
-            Err(SessionError::Corrupt { message }) => assert!(message.contains("已经显示在另一块分屏"), "{message}"),
+            Err(SessionError::Corrupt { message }) => assert!(message.contains("已经在另一块分屏里"), "{message}"),
             other => panic!("期望 Corrupt，实际 {other:?}"),
         }
         assert!(!path.exists(), "被拒的保存不该留下文件");
@@ -836,17 +953,86 @@ mod tests {
         let path = path_in(dir.path());
         let mut s = session(vec![tab(Some("/a"), None), tab(Some("/b"), None)]);
         // 一块分屏显示第二个标签，聚焦它：focused 是 panes 的下标 0，不是标签下标 1
-        s.panes = vec![1];
+        s.panes = vec![SessionPane { tabs: vec![1], active: 1 }];
         s.focused = 0;
         save_session(&path, s.clone()).unwrap();
         let loaded = load_session(&path).unwrap().unwrap();
         assert_eq!(loaded.focused, 0);
-        assert_eq!(loaded.panes, vec![1]);
+        assert_eq!(loaded.panes, s.panes);
 
         // focused=1 在只有一块分屏时必须被拒绝
         s.focused = 1;
         fs::write(&path, serde_json::to_vec(&s).unwrap()).unwrap();
         assert!(matches!(load_session(&path), Err(SessionError::Corrupt { .. })));
+    }
+
+    /// **M4-Q 及以前写下的存档必须还能读回来。**
+    ///
+    /// 这条是「改了 `panes` 的形状却不 bump `SESSION_VERSION`」那个决定的唯一依据：
+    /// 那个推理成立与否，取决于旧文件解析成什么。要是这里变成 `Err(Corrupt)`，
+    /// 所有升级上来的用户重启一次就丢光会话连未保存的草稿——而他们只会认为「这功能坏了」。
+    ///
+    /// 旧形状是「每块分屏显示哪一个标签」，迁移后读成「每个下标自成一屏」，
+    /// 也就是用户升级前看到的那个版面。
+    #[test]
+    fn 旧存档的数字数组_panes_读成分组形状() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        const FMT: &str = r#""format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false"#;
+        let tab_json = |path: &str| {
+            format!(r#"{{"path":"{path}",{FMT},"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}}"#)
+        };
+        // 两块分屏：第 0 屏显示标签 0，第 1 屏显示标签 2，聚焦第 1 屏。
+        // 标签 1 谁都不显示——旧模型里这是合法的孤儿（`mergePane` 就会造出来），
+        // 而新模型的不变量 2 不许它存在，所以迁移要把它收编进 `focused` 那一屏
+        let raw = format!(
+            r#"{{"version":1,"direction":"row","focused":1,"tabs":[{},{},{}],"panes":[0,2]}}"#,
+            tab_json("/a"),
+            tab_json("/b"),
+            tab_json("/c")
+        );
+        fs::write(&path, raw).unwrap();
+
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.panes,
+            vec![
+                SessionPane { tabs: vec![0], active: 0 },
+                // 孤儿 1 并进 focused（= 第 1 屏）的末尾，于是「标签还在，只是挤在同一屏里」
+                SessionPane { tabs: vec![2, 1], active: 2 }
+            ]
+        );
+        assert_eq!(loaded.focused, 1);
+        assert_eq!(loaded.tabs.len(), 3);
+    }
+
+    /// 旧档里下标越界或重复时**治而不拒**：跳过那一条，其余照常恢复。
+    ///
+    /// `validate` 只有整份作废一招，而作废的代价是所有标签连草稿一起赔进去——
+    /// 为一个只是不好看的下标付这个价不划算。
+    #[test]
+    fn 旧存档里的脏下标被跳过而不是整份作废() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = path_in(dir.path());
+
+        const FMT: &str = r#""format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false"#;
+        let tab_json = |path: &str| {
+            format!(r#"{{"path":"{path}",{FMT},"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}}"#)
+        };
+        // 7 越界、0 重复出现两次
+        let raw = format!(
+            r#"{{"version":1,"direction":"row","focused":0,"tabs":[{},{}],"panes":[0,7,0,1]}}"#,
+            tab_json("/a"),
+            tab_json("/b")
+        );
+        fs::write(&path, raw).unwrap();
+
+        let loaded = load_session(&path).unwrap().unwrap();
+        assert_eq!(
+            loaded.panes,
+            vec![SessionPane { tabs: vec![0], active: 0 }, SessionPane { tabs: vec![1], active: 1 }]
+        );
     }
 
     /// **M1-F 时代写下的存档必须还能读回来。**

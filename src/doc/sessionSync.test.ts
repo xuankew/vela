@@ -89,7 +89,10 @@ function sessionOf(tabs: SessionTab[], overrides: Partial<Session> = {}): Sessio
     direction: 'row',
     focused: 0,
     tabs,
-    panes: [0],
+    // 默认「一块分屏揣着全部标签、显示头一个」：M4-R 起 `panes` 是分组形状，
+    // 而 workspace 的不变量 2 要求每个标签都属于某一屏（没人认领的孤儿由
+    // `panesFromSession` 收编，但测试里写得明白比依赖那条兜底好）
+    panes: [{ tabs: tabs.map((_, i) => i), active: 0 }],
     project: null,
     recent: [],
     recentProjects: [],
@@ -167,7 +170,7 @@ function attachEditor(ws: Workspace, paneId: number, state: EditorState): Editor
 function remountAll(ws: Workspace) {
   for (const p of ws.panes()) {
     if (p.controller) continue
-    const tab = ws.tabs().find((t) => t.id === p.tabId())!
+    const tab = p.tabs().find((t) => t.id === p.activeTabId())!
     attachEditor(ws, p.id, tab.snapshot.state)
   }
 }
@@ -290,7 +293,14 @@ describe('start：启动时读回上次的会话', () => {
           sessionTab({ path: '/a.txt' }),
           sessionTab({ path: null, draft: '没存过的稿子', dirty: true, selection: [[3, 3]], scrollTop: 90 }),
         ],
-        { direction: 'column', focused: 1, panes: [0, 1] },
+        {
+          direction: 'column',
+          focused: 1,
+          panes: [
+            { tabs: [0], active: 0 },
+            { tabs: [1], active: 1 },
+          ],
+        },
       ),
     )
 
@@ -415,14 +425,19 @@ describe('节流自动保存：轮询 + 比对内容', () => {
     const h = harness()
     await h.sync.start()
     await h.clock.fire()
-    expect(lastSaved().panes).toEqual([0])
+    expect(lastSaved().panes).toEqual([{ tabs: [0], active: 0 }])
 
     h.ws.split('column')
     remountAll(h.ws)
     await h.clock.fire()
 
     expect(session.saveSession).toHaveBeenCalledTimes(2)
-    expect(lastSaved().panes).toEqual([0, 1])
+    // M4-R 起 `panes` 是分组形状：每屏揣着自己那排标签 + 显示着哪一个。
+    // `split('column')` 没带 `moveTabId`，于是新那屏拿的是一个空白标签（id 1）
+    expect(lastSaved().panes).toEqual([
+      { tabs: [0], active: 0 },
+      { tabs: [1], active: 1 },
+    ])
     expect(lastSaved().direction).toBe('column')
     expect(lastSaved().focused).toBe(1)
   })
@@ -614,7 +629,7 @@ describe('项目树那一半（M2-B-4）', () => {
     // 拼的是**同一个对象**，不是把 workspace 那半覆盖掉：
     // `serializeSession` 返回的 project 恒为 null，展开顺序错了就会是这样
     expect(saved.tabs).toHaveLength(1)
-    expect(saved.panes).toEqual([0])
+    expect(saved.panes).toEqual([{ tabs: [0], active: 0 }])
     expect(saved.version).toBe(SESSION_VERSION)
   })
 

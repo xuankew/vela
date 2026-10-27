@@ -33,7 +33,7 @@ import {
  * 多光标、非零滚动、column 方向、非空的 MRU。
  */
 const GOLDEN_SESSION =
-  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[0,1],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}'
+  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0.0,"scrollLeft":0.0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0.0}],"panes":[{"tabs":[0],"active":0},{"tabs":[1],"active":1}],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}'
 
 /**
  * 同一份数据在 `JSON.stringify` 之后的样子。与上面**只差三处**：`0.0` 变成 `0`。
@@ -43,10 +43,10 @@ const GOLDEN_SESSION =
  * 把两个字面量并排放在这里，是为了让这点差异**看得见**，而不是让人对着两个文件犯嘀咕。
  */
 const GOLDEN_SESSION_JS =
-  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0}],"panes":[0,1],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}'
+  '{"version":1,"direction":"column","focused":1,"tabs":[{"path":"/tmp/a.txt","format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false,"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0},{"path":null,"format":{"encoding":"gbk","bom":false,"eol":"crlf"},"dirty":true,"lossy":true,"draft":"未保存\\n草稿","selection":[[0,3],[4,4]],"main":1,"scrollTop":120.5,"scrollLeft":0}],"panes":[{"tabs":[0],"active":0},{"tabs":[1],"active":1}],"project":{"roots":[{"root":"/Users/me/code/vela","expanded":["","src/doc"]},{"root":"/Users/me/notes","expanded":[""]}]},"recent":["/tmp/a.txt","/Users/me/code/vela/src/doc/tab.ts"],"recentProjects":[["/Users/me/code/vela","/Users/me/notes"],["/tmp/a.txt"]]}'
 
-/** 696 = GOLDEN_SESSION 的 UTF-8 字节数（不是字符数，中文占 3 字节），下面有用例钉住这条关系 */
-const GOLDEN_REPORT = '{"bytesWritten":696,"droppedDrafts":0}'
+/** 740 = GOLDEN_SESSION 的 UTF-8 字节数（不是字符数，中文占 3 字节），下面有用例钉住这条关系 */
+const GOLDEN_REPORT = '{"bytesWritten":740,"droppedDrafts":0}'
 
 /** 与 GOLDEN_SESSION 语义相同的对象字面量，用来做 deep-equal 与「前端能不能造出来」的检查 */
 function sampleSession(): Session {
@@ -82,7 +82,12 @@ function sampleSession(): Session {
         scrollLeft: 0,
       },
     ],
-    panes: [0, 1],
+    // 两块分屏各揣一个标签（M4-R 分组模型）。下标是**全局**的（指向 `tabs`），
+    // `active` 同样是全局下标而不是屏内编号
+    panes: [
+      { tabs: [0], active: 0 },
+      { tabs: [1], active: 1 },
+    ],
     // 空字符串是**根**那一层的 rel。它出现在契约里，是为了让「两边对根怎么表示」这件事
     // 有个对照物——漂了的表现是重启后树整个收起，而不是一条报错。
     // 两个根：`roots` 的顺序**就是** `rootIndex`，只放一个的话「顺序被排了」看不出来
@@ -134,6 +139,10 @@ describe('Rust → 前端 的字段名', () => {
     ])
     // format 复用 fs 的契约，嵌套字段名也必须对
     expect(Object.keys(parsed.tabs[0]!.format)).toEqual(['encoding', 'bom', 'eol'])
+    // `SessionPane` 的两个字段名（M4-R）。`active` 尤其要钉：写成 `activeTab` /
+    // `activeIndex` 的话 serde 那边缺字段会**报错**（不是静默），但报的是
+    // 「上次的会话没能读回来」，用户看不出是自己拼错了
+    expect(Object.keys(parsed.panes[0]!)).toEqual(['tabs', 'active'])
   })
 
   it('解析出来的值与前端能造出来的对象完全相等', () => {
@@ -355,9 +364,9 @@ describe('可空字段必须显式是 null', () => {
 
 describe('错误落地成人能读的话', () => {
   it('corrupt 说的是「上次的会话没能读回来」，不是抛 Rust 的原始报错', () => {
-    const msg = describeSessionError({ kind: 'corrupt', message: 'panes[0]=3 越界' })
+    const msg = describeSessionError({ kind: 'corrupt', message: 'panes[0].tabs 里有 3，越界（只有 1 个标签）' })
     expect(msg).toContain('上次的会话没能读回来')
-    expect(msg).toContain('panes[0]=3')
+    expect(msg).toContain('panes[0].tabs 里有 3')
   })
 
   it('version 把两个版本号都报出来', () => {

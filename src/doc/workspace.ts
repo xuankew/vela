@@ -11,7 +11,7 @@ import { languageFor, loadSupport, sameLanguage, type LanguageChoice } from '../
 import type { LinkFilesHook } from '../editor/linkSource'
 import type { PasteImageHook } from '../editor/paste'
 import { INDENT_UNIT, indentLabel, languageExtensions } from '../editor/setup'
-import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionTab } from '../ipc/session'
+import { MAX_SESSION_TABS, SESSION_VERSION, type Session, type SessionPane, type SessionTab } from '../ipc/session'
 import {
   applyViewConfig,
   createTab,
@@ -24,19 +24,27 @@ import {
 } from './tab'
 
 /**
- * 工作区：标签的集合 + 分屏的集合 + 两者之间「谁显示谁」的关系。
+ * 工作区：一堆**分屏**，每块分屏自己揣着一排标签（M4-R 起是分组模型，此前是扁平模型）。
  *
- * **模型是扁平的**：`panes` 是一排分屏，`direction` 决定它们横着排还是竖着排，
- * 最多 `MAX_PANES` 个。刻意不做 VS Code 那种嵌套分组（左右各再上下分）——
- * 那要求一棵布局树、每个节点各自的方向与比例，而轻量编辑器里真正高频的只有
- * 「左右并排看两个文件」与「上下对照」。扁平模型下这两个都是一次点击。
+ * **模型**：`panes` 是一排分屏，`direction` 决定它们横着排还是竖着排，最多 `MAX_PANES` 个。
+ * 每块分屏有自己的标签清单（`Pane.tabs`，屏幕上的顺序）与「正在显示哪一个」
+ * （`Pane.activeTabId`），标签条因此是**每屏一条**、跟着分屏走。
+ * 刻意不做 VS Code 那种嵌套分组（左右各再上下分）——那要求一棵布局树、每个节点各自的
+ * 方向与比例，而轻量编辑器里真正高频的只有「左右并排看两个文件」与「上下对照」。
+ * 扁平模型下这两个都是一次点击。
  *
- * **两条不变量**：
- * 1. `tabs()` 永远非空，`panes()` 也永远非空。允许「零」的话所有 `editor.*` 命令的 `when`
- *    会同时失效、状态栏没有可显示的对象、`activeTab()` 变成 nullable 并传染给每一个调用点。
- * 2. **一个标签同时只显示在一个分屏里**（可以有标签谁都不显示，比如它的分屏被合并掉了）。
- *    允许两个分屏显示同一个标签的话，`Tab.snapshot` 就不再是「没显示时的唯一真相」，
- *    撤销历史与滚动位置也会分叉成两份。
+ * **三条不变量**：
+ * 1. `panes()` 永远非空，每块分屏的 `tabs()` 也永远非空。允许「零」的话所有 `editor.*`
+ *    命令的 `when` 会同时失效、状态栏没有可显示的对象、`activeTab()` 变成 nullable
+ *    并传染给每一个调用点。所以「关掉一块分屏里最后一个标签」= 连这块分屏一起收掉
+ *    （只剩一块时改成补一个新空标签，见 `detachFromPane` 的 `orphan` 参数）。
+ * 2. **一个标签属于且只属于一块分屏**。`tabs()` 是把各屏的清单按屏幕顺序摊平得到的
+ *    **派生值**，不是第二份真相——于是「谁都不显示的孤儿标签」这一档在 M4-R 之后
+ *    **不存在了**（此前由 `mergePane` 造出来；现在合并是把牺牲者的整排标签并进幸存者）。
+ * 3. **一块分屏同时只有一个标签是活的**（`activeTabId` 那个，它有 CM6 的 view；
+ *    同屏其余标签只有 `snapshot`）。允许同一份文档在两处各显示一次的话，`Tab.snapshot`
+ *    就不再是「没显示时的唯一真相」，撤销历史与滚动位置会分叉成两份——所以「右分屏看
+ *    我正看的这份」是**搬**过去（`split(dir, tabId)`），不是复制。
  *
  * **为什么用 `createSignal` 而不是 `createStore`**：Tab 里揣着 CM6 的 `EditorState` 与
  * `Compartment`。store 会把嵌套的普通对象包成代理，而 CM6 到处靠 `===` 比较 state 与
@@ -109,32 +117,57 @@ export const MAX_PANES = 4
 export const MAX_RECENT = 50
 
 /**
- * 一块可见编辑区。
+ * 一块可见编辑区 = 一排标签 + 其中正在显示的那一个 + 一个 CM6 实例。
  *
- * `tabId` 是 Accessor 而不是普通字段：标签条要拿它判断「哪个标签是活动的」，
- * 而活动标签正是聚焦分屏显示的那个。用普通字段的话这次变更不会触发任何重渲染。
+ * 两个 Accessor 而不是普通字段：标签条要拿它们判断「哪一格是活动的」「这一屏有哪几格」，
+ * 用普通字段的话这些变更不会触发任何重渲染。
  */
 export interface Pane {
   readonly id: number
-  readonly tabId: Accessor<number>
+  /** 这块分屏的标签，**屏幕上的顺序**。标签条按它渲染，拖拽重排改的也是它 */
+  readonly tabs: Accessor<Tab[]>
+  /**
+   * 正在显示的那个标签的 id。同屏其余标签只有 `snapshot`、没有 view。
+   *
+   * ⚠️ 它**必须**在 `tabs()` 里（文件头不变量 2、3 的另一半）。所有写它的地方都在
+   * `batch` 里与写 `tabs` 的那一下同批落地，否则订阅者会读到「活动标签不在这一屏的
+   * 清单里」这个中间态——`App.tsx` 的 `paneState` 里那句 `find(...)!` 当场就炸
+   */
+  readonly activeTabId: Accessor<number>
   /** 编辑器实例。挂载前与销毁后是 null */
   readonly controller: EditorController | null
 }
 
 /** Pane 的可写形态，只在 workspace 内部流转 */
 interface PaneRecord extends Pane {
-  readonly setTabId: Setter<number>
+  readonly setTabs: Setter<Tab[]>
+  readonly setActiveTabId: Setter<number>
   controller: EditorController | null
 }
 
 export interface Workspace {
+  /**
+   * **所有**标签，按「屏幕上的分屏顺序 → 每屏内部的顺序」摊平。
+   *
+   * 🔴 这是一个**派生值**（读的时候现摊平，实现与「为什么不用 memo」见 `createWorkspace` 里那一份），
+   * 不是第二份真相：真相在 `Pane.tabs` 里
+   * （文件头不变量 2）。给「所有打开的文档」用的那些消费者——`fileWatch` 的订阅清单、
+   * 全局替换之后的重读、`anyDirty` / `dirtyPaths`、会话序列化、词补全的「其它文档」——
+   * 要的就是这个摊平后的全集，它们不关心标签属于哪一屏。
+   *
+   * ⚠️ 每次调用都是**新数组**，所以 `===` 在这里什么也说明不了：要判「现场没变过」
+   * 得逐元素比引用
+   *
+   * ⛔ 别把它当写入端：没有任何 `setTabs`，改标签归属只能走 `newTab` / `closeTab` /
+   * `moveTab` / `reorder` / `split` / `mergePane` 这些方法，它们负责同时维护
+   * 「哪一屏有哪些标签」与「那一屏显示哪一个」这两件事。
+   */
   readonly tabs: Accessor<Tab[]>
   readonly panes: Accessor<Pane[]>
   readonly direction: Accessor<SplitDirection>
   readonly focusedPaneId: Accessor<number>
   /** 永远有值（见上面的不变量）：聚焦分屏正在显示的那个标签 */
   readonly activeTab: Accessor<Tab>
-  readonly activeIndex: Accessor<number>
   readonly lineWrap: Accessor<boolean>
   /** 当前 CM6 是不是暗色（M4-C）。与 `lineWrap` 同为全局视图设置的响应式镜像 */
   readonly dark: Accessor<boolean>
@@ -217,36 +250,74 @@ export interface Workspace {
    * 抢的表现是查找面板的输入框留不住焦点、以及正文被滚回顶部。
    */
   notePaneFocus: (paneId: number) => void
-  /** 加一块分屏并把整排的方向定成 `direction`。已到上限时只改方向 */
-  split: (direction: SplitDirection) => void
-  /** 合并掉一块分屏。它显示的标签留在标签条上，只是不再被任何分屏显示 */
-  closePane: (paneId: number) => void
+  /**
+   * 加一块分屏并把整排的方向定成 `direction`。已到上限时只改方向。
+   *
+   * 新分屏里有谁：给了 `moveTabId` 就把那个标签**搬**过去（它原来那一屏改显示右邻居，
+   * 搬空了就补一个新空标签）；不给就装一个新空标签。
+   * ⛔ 不会让同一份文件同时显示在两处，理由写在实现处
+   */
+  split: (direction: SplitDirection, moveTabId?: number) => void
+  /**
+   * 把一块分屏合掉：它的**整排标签并进**另一块（焦点所在的那块；被合的正是焦点所在时
+   * 并进剩下的最后一块），一个都不关。
+   * 「合并分屏」（塌回单栏）走这一条
+   */
+  mergePane: (paneId: number) => void
+  /**
+   * 关掉一块分屏**和它里面的所有标签**。脏的那些**一次问完**（保存／不保存／取消），
+   * 取消或保存没成功就什么都不动。只剩一块分屏时是空操作——那是「关闭所有标签」的活儿
+   */
+  closePane: (paneId: number) => Promise<void>
   /** 循环聚焦：n 为正往后、为负往前 */
   cyclePane: (step: number) => void
-  newTab: () => Tab
+  /** 在 `paneId`（缺省 = 聚焦的那块）里新建一个空标签并显示它 */
+  newTab: (paneId?: number) => Tab
   openViaDialog: () => Promise<void>
   /** 打开一个已知路径。「最近文件」与拖拽落文件都走这里 */
   openAt: (path: string) => Promise<void>
-  /** 脏标签会先弹确认；用户选「取消」或保存没成功时，标签留在原处 */
+  /**
+   * 脏标签会先弹确认；用户选「取消」或保存没成功时，标签留在原处。
+   *
+   * 关掉某一屏的**最后一个**标签 = 连那一屏一起收掉（只剩一屏时补一个新空标签），
+   * 见文件头不变量 1
+   */
   closeTab: (id: number) => Promise<void>
   /**
-   * 关掉除 `id` 之外的所有标签（右键菜单的「关闭其它标签」）。
+   * 关掉 `id` **所在那一屏**里除它之外的所有标签（右键菜单的「关闭其它标签」）。
+   *
+   * 🔴 作用域是那一屏，不是全部：标签条每屏一条，菜单是从某一屏的标签上弹出来的，
+   * 「其它」自然指同一屏里的其它（2026-10-27 用户在两个选项里挑了这一档）。
+   * 隔壁那屏的标签一个都不动。
    *
    * 脏的那些**一次问完**（与 `requestWindowClose` 同一条口径），选「取消」就一个都不关。
    * `id` 不存在时什么都不做——菜单弹着的时候那个标签可能已经被关掉了
    */
   closeOtherTabs: (id: number) => Promise<void>
   /**
-   * 关掉所有标签（右键菜单的「关闭所有标签」）。
+   * 关掉 `paneId`（缺省 = 聚焦的那块）里的所有标签（右键菜单的「关闭所有标签」）。
    *
-   * 关完之后标签条上是一个**新的空标签**，不是空的标签条：那是文件头那条不变量
-   * （至少一个标签、至少一块分屏）要求的，`removeFromList` 在关掉最后一个时自己会补
+   * 那一屏因此空了：还剩别的分屏就连这一屏一起收掉，只剩这一块时留一个**新的空标签**
+   * ——文件头不变量 1 不允许「零标签的现场」
    */
-  closeAllTabs: () => Promise<void>
-  /** 标签已经在某个分屏里显示时聚焦那个分屏，否则把它装进聚焦的分屏 */
+  closeAllTabs: (paneId?: number) => Promise<void>
+  /** 显示这个标签并把焦点交给它所在的那一屏（它已经在显示时只是换焦点） */
   activateTab: (id: number) => void
-  /** 拖拽重排：把 dragged 挪到 target 原来的位置上 */
+  /**
+   * 拖拽重排：把 dragged 挪到 target 现在的位置上。
+   *
+   * 两个标签同屏 = 纯粹的换顺序；**不同屏 = 把 dragged 搬进 target 那一屏**
+   * （成为那一屏正在显示的标签，焦点也跟过去）。一条方法覆盖两种落点是因为手势只有一个：
+   * 用户拖着一个标签放到另一个标签上，他不知道也不该需要知道两者是否同屏
+   */
   reorder: (draggedId: number, targetId: number) => void
+  /**
+   * 把标签搬进 `targetPaneId`，落在 `index`（缺省 = 末尾），并成为那一屏正在显示的标签。
+   *
+   * 拖到某一屏的**空白处**（标签条上没有标签可对齐的位置）走这一条；`reorder` 内部
+   * 跨屏那一支也走它。源那一屏被搬空了就按 `closeTab` 同一条规矩收掉
+   */
+  moveTab: (tabId: number, targetPaneId: number, index?: number) => void
   save: () => Promise<void>
   saveAs: () => Promise<void>
   setLineWrap: (on: boolean) => void
@@ -353,7 +424,6 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   )
   const promptDiscard: DiscardPrompt = options.promptDiscard ?? (async () => 'cancel')
 
-  const [tabs, setTabs] = createSignal<Tab[]>([])
   const [panes, setPanes] = createSignal<PaneRecord[]>([])
   const [focusedPaneId, setFocusedPaneId] = createSignal(-1)
   const [direction, setDirection] = createSignal<SplitDirection>('row')
@@ -370,6 +440,23 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   /** MRU。写入只走 `remember`，恢复时被 `restoreSession` 整个换掉 */
   const [recent, setRecent] = createSignal<string[]>([])
 
+  /**
+   * 所有标签，摊平各屏的清单。**派生值**：真相在 `Pane.tabs` 里，这里只是把它们串起来。
+   *
+   * 🔴 刻意是普通箭头函数而不是 `createMemo`（与下面 `focusedView` 同一个选择，理由不同）：
+   * memo 在这里换不来任何东西——没有消费者拿它的**数组身份**当判据（`sessionSync` 的节流
+   * 比的是整份 `Session` 的 `JSON.stringify`，`fileWatch` 比的是排好序的路径清单），
+   * 而摊平几块分屏、几十个标签的一次 `flatMap` 也不比 memo 那次相等比较贵。
+   * 换来的是两条：一，`createWorkspace()` 可以裸调（测试夹具里到处都是），不必先起一个
+   * `createRoot`——没有 owner 的计算会被 Solid 的开发构建逐个 warn 一句
+   * 「will never be disposed」，几百条那样的 warn 会把真正要紧的那几条淹掉；
+   * 二，少一条排序约束（memo 是**立刻**求值的，见 `focusedView` 上那条）。
+   *
+   * ⚠️ 于是每次调用都返回**新数组**：要「现场一点没变」这个判据的地方得逐元素比引用
+   * （`every((t, i) => t === before[i])`），不能比 `===`
+   */
+  const tabs = (): Tab[] => panes().flatMap((p) => p.tabs())
+
   let nextTabId = 1
   let nextPaneId = 1
 
@@ -383,26 +470,40 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return paneById(focusedPaneId()) ?? list[0]!
   }
 
+  /** 这个标签属于哪一屏（不变量 2：至多一屏，所以 `find` 就是全部答案） */
   function paneOfTab(tabId: number): PaneRecord | undefined {
-    return panes().find((p) => p.tabId() === tabId)
+    return panes().find((p) => p.tabs().some((t) => t.id === tabId))
   }
 
   function tabById(id: number): Tab | undefined {
     return tabs().find((t) => t.id === id)
   }
 
+  /**
+   * 某一屏**正在显示**的那个标签，也就是它唯一有 CM6 view 的那一个。
+   *
+   * 兜底 `?? p.tabs()[0]!` 只为「写 `activeTabId` 与写 `tabs` 不在同一批」这种
+   * 编程错误兜底：不变量要求它一定在清单里，真落空时退回首格总比返回 `undefined`
+   * 再把 `Tab` 的 nullable 传染给每一个调用点好
+   */
+  function activeOf(p: PaneRecord): Tab {
+    const list = p.tabs()
+    return list.find((t) => t.id === p.activeTabId()) ?? list[0]!
+  }
+
   function activeTab(): Tab {
-    return tabById(focusedPane().tabId()) ?? tabs()[0]!
+    return activeOf(focusedPane())
   }
 
   /**
-   * 显示某个标签的那个分屏的编辑器实例。
+   * 显示某个标签的那个分屏的编辑器实例。**只有那一屏的活动标签才有**（不变量 3）。
    *
    * 存在时 `view.state` 才是这个标签的最新状态——`snapshot` 只在切走的那一刻更新，
    * 显示期间它一直是旧的。读错来源会让「保存」写出旧内容。
    */
   function viewOf(tab: Tab): EditorController | null {
-    return paneOfTab(tab.id)?.controller ?? null
+    const pane = paneOfTab(tab.id)
+    return pane !== undefined && pane.activeTabId() === tab.id ? pane.controller : null
   }
 
   /**
@@ -541,39 +642,28 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return tab
   }
 
-  function makePane(tabId: number): PaneRecord {
-    const [id, setId] = createSignal(tabId)
-    return { id: nextPaneId++, tabId: id, setTabId: setId, controller: null }
-  }
-
-  /** 把分屏里那份现场存回标签，之后 view 就可以去显示别的东西了 */
-  function capture(pane: PaneRecord) {
-    const tab = tabById(pane.tabId())
-    if (tab && pane.controller) tab.snapshot = pane.controller.capture()
-  }
-
   /**
-   * 让一个分屏改显示另一个标签：先把当前标签的现场存回去，再把目标标签装进来。
-   *
-   * `capture` 必须在 `restore` 之前——反过来就是拿目标标签的 state 覆盖掉当前标签
-   * 还没存盘的最后一次编辑。
-   *
-   * 🔴 整段包在 `batch` 里，因为 `pane.setTabId` 是一次**信号写入**：不包的话它当场就把
-   * 订阅者刷一遍，而那时 `restore` 还没跑，订阅者看到的是「新标签 id + 上一份文档的正文」
-   * 这么一个撕裂的现场。预览面板正好踩在这一条上——它的 effect 读 `tabId()` 判定
-   * 「换标签了，立刻重渲染」，然后从 `view.state` 里读出**上一个**标签的正文渲染出来；
-   * 而 `restore` 走的是 `view.setState`，不触发 CM6 的 updateListener（同 `host.setText`
-   * 里那条注释），于是没有任何东西会再叫它一遍，预览就永远停在上一份文档上。
-   * 度量那一路看不见这个 bug：`syncMetrics(next)` 是把 `next` **显式**递进去的。
+   * 造一块分屏。`list` 是它的初始标签（至少一个，见文件头不变量 1），
+   * `activeId` 缺省 = 头一个。
    */
-  function showIn(pane: PaneRecord, next: Tab) {
-    if (pane.tabId() === next.id) return
-    batch(() => {
-      capture(pane)
-      pane.setTabId(next.id)
-      pane.controller?.restore(next.snapshot)
-      if (pane.id === focusedPaneId()) syncMetrics(next)
-    })
+  function makePane(list: Tab[], activeId?: number): PaneRecord {
+    const [own, setOwn] = createSignal(list)
+    const [active, setActive] = createSignal(activeId ?? list[0]!.id)
+    return {
+      id: nextPaneId++,
+      tabs: own,
+      setTabs: setOwn,
+      activeTabId: active,
+      setActiveTabId: setActive,
+      controller: null,
+    }
+  }
+
+  /** 把分屏里那份现场存回**它正在显示的那个标签**，之后 view 就可以去显示别的东西了 */
+  function capture(pane: PaneRecord) {
+    if (!pane.controller) return
+    const tab = pane.tabs().find((t) => t.id === pane.activeTabId())
+    if (tab) tab.snapshot = pane.controller.capture()
   }
 
   function attach(paneId: number, controller: EditorController) {
@@ -582,8 +672,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     pane.controller = controller
     // 视图就是用这个标签的 state 挂起来的，不需要 restore（那会把一个全新视图的 docView
     // 拆了重建）；但滚动位置得补上——会话恢复出来的标签带着非零滚动，新 view 是从 0 起的
-    const tab = tabById(pane.tabId())
-    if (tab) controller.applyScroll(tab.snapshot)
+    controller.applyScroll(activeOf(pane).snapshot)
     if (paneId === focusedPaneId()) {
       syncMetrics(activeTab())
       // 聚焦的那块要真的能打字。`split` 里的 `focusPane` 跑的时候新分屏的 controller
@@ -641,33 +730,192 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     focusPane(next.id)
   }
 
-  function split(splitDirection: SplitDirection) {
-    setDirection(splitDirection)
-    if (panes().length >= MAX_PANES) return
-    // 新分屏装一个新空标签，而不是把当前标签复制过去：一个标签只能显示在一个分屏里
-    // （见文件头的不变量 2）。要对照两个文件的话，在新分屏里打开另一个就是。
-    const tab = makeTab()
-    setTabs([...tabs(), tab])
-    const pane = makePane(tab.id)
-    setPanes([...panes(), pane])
-    focusPane(pane.id)
+  /**
+   * 一次性换掉某一屏的**标签清单**与**正在显示哪一个**。
+   *
+   * 所有改归属的动作（新建、关掉、搬走、搬进来、重排、合并、切换活动标签）都走它，于是
+   * 「先 capture 再 restore」「整段 batch」「聚焦那一屏要刷度量」这三件事只有一份实现。
+   * 🔴 少任何一件都是一条难查的缺陷：
+   *
+   * - **capture 漏了** = 用户最后几个字没了。`snapshot` 是切走那一刻的旧现场，
+   *   而 capture 必须跑在 `setActiveTabId` **之前**——它读的是「此刻 view 上是哪一个」，
+   *   写入之后这个信息就没了。
+   * - **batch 漏了** = 订阅者读到撕裂的中间态。`pane.setActiveTabId` 是一次信号写入，
+   *   不包的话它当场就把订阅者刷一遍，而那时 `restore` 还没跑，它们看到的是
+   *   「新标签 id + 上一份文档的正文」。预览面板正好踩在这一条上——它的 effect 读
+   *   `activeTabId()` 判定「换标签了，立刻重渲染」，然后从 `view.state` 里读出**上一个**
+   *   标签的正文渲染出来；而 `restore` 走的是 `view.setState`，不触发 CM6 的
+   *   updateListener（同 `host.setText` 里那条注释），于是没有任何东西会再叫它一遍，
+   *   预览就永远停在上一份文档上。度量那一路看不见这个 bug：`syncMetrics(shown)`
+   *   是把 `shown` **显式**递进去的。
+   * - **度量漏了** = 状态栏停在上一份文档的行列数上。
+   *
+   * @param activeId 换完之后要显示的那个。⛔ 必须在 `list` 里——不在就是调用方的编程错误，
+   * 这里什么都不做（`activateTab` 对不存在的 id 是空操作，同一条兜底口径）
+   */
+  function writePane(pane: PaneRecord, list: Tab[], activeId: number) {
+    const shown = list.find((t) => t.id === activeId)
+    if (shown === undefined) return
+    const before = pane.activeTabId()
+    batch(() => {
+      // `before !== activeId` 才 capture：活动标签没换时 view 上显示的正是它自己，
+      // 那一份 snapshot 由 detach / 切走那条路负责，这里再抓一次只是白做一趟序列化。
+      // ⚠️ 换的那一下必须抓**在写入之前**：`capture` 读的是「此刻 view 上是哪一个」，
+      // 而 `setActiveTabId` 一写，这个信息就没了
+      if (before !== activeId) capture(pane)
+      pane.setTabs(list)
+      if (before !== activeId) {
+        pane.setActiveTabId(activeId)
+        pane.controller?.restore(shown.snapshot)
+      }
+      if (pane.id === focusedPaneId()) syncMetrics(shown)
+    })
   }
 
-  function closePane(paneId: number) {
+  /**
+   * 收掉一块**已经空了**的分屏：现场存回标签、从 `panes()` 里摘掉、焦点交给邻居。
+   *
+   * ⚠️ 调用方负责保证还剩至少一块（不变量 1：`panes()` 永远非空）。
+   * 焦点给「原来那个位置上的那一块」，也就是右邻居；被收的是最后一块时退回新的末尾
+   */
+  function dropEmptyPane(victim: PaneRecord) {
+    capture(victim)
+    const list = panes()
+    const at = list.findIndex((p) => p.id === victim.id)
+    const rest = list.filter((p) => p.id !== victim.id)
+    // batch：`setPanes` 与紧接着那次改焦点必须一起落地，否则订阅者会看到
+    // 「`focusedPaneId` 指着一块已经不在 `panes()` 里的分屏」这么一档
+    batch(() => {
+      setPanes(rest)
+      if (victim.id === focusedPaneId()) focusPane(rest[Math.min(at, rest.length - 1)]!.id)
+    })
+  }
+
+  /**
+   * 把 `id` 那个标签从它所在那一屏的清单里摘出来（**不关文档、不还 fd**），
+   * 并给那一屏换一个显示的标签：右邻居优先——摘掉第 i 个之后，原来的第 i+1 个正好落到
+   * 下标 i 上；它是最后一个时退回末尾。
+   *
+   * 那一屏因此空了怎么办由 `orphan` 决定：
+   * - `'fresh'`：补一个新空标签。`split` 搬走某屏唯一的标签时用——用户刚要求「分屏」，
+   *   那一屏不能就地消失；
+   * - `'close'`：连这一屏一起收掉（关标签、跨屏拖拽都是这一档，与其它编辑器一致）。
+   *   只剩一块分屏时退回 `'fresh'`，因为不变量 1 不许「零分屏」。
+   *
+   * @returns 它原来所在的那一屏；`id` 不存在时 `undefined`
+   */
+  function detachFromPane(id: number, orphan: 'fresh' | 'close'): PaneRecord | undefined {
+    const owner = paneOfTab(id)
+    if (owner === undefined) return undefined
+    const list = owner.tabs()
+    const index = list.findIndex((t) => t.id === id)
+    const rest = list.filter((t) => t.id !== id)
+    if (rest.length === 0) {
+      if (orphan === 'close' && panes().length > 1) {
+        dropEmptyPane(owner)
+        return owner
+      }
+      const fresh = makeTab()
+      writePane(owner, [fresh], fresh.id)
+      return owner
+    }
+    // 活动标签没被摘走时 `activeTabId` 原样传回去，`writePane` 于是跳过 capture/restore
+    const next = rest[Math.min(index, rest.length - 1)]!
+    writePane(owner, rest, owner.activeTabId() === id ? next.id : owner.activeTabId())
+    return owner
+  }
+
+  /**
+   * 加一块分屏，并把整排的方向定成 `splitDirection`。已到 `MAX_PANES` 时只改方向。
+   *
+   * 新分屏里有谁：不给 `moveTabId` 就是一个**新空标签**；给了就把那个标签**搬**进去，
+   * 它原来那一屏改显示右邻居（搬空了就补一个空标签，见 `detachFromPane`）。
+   *
+   * ⛔ 不做 VS Code 那种「同一份文件在两块分屏里各显示一次」：那要求一个标签同时挂在
+   * 两处，正是文件头不变量 2、3 排除的情况（`snapshot` 不再是唯一真相，撤销历史与滚动
+   * 位置会分叉）。搬走 + 原地换一个是扁平模型下唯一既满足「右分屏看我正看的这份」、
+   * 又不破不变量的做法。
+   */
+  function split(splitDirection: SplitDirection, moveTabId?: number) {
+    setDirection(splitDirection)
+    if (panes().length >= MAX_PANES) return
+    // 整段包在 batch 里：搬标签时中间会短暂出现「那个标签谁都不属于」的一刻
+    // （源那一屏已经把它摘了、新分屏还没进 `panes()`），不包的话 `<For>` 会渲染到这一档
+    batch(() => {
+      const moving = moveTabId === undefined ? undefined : tabById(moveTabId)
+      let list: Tab[]
+      if (moving === undefined || detachFromPane(moving.id, 'fresh') === undefined) {
+        // 第二种情况是兜底：菜单弹着的时候那个标签可能已经被关掉了（`tabById` 落空）
+        list = [makeTab()]
+      } else {
+        list = [moving]
+      }
+      const pane = makePane(list)
+      setPanes([...panes(), pane])
+      focusPane(pane.id)
+    })
+  }
+
+  /**
+   * 把一块分屏合掉：它的**整排标签并进另一块**，一个都不关。
+   *
+   * 并进哪一块：焦点所在的那块；被合的正是焦点那块时，并进剩下的最后一块
+   * （与「合并分屏」塌回单栏时用户看着的那一块是同一块）。
+   *
+   * 「合并分屏」（`editor.mergePanes`、「窗口」菜单）走这一条：收掉几块分屏的时候
+   * 顺手关掉十几个标签不是「合并」该有的副作用——用户要的是版面塌回单栏，文档还都在。
+   * 要连标签一起关的是 `closePane`。
+   */
+  function mergePane(paneId: number) {
     if (panes().length <= 1) return
     const victim = paneById(paneId)
     if (!victim) return
-    // 现场先存回标签：分屏一没，Solid 就会卸载 EditorPane 并 destroy 掉那个 view
-    capture(victim)
     const rest = panes().filter((p) => p.id !== paneId)
-    setPanes(rest)
-    if (paneId === focusedPaneId()) focusPane(rest[rest.length - 1]!.id)
+    const target = (paneId === focusedPaneId() ? undefined : paneById(focusedPaneId())) ?? rest[rest.length - 1]!
+    batch(() => {
+      // 现场先存回标签：分屏一没，Solid 就会卸载 EditorPane 并 destroy 掉那个 view。
+      // 只有它**正在显示**的那一个需要抓，同屏其余标签本来就只有 snapshot
+      capture(victim)
+      writePane(target, [...target.tabs(), ...victim.tabs()], target.activeTabId())
+      setPanes(rest)
+      if (paneId === focusedPaneId()) focusPane(target.id)
+    })
   }
 
-  function newTab(): Tab {
+  /**
+   * 关掉一块分屏**和它里面的所有标签**。脏的那些**一次问完**（保存／不保存／取消），
+   * 选「取消」或保存没成功就什么都不动。
+   *
+   * 与 `mergePane` 的差别就是这些标签：「关闭就是关掉了」。分屏没了、里面那些文档还
+   * 赖在标签条上，用户看不出它们跟哪块分屏有过关系——那正是被当成 bug 报上来的现场。
+   *
+   * ⚠️ 只剩一块分屏时是空操作：那一屏空了整个现场就没了（不变量 1），而「把手上这一屏
+   * 的标签全关掉、留一个空文档」是「关闭所有标签」的活儿，两个入口不该有两种结果
+   */
+  async function closePane(paneId: number) {
+    if (panes().length <= 1) return
+    const victim = paneById(paneId)
+    if (!victim) return
+    if (!(await settle(victim.tabs().filter((t) => t.doc.dirty())))) return
+    // 弹框那段时间里用户可能自己关掉了这块分屏（或者关到只剩一块了），重新查一遍现场
+    const doomed = panes().length > 1 ? paneById(paneId) : undefined
+    if (doomed === undefined) return
+    const doomedTabs = doomed.tabs()
+    batch(() => {
+      dropEmptyPane(doomed)
+    })
+    // 🔴 fd 在分屏与标签都从状态里摘掉**之后**才还：反过来的话那一段窗口里
+    // `fileWatch.currentPaths()` 还看得见它们，真来一条外部改动事件就会给一个
+    // 马上就要被扔掉的标签再开一个分片，而那个 fd 永远没人 dispose。
+    // 理由与 `dropTab` 里那一段逐字相同
+    for (const tab of doomedTabs) tab.doc.releaseShard()
+  }
+
+  function newTab(paneId?: number): Tab {
+    const pane = (paneId === undefined ? undefined : paneById(paneId)) ?? focusedPane()
     const tab = makeTab()
-    setTabs([...tabs(), tab])
-    showIn(focusedPane(), tab)
+    // 接在末尾而不是紧跟活动标签：这一屏的清单是**屏幕顺序**，用户点「+」时眼睛在右边
+    writePane(pane, [...pane.tabs(), tab], tab.id)
     return tab
   }
 
@@ -689,20 +937,23 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     setRecent([path, ...list.filter((p) => p !== path)].slice(0, MAX_RECENT))
   }
 
+  /**
+   * 显示 `id` 那个标签，并把焦点交给它所在的那一屏。
+   *
+   * 🔴 焦点**跟着标签走**，⛔ 不是「把它搬进聚焦的这一屏」：分组模型下标签属于某一屏，
+   * 搬过来等于把它从原来那一屏的标签条上摘走，而用户点的明明是自己那一屏里的一格。
+   * 连带后果是「跳到定义」「搜索结果」「`Cmd+P`」这几条最终落在这里的入口都会把光标
+   * 带过去——去哪个文档，光标就跟到哪一屏，这正是用户报的那三条里第 1、2 条要的方向。
+   */
   function activateTab(id: number) {
-    const tab = tabById(id)
-    if (!tab) return
-    // 放在两条分支**之前**：「聚焦那个已经在显示它的分屏」与「把它装进聚焦的分屏」
-    // 在 MRU 看来是同一件事——用户现在看的是它
-    remember(tab.doc.path())
-    // 已经在某个分屏里显示 → 聚焦那个分屏，而不是把它从那边搬过来：
-    // 搬走会让那个分屏空掉，而「一个标签只能显示在一个分屏里」也不允许它同时留在两处
     const owner = paneOfTab(id)
-    if (owner) {
-      focusPane(owner.id)
-      return
-    }
-    showIn(focusedPane(), tab)
+    if (owner === undefined) return
+    const tab = owner.tabs().find((t) => t.id === id)
+    if (tab === undefined) return
+    remember(tab.doc.path())
+    // 清单原样传回去：换的只是「显示哪一个」，`writePane` 看见 `activeId` 变了才 capture/restore
+    writePane(owner, owner.tabs(), tab.id)
+    focusPane(owner.id)
   }
 
   /**
@@ -729,12 +980,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return true
   }
 
-  /** 真正把标签摘掉：先从标签条上拿掉并给空出来的分屏换一个标签，最后还 fd */
+  /** 真正把标签摘掉：先从它那一屏的清单里拿掉（那一屏因此空了就收掉），最后还 fd */
   function dropTab(id: number) {
     const doomed = tabById(id)
     if (!doomed) return
-    removeFromList(id)
-    // 🔴 分片的 fd 在这儿还回去，而顺序必须是**先从标签表里摘掉，再还**。反过来的话
+    detachFromPane(id, 'close')
+    // 🔴 分片的 fd 在这儿还回去，而顺序必须是**先从状态里摘掉，再还**。反过来的话
     // `releaseShard()` 把 `doc.shard()` 置回 null 的那一刻，这个标签**还在** `tabs()` 里，
     // 于是 `fileWatch.currentPaths()` 会把它当成一个普通内联标签送进清单——
     // Rust 侧白白订一次目录又立刻退订。更要紧的是同一段窗口里真来了一条外部改动事件的话，
@@ -746,70 +997,6 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     // ⚠️ 刻意放在 `dropTab` 而不是 `ShardPane` 的 onCleanup：换标签也会卸载那个组件，
     // 而分片必须活到标签真的关掉为止（理由写在 `ShardPane.tsx` 的模块文档里）
     doomed.doc.releaseShard()
-  }
-
-  /**
-   * 把标签从标签条上摘掉，并给显示着它的那块分屏换一个标签显示。不碰任何 fd。
-   *
-   * 换谁：右邻居优先，但**只能挑一个没在别的分屏里显示着的**——否则两块分屏会显示同一个
-   * 标签，正是文件头不变量 2 排除的情况（`snapshot` 不再是「没显示时的唯一真相」）。
-   * 一个都挑不出来时就补一个空标签：宁可标签条上多一个「空文档」，也不能让现场分叉。
-   */
-  function removeFromList(id: number) {
-    // 🔴 整个函数体裹在 `batch` 里，因为中间那几步会短暂造出「某块分屏显示的标签不在
-    // `tabs()` 里」的状态：`setTabs` 已经把它摘掉了，而 `showIn` 还没给那块分屏换上新标签。
-    //
-    // 这个窗口从前没人看得见——`EditorPane` 只在 `onMount` 读一次 props，换标签不重挂。
-    // 但 M2-H 之后 `App.tsx` 在每块分屏外面套了一层 `<Show when={shardOf(pane)}>`：
-    // `shardOf` 查不到标签就返回 null，于是关掉一个**分片**标签的那一瞬间，那块分屏从
-    // 「只读分片」翻成 fallback，真的去挂一个新的 `EditorPane`，而 `paneState` 里那句
-    // `tabs().find(...)!` 当场炸——`!` 的前提是「分屏新建时它的标签一定已经在 `tabs()` 里」
-    // （见 workspace 的 `split`），中间态正好破坏这条前提。
-    //
-    // 而炸点在 `closeTab` 这个 async 函数体内，所以它变成一个没人接的 rejected promise：
-    // `dropTab` 后半句的 `releaseShard()` 再也跑不到，那个 fd 就这么漏了，一点声音都没有。
-    batch(() => {
-      const list = tabs()
-      const index = list.findIndex((t) => t.id === id)
-      if (index < 0) return
-      const rest = list.filter((t) => t.id !== id)
-
-      // 关掉最后一个 = 换一个空标签进来（见文件头的不变量）。
-      // 此时必然只剩一块分屏：分屏数永远 ≤ 标签数（split 一次同时加一个标签和一块分屏，
-      // closePane 只减分屏不减标签），所以标签只剩一个时分屏也只剩一块。
-      if (rest.length === 0) {
-        const fresh = makeTab()
-        setTabs([fresh])
-        const only = panes()[0]!
-        showIn(only, fresh)
-        focusPane(only.id)
-        return
-      }
-
-      const victim = paneOfTab(id)
-      // 这个标签谁都没显示（比如它的分屏刚被合并掉），那就只是从标签条上摘掉
-      if (!victim) {
-        setTabs(rest)
-        return
-      }
-
-      const elsewhere = new Set(
-        panes()
-          .filter((p) => p.id !== victim.id)
-          .map((p) => p.tabId()),
-      )
-      const free = rest.filter((t) => !elsewhere.has(t.id))
-      if (free.length === 0) {
-        const fresh = makeTab()
-        setTabs([...rest, fresh])
-        showIn(victim, fresh)
-        return
-      }
-      setTabs(rest)
-      // 摘掉第 i 个之后，原来的第 i+1 个正好落到 `free` 的下标 i 上；
-      // 关掉的是最后一个（或右邻居都被别的分屏占着）时退回末尾
-      showIn(victim, free[Math.min(index, free.length - 1)]!)
-    })
   }
 
   async function closeTab(id: number) {
@@ -833,9 +1020,9 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
    * ⚠️ 取消（或保存没成功）时**一个都不关**，而不是「关掉干净的那些」：用户点的是取消，
    * 半关一半留在屏幕上比什么都没发生更难解释。
    *
-   * 逐个 `dropTab` 而不是自己拼一个新列表：摘掉一个标签要顺带处理「哪块分屏改显示谁」
-   * 与「还掉分片的 fd」，那两件事都已经在 `removeFromList` / `dropTab` 里写对了，
-   * 自己拼等于把它们重抄一遍。
+   * 逐个 `dropTab` 而不是自己拼一个新列表：摘掉一个标签要顺带处理「那一屏改显示谁」
+   * 「那一屏空了要不要收掉」与「还掉分片的 fd」，那三件事都已经在 `detachFromPane` /
+   * `dropTab` 里写对了，自己拼等于把它们重抄一遍。
    */
   async function dropTabs(doomed: readonly Tab[]) {
     if (doomed.length === 0) return
@@ -844,23 +1031,72 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   async function closeOtherTabs(id: number) {
-    if (!tabById(id)) return
-    await dropTabs(tabs().filter((t) => t.id !== id))
+    // 作用域是 `id` **所在那一屏**：菜单是从那一屏的标签条上弹出来的，「其它」就是同屏的其它
+    const owner = paneOfTab(id)
+    if (owner === undefined) return
+    await dropTabs(owner.tabs().filter((t) => t.id !== id))
   }
 
-  async function closeAllTabs() {
-    await dropTabs(tabs())
+  async function closeAllTabs(paneId?: number) {
+    const pane = (paneId === undefined ? undefined : paneById(paneId)) ?? focusedPane()
+    await dropTabs(pane.tabs())
   }
 
   function reorder(draggedId: number, targetId: number) {
     if (draggedId === targetId) return
-    const list = [...tabs()]
+    const owner = paneOfTab(draggedId)
+    const target = paneOfTab(targetId)
+    if (owner === undefined || target === undefined) return
+    // 拖到**别的**一屏的标签上 = 搬进那一屏，落点就是被压住的那一格。
+    // 手势只有一个（拖着标签放到另一个标签上），用户不知道也不该需要知道两者是否同屏
+    if (owner.id !== target.id) {
+      moveTab(
+        draggedId,
+        target.id,
+        target.tabs().findIndex((t) => t.id === targetId),
+      )
+      return
+    }
+    const list = [...owner.tabs()]
     const from = list.findIndex((t) => t.id === draggedId)
     const to = list.findIndex((t) => t.id === targetId)
     if (from < 0 || to < 0) return
     const [moved] = list.splice(from, 1)
     list.splice(to, 0, moved!)
-    setTabs(list)
+    // 换顺序不换活动标签：`writePane` 看见 `activeId` 没变就跳过 capture/restore，
+    // 于是拖一下标签不会把正文重新 setState 一遍（那会拆掉 docView、丢掉滚动位置）
+    writePane(owner, list, owner.activeTabId())
+  }
+
+  function moveTab(tabId: number, targetPaneId: number, index?: number) {
+    const tab = tabById(tabId)
+    const target = paneById(targetPaneId)
+    if (tab === undefined || target === undefined) return
+    const owner = paneOfTab(tabId)
+    if (owner === undefined) return
+    const clamp = (n: number, len: number) => Math.min(Math.max(0, n), len)
+    if (owner.id === target.id) {
+      const list = [...target.tabs()]
+      const from = list.findIndex((t) => t.id === tabId)
+      const at = clamp(index ?? list.length - 1, list.length - 1)
+      if (from === at) return
+      const [moved] = list.splice(from, 1)
+      list.splice(at, 0, moved!)
+      writePane(target, list, target.activeTabId())
+      return
+    }
+    batch(() => {
+      // 🔴 先摘、后插：摘的那一下会把它的现场 capture 进 `snapshot`（`writePane` 换活动
+      // 标签时抓的正是「此刻 view 上那一个」），而目标那一屏随后 `restore` 的就是这份
+      // snapshot。反过来先插后摘的话，restore 用到的是**上一轮**的旧现场——用户搬过去
+      // 之后发现最后几个字没了，而那正好是拖拽最容易撞上的一档（拖的就是正在看的那份）
+      detachFromPane(tabId, 'close')
+      const list = [...target.tabs()]
+      list.splice(clamp(index ?? list.length, list.length), 0, tab)
+      writePane(target, list, tab.id)
+      // 焦点跟着搬过去的标签走：用户把它扔进那一屏，下一步就是要在那儿打字
+      focusPane(target.id)
+    })
   }
 
   async function openAt(path: string) {
@@ -871,7 +1107,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       activateTab(existing.id)
       return
     }
-    const active = activeTab()
+    // 🔴 「就地复用」与「新开一格」都只发生在**聚焦的那一屏**：这正是用户报的
+    // 「光标在哪一屏，打开的文件就落在哪一屏」。⛔ 别改成「哪一屏已经有这个文件就复用」
+    // ——那条上面 `existing` 那一段已经管了，而且它会把焦点搬走
+    const pane = focusedPane()
+    const active = activeOf(pane)
     // 干净的无名标签就地复用：不然「新建 → 打开」这套动作每来一次就多一个空标签，
     // 标签条很快全是没用的「空文档」
     if (active.doc.path() === null && !active.doc.dirty()) {
@@ -881,7 +1121,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       remember(active.doc.path())
       return
     }
-    const tab = newTab()
+    const tab = newTab(pane.id)
     await tab.doc.openAt(path)
     remember(tab.doc.path())
   }
@@ -961,22 +1201,51 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
-   * 要存进会话的标签。超出 `MAX_SESSION_TABS` 时从后面截断，但**正在显示的标签一个都不丢**。
+   * 要存进会话的现场：一份摊平的标签清单 + 每屏「有哪几格、显示哪一格」的下标。
    *
-   * 丢一个显示中的标签会让 `panes` 里的一个下标悬空，而 Rust 侧的 `validate` 会因此
-   * 拒掉**整份**存档——为了少存几个标签把整个会话弄没了，是最坏的一笔交换。
+   * 超出 `MAX_SESSION_TABS` 时**从后面砍**：分屏按顺序处理，预算用完了后面的分屏整块不存；
+   * 一屏里放不下的标签也是从末尾砍。唯一硬要求是**每一屏正在显示的那个一定留住**——
+   * 丢一个显示中的标签会让 `panes[i].active` 指向一个不存在的下标，而 Rust 侧的
+   * `validate` 会因此拒掉**整份**存档：为了少存几个标签把整个会话弄没了，是最坏的一笔交换。
+   *
+   * ⚠️ 于是每屏先扣一格给显示中的标签，剩下的才按屏幕顺序装别的（`spare`）。
+   * 顺序按屏幕顺序走，截断也就不会把标签条打乱
    */
-  function tabsForSession(): Tab[] {
-    const list = tabs()
-    if (list.length <= MAX_SESSION_TABS) return list
-    const shown = new Set(panes().map((p) => p.tabId()))
-    const budget = MAX_SESSION_TABS - shown.size
+  function layoutForSession(): {
+    tabs: Tab[]
+    panes: SessionPane[]
+    focused: number
+  } {
     const kept: Tab[] = []
-    // 按原顺序遍历，于是 kept 也是原顺序：截断不该把标签条的顺序打乱
-    for (const tab of list) {
-      if (shown.has(tab.id) || kept.length < budget) kept.push(tab)
+    const indexOf = new Map<number, number>()
+    const out: SessionPane[] = []
+    let focused = -1
+    for (const pane of panes()) {
+      // 预算一个都不剩了：这一屏整个不存（`active` 那一格是硬要求，塞不进去）
+      if (kept.length >= MAX_SESSION_TABS) break
+      const shown = activeOf(pane)
+      let spare = MAX_SESSION_TABS - kept.length - 1
+      const indices: number[] = []
+      // 按屏幕顺序遍历，于是存下来的顺序也是屏幕顺序：截断不该把标签条打乱
+      for (const tab of pane.tabs()) {
+        if (tab.id !== shown.id) {
+          if (spare <= 0) continue
+          spare -= 1
+        }
+        indices.push(kept.length)
+        indexOf.set(tab.id, kept.length)
+        kept.push(tab)
+      }
+      out.push({ tabs: indices, active: indexOf.get(shown.id)! })
+      if (pane.id === focusedPaneId()) focused = out.length - 1
     }
-    return kept
+    return {
+      tabs: kept,
+      panes: out,
+      // 聚焦那一屏被截掉了就退到留下的最后一屏——被砍掉的都在后面，
+      // 所以「最后一屏」正是离用户原来那一屏最近的
+      focused: focused < 0 ? Math.max(0, out.length - 1) : focused,
+    }
   }
 
   function serializeTab(tab: Tab): SessionTab {
@@ -1008,22 +1277,16 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   function serializeSession(): Session {
-    const list = tabsForSession()
-    const indexOf = new Map<number, number>()
-    list.forEach((tab, i) => indexOf.set(tab.id, i))
-    const paneList = panes()
+    const layout = layoutForSession()
     return {
       version: SESSION_VERSION,
       direction: direction(),
-      // 夹到 0：`findIndex` 落空时返回 -1，而 -1 对 serde 的 `usize` 是非法值，
-      // 整份存档会解析失败。`focusedPane()` 本来也是「找不到就退回第一块」这个口径
-      focused: Math.max(
-        0,
-        paneList.findIndex((p) => p.id === focusedPaneId()),
-      ),
-      tabs: list.map(serializeTab),
-      // 下标一定取得到：tabsForSession 保证了显示中的标签一个都没被截掉
-      panes: paneList.map((p) => indexOf.get(p.tabId())!),
+      // `layoutForSession` 已经把「聚焦那一屏被截掉」兜成了最后一屏的下标，
+      // 所以这里不会再出现 -1（它对 serde 的 `usize` 是非法值，整份存档会解析失败）
+      focused: layout.focused,
+      tabs: layout.tabs.map(serializeTab),
+      // 下标一定取得到：`layoutForSession` 保证了每屏正在显示的那个一个都没被截掉
+      panes: layout.panes,
       // 这一格永远是 null，由 `sessionSync` 从项目树那边覆盖掉。
       //
       // 不在这里填是因为 workspace **不知道项目树存在**：树管「磁盘上有什么」，
@@ -1077,6 +1340,65 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     for (const tab of tabs()) tab.doc.releaseShard()
   }
 
+  /**
+   * 把存档里的分屏形状还原成 `PaneRecord[]`。
+   *
+   * ## 分工：Rust 拒，前端治孤儿
+   *
+   * 🔴 Rust 侧的 `validate`（`crates/vela-core/src/session/mod.rs`）对**空分屏、下标越界、
+   * 同一个下标被两屏认领、`active` 不在自己的 `tabs` 里**四种一律整份作废——用户看到的
+   * 是「上次的会话没能读回来」那一句。它**只放过一种**：没人认领的孤儿标签
+   * （`tabs` 里有、任何一屏的 `tabs` 都没提到）。那一种的正确处置不是作废，而是
+   * 「标签还在，只是挤在同一屏里」，所以留给这里收编——为它赔上所有草稿（连未保存的）
+   * 不划算。分工的两端各有一段注释，改一边要改另一边。
+   *
+   * 于是这里实际要做的只有第 3 条；前两条是**顺带**的防御：真存档到不了这两档
+   * （Rust 已经拒了），而 `fresh[index]` 在类型上就是 `Tab | undefined`
+   * （`noUncheckedIndexedAccess`），不写这一手连编译都过不去。
+   *
+   * 1. **下标越界**（`fresh[index]` 是 undefined）：跳过。
+   * 2. **同一个下标出现在两块分屏里**：只认第一次。整屏都被这两条过滤光了就不建它
+   *    （一块空分屏违反不变量 1）。
+   * 3. **孤儿**：塞进 `focused` 那一屏的末尾。旧模型（M4-R 之前）里孤儿是合法状态
+   *    ——`mergePane` 就会造出来——而新模型的不变量 2 要求「每个标签恰好属于一屏」。
+   *    旧档本身由 Rust 的 `migrate_legacy_panes` 在**读的那一刻**就收编过了，
+   *    所以走到这里的孤儿只可能来自手改的存档。
+   *
+   * ⚠️ 这里刻意不做「跨版本的形状猜测」：旧档（`panes: number[]`）到不了这里，
+   * 它在 Rust 侧就被读成新形状了（见 `session/mod.rs` 的 `RawPanes`）。
+   */
+  function panesFromSession(session: Session, fresh: Tab[]): PaneRecord[] {
+    const claimed = new Set<number>()
+    const built: { list: Tab[]; active: number }[] = []
+    for (const saved of session.panes) {
+      const list: Tab[] = []
+      for (const index of saved.tabs) {
+        const tab = fresh[index]
+        if (tab === undefined || claimed.has(index)) continue
+        claimed.add(index)
+        list.push(tab)
+      }
+      // 整屏都被上面两条过滤光了就别建它：一块空分屏违反不变量 1
+      if (list.length === 0) continue
+      const savedActive = fresh[saved.active]
+      built.push({
+        list,
+        active: savedActive !== undefined && list.includes(savedActive) ? savedActive.id : list[0]!.id,
+      })
+    }
+
+    const orphans = fresh.filter((_, i) => !claimed.has(i))
+    if (built.length === 0) {
+      // 一块合法的分屏都没有（下标全越界）。此时 fresh 一定非空——空的那一档
+      // 由 `restoreSession` 在调用这里之前就换成了一个新标签
+      built.push({ list: orphans, active: orphans[0]!.id })
+    } else if (orphans.length > 0) {
+      const at = Math.min(Math.max(0, session.focused), built.length - 1)
+      built[at]!.list.push(...orphans)
+    }
+    return built.map(({ list, active }) => makePane(list, active))
+  }
+
   async function restoreSession(session: Session): Promise<void> {
     // 先一次建好所有标签，再灌内容：panes 用的是 session 里的下标，靠 `fresh[i]` 对齐，
     // 边建边插会让下标错位
@@ -1107,28 +1429,31 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
     session.tabs.forEach((saved, i) => applyRestoredPosition(fresh[i]!, saved))
 
-    const freshPanes = session.panes.map((tabIndex) => makePane(fresh[tabIndex]!.id))
+    // 存档里一个标签都没有（Rust 侧 `validate` 会拒，但本方法是公开的，测试也手搓存档）
+    // 就退回「一块分屏 + 一个空标签」，那正是启动时的初始状态
+    const freshPanes = fresh.length === 0 ? [makePane([makeTab()])] : panesFromSession(session, fresh)
     setDirection(session.direction)
     // 🔴 旧的那批标签整个被扔掉，它们身上的分片得还回去（理由见 `dropTab` 里那一段）。
     //
-    // 位置是**紧贴着 `setTabs(fresh)`**，不是这个方法开头。放在开头的话，从这里到
-    // `setTabs` 之间隔着上面那一整段 `await Promise.all`——几十个文件的并行读盘，
+    // 位置是**紧贴着 `setPanes(freshPanes)`**，不是这个方法开头。放在开头的话，从这里到
+    // `setPanes` 之间隔着上面那一整段 `await Promise.all`——几十个文件的并行读盘，
     // 几百毫秒起步。那段时间里旧标签还在 `tabs()` 上、而 `shard()` 已经是 null，
     // 于是 `fileWatch` 会把它们当成普通内联标签送进清单；真来一条外部改动事件的话，
     // `reload` → 撞 too_large → 再开一个分片，而那个 fd 挂在一个马上就要被扔掉的
     // 标签上，`dispose` 永远不会被调到。
     //
     // 紧贴着就没有这个问题：两行之间没有 `await`，Solid 的 effect 要等到这一批更新
-    // 落地之后才跑，那时它看见的已经是 `fresh`。
+    // 落地之后才跑，那时它看见的已经是 `freshPanes`（`tabs()` 是从它现摊平出来的，
+    // 同一批里一起换掉）。
     //
     // ⚠️ 这个方法只在启动时用一次，那时通常一个分片都没有——但「只用在启动时」
     // 是文档里的一句话而不是类型系统里的一条约束，而漏一个 fd 是没有声音的
     releaseAllShards()
-    setTabs(fresh)
     // 旧的那批分屏由 Solid 卸载 EditorPane 时自己收尾：`detach` 在 panes() 里找不到
     // 旧记录会直接返回，controller 由 EditorPane 的 onCleanup 销毁，不会泄漏
     setPanes(freshPanes)
-    setFocusedPaneId(freshPanes[session.focused]!.id)
+    // 夹一次：`focused` 是存档里的下标，而上面那一段治脏数据的功夫可能让分屏数变少
+    setFocusedPaneId(freshPanes[Math.min(Math.max(0, session.focused), freshPanes.length - 1)]!.id)
     // 只夹长度，**不去重也不校验路径**：
     // - 夹是必须的，因为 Rust 侧刻意不截断（见 `Session::recent` 的文档），
     //   一份手改过的存档能塞进来几万条，全背着就是白占内存；
@@ -1142,8 +1467,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   // 起始的那一个空标签与那一块分屏。放在所有函数声明之后：
   // makeTab 要用 host，host 要用 activeTab，activeTab 要用 focusedPane
   const firstTab = makeTab()
-  const firstPane = makePane(firstTab.id)
-  setTabs([firstTab])
+  const firstPane = makePane([firstTab])
   setPanes([firstPane])
   setFocusedPaneId(firstPane.id)
   // `syncMetrics` 是普通函数（声明见上），读一次编辑器状态就把度量推进 signal。
@@ -1159,7 +1483,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
    *
    * 1. memo 在这里换不来任何东西。唯一的消费者（预览面板）自己就是防抖的，
    *    而这一层做的事只有「查一个字段」，比 memo 的比较还便宜。
-   * 2. **memo 会把「同一块分屏换标签」整个吞掉。** `showIn` 走的是 `capture` + `restore`，
+   * 2. **memo 会把「同一块分屏换标签」整个吞掉。** `show` 走的是 `capture` + `restore`，
    *    不重建 view，于是换标签前后 `controller` 是**同一个实例**——`===` 相等，memo 不通知，
    *    订阅者收不到任何信号。少这一下的症状是「切了标签，旁边的预览还停在上一份文档」，
    *    而它只在「换标签但没换分屏」这条路上发作，分屏之间切反倒是对的。
@@ -1172,10 +1496,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     // `PaneRecord` 上一个普通可变字段，那一下不触发任何信号，不留这个痕迹就没人知道
     attachedAt()
     const pane = focusedPane()
-    // `tabById(...)` 那一次读同样是为了订阅（理由见上面第 2 条）。
-    // 返回 `null` 而不是直接 `pane.controller`：一个标签都不在 `tabs()` 里的分屏
-    // 没有「当前文档」可言，那时说「没有可预览的正文」比递一个显示着幽灵文档的实例诚实
-    return tabById(pane.tabId()) === undefined ? null : pane.controller
+    // 同上，读 `activeTabId()` 也只为订阅：换标签不重建 view，`controller` 这个引用
+    // 一个字都没变，而「显示的是哪份文档」变了（这正是上面第 2 条那个坑）
+    pane.activeTabId()
+    return pane.controller
   }
 
   return {
@@ -1184,7 +1508,6 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     direction,
     focusedPaneId,
     activeTab,
-    activeIndex: () => tabs().findIndex((t) => t.id === activeTab().id),
     lineWrap: wrap,
     dark,
     minimap: minimapOn,
@@ -1194,9 +1517,9 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     focusedEditor: () => focusedPane().controller,
     tabOfView(view) {
       const pane = panes().find((p) => p.controller?.view === view)
-      // `?? null` 那一半是「分屏还在、但它显示的标签已经被关掉了」：
-      // 与 `focusedView` 返回 null 的理由同一条——没有「当前文档」就别假装有
-      return pane === undefined ? null : (tabById(pane.tabId()) ?? null)
+      // 找不到就返回 null：这个 view 所属的分屏已经被摘掉（`panes()` 里没有它了），
+      // 此刻它正在被 destroy，什么都不该做——与 `focusedView` 返回 null 的理由同一条
+      return pane === undefined ? null : activeOf(pane)
     },
     controllerOfView(view) {
       const pane = panes().find((p) => p.controller?.view === view)
@@ -1209,6 +1532,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     focusPane,
     notePaneFocus,
     split,
+    mergePane,
     closePane,
     cyclePane,
     newTab,
@@ -1219,6 +1543,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     closeAllTabs,
     activateTab,
     reorder,
+    moveTab,
     async save() {
       const doc = activeTab().doc
       await doc.save()
