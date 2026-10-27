@@ -25,16 +25,107 @@ type TabMenuAction = 'reveal' | 'splitRight' | 'splitDown' | 'closePane' | 'clos
 const REVEAL_ITEM: ContextMenuItem<TabMenuAction> = { action: 'reveal', label: '打开文件所在目录' }
 
 /**
- * 正在被拖的那个标签的 id。
+ * 正在被拖的那个标签。
  *
  * 🔴 **模块级**而不是组件内：拖拽的两个端点在 M4-R 之后常常不是同一个组件实例——
- * 从左边那屏的标签条拖到右边那屏的标签条上，`dragstart` 在一个实例里、`drop` 在另一个里。
+ * 从左边那屏的标签条拖到右边那屏的标签条上，`mousedown` 在一个实例里、松手在另一个里。
  * 放在组件内的话目标那一屏永远读到 `null`，跨屏拖拽就成了「拖过去什么也没发生」。
  *
+ * ⛔ 用的是鼠标事件而不是 HTML5 拖放（`draggable` + dragstart/drop）。
+ * Tauri 的 `dragDropEnabled` 默认是开的，它接管的是**整个 webview 的拖放会话**：
+ * 开着它，DOM 的 `dragstart`/`drop` 在真窗口里压根不触发（上游把这扇门锁掉了，
+ * 见 tauri-apps/tauri#14373），而这一份我们得留着——从访达拖文件进窗口要的就是它
+ * （`src/ipc/dragDrop.ts`）。同一时刻只能留一个，于是标签自己走鼠标手势。
+ *
  * 不是 signal：拖拽过程中没有任何渲染依赖它。
- * ⚠️ 同一时刻只可能有一次拖拽（浏览器保证），所以一个变量就够，不需要按实例分开
+ * ⚠️ 同一时刻只可能有一次拖拽（一个指针），所以一个变量就够，不需要按实例分开
  */
-let draggedTabId: number | null = null
+type TabDrag = {
+  tabId: number
+  /** 按下时的那个坐标：没越过阈值就还是一次普通点击 */
+  startX: number
+  startY: number
+  /** 越过阈值了没有。没越过时松手什么都不做 */
+  moved: boolean
+  /** 拖的是哪一个元素：`.dragging` 只挂得起在它身上，由 id 反查 DOM 要额外一套约定 */
+  el: HTMLElement
+}
+let tabDrag: TabDrag | null = null
+
+/** 起拖至少要挪开这么多像素。太低的话手抖一下就变成拖拽，点击丢了 */
+const DRAG_THRESHOLD = 4
+
+/**
+ * 拖拽期间挂在 window 上的那两只耳朵。
+ *
+ * 为什么挂在 window 而不是元素上：指针可能一路挪到标签条外面（正文、别的屏、窗口外），
+ * 元素自己的 `mousemove` 就断了；而「在哪个目标上松手」由下面各元素自己的 `mouseup`
+ * 处理——**冒泡得到的最里层就是落点**，不需要 `elementFromPoint`
+ * （jsdom 压根没实现那一个）。
+ *
+ * 同样因为跨实例，这两只是模块级的，谁起拖谁装、收尾时拔掉
+ */
+let watching = false
+
+function onWatchMove(event: MouseEvent): void {
+  const drag = tabDrag
+  if (drag === null || drag.moved) return
+  if (Math.abs(event.clientX - drag.startX) + Math.abs(event.clientY - drag.startY) < DRAG_THRESHOLD) return
+  drag.moved = true
+  drag.el.classList.add('dragging')
+  // 整扇窗口改成「抓着东西」的指针，并把选字关掉：一路拖到正文上时不该顺手划选一段
+  document.body.classList.add('tab-dragging')
+}
+
+/** 松手在标签与标签条以外的一切地方 = 取消（拖出窗口、拖到正文上） */
+function onWatchUp(): void {
+  finishTabDrag()
+}
+
+function startWatch(): void {
+  if (watching) return
+  watching = true
+  window.addEventListener('mousemove', onWatchMove)
+  window.addEventListener('mouseup', onWatchUp)
+  window.addEventListener('blur', onWatchUp)
+}
+
+function stopWatch(): void {
+  if (!watching) return
+  watching = false
+  window.removeEventListener('mousemove', onWatchMove)
+  window.removeEventListener('mouseup', onWatchUp)
+  window.removeEventListener('blur', onWatchUp)
+}
+
+/** 收尾：不论成功、取消还是没起拖，走的都是这一个出口，不留半个视觉状态 */
+function finishTabDrag(): void {
+  if (tabDrag !== null) {
+    tabDrag.el.classList.remove('dragging')
+    tabDrag = null
+  }
+  document.body.classList.remove('tab-dragging')
+  stopWatch()
+}
+
+/** 左键按下某个标签 = 起一次待定的拖拽。要不要真的算拖，由阈值那一段决定 */
+function beginTabDrag(event: MouseEvent, tabId: number): void {
+  // 只认左键：右键是菜单的，中键是别的手势的
+  if (event.button !== 0) return
+  // × 那一个格子自己会关闭标签，不该顺手起拖
+  const target = event.target as Element | null
+  if (target?.closest('.tab-close')) return
+  // ⛔ 不 `preventDefault()`：mousedown 的默认动作是聚焦与选字，而 `click` 照样会触发，
+  // 激活标签靠的还是那一次 click。选了字也不会——`.tab` 上挂着 `user-select: none`
+  tabDrag = {
+    tabId,
+    startX: event.clientX,
+    startY: event.clientY,
+    moved: false,
+    el: event.currentTarget as HTMLElement,
+  }
+  startWatch()
+}
 
 export interface TabStripProps {
   workspace: Workspace
@@ -59,12 +150,13 @@ export interface TabStripProps {
 /**
  * 一块分屏的标签条。
  *
- * 重排与跨屏搬动用 HTML5 拖放（`draggable` + dragstart/dragover/drop）而不是自己监听鼠标：
- * 自己实现要处理自动滚动、拖出窗口取消、以及 macOS 上拖拽与文本选择的抢占，
- * 而这里只需要「放下时换个位置」，浏览器已经全做完了。
+ * 重排与跨屏搬动用**鼠标手势**（mousedown → 越过阈值 → 在目标上 mouseup）：
+ * HTML5 拖放这条路在 Tauri 里是堵的（`dragDropEnabled` 默认开着，把整扇 webview 的
+ * 拖放会话占走了，而我们拿它接访达的文件），自己听鼠标在这里也不需要自动滚动与
+ * 拖出窗口取消那些——那些是原生会话替我们做的，我们只需要「按下、挪开、松手」。
  *
- * ⚠️ `dragover` 必须 `preventDefault()`，否则浏览器认为这里不接受放置，`drop` 压根不触发。
- * 这是拖放 API 最常被踩的一条。标签条自己那一份也要（放到空白处 = 搬到这一屏的末尾）。
+ * ⚠️ 「在目标上松开」这一步必须挂在目标元素自己身上，而不是靠全局的 mouseup 现查落点：
+ * 冒泡得到的最里层就是落点，而 jsdom 里 `elementFromPoint` 压根没有。
  *
  * ## 放下时的三种落点
  *
@@ -227,13 +319,20 @@ export function TabStrip(props: TabStripProps) {
         // 标签条自己」：标签、「+」都是它的子元素，双击它们时 target 是子元素，不会走到这里
         if (e.target === e.currentTarget) ws.newTab(props.paneId)
       }}
-      onDragOver={(e) => e.preventDefault()}
-      onDrop={(e) => {
-        // 放到空白处 = 搬到这一屏的末尾。落在某个标签上的那一次由标签自己
+      onMouseUp={(e) => {
+        // 落在这条标签条的空白处 = 搬到这一屏的末尾。落在某个标签上的那一次由标签自己
         // `stopPropagation()` 拦掉，不会走到这里（否则会变成「搬过来又挪到末尾」）
-        e.preventDefault()
-        if (draggedTabId !== null) ws.moveTab(draggedTabId, props.paneId)
-        draggedTabId = null
+        if (tabDrag === null || !tabDrag.moved) return
+        ws.moveTab(tabDrag.tabId, props.paneId)
+        e.currentTarget.classList.remove('drop-end')
+        finishTabDrag()
+      }}
+      onMouseEnter={(e) => {
+        // 拖拽进行中的落点提示。没在拖的时候什么也不加，静态样式一点不碰
+        if (tabDrag?.moved) e.currentTarget.classList.add('drop-end')
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.classList.remove('drop-end')
       }}
     >
       <For each={ownTabs()}>
@@ -244,23 +343,24 @@ export function TabStrip(props: TabStripProps) {
             role="tab"
             aria-selected={shownId() === tab.id}
             title={tab.doc.path() ?? UNTITLED_LABEL}
-            draggable={true}
+            onMouseDown={(e) => beginTabDrag(e, tab.id)}
             onClick={() => ws.activateTab(tab.id)}
             onContextMenu={(e) => onTabContextMenu(e, { id: tab.id, path: tab.doc.path() })}
-            onDragStart={() => {
-              draggedTabId = tab.id
-            }}
-            onDragEnd={() => {
-              draggedTabId = null
-            }}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => {
-              // 🔴 `stopPropagation` 是必须的：不拦的话这一次 drop 还会冒到标签条自己那一份
+            onMouseUp={(e) => {
+              // 落在这一格上 = 搬到这一屏、压在这一格的位置（跨屏也是同一个方法）
+              if (tabDrag === null || !tabDrag.moved) return
+              // 🔴 `stopPropagation` 是必须的：不拦的话这一次松手还会冒到标签条自己那一份
               // 上去，于是「放到某一格上」变成「搬到这一屏的末尾」，落点被悄悄改掉
               e.stopPropagation()
-              e.preventDefault()
-              if (draggedTabId !== null) ws.reorder(draggedTabId, tab.id)
-              draggedTabId = null
+              if (tabDrag.tabId !== tab.id) ws.reorder(tabDrag.tabId, tab.id)
+              e.currentTarget.classList.remove('drop-into')
+              finishTabDrag()
+            }}
+            onMouseEnter={(e) => {
+              if (tabDrag?.moved && tabDrag.tabId !== tab.id) e.currentTarget.classList.add('drop-into')
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.classList.remove('drop-into')
             }}
           >
             <span class="tab-name">{tab.doc.name()}</span>

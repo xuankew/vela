@@ -867,7 +867,7 @@ select {
   color: var(--vela-fg-dim);
   border-left: 1px solid transparent;
   cursor: default;
-  /* 标签是 draggable 的：不关掉文本选择，拖动的第一下会变成选中文字 */
+  /* 标签是可以按着拖的（见 TabStrip 的鼠标手势）：不关掉文本选择，拖动的第一下会变成选中文字 */
   user-select: none;
 }
 
@@ -896,6 +896,34 @@ select {
 .editor-host:not(.focused) .tab.active {
   color: var(--vela-fg-dim);
   background: var(--vela-bg-alt);
+}
+
+/* ---------- 标签拖拽（M4-Q／M4-R 的手势） ---------- */
+
+/* 拖拽期间整扇窗口都是「抓着一个标签」：指针换成 grabbing，并把选字关掉——
+   一路拖过正文时不该顺手划出一段选区。
+   ⚠️ 挂在 `body` 而不是标签条上：指针会跑到别的分屏、正文、甚至标签条外面，
+   而这三段视觉都得一直在，直到松手 */
+body.tab-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* 被拖着的那一格：留在原地、压暗，让用户一直看得见「我拿的是哪一个」 */
+.tab.dragging {
+  opacity: 0.45;
+}
+
+/* 落点是别的标签 = 左边来一条竖线，表示「插在这一格的位置」。
+   只用 `border-left-color`（`.tab` 上本来就挂着一条透明的左边框），
+   不额外加宽度：改宽度会让整条标签条横向抖一下 */
+.tab.drop-into {
+  border-left-color: var(--vela-accent);
+}
+
+/* 落点是这一屏的末尾 = 整条标签条亮一档底色，与上面那一条竖线是两种不同的意思 */
+.tab-strip.drop-end {
+  background: var(--vela-bg-panel);
 }
 
 .tab-name {

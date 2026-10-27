@@ -120,24 +120,39 @@ function fire(el: Element, type: string): Event {
   return event
 }
 
-/** 同一屏里重排：dragstart 在源上，dragover + drop 在目标上 */
-function drag(from: number, to: number, pane = 0): Event {
-  fire(tabs(pane)[from]!, 'dragstart')
-  fire(tabs(pane)[to]!, 'dragover')
-  return fire(tabs(pane)[to]!, 'drop')
+/** 手派一个鼠标事件。`clientX/clientY` 是给阈值那一段读的，缺省当成 0 */
+function mouse(el: EventTarget, type: string, x = 0, y = 0): MouseEvent {
+  const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 })
+  el.dispatchEvent(event)
+  return event
+}
+
+/**
+ * 一次完整的拖拽手势：按下 → 挪出阈值 → 在目标上松手。
+ *
+ * ⚠️ 阈值那一段的 `mousemove` 挂在 **window** 上（指针会跑到元素外面），所以中间这一下
+ * 必须派给 window；派给元素的话它只会冒泡到 window 一次，效果一样，但读代码的人会以为
+ * 组件里还另有一只 `mousemove` 的耳朵
+ */
+function dragOn(from: Element, to: Element): void {
+  mouse(from, 'mousedown', 10, 10)
+  mouse(window, 'mousemove', 60, 10)
+  mouse(to, 'mouseup', 60, 10)
+}
+
+/** 同一屏里重排：起点与终点都是这一屏的标签 */
+function drag(from: number, to: number, pane = 0): void {
+  dragOn(tabs(pane)[from]!, tabs(pane)[to]!)
 }
 
 /**
  * 跨屏搬：源与目标在**不同的组件实例**里。
  *
- * 🔴 这正是 `draggedTabId` 必须是模块级变量的原因：放在组件内的话，目标那一屏的
- * `onDrop` 读到的永远是它自己那一份 `null`，手势就成了「拖过去什么也没发生」
+ * 🔴 这正是那份拖拽状态必须是模块级变量的原因：放在组件内的话，目标那一屏的
+ * `onMouseUp` 读到的永远是它自己那一份 `null`，手势就成了「拖过去什么也没发生」
  */
-function dragAcross(fromPane: number, fromIndex: number, toPane: number, toIndex: number | 'blank'): Event {
-  fire(tabs(fromPane)[fromIndex]!, 'dragstart')
-  const target = toIndex === 'blank' ? strip(toPane) : tabs(toPane)[toIndex]!
-  fire(target, 'dragover')
-  return fire(target, 'drop')
+function dragAcross(fromPane: number, fromIndex: number, toPane: number, toIndex: number | 'blank'): void {
+  dragOn(tabs(fromPane)[fromIndex]!, toIndex === 'blank' ? strip(toPane) : tabs(toPane)[toIndex]!)
 }
 
 beforeEach(() => {
@@ -196,11 +211,41 @@ describe('渲染', () => {
     expect(tabs()[1]!.querySelector('.tab-dot')).toBeNull()
   })
 
-  it('每个标签都 draggable，否则 HTML5 拖放压根不启动', () => {
+  /**
+   * ⛔ 标签上不许有 `draggable`。
+   *
+   * 这不是一句风格洁癖：HTML5 拖放在 Tauri 里是堵死的——`dragDropEnabled` 默认开着，
+   * 把整扇 webview 的拖放会话占走（访达拖文件进窗口靠的就是它，见 `src/ipc/dragDrop.ts`），
+   * DOM 那套 `dragstart`/`drop` 在真窗口里压根不触发。谁把它加回来，界面上看着更「标准」，
+   * 真机上跨屏拖拽就又回到「拖过去什么也没发生」
+   */
+  it('标签不挂 draggable：那条路在 Tauri 里被原生拖放占着，只能用鼠标手势', () => {
     const ws = mount(createWorkspace())
     ws.newTab()
     ws.newTab()
-    expect(tabs().map((t) => t.getAttribute('draggable'))).toEqual(['true', 'true', 'true'])
+    expect(tabs().map((t) => t.getAttribute('draggable'))).toEqual([null, null, null])
+  })
+
+  it('按下并挪开才算拖拽：源格压暗、整扇窗口换成 grabbing', () => {
+    const ws = mount(createWorkspace())
+    ws.newTab()
+    const before = ws.tabs().map((t) => t.id)
+
+    mouse(tabs()[0]!, 'mousedown', 10, 10)
+    // 只挪了 1px：手抖不算拖拽，这一路走完还是一次普通点击
+    mouse(window, 'mousemove', 11, 10)
+    expect(tabs()[0]!.classList.contains('dragging')).toBe(false)
+    expect(document.body.classList.contains('tab-dragging')).toBe(false)
+
+    mouse(window, 'mousemove', 30, 10)
+    expect(tabs()[0]!.classList.contains('dragging')).toBe(true)
+    expect(document.body.classList.contains('tab-dragging')).toBe(true)
+
+    // 松手在正文上（不属于任何标签条）= 取消，顺序一点不动
+    mouse(window, 'mouseup', 30, 300)
+    expect(ws.tabs().map((t) => t.id)).toEqual(before)
+    expect(tabs()[0]!.classList.contains('dragging')).toBe(false)
+    expect(document.body.classList.contains('tab-dragging')).toBe(false)
   })
 })
 
@@ -416,11 +461,23 @@ describe('拖拽重排', () => {
     expect(names()).toHaveLength(3)
   })
 
-  it('dragover 被 preventDefault——不拦的话浏览器认为这里不接受放置，drop 压根不触发', () => {
+  it('没起拖的 mouseup 是空操作（比如从访达拖进来的文件落在标签条上）', () => {
     const ws = mount(createWorkspace())
     ws.newTab()
-    fire(tabs()[0]!, 'dragstart')
-    expect(fire(tabs()[1]!, 'dragover').defaultPrevented).toBe(true)
+    const before = ws.tabs().map((t) => t.id)
+    mouse(tabs()[0]!, 'mouseup')
+    expect(ws.tabs().map((t) => t.id)).toEqual(before)
+  })
+
+  it('拖到一半取消之后再松手也不动——拖出窗口松手不能留下半个操作', () => {
+    const ws = mount(createWorkspace())
+    ws.newTab()
+    const before = ws.tabs().map((t) => t.id)
+    mouse(tabs()[0]!, 'mousedown', 10, 10)
+    mouse(window, 'mousemove', 30, 10)
+    mouse(window, 'mouseup', 30, 300)
+    mouse(tabs()[1]!, 'mouseup', 30, 10)
+    expect(ws.tabs().map((t) => t.id)).toEqual(before)
   })
 
   it('拖到自己身上不动', () => {
@@ -430,32 +487,14 @@ describe('拖拽重排', () => {
     drag(1, 1)
     expect(ws.tabs().map((t) => t.id)).toEqual(before)
   })
-
-  it('没有正在拖的标签时，drop 是空操作（比如从窗口外拖进来的文件）', () => {
-    const ws = mount(createWorkspace())
-    ws.newTab()
-    const before = ws.tabs().map((t) => t.id)
-    fire(tabs()[0]!, 'drop')
-    expect(ws.tabs().map((t) => t.id)).toEqual(before)
-  })
-
-  it('dragend 之后再 drop 也不动——拖拽被取消（拖出窗口松手）不能留下半个操作', () => {
-    const ws = mount(createWorkspace())
-    ws.newTab()
-    const before = ws.tabs().map((t) => t.id)
-    fire(tabs()[0]!, 'dragstart')
-    fire(tabs()[0]!, 'dragend')
-    fire(tabs()[1]!, 'drop')
-    expect(ws.tabs().map((t) => t.id)).toEqual(before)
-  })
 })
 
 describe('跨屏拖拽（M4-R）', () => {
   /**
    * 用户要的第三条：「两边的文件可以拖动到对方屏幕中，但是屏幕上面要展示各自的标签页」。
    *
-   * ⚠️ jsdom 里这些是**合成事件**：`dragstart`/`dragover`/`drop` 三下都是手派的，
-   * 而真窗口里那三下由系统的拖拽会话驱动（还带 dataTransfer、自动滚动、拖出窗口取消）。
+   * ⚠️ jsdom 里这三下（mousedown / window 的 mousemove / 目标上的 mouseup）都是手派的，
+   * 真窗口里它们由系统的指针驱动，还会带上原生才会有的东西（拖过边缘时标签条自己该滚动）。
    * 这里钉的是接线（哪个 handler 调到哪个 workspace 方法），真手势要在真窗口里看
    */
   it('放到另一屏的空白处 = 搬进那一屏的末尾', () => {
@@ -529,12 +568,41 @@ describe('跨屏拖拽（M4-R）', () => {
     expect(ws.activeTab()).toBe(a)
   })
 
-  it('dragover 在标签条空白处也被 preventDefault——不然放到空白处 drop 压根不触发', () => {
+  /**
+   * 落点提示。
+   *
+   * 鼠标手势没有系统拖拽会话帮忙画「拖影」，所以「我现在会落在哪儿」必须由自己标出来，
+   * 否则用户只能松手了才知道成败。两条提示是两种不同的意思：压在别的标签上 = 插进那一格
+   * （左边框一条竖线），落在这一屏的空白处 = 追加到末尾（整条亮一档底色）
+   */
+  it('拖拽中的落点提示：别的屏的标签亮左边框，标签条空白处亮一档底色', () => {
     const ws = createWorkspace()
+    ws.newTab()
     ws.split('row')
+    // ⚠️ 先把右边那块分屏对象存下来：左边那一屏唯一的标签被拖走之后它会被收掉，
+    // 下标整体前移一位，`ws.panes()[1]` 到那时候读的已经不是同一块屏了
+    const right = ws.panes()[1]!
     mountPair(ws)
-    fire(tabs(0)[0]!, 'dragstart')
-    expect(fire(strip(1), 'dragover').defaultPrevented).toBe(true)
+    expect(ws.panes()).toHaveLength(2)
+    mouse(tabs(0)[0]!, 'mousedown', 10, 10)
+    mouse(window, 'mousemove', 30, 10)
+
+    mouse(tabs(1)[0]!, 'mouseenter', 30, 10)
+    expect(tabs(1)[0]!.classList.contains('drop-into')).toBe(true)
+    mouse(tabs(1)[0]!, 'mouseleave', 30, 20)
+    expect(tabs(1)[0]!.classList.contains('drop-into')).toBe(false)
+
+    const targetStrip = strip(1)
+    mouse(targetStrip, 'mouseenter', 30, 10)
+    expect(targetStrip.classList.contains('drop-end')).toBe(true)
+
+    // 就在那一片空白上松手：搬进那一屏的末尾，提示一起收掉。
+    // ⚠️ 之后一直用 `targetStrip` 这个引用而不是再查一次 `strip(1)`——左边那一屏此刻已经收掉，
+    // 第二条标签条整个从 DOM 上摘下来了，再按下标查会查到别的东西
+    mouse(targetStrip, 'mouseup', 30, 10)
+    expect(targetStrip.classList.contains('drop-end')).toBe(false)
+    expect(document.body.classList.contains('tab-dragging')).toBe(false)
+    expect(right.tabs()).toHaveLength(2)
   })
 
   it('落到某个标签上时不会再冒到标签条那一份：落点不会被改成「末尾」', () => {
@@ -546,12 +614,12 @@ describe('跨屏拖拽（M4-R）', () => {
     const right = target.tabs().map((t) => t.id)
     mountPair(ws)
 
-    const e = dragAcross(0, 0, 1, 0)
+    dragAcross(0, 0, 1, 0)
 
-    // 🔴 标签自己的 `onDrop` 必须 `stopPropagation()`：不拦的话同一次 drop 还会走到
+    // 🔴 标签自己的 `onMouseUp` 必须 `stopPropagation()`：不拦的话同一次松手还会走到
     // 标签条那一份上去，于是「放到第一格」变成「搬过来又挪到末尾」——落点被悄悄改掉，
-    // 而用户看到的是标签总是落在最后
-    expect(e.defaultPrevented).toBe(true)
+    // 而用户看到的是标签总是落在最后。这一条断言认的就是**落点本身**：
+    // 少了那一句，下面这一行会排成 `[right[0], right[1], a.id]`
     expect(target.tabs().map((t) => t.id)).toEqual([a.id, right[0]!, right[1]!])
   })
 })
