@@ -42,6 +42,10 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }))
 
 import { TabStrip } from './TabStrip'
 import { createWorkspace } from './workspace'
+// ⚠️ `?raw` 而不是 `node:fs`：tsconfig 的 `types` 只有 `vite/client`，没有 node 的类型
+// （与 `md/render.test.ts` 同一路子）。拿到的是**源码文本**，不是生效的样式——
+// jsdom 不做布局，叠放只能靠人眼在真窗口里看，这里钉的是它的前提
+import stylesSource from '../styles.css?raw'
 
 let container: HTMLDivElement
 let dispose: () => void
@@ -444,5 +448,26 @@ describe('右键菜单', () => {
     await new Promise((r) => setTimeout(r, 0))
 
     expect(errors).toEqual(['打不开：{"kind":"not_found","path":"/repo/gone.txt"}'])
+  })
+
+  /**
+   * 哨兵：钉住「右键菜单不会被编辑器里的浮层盖住」的**前提**，不是叠放本身。
+   *
+   * 为什么只能钉前提：jsdom 不做布局，测试环境也不加载 `styles.css`，所以「谁盖住谁」
+   * 在这里根本无从观测（`getComputedStyle` 拿不到任何数）。能钉的只有源码里那条规则。
+   *
+   * 少了 `z-index: 0` 会发生什么（2026-10-27 用户报的真实缺陷）：CM6 的 baseTheme 给
+   * `.cm-panels`（查找/替换面板）z-index 300、给 `.cm-tooltip`（补全/悬浮）500，而
+   * `.editor-host` 只有 `position: relative` 时**不构成层叠上下文**，那两个数会一路逃到
+   * 根上下文里跟外部浮层比大小——菜单 `.tree-menu` 是 `position: fixed` + z-index 10，
+   * 比不过 300，于是查找框开着时右键标签弹出的菜单被它盖掉一半。
+   *
+   * ⛔ 也别改成抬 `.tree-menu` 的 z-index：那会让菜单盖到命令面板（20）与模态框之上。
+   * ⚠️ 这条哨兵能读到 CSS 源码，靠的是 `vitest.config.ts` 里 `css: { include: [/styles\.css/] }`；
+   * 少了那行，`?raw` 会被 vitest 桩成空串，这里就恒红（红的含义是「前提没了」，不是断言写错）。
+   */
+  it('哨兵：查找面板不能盖住右键菜单——.editor-host 必须自带层叠上下文', () => {
+    const block = /\.editor-host\s*\{[^}]*\}/.exec(stylesSource)?.[0] ?? ''
+    expect(block).toContain('z-index: 0')
   })
 })

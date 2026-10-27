@@ -1035,6 +1035,15 @@ select {
   display: flex;
   flex-direction: column;
   position: relative;
+  /* 🔴 这个 0 不是装饰：CM6 的 baseTheme 给 `.cm-panels`（查找/替换面板，sticky）z-index 300、
+     给 `.cm-tooltip`（补全/悬浮）500、给 `.cm-gutters`（行号槽）200，而本类只有 position
+     没有 z-index 时**不构成层叠上下文**，那几个数会一路逃到根上下文里跟外部浮层比大小——
+     右键菜单 `.tree-menu` 是 fixed + 10，比不过 300，于是查找面板开着时菜单被它盖掉一半
+     （2026-10-27 用户报的截图）。补一个 0 把 CM6 的浮层关回编辑器格子内部：格子里的相对
+     顺序一个都不变（panels 仍盖正文、tooltip 仍盖 panels），变的只是它们不再越界；附带
+     左分屏的补全下拉也盖不到右分屏正文了。⛔ 别顺手「优化」成 isolation: isolate 或删掉——
+     删掉就是复发，`TabStrip.test.tsx` 里有一条哨兵钉着这个 0 */
+  z-index: 0;
   /* 不透明：否则上面 .body 的分隔线底色会透过来 */
   background: var(--vela-bg);
 }
@@ -1858,7 +1867,10 @@ select {
 /* ---------- 模态对话框（未保存改动的关闭确认）---------- */
 
 /* fixed 而不是 absolute：`.app` 是行数固定的 grid，绝对定位的子元素不是 grid item，
-   遮罩因此不会挤出一行来。z-index 要盖住 CM6——查找面板那些浮层自带层叠上下文。 */
+   遮罩因此不会挤出一行来。z-index 要盖住 CM6 的浮层：查找面板 300、补全 tooltip 500。
+   ⚠️ 10 盖不住那两个数——真正兜住的是 `.editor-host` 那个 `z-index: 0`（M4-P），
+   它把 CM6 的浮层关在编辑器格子内部，于是根上下文里 10 就够。删掉那一行，
+   查找面板开着时这张确认单按同一条机制也会被盖住（推定，未在真机上验过）。 */
 .modal-backdrop {
   position: fixed;
   inset: 0;
