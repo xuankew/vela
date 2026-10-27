@@ -36,6 +36,7 @@ import { copySelection, cutSelection, pasteInto, writeClipboard } from './editor
 import { EditorPane } from './editor/EditorPane'
 import { languageFor } from './editor/language'
 import { clickAction, definitionAt } from './goto/definition'
+import { createNavHistory, type NavEntry } from './goto/history'
 import { createQuickOpen, type Commit } from './goto/store'
 import { symbolTable, wordUnderCaret } from './goto/syntax'
 import { attachFileDrop, handleDroppedPaths } from './ipc/dragDrop'
@@ -318,7 +319,6 @@ export default function App() {
     promptDiscard: (names) => new Promise<DiscardDecision>((resolve) => setPendingClose({ names, resolve })),
     pasteImage: pasteImageInto,
     clickDefinition: definitionFromClick,
-    onFontSizeZoom: settings.stepZoomedFontSize,
     linkFiles: linkFilesFor,
   })
   const activeDoc = () => ws.activeTab().doc
@@ -572,13 +572,94 @@ export default function App() {
     },
   })
 
+  /**
+   * 跳转历史（M5-3，`Mod+Alt+←` 返回 / `Mod+Alt+→` 前进）。
+   *
+   * 栈本身是纯数据（`goto/history.ts`），这一层给它三样东西：
+   * 「哪些标签还活着」（`isLive`）、「用户此刻站在哪儿」（`navHere`）、
+   * 「把一条历史装回去」（`navRestore`）。
+   *
+   * ⚠️ `untrack`：`back` / `forward` 是命令，跑在按键处理器里，本来也不在追踪作用域内；
+   * 但 `isLive` 读的是 `ws.tabs()`，而这一条万一哪天被塞进一个 `createEffect` 里，
+   * 没有 `untrack` 就会多出一个「标签表一变就跑一遍」的订阅——那种重跑不报错、结果也对，
+   * 只是白跑，而「这个 effect 为什么又跑了一遍」是这类代码里最难查的一种问题
+   */
+  const nav = createNavHistory({
+    isLive: (entry) => untrack(() => ws.tabs().some((t) => t.id === entry.tabId)),
+  })
+
+  /**
+   * 「用户此刻站在哪儿」：聚焦的那个标签 + 它的光标。
+   *
+   * ⚠️ 只读分片那块分屏里没有 `EditorController`（`ShardPane` 不是 CM6），
+   * 于是 `pos` 是 null——那一条历史只能把标签切回来，不动滚动位置。
+   * 理由与补齐它的代价都写在 `goto/history.ts` 的文件头
+   */
+  function navHere(): NavEntry {
+    const controller = ws.focusedEditor()
+    return {
+      tabId: ws.activeTab().id,
+      pos: controller === null ? null : controller.view.state.selection.main.head,
+    }
+  }
+
+  /**
+   * 把一条历史装回去。
+   *
+   * `activateTab` 已经含了「它在别的分屏里显示着就聚焦那块分屏」，所以回到另一块分屏里的
+   * 标签也走得通，不需要先找分屏。落点复用 `reveal`（自带 focus 与居中滚动），
+   * 与 `jumpToHit` / `gotoCommit` 用的是同一个原语。
+   */
+  function navRestore(entry: NavEntry): void {
+    ws.activateTab(entry.tabId)
+    if (entry.pos === null) return
+    const controller = ws.focusedEditor()
+    // 切回来之后可能是一块只读分片（文件在这期间长过了 4 MiB），那就没有光标可放
+    if (controller === null) return
+    // 🔴 夹一下：历史里的位置是**跳走那一刻**的，而这份文档可能在这期间被改短了
+    // （外部改动重载、替换全部）。超长的位置递进 `dispatch` 不是「落在末尾」而是当场抛
+    const pos = Math.min(entry.pos, controller.view.state.doc.length)
+    controller.reveal(pos, pos)
+  }
+
+  /**
+   * 返回上一个跳转的位置（`Mod+Alt+←`）。
+   *
+   * ⚠️ 退无可退时**说一句**而不是沉默，与 `alignTable` / `wordCount` 同一条理由：
+   * 一个按下去没反应的快捷键，用户得到的信息是零，他没法区分「历史是空的」和「这个键坏了」
+   */
+  function gotoBack(): void {
+    const entry = nav.back(navHere())
+    if (entry === null) {
+      setEditorNotice({ level: 'plain', text: '没有可返回的位置' })
+      return
+    }
+    navRestore(entry)
+  }
+
+  /** `gotoBack` 的镜像（`Mod+Alt+→`） */
+  function gotoForward(): void {
+    const entry = nav.forward(navHere())
+    if (entry === null) {
+      setEditorNotice({ level: 'plain', text: '没有可前进的位置' })
+      return
+    }
+    navRestore(entry)
+  }
+
   /** 点一条搜索结果：打开那个文件、跳到那一行、选中那一段 */
   async function jumpToHit(hit: HitRow) {
+    // ⚠️ 原点必须在 `openAt` **之前**取：那一下会换掉聚焦的标签，之后 `navHere()`
+    // 读到的就是目的地了，记下来的历史会是「跳到这儿之前我在这儿」
+    const origin = navHere()
     await ws.openAt(hit.path)
     // ⚠️ 打开可能没成：文件在搜完之后被删了、外接盘掉了、权限变了。那种情况下聚焦的
     // 编辑器里是**别的**文档，照着搜索结果里的行号跳过去就是在改一个无关文件的光标位置。
     // 失败本身文档已经说在提示条上了，这里只需要不动
     if (ws.activeTab().doc.path() !== hit.path) return
+    // 到这儿才算「这一跳真的会发生」：上面那条核对没过时一个字都不记，
+    // 否则用户按返回会回到他**根本没离开过**的地方，而那与「没有历史」在界面上分不出来
+    nav.push(origin)
     // 🔴 分片标签没有编辑器实例，`focusedEditor()` 是 null。这一支**必须排在它前面**：
     // 搜索收文件的上限（64 MiB）比整份进内存的上限（4 MiB）宽，所以 4–64 MiB 这一段
     // 里的文件**搜得到、却是以分片方式打开的**。漏掉它的症状是「点了搜索结果，
@@ -636,9 +717,15 @@ export default function App() {
       return
     }
     if (action.kind === 'openFile') {
+      // ⚠️ 原点必须在 `openAt` **之前**取，与 `jumpToHit` 逐字同一条理由
+      const origin = navHere()
       await ws.openAt(action.path)
       // 与 `jumpToHit` 同一条核对：打开失败时聚焦的是别的文档，不该动它的光标
       if (ws.activeTab().doc.path() !== action.path) return
+      // 换文件本身就是一次跳转：`Cmd+P` 打开另一个文件之后按返回，该回到原来那个。
+      // ⚠️ 挑中的正是当前文件、而且没有行号时这一条会记下「回到脚下这一处」——
+      // 那种条目由 `history.ts` 在弹栈时自己跳过，所以这里不必再判一次
+      nav.push(origin)
       // 分片标签先接一手（理由与 `jumpToHit` 里那一段逐字相同）。
       // ⚠️ 没有行号时这里**什么都不做**：分片面板没有可聚焦的编辑器，
       // 而一份只读文本也没什么可打的——要键盘滚动的话在面板里点一下就有了
@@ -668,11 +755,18 @@ export default function App() {
       // `:42` 在一个几百万行的日志上恰恰是最常用的那一下，所以它必须能用。
       // `gotoPos` 只可能来自 `@标题`，而标题清单要有语法树；分片标签没有 CM6 state，
       // `symbols()` 上面早就返回 null 了，浮层里压根不会出现这一项
-      if (action.kind === 'gotoLine') shard.gotoLine(action.line)
+      if (action.kind === 'gotoLine') {
+        nav.push(navHere())
+        shard.gotoLine(action.line)
+      }
       return
     }
     const controller = ws.focusedEditor()
     if (controller === null) return
+    // 同文档内的一跳（`:42`、`@标题`、`⌥⌘D` 跳到定义、点大纲）：原点就是脚下这一处，
+    // 于是可以**就地**取而不必先存一个局部——这一句与下面那两个 `reveal` 之间没有任何东西
+    // 会动光标，而 `openFile` 那一支不行（`openAt` 会换掉聚焦的标签）
+    nav.push(navHere())
     if (action.kind === 'gotoLine') {
       const target = revealTarget(controller.view.state.doc, action.line, [])
       controller.reveal(target.anchor, target.head)
@@ -818,6 +912,10 @@ export default function App() {
     if (tab === null || controller === null) return false
     const action = clickAction(definitionAt(view.state, tab.doc.path(), pos), tree.roots().length > 0)
     if (action.kind === 'jump') {
+      // 原点记的是**点下去那一处**，⛔ 不是这块分屏原来的光标：用户是滚到别处、
+      // 指着那个引用按的 Cmd+Click，「回去」要回到的正是他手里那个引用，
+      // 而不是他二十分钟前离开的那一处（VS Code 的 Cmd+Click → 返回也是这个口径）
+      nav.push({ tabId: tab.id, pos })
       // `reveal` 自带 `focus` 与居中滚动，正是「在点的那块分屏里跳过去」的完整语义。
       // 走它而不是 `gotoCommit`：后者只认聚焦分屏，而这一条链路的定义就在**这一块**里
       controller.reveal(action.pos, action.pos)
@@ -1248,10 +1346,13 @@ export default function App() {
       saveFileAs: ws.saveAs,
       applyLineWrap: (on) => ws.setLineWrap(on),
       toggleMinimap: () => ws.setMinimap(!ws.minimap()),
-      // 字号的档位夹取与写穿都在 store 里，这里只把命令接到 store 的方法上。
-      // ⚠️ 递的是**裸引用**（`settings.stepFontSize` 而不是 `(d) => settings.stepFontSize(d)`）：
+      // 字号的夹取与 CSS 变量都在 store 里，这里只把命令接到 store 的方法上。
+      // ⚠️ 走的是**无级缩放**（`stepZoomedFontSize`，±1px、8~72、不写盘）而不是档位步进：
+      // `Mod+=` / `Mod+-` 是原先 Cmd+滚轮那套手感的接替者，滚轮因为误触已经拆掉了。
+      // 档位那条路仍然留着入口——设置里的字号下拉（`setFontSize`）。
+      // ⚠️ 递的是**裸引用**（`settings.stepZoomedFontSize` 而不是 `(d) => settings.stepZoomedFontSize(d)`）：
       // store 里这些是具名函数、不依赖 `this`，正是为了能被这样递出去
-      adjustFontSize: settings.stepFontSize,
+      adjustFontSize: settings.stepZoomedFontSize,
       resetFontSize: settings.resetFontSize,
       splitRight: () => ws.split('row'),
       splitDown: () => ws.split('column'),
@@ -1283,6 +1384,8 @@ export default function App() {
       gotoFile: () => void goto.show(),
       gotoSymbol: () => void goto.show('@'),
       gotoDefinition,
+      gotoBack,
+      gotoForward,
       // 两条都**不带参数**：`toolbox.show()` 停在上次那个工具上，`palette.show()` 清空查询词。
       // 「从命令面板里挑一个工具」那条路径不走这里——`tools/registry.ts` 的 `openTool(id)`
       // 是工具箱自己投影进注册表的那一条命令，与 `toolbox.open` 是两扇门，理由写在那儿
@@ -1348,8 +1451,10 @@ export default function App() {
             togglePreview: () => setPreviewMode((m) => nextPreviewMode(m)),
             toggleOutline: () => setOutlineVisible((v) => !v),
             toggleJsonPreview: () => setJsonPreviewVisible((v) => !v),
-            zoomIn: () => settings.stepFontSize(1),
-            zoomOut: () => settings.stepFontSize(-1),
+            // 与命令 `view.increaseFontSize` / `view.decreaseFontSize` 共用同一个无级缩放：
+            // 菜单项和快捷键必须是同一个行为，理由写在上面 `adjustFontSize` 那一处
+            zoomIn: () => settings.stepZoomedFontSize(1),
+            zoomOut: () => settings.stepZoomedFontSize(-1),
             resetZoom: settings.resetFontSize,
             toggleLineWrap: () => ws.setLineWrap(!ws.lineWrap()),
             // 与命令面板的 `view.toggleMinimap` 共用同一个翻转：两个入口必须是同一个行为

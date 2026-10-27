@@ -85,8 +85,12 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &MenuItem::with_id(app, "window.split_down", "下分屏", true, Some("CmdOrCtrl+Shift+\\"))?,
             &MenuItem::with_id(app, "window.merge_panes", "合并分屏", true, Option::<&str>::None)?,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "window.focus_next", "聚焦下一个分屏", true, Some("CmdOrCtrl+Alt+Right"))?,
-            &MenuItem::with_id(app, "window.focus_prev", "聚焦上一个分屏", true, Some("CmdOrCtrl+Alt+Left"))?,
+            // 🔴 这两条的键 M5-3 起让给了「返回/前进」（`goto.back` / `goto.forward`，
+            // 注册表里绑 `Mod+Alt+←→`），切焦点挪到 `Mod+Alt+Shift+←→`。
+            // 两边必须同时改：原生 accelerator 在事件到达 webview 之前就被系统吃掉一次，
+            // 只改一边的话同一个键会既切分屏又跳历史
+            &MenuItem::with_id(app, "window.focus_next", "聚焦下一个分屏", true, Some("CmdOrCtrl+Alt+Shift+Right"))?,
+            &MenuItem::with_id(app, "window.focus_prev", "聚焦上一个分屏", true, Some("CmdOrCtrl+Alt+Shift+Left"))?,
             &MenuItem::with_id(app, "window.close_pane", "关闭分屏", true, Option::<&str>::None)?,
         ],
     )?;

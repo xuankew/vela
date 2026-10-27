@@ -255,7 +255,7 @@ export interface Workspace {
   setDarkTheme: (on: boolean) => void
   /** 切换缩略图（M4-H）。与 `setDarkTheme` 同一个模子：共享槽位一次拨动所有标签 */
   setMinimap: (on: boolean) => void
-  /** Cmd+滚轮缩放后通知所有显示中的 view dispatch 空 transaction，触发 measure 对齐行号 */
+  /** 无级缩放（`Mod+=` / `Mod+-`）后通知所有显示中的 view dispatch 空 transaction，触发 measure 对齐行号 */
   notifyFontSizeChanged: () => void
   /** 有没有任何标签还没落盘 */
   anyDirty: () => boolean
@@ -315,13 +315,6 @@ export interface WorkspaceOptions {
    */
   pasteImage?: PasteImageHook
   /**
-   * Cmd/Ctrl+鼠标滚轮调整字号的回调。
-   *
-   * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
-   * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
-   */
-  onFontSizeZoom?: (delta: number) => void
-  /**
    * `Cmd/Ctrl+Click` 查到定义时问谁（M5-2）。
    *
    * ⚠️ 与 [`WorkspaceOptions.pasteImage`] 同一条时序竞态：钩子拿到的是**收到点击的那个 view**，
@@ -354,7 +347,6 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     liveStates,
     options.pasteImage,
     options.dark ?? true,
-    options.onFontSizeZoom,
     options.clickDefinition,
     options.minimap ?? true,
     options.linkFiles,
@@ -954,7 +946,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   /**
-   * Cmd+滚轮缩放后通知所有显示中的 view 重新测量行号 gutter。
+   * 无级缩放（`Mod+=` / `Mod+-`）后通知所有显示中的 view 重新测量行号 gutter。
    *
    * CSS 变量已更新，但 CM6 的行号 gutter 插件只在 lineNumberConfig facet 变化时才重测。
    * dispatch 空 transaction 不会改变 facet，所以必须直接调用 requestMeasure() 强制触发。

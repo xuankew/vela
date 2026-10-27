@@ -59,13 +59,24 @@ import {
 import { applyThemeAttr, DEFAULT_THEME, resolveTheme, sanitizeThemeId, watchSystemTheme, type ThemeId } from './theme'
 
 /**
- * 字号档位。工具栏的 select 直接列这些值，所以冒出一个档外值（17px）会让 select 变空白——
- * 这正是 sanitize 要把档外值打回默认的原因。
+ * 字号档位。外观浮层与设置页的 select 列的就是这些值，`sanitizeFontSize` 也只认它们。
  *
  * ⚠️ 这是**纯 UI 概念**，Rust 侧不知道它存在（`Settings.fontSize` 是个裸 `u32`）。
  * 从 `App.tsx` 挪到这一层，是因为夹档位是 sanitize 的一部分，而 sanitize 归这一层。
  */
 export const FONT_SIZES: readonly number[] = [12, 13, 14, 15, 16, 18, 20]
+
+/**
+ * 字号下拉的候选项：预设档位，外加当前值（当它是 `Cmd/Ctrl + =/-` 无级缩放出来的档外值时）。
+ *
+ * 🔴 少了档外那一项，select 会因为「没有 option 匹配当前值」而退回显示第一项（12px），
+ * 可编辑器实际是 17px——界面在撒谎。缩放之后打开外观浮层是常规路径，不是边角情况。
+ * 档外值只出现在这一份候选里，**不进** `sanitizeFontSize`：写盘的仍然是档位值。
+ */
+export function fontSizeChoices(current: number): readonly number[] {
+  if (FONT_SIZES.includes(current)) return FONT_SIZES
+  return [...FONT_SIZES, current].sort((a, b) => a - b)
+}
 
 /**
  * 内置默认字号。与 Rust `settings::DEFAULT_FONT_SIZE` 同值——两边各写一份、由
@@ -80,7 +91,7 @@ function sanitizeFontSize(n: number): number {
 }
 
 /**
- * Cmd+滚轮无级缩放的上下限。比预设档位宽得多，但仍有边界防止失控。
+ * `Cmd/Ctrl + =/-` 无级缩放的上下限与步长。比预设档位宽得多，但仍有边界防止失控。
  * 下限 8px 是「勉强可读」的底线，上限 72px 是「标题级别」的极限。
  */
 export const ZOOMED_FONT_SIZE_MIN = 8
@@ -170,7 +181,7 @@ export interface SettingsStoreOptions {
   /**
    * 字号变化后的回调。`App.tsx` 注入成 `() => ws.notifyFontSizeChanged()`。
    *
-   * 🔴 用途：Cmd+滚轮无级缩放后，CSS 变量已更新，但 CM6 的行号 gutter 需要一次 measure
+   * 🔴 用途：无级缩放（`Mod+=` / `Mod+-`）改了 CSS 变量，但 CM6 的行号 gutter 需要一次 measure
    * 才能重新对齐。dispatch 一个空 transaction 就能触发 measure。
    * 没注入就不做额外操作（档位选择走 setFontSize，本身就会 persist → 下次启动一致）。
    */
@@ -182,7 +193,7 @@ export interface SettingsStore {
   readonly fontKey: Accessor<FontVariantId>
   /** 当前代码区字体 ID（已 sanitize） */
   readonly codeFontKey: Accessor<CodeFontId>
-  /** 当前字号（档位选择或滚轮缩放后的实际值） */
+  /** 当前字号（档位选择或无级缩放后的实际值） */
   readonly fontSize: Accessor<number>
   /** 当前行高（无单位倍数，已夹到 `LINE_HEIGHT_MIN..=LINE_HEIGHT_MAX`、归一化到两位小数） */
   readonly lineHeight: Accessor<number>
@@ -209,14 +220,10 @@ export interface SettingsStore {
   setCodeFont: (id: CodeFontId) => void
   /** 用户选了字号（会夹到档位）：更新 + 应用 + 写穿 */
   setFontSize: (n: number) => void
-  /** `Cmd/Ctrl + =/-`：在档位之间走一步。档外（被手改过）时回到默认档 */
-  stepFontSize: (delta: number) => void
   /** `Cmd/Ctrl + 0`：回到默认字号 */
   resetFontSize: () => void
-  /** Cmd+滚轮无级缩放：步进 +/- 1px，不写盘，只改 CSS 变量 */
+  /** `Cmd/Ctrl + =/-`：无级缩放，步进 +/- 1px，不写盘，只改 CSS 变量 */
   stepZoomedFontSize: (delta: number) => void
-  /** 重置滚轮缩放，回到档位值 */
-  resetZoomedFontSize: () => void
   /** 用户设了行高（会夹 + 归一化）：更新 + 应用 + 写穿 */
   setLineHeight: (n: number) => void
   /** 外观浮层里的行高步进器：走一步 `LINE_HEIGHT_STEP` */
@@ -252,7 +259,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   const [fontKey, setFontKey] = createSignal<FontVariantId>(DEFAULT_VARIANT)
   const [codeFontKey, setCodeFontKey] = createSignal<CodeFontId>(DEFAULT_CODE_FONT)
   const [fontSize, setFontSizeSignal] = createSignal(DEFAULT_FONT_SIZE)
-  /** Cmd+滚轮缩放后的字号（无级，不写盘）。`null` = 没缩放过，用档位值 */
+  /** 无级缩放后的字号（不写盘）。`null` = 没缩放过，用档位值 */
   const [zoomedFontSize, setZoomedFontSizeSignal] = createSignal<number | null>(null)
   const [lineHeight, setLineHeightSignal] = createSignal(DEFAULT_LINE_HEIGHT)
   const [letterSpacing, setLetterSpacingSignal] = createSignal(DEFAULT_LETTER_SPACING)
@@ -400,7 +407,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   }
 
   // ⚠️ 这些 mutator 都是**具名函数**而不是对象字面量里的方法：`App.tsx` 会把它们当裸引用
-  // 递出去（`adjustFontSize: settings.stepFontSize`），方法里的 `this` 在那种调用下是
+  // 递出去（`adjustFontSize: settings.stepZoomedFontSize`），方法里的 `this` 在那种调用下是
   // undefined。互相调用一律走这些局部函数，不碰 `this`
   function setFontVariant(id: FontVariantId): void {
     setFontKey(id)
@@ -417,22 +424,10 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   function setFontSize(n: number): void {
     const clamped = sanitizeFontSize(n)
     setFontSizeSignal(clamped)
-    // 用户手动选档位时，清除滚轮缩放状态，避免下次打开对话框时 effectiveFontSize 返回旧值
+    // 用户手动选档位时，清除无级缩放状态，避免下次打开对话框时 effectiveFontSize 返回旧值
     setZoomedFontSizeSignal(null)
     applyFontSizeVar(clamped)
     persist()
-  }
-
-  function stepFontSize(delta: number): void {
-    // ⚠️ 必须读原始的 fontSize 信号，而不是 effectiveFontSize()：
-    // 如果用户之前用过滚轮缩放，effectiveFontSize() 会返回缩放值（不在 FONT_SIZES 里），
-    // 导致 indexOf 永远返回 -1，步进器从默认档起步而不是从当前档
-    const index = FONT_SIZES.indexOf(fontSize())
-    // 档外（被手改过、或还没 sanitize）时回到默认档，而不是从 -1 起步
-    const next =
-      index < 0 ? DEFAULT_FONT_SIZE : FONT_SIZES[Math.min(FONT_SIZES.length - 1, Math.max(0, index + delta))]!
-    // next 一定是合法档位，走 setFontSize 会再 sanitize 一次（无副作用），顺带写穿并清除缩放状态
-    setFontSize(next)
   }
 
   function resetFontSize(): void {
@@ -479,19 +474,12 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     persist()
   }
 
-  /** Cmd+滚轮无级缩放：步进 +/- 1px，不写盘，只改 CSS 变量 */
+  /** `Cmd/Ctrl + =/-`：无级缩放，步进 +/- 1px，不写盘，只改 CSS 变量 */
   function stepZoomedFontSize(delta: number): void {
     const base = zoomedFontSize() ?? fontSize()
-    const next = Math.min(ZOOMED_FONT_SIZE_MAX, Math.max(ZOOMED_FONT_SIZE_MIN, base + delta))
+    const next = Math.min(ZOOMED_FONT_SIZE_MAX, Math.max(ZOOMED_FONT_SIZE_MIN, base + delta * ZOOMED_FONT_SIZE_STEP))
     setZoomedFontSizeSignal(next)
     applyFontSizeVar(next)
-    options.onFontSizeChange?.()
-  }
-
-  /** 重置滚轮缩放，回到档位值 */
-  function resetZoomedFontSize(): void {
-    setZoomedFontSizeSignal(null)
-    applyFontSizeVar(fontSize())
     options.onFontSizeChange?.()
   }
 
@@ -512,10 +500,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setFontVariant,
     setCodeFont,
     setFontSize,
-    stepFontSize,
     resetFontSize,
     stepZoomedFontSize,
-    resetZoomedFontSize,
     setLineHeight,
     stepLineHeight,
     resetLineHeight,

@@ -73,13 +73,6 @@ export interface ViewConfig {
    */
   readonly pasteImage?: PasteImageHook
   /**
-   * Cmd/Ctrl+鼠标滚轮调整字号的回调。
-   *
-   * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
-   * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
-   */
-  readonly onFontSizeZoom?: (delta: number) => void
-  /**
    * `Cmd/Ctrl+Click` 跳到定义的处理者，工作区内所有标签共用同一个（M5-2）。
    *
    * 与 `pasteImage` 同一条理由：「点到的那个词在**哪份文档**里查定义」是工作区的知识，
@@ -108,7 +101,6 @@ export function createViewConfig(
   peerStates: () => Iterable<EditorState> = () => [],
   pasteImage?: PasteImageHook,
   dark = true,
-  onFontSizeZoom?: (delta: number) => void,
   clickDefinition?: DefinitionClickHook,
   minimap = true,
   linkFiles?: LinkFilesHook,
@@ -125,7 +117,6 @@ export function createViewConfig(
     minimapSlot: new Compartment(),
     peerStates,
     ...(pasteImage ? { pasteImage } : {}),
-    ...(onFontSizeZoom ? { onFontSizeZoom } : {}),
     ...(clickDefinition ? { clickDefinition } : {}),
     ...(linkFiles ? { linkFiles } : {}),
   }
@@ -200,7 +191,6 @@ export function buildState(
     languageSlot,
     peerStates: config.peerStates,
     ...(config.pasteImage ? { pasteImage: config.pasteImage } : {}),
-    ...(config.onFontSizeZoom ? { onFontSizeZoom: config.onFontSizeZoom } : {}),
     ...(config.clickDefinition ? { clickDefinition: config.clickDefinition } : {}),
     // 两个都到位才装：缺了路径就只能算绝对路径，而绝对路径链接换台机器就全断
     ...(config.linkFiles && docPath ? { completeLinks: (typed: string) => config.linkFiles!(typed, docPath()) } : {}),

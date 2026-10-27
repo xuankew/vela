@@ -44,7 +44,7 @@ export interface BuiltinHooks {
    * 落值在宿主——缩略图状态活在工作区的共享槽位里，不属于任何单个编辑器实例。
    */
   toggleMinimap: () => void
-  /** 字号是全局 CSS 变量，不属于任何单个编辑器实例 */
+  /** 字号是全局 CSS 变量，不属于任何单个编辑器实例；宿主接的是 ±1px 无级步进，不写盘 */
   adjustFontSize: (delta: number) => void
   resetFontSize: () => void
   /**
@@ -223,6 +223,26 @@ export interface BuiltinHooks {
    * 弹一句「没找到定义」等于把用户一次正常的多光标操作染成报错
    */
   gotoDefinition: () => void
+  /**
+   * 返回上一个跳转的位置（M5-3，`Mod+Alt+←`）。
+   *
+   * 它就是上面那一条注释里「留给『跳出去之后还能回得来』的一整套上下文栈」：
+   * 每一次把人 teleport 走的跳转（跳到定义、`Cmd+P` / `Cmd+R` 浮层、点搜索结果、点大纲标题）
+   * 都在起跳前记下「站在哪儿」，这一条把栈顶那一条装回去。
+   *
+   * ⚠️ 是**导航栈**而不是「最后一次改正文的地方」：连跳两次可以连退两次。
+   * 「回到最后编辑处」是另一件事（VS Code 的 Go to Last Edit Location），v1 没做。
+   *
+   * 不设 `when`：退无可退是常态（刚打开一个文件就按它），而那种情况该**说一句**
+   * 「没有可返回的位置」，与 `alignTable` / `wordCount` 同一条理由——
+   * 一个按下去没反应的快捷键，用户没法区分「历史是空的」和「这个键坏了」
+   */
+  gotoBack: () => void
+  /**
+   * 前进到下一个位置（M5-3，`Mod+Alt+→`）。`gotoBack` 的镜像，与浏览器的前进同一条语义：
+   * 退到中间之后**再跳一次**就把前进那一段清掉了，因为原来那条「前进」不再成立
+   */
+  gotoForward: () => void
   /**
    * 展开工具箱那块大浮层（M3-B-1，`Mod+Shift+T`）。
    *
@@ -411,8 +431,14 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     // 的是 ÷，但我们的解析走 event.code 的物理键位（见 commands/keybinding.ts），所以能匹配。
     registry.register(cmCommand('editor.startCompletion', '触发词补全', startCompletion, 'Alt+/')),
 
-    // 分屏。快捷键沿用 VS Code 的既有约定（`Mod+\` 右分屏、`Mod+Shift+\` 下分屏、
-    // `Mod+Alt+←→` 切焦点），不另发明。
+    // 分屏。快捷键沿用 VS Code 的既有约定（`Mod+\` 右分屏、`Mod+Shift+\` 下分屏），不另发明。
+    //
+    // ⚠️ **切焦点那两条原本是 `Mod+Alt+←→`，M5-3 起让给了「返回/前进」**：那一组键在
+    // 浏览器与 IDE 里读作导航历史，而「切分屏焦点」这件事本来就有工具栏与右键菜单两个入口。
+    // 让出来的键挪到 `Mod+Alt+Shift+←→`——那一族此前是空的（`node_modules/@codemirror/*/dist`
+    // 里带 `Left`/`Right` 的绑定只有 `Alt-` / `Ctrl-` / `Mod-` 三条前缀，一个 `Mod-Alt-` 都没有；
+    // 原生菜单也没有）。🔴 `src-tauri/src/menu.rs` 里 `window.focus_next` / `window.focus_prev`
+    // 那两个 accelerator 必须同步改，只改一边的话同一个键会既切分屏又跳历史。
     //
     // 🔴 这五条**一律不设 `when`**。它们从前都写着 `ctx.editor !== null` 那个条件，
     // 而 M2-H 之后那一条是错的：只读分片那块分屏里**没有** `EditorController`
@@ -442,14 +468,14 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       id: 'editor.focusNextPane',
       title: '聚焦下一块分屏',
       category: '编辑器',
-      keybinding: 'Mod+Alt+Right',
+      keybinding: 'Mod+Alt+Shift+Right',
       run: () => hooks.focusNextPane(),
     }),
     registry.register({
       id: 'editor.focusPreviousPane',
       title: '聚焦上一块分屏',
       category: '编辑器',
-      keybinding: 'Mod+Alt+Left',
+      keybinding: 'Mod+Alt+Shift+Left',
       run: () => hooks.focusPreviousPane(),
     }),
     // 分屏的收口两条。⛔ 都刻意不绑 `Mod+W`：macOS 的原生菜单快捷键等价物在事件到达 webview
@@ -480,7 +506,8 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     // 就被吃掉了，绑在这儿收不到按键——与上面「合并分屏」不绑 `Mod+W` 同一条理由。
     // 于是取 O = Others、A = All，两个键此前都是空的：`@codemirror` 与 `@lezer` 的 dist 里
     // 搜不到 `Mod-Alt-o` / `Mod-Alt-a`（`Mod-Alt-` 那一批只有 ArrowUp/ArrowDown 与 Enter），
-    // 本项目的原生菜单占的是 `⌥⌘J` / `⌥⌘V` / `⌥⌘←→`，注册表里已占的是 `⌥⌘F` / `⌥⌘D`。
+    // 本项目的原生菜单占的是 `⌥⌘J` / `⌥⌘V`（当时还有 `⌥⌘←→` 切分屏焦点，M5-3 起那一对
+    // 挪到了 `⌥⇧⌘←→`、原键让给「返回/前进」），注册表里已占的是 `⌥⌘F` / `⌥⌘D`。
     //
     // 不设 `when`：与分屏那五条同一条理由——只读分片里 `ctx.editor` 是 null，
     // 而「关掉其它标签」跟有没有编辑器无关；gate 上去的后果是打开一个 100 MB 的日志
@@ -675,8 +702,11 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
     // 本项目注册表里已经占着的 `Mod+Alt-` 是 `←→↑↓` / `Enter` / `V` / `J`，
     // 而 Rust 侧没有任何 `accelerator`（原生菜单不占键）。
     //
-    // ⚠️ 与 VS Code 的 `F12` 不同字母：那个功能位要留给「跳出去之后还能回得来」的一整套
-    // 上下文栈，而这一条只是「在同一份文件里找到它的声明」，不需要历史。
+    // ⚠️ 与 VS Code 的 `F12` 不同字母：那一整套「跳出去之后还能回得来」的上下文栈
+    // 后来做成了下面那两条 `goto.back` / `goto.forward`（M5-3），键位取的是 `Mod+Alt+←→`
+    // ——与浏览器/IDE 的既有约定一致，代价是把「切分屏焦点」挤到了 `Mod+Alt+Shift+←→`。
+    // 这一条本身只是「在同一份文件里找到它的声明」，⛔ 不自己记历史：
+    // 落点是 `gotoCommit` 的 `gotoPos` 那一支，历史在那里统一记，于是四个入口共用一份栈。
     // 换文件的那一半是 `search.wordInFiles`，不在这里
     registry.register({
       id: 'goto.definition',
@@ -684,6 +714,29 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       category: '跳转',
       keybinding: 'Mod+Alt+D',
       run: () => hooks.gotoDefinition(),
+    }),
+    // 跳转历史（M5-3）。两条都**不设 `when`**，理由写在 `BuiltinHooks.gotoBack` 上。
+    //
+    // 🔴 键位是从「聚焦下一块/上一块分屏」手里接过来的，那两条同时挪到了
+    // `Mod+Alt+Shift+←→`——`src-tauri/src/menu.rs` 里那两个原生 accelerator 也一起改了，
+    // ⛔ 只改一边的话同一个键会**既切分屏又跳历史**（原生菜单项在事件到达 webview 之前
+    // 就被系统吃掉一次，注册表那条在捕获阶段又跑一次，M4-O 记过这个双触发的坑）。
+    //
+    // ⚠️ 方向沿用本项目既有的一条约定：`←` 往更早、`→` 往更近，与书签那一对
+    // （`Mod+Alt+[` 上一个 / `Mod+Alt+]` 下一个）、`Mod+Shift+G` 查上一个同一条
+    registry.register({
+      id: 'goto.back',
+      title: '返回上一个位置',
+      category: '跳转',
+      keybinding: 'Mod+Alt+Left',
+      run: () => hooks.gotoBack(),
+    }),
+    registry.register({
+      id: 'goto.forward',
+      title: '前进到下一个位置',
+      category: '跳转',
+      keybinding: 'Mod+Alt+Right',
+      run: () => hooks.gotoForward(),
     }),
     // ⛔ 刻意**不**注册 `goto.line`。跳行这件事已经有两个入口了：CM6 原生的 `gotoLine`
     // （绑 Mod+Alt+G，它自己会弹一个输入框），以及这个浮层里的 `:42` 语法。再注册一条

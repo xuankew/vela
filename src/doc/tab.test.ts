@@ -247,7 +247,7 @@ describe('M3-A-6：链接补全的注入链', () => {
   const DOC = '[图]('
 
   function configWith(linkFiles?: LinkFilesHook): ViewConfig {
-    return createViewConfig(true, () => [], undefined, true, undefined, undefined, true, linkFiles)
+    return createViewConfig(true, () => [], undefined, true, undefined, true, linkFiles)
   }
 
   /**

@@ -939,14 +939,23 @@ describe('App 接线', () => {
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
   })
 
-  it('字号只在预设档位间走，不会冒出 select 显示不了的档外值', async () => {
-    // 从最小档继续缩小应当停在 12px
-    press('0', modInit())
-    press('-', modInit())
-    press('-', modInit())
-    press('-', modInit())
-    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('12px')
-    expect((await fontSizeSelect()).value).toBe('12')
+  it('加号键的两条来路都放大字号，档外值也进 select，两端夹住', async () => {
+    // 主键盘区的「加号」是 Shift+`=`，小键盘的 `key` 直接是 `'+'`。用户按的都是加号，
+    // 两条来路必须命中同一条命令——当年「感觉只有滚轮能缩放」正是这个洞造成的
+    press('+', { ...modInit(), shiftKey: true })
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('15px')
+    press('+', modInit())
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('16px')
+    press('+', modInit())
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('17px')
+
+    for (let i = 0; i < 80; i++) press('-', modInit())
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('8px')
+    for (let i = 0; i < 80; i++) press('=', modInit())
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('72px')
+
+    // 档外值必须出现在候选里：少这一项，select 会退回显示第一项（12px），可编辑器实际是 72px
+    expect((await fontSizeSelect()).value).toBe('72')
   })
 
   it('「新建」另开一个空标签，状态栏与编辑器都跟着换过去', () => {
@@ -1341,14 +1350,16 @@ describe('分屏接线', () => {
     expect(container.querySelector('.body')?.classList.contains('column')).toBe(true)
   })
 
-  it('Mod+Alt+→ 把焦点交给下一块分屏，并回绕', () => {
+  it('Mod+Alt+Shift+→ 把焦点交给下一块分屏，并回绕', () => {
     press('\\', modInit())
     expect(focused()).toBe(1)
 
-    press('ArrowRight', { ...modInit(), altKey: true })
+    // 🔴 必须带 shiftKey：M5-3 起 `Mod+Alt+←→` 是「返回/前进上一个跳转位置」，
+    // 少按一个 Shift 会跳去导航栈，焦点一动不动——那条命令还会弹「没有可返回的位置」
+    press('ArrowRight', { ...modInit(), altKey: true, shiftKey: true })
     expect(focused()).toBe(0)
 
-    press('ArrowLeft', { ...modInit(), altKey: true })
+    press('ArrowLeft', { ...modInit(), altKey: true, shiftKey: true })
     expect(focused()).toBe(1)
   })
 
@@ -2650,6 +2661,155 @@ describe('跳转浮层接线（M2-E）', () => {
     expect(ipc.openFile).toHaveBeenCalledWith('/repo/src/b.ts')
     expect(palette()).toBeNull()
     expect(view().state.doc.toString()).toBe('第二份')
+  })
+})
+
+describe('跳转历史接线（M5-3）', () => {
+  /**
+   * 60 行的定长正文。与上面 M2-E 那两条跳行用例逐字同源：
+   * `statusCounts()` 恒为 `60 行 · 410 字符`，第 42 行的行首恒为 278
+   */
+  function typeSixtyLines(): void {
+    typeText(Array.from({ length: 60 }, (_, i) => `第 ${i + 1} 行`).join('\n'))
+  }
+
+  /** 按一次 `Mod+Alt+←` / `Mod+Alt+→`。⚠️ 不带 Shift：带上就切成「换分屏焦点」了 */
+  function nav(key: 'ArrowLeft' | 'ArrowRight'): void {
+    press(key, { ...modInit(), altKey: true })
+  }
+
+  /** 用浮层跳一次行（`:N` 回车）。走的是 `gotoCommit` 的 inline 分支——与 ⌥⌘D、点大纲同一条 */
+  async function jumpToLine(line: number): Promise<void> {
+    press('p', modInit())
+    await flush()
+    typeGoto(`:${line}`)
+    await flush()
+    pressInPalette('Enter')
+    await flush()
+  }
+
+  it('跳两次之后返回两步走回第 10 行与第 1 行，前进两步原样走回来', async () => {
+    typeSixtyLines()
+    expect(cursorLine()).toBe(1)
+
+    await jumpToLine(10)
+    await jumpToLine(42)
+    expect(cursorLine()).toBe(42)
+
+    nav('ArrowLeft')
+    await flush()
+    expect(cursorLine()).toBe(10)
+
+    nav('ArrowLeft')
+    await flush()
+    expect(cursorLine()).toBe(1)
+
+    // 前进栈里应该**恰好**是刚才退掉的那两条：退到底那一下没往里面塞东西
+    nav('ArrowRight')
+    await flush()
+    expect(cursorLine()).toBe(10)
+
+    nav('ArrowRight')
+    await flush()
+    expect(cursorLine()).toBe(42)
+
+    // 全程只动光标，一个字符都不该改；`:N` 那条路也不发 IPC
+    expect(statusCounts()).toBe('60 行 · 410 字符')
+    expect(ipc.openFile).not.toHaveBeenCalled()
+  })
+
+  it('没有历史时按下去只说一句，光标一动不动', async () => {
+    typeSixtyLines()
+    expect(notices()).toEqual([])
+
+    nav('ArrowLeft')
+    await flush()
+    // 「按了没反应」与「按了但没东西可退」是两回事：前者用户只会以为快捷键坏了。
+    // ⚠️ 用 `toContain`：提示条那个节点里还挂着关闭按钮的 `×`，整段文本读出来是带尾巴的
+    expect(notices()[0]!.level).toBe('plain')
+    expect(notices()[0]!.text).toContain('没有可返回的位置')
+    expect(cursorLine()).toBe(1)
+
+    nav('ArrowRight')
+    await flush()
+    expect(notices()[0]!.text).toContain('没有可前进的位置')
+    expect(cursorLine()).toBe(1)
+  })
+
+  /**
+   * 从浮层里开第 index 个候选（点一行 = 选中并落地）。
+   *
+   * ⚠️ 不能靠敲字挑：`projectCmd` 那个桩是**按数组顺序原样回**的，不做模糊过滤，
+   * 敲 `b.ts` 递上去它照样把 `a.ts` 排在第一位，于是两次都开了同一个文件
+   */
+  async function openCandidate(index: number): Promise<void> {
+    press('p', modInit())
+    await flush()
+    paletteRows()[index]!.click()
+    await flush()
+  }
+
+  it('从浮层开了另一个文件，返回时切回原来那一个标签', async () => {
+    await openProject()
+    const disk: Record<string, string> = { '/repo/src/a.ts': 'A 的正文', '/repo/src/b.ts': 'B 的正文' }
+    projectCmd.result = { matches: [matchOf('src/a.ts'), matchOf('src/b.ts')], total: 2 }
+    ipc.openFile.mockImplementation(async (path: string) => textFile({ text: disk[path] ?? '正文' }))
+
+    await openCandidate(0)
+    await openCandidate(1)
+    expect(statusName()).toBe('b.ts')
+    expect(view().state.doc.toString()).toBe('B 的正文')
+
+    nav('ArrowLeft')
+    await flush()
+    expect(statusName()).toBe('a.ts')
+    expect(view().state.doc.toString()).toBe('A 的正文')
+
+    nav('ArrowRight')
+    await flush()
+    expect(statusName()).toBe('b.ts')
+  })
+
+  it('历史里那个标签已经关掉了：跳过它落到再上一条，而不是卡在那儿不动', async () => {
+    await openProject()
+    const disk: Record<string, string> = {
+      '/repo/src/a.ts': 'A 的正文',
+      '/repo/src/b.ts': 'B 的正文',
+      '/repo/src/c.ts': 'C 的正文',
+    }
+    projectCmd.result = {
+      matches: [matchOf('src/a.ts'), matchOf('src/b.ts'), matchOf('src/c.ts')],
+      total: 3,
+    }
+    ipc.openFile.mockImplementation(async (path: string) => textFile({ text: disk[path] ?? '正文' }))
+
+    await openCandidate(0)
+    await openCandidate(1)
+    await openCandidate(2)
+    // ⚠️ 是 3 个不是 4 个：头一个文件是**顶掉**那个空文档标签开的，
+    // 于是历史里也没有「空文档」那一条
+    expect(tabs()).toHaveLength(3)
+    expect(statusName()).toBe('c.ts')
+
+    // 关掉中间的 b.ts（正文是从盘上读来的，没有改动，走的是 closeTab 的快路径）。
+    // 此刻栈里是 a.ts → b.ts，栈顶那一条已经死了
+    tabs()[1]!.querySelector<HTMLButtonElement>('.tab-close')!.click()
+    await flush()
+    expect(tabs()).toHaveLength(2)
+    expect(statusName()).toBe('c.ts')
+
+    // 🔴 这一条是「返回看起来坏了」那个类目的病根：停在死条目上 = 按下去纹丝不动，
+    // 而用户分不清「历史空了」和「键坏了」
+    nav('ArrowLeft')
+    await flush()
+    expect(statusName()).toBe('a.ts')
+    expect(view().state.doc.toString()).toBe('A 的正文')
+
+    // 死条目是被**丢掉**的，不是留在那儿每次重来一遍：再按一次就该说没有了
+    nav('ArrowLeft')
+    await flush()
+    expect(notices()[0]!.text).toContain('没有可返回的位置')
+    expect(statusName()).toBe('a.ts')
   })
 })
 
@@ -4572,14 +4732,19 @@ describe('分层配置接线（M4-A）', () => {
     expect(settingsCmd.saved).toEqual([])
   })
 
-  it('Mod+= 改字号后写穿到 save_settings，存的正是新档位那一整份', async () => {
+  it('Mod+= 的无级缩放不写盘，Mod+0 回档位才写穿', async () => {
     press('=', modInit())
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('15px')
     await flush()
-    // 写队列是异步的：一次改动最终只落一次盘，且存的是**当前值**（不是旧值）
+    // 临时手感不该每按一下快捷键就落一次 save_settings（这正是滚轮时代定下的口径）
+    expect(settingsCmd.saved).toEqual([])
+
+    press('0', modInit())
+    expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('14px')
+    await flush()
     expect(settingsCmd.saved).toHaveLength(1)
     expect(settingsCmd.saved[0]).toEqual({
-      fontSize: 15,
+      fontSize: 14,
       fontVariant: 'screen-gb',
       codeFont: 'maple-cn',
       lineHeight: 1.75,

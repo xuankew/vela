@@ -3471,7 +3471,7 @@ select {
 /* ──────────────────────── CM6 行号 gutter（R11）─────────────────────────
    🔴 必须用 `!important`：CM6 base theme 的 `.cm-lineNumbers .cm-gutterElement`
    没有显式字号，但它的样式模块挂载顺序可能晚于我们的 theme 模块，导致覆盖失败。
-   行号要跟随 `--vela-font-size`，否则 Cmd+滚轮缩放时编辑器内容变大但行号保持原尺寸。 */
+   行号要跟随 `--vela-font-size`，否则 `Cmd/Ctrl + =/-` 无级缩放时编辑器内容变大但行号保持原尺寸。 */
 .cm-gutters {
   font-size: var(--vela-font-size, 14px) !important;
 }

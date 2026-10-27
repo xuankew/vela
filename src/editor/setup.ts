@@ -38,7 +38,6 @@ import { changeGutter } from './changeGutter'
 import { bookmarkGutter } from './bookmarks'
 import { minimapExtension } from './minimap'
 import { definitionClick, type DefinitionClickHook } from './clickJump'
-import { fontSizeZoom } from './fontSizeZoom'
 import { indentGuides } from './indentGuides'
 import { jsonLint } from './jsonLint'
 import { isJsonLanguage, type LanguageChoice } from './language'
@@ -364,13 +363,6 @@ export interface EditorSetupOptions {
    */
   clickDefinition?: DefinitionClickHook
   /**
-   * Cmd/Ctrl+鼠标滚轮调整字号的回调。没传就不装这条扩展。
-   *
-   * 参数是步进方向：`+1` = 放大（向上滚），`-1` = 缩小（向下滚）。
-   * 由 settings store 统一管 sanitize + CSS 变量 + 写穿。
-   */
-  onFontSizeZoom?: (delta: number) => void
-  /**
    * Markdown 里打完 `](` 之后问谁要候选（M3-A-6）。缺省 = 不装这条扩展，
    * 补全就只剩词补全与语言包自带的那些。
    *
@@ -431,7 +423,6 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
     peerStates,
     pasteImage,
     clickDefinition,
-    onFontSizeZoom,
     completeLinks,
   } = options
 
@@ -515,8 +506,6 @@ export function buildExtensions(options: EditorSetupOptions): Extension[] {
   // ⚠️ 装了也**不等于接管每一次点击**——宿主回 false 时 CM6 的内置处理照旧跑，
   // 这正是那条口径（查不到定义就不动这个手势位）的落点，见 `./clickJump` 文件头
   if (clickDefinition !== undefined) exts.push(definitionClick(clickDefinition))
-  // Cmd/Ctrl+鼠标滚轮调整字号。没传就不装：保持与 Mod+=/- 同一套步进逻辑
-  if (onFontSizeZoom !== undefined) exts.push(fontSizeZoom(onFontSizeZoom))
   // Markdown 链接补全（M3-A-6）。没传就不装：这一组扩展只注册进 markdownLanguage 的数据里，
   // 装了也不影响别的语言，但仍按「宿主没接就一个字都不装」的口径来，与其他钩子一致
   if (completeLinks !== undefined) exts.push(linkCompletions(completeLinks))

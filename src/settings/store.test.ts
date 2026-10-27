@@ -40,12 +40,15 @@ import {
   DEFAULT_LETTER_SPACING,
   DEFAULT_LINE_HEIGHT,
   FONT_SIZES,
+  fontSizeChoices,
   LETTER_SPACING_MAX,
   LETTER_SPACING_MIN,
   LETTER_SPACING_STEP,
   LINE_HEIGHT_MAX,
   LINE_HEIGHT_MIN,
   type SettingsStore,
+  ZOOMED_FONT_SIZE_MAX,
+  ZOOMED_FONT_SIZE_MIN,
 } from './store'
 
 /** 写队列是微任务链，`setTimeout(0)` 把它冲干净（与 sessionSync.test.ts 同一条做法，不用假表） */
@@ -336,22 +339,34 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
     expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({ fontSize: DEFAULT_FONT_SIZE })
   })
 
-  it('stepFontSize 在档位之间走，到两端就停住', () => {
+  it('stepZoomedFontSize 一次走 1px，两端夹住，而且不写盘', async () => {
     expect(store.fontSize()).toBe(14)
-    store.stepFontSize(1)
-    expect(store.fontSize()).toBe(15)
-    store.stepFontSize(1)
+    store.stepZoomedFontSize(1)
+    store.stepZoomedFontSize(1)
     expect(store.fontSize()).toBe(16)
-    store.stepFontSize(-1)
+    store.stepZoomedFontSize(-1)
     expect(store.fontSize()).toBe(15)
-    // 顶到最大档（20）再 +1 还是 20
-    store.setFontSize(20)
-    store.stepFontSize(1)
-    expect(store.fontSize()).toBe(20)
-    // 顶到最小档（12）再 -1 还是 12
-    store.setFontSize(12)
-    store.stepFontSize(-1)
-    expect(store.fontSize()).toBe(12)
+
+    // 无级缩放是**临时**的：不落盘，否则每按一下快捷键就是一次 save_settings
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+
+    for (let i = 0; i < 80; i++) store.stepZoomedFontSize(-1)
+    expect(store.fontSize()).toBe(ZOOMED_FONT_SIZE_MIN)
+    for (let i = 0; i < 80; i++) store.stepZoomedFontSize(1)
+    expect(store.fontSize()).toBe(ZOOMED_FONT_SIZE_MAX)
+  })
+
+  it('缩放出来的档外值会进下拉候选，选档位则把缩放清掉并写穿档位值', async () => {
+    store.stepZoomedFontSize(3)
+    expect(store.fontSize()).toBe(17)
+    expect(fontSizeChoices(17)).toEqual([...FONT_SIZES, 17].sort((a, b) => a - b))
+    expect(fontSizeChoices(16)).toEqual(FONT_SIZES)
+
+    store.setFontSize(18)
+    expect(store.fontSize()).toBe(18)
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls.at(-1)![0]).toMatchObject({ fontSize: 18 })
   })
 
   it('resetFontSize 回到默认档', () => {

@@ -296,8 +296,8 @@ describe('整条链：真 TypeScript 语法树 + 从 workspace 那一层的入�
     if (description === null) throw new Error(`用例写错了：${PATH} 在 language-data 里没有语法包`)
     const support = await description.load()
     if (support === null) throw new Error(`用例写错了：${PATH} 的语法包 load() 回了 null`)
-    // 与 `createWorkspace` 逐字同一条：钩子从 options 走到 config 的第 6 个位置参数上
-    const config = createViewConfig(false, () => [], undefined, true, undefined, hook)
+    // 与 `createWorkspace` 逐字同一条：钩子从 options 走到 config 的第 5 个位置参数上
+    const config = createViewConfig(false, () => [], undefined, true, hook)
     const languageSlot = new Compartment()
     const state = buildState(doc, config, languageSlot)
     const ready = state.update({

@@ -54,6 +54,8 @@ function makeHooks(): BuiltinHooks {
     gotoFile: vi.fn(),
     gotoSymbol: vi.fn(),
     gotoDefinition: vi.fn(),
+    gotoBack: vi.fn(),
+    gotoForward: vi.fn(),
     openToolBox: vi.fn(),
     openCommandPalette: vi.fn(),
   }
@@ -185,13 +187,13 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('六十一条命令全部注册成功，且互不抢占快捷键', () => {
+  it('六十五条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按 id 前缀分组的：
     // 「工具」(U+5DE5) < 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」(U+7F16)
     // < 「视图」(U+89C6) < 「跳转」(U+8DF3) < 「项目」(U+9879)。
     // 两条 search.* 排在 file.* 之前正是这个缘故——它们的 id 以 s 开头，本该在 file.* 之后；
-    // 两条 goto.* 排在 view.* 之后同理。⚠️ 「跳转」的码点比「视图」**大**，
+    // 四条 goto.* 排在 view.* 之后同理。⚠️ 「跳转」的码点比「视图」**大**，
     // 凭字形或拼音猜排序在这里必错
     expect(registry.list().map((c) => c.id)).toEqual([
       // 「工具」这一组只有一条：M3-B-1 交的是工具箱那个**入口**，
@@ -255,8 +257,10 @@ describe('内置命令', () => {
       'view.toggleOutline',
       'view.togglePreview',
       'view.toggleSidebar',
+      'goto.back',
       'goto.definition',
       'goto.file',
+      'goto.forward',
       'goto.symbol',
       'project.addFolder',
       'project.closeFolder',
@@ -346,6 +350,12 @@ describe('内置命令', () => {
   it('Mod+= / Mod+- / Mod+0 分派到字号命令', async () => {
     const { registry, hooks } = makeRegistry(null)
     expect(registry.findForKey(event('=', { metaKey: true }))?.id).toBe('view.increaseFontSize')
+    // 用户按的是「加号」，而加号有两条来路：主键盘区是 Shift+`=`（code 仍是 Equal），
+    // 小键盘的 key 直接是 '+'。两条都得命中同一条命令，否则快捷键看着像没接上
+    expect(registry.findForKey(event('+', { metaKey: true, shiftKey: true, code: 'Equal' }))?.id).toBe(
+      'view.increaseFontSize',
+    )
+    expect(registry.findForKey(event('+', { metaKey: true, code: 'NumpadAdd' }))?.id).toBe('view.increaseFontSize')
     expect(registry.findForKey(event('-', { metaKey: true }))?.id).toBe('view.decreaseFontSize')
     expect(registry.findForKey(event('0', { metaKey: true }))?.id).toBe('view.resetFontSize')
 
@@ -510,12 +520,20 @@ describe('M1-D-5：分屏命令的接线', () => {
     expect(registry.findForKey(event('\\', { metaKey: true, shiftKey: true }))?.id).toBe('editor.splitDown')
   })
 
-  it('Mod+Alt+←→ 切分屏焦点，不与 Mod+Alt+↑↓ 加光标互抢', () => {
+  it('Mod+Alt+Shift+←→ 切分屏焦点，不与 Mod+Alt+↑↓ 加光标互抢', () => {
     const { registry } = makeRegistry(fakeController(false))
-    expect(registry.findForKey(event('ArrowRight', { metaKey: true, altKey: true }))?.id).toBe('editor.focusNextPane')
-    expect(registry.findForKey(event('ArrowLeft', { metaKey: true, altKey: true }))?.id).toBe(
+    expect(registry.findForKey(event('ArrowRight', { metaKey: true, altKey: true, shiftKey: true }))?.id).toBe(
+      'editor.focusNextPane',
+    )
+    expect(registry.findForKey(event('ArrowLeft', { metaKey: true, altKey: true, shiftKey: true }))?.id).toBe(
       'editor.focusPreviousPane',
     )
+    // 🔴 少一个 Shift 就是**另一对命令**（M5-3 起 `Mod+Alt+←→` 归跳转历史）：
+    // 这一条钉的是「让位让干净了」——切焦点那两条如果还留着旧键，
+    // 这里会命中 `editor.focusNextPane`，而 `conflicts()` 那条断言照样是空的
+    // （同一个键被两条命令占着时 `findForKey` 按注册顺序挑一个，不报错）
+    expect(registry.findForKey(event('ArrowRight', { metaKey: true, altKey: true }))?.id).toBe('goto.forward')
+    expect(registry.findForKey(event('ArrowLeft', { metaKey: true, altKey: true }))?.id).toBe('goto.back')
     expect(registry.findForKey(event('ArrowUp', { metaKey: true, altKey: true }))?.id).toBe('editor.addCursorAbove')
     expect(registry.findForKey(event('ArrowDown', { metaKey: true, altKey: true }))?.id).toBe('editor.addCursorBelow')
   })
@@ -892,6 +910,48 @@ describe('M5-1：跳到定义与「拿这个词去搜」的接线', () => {
     expect(hooks.gotoDefinition).toHaveBeenCalledOnce()
     expect(await registry.execute('search.wordInFiles')).toBe(true)
     expect(hooks.searchWordInFiles).toHaveBeenCalledOnce()
+  })
+})
+
+describe('M5-3：跳转历史两条命令的接线', () => {
+  it('两条各分派到自己的 hook——接反了不会报错，只会「按返回却前进」', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('goto.back')).toBe(true)
+    expect(hooks.gotoBack).toHaveBeenCalledOnce()
+    expect(hooks.gotoForward).not.toHaveBeenCalled()
+    expect(await registry.execute('goto.forward')).toBe(true)
+    expect(hooks.gotoForward).toHaveBeenCalledOnce()
+    // ⛔ 不蹭同分类那几条：`goto.back` 接到 `gotoSymbol` 上的话按 ⌥⌘← 弹的是浮层
+    expect(hooks.gotoSymbol).not.toHaveBeenCalled()
+    expect(hooks.gotoDefinition).not.toHaveBeenCalled()
+  })
+
+  it('标题、分类与展示名', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    expect(registry.get('goto.back')?.title).toBe('返回上一个位置')
+    expect(registry.get('goto.back')?.category).toBe('跳转')
+    expect(registry.get('goto.forward')?.title).toBe('前进到下一个位置')
+    expect(registry.get('goto.forward')?.category).toBe('跳转')
+    // MOD_ORDER 是 ctrl→alt→shift→meta，于是三条修饰键读作 ⌥⇧⌘ 而不是按键盘上按下的顺序。
+    // 与 `goto.definition` 那条 ⌥⌘D 同一条规矩
+    expect(registry.list().find((c) => c.id === 'goto.back')?.keybindings).toEqual(['⌥⌘←'])
+    expect(registry.list().find((c) => c.id === 'goto.forward')?.keybindings).toEqual(['⌥⌘→'])
+    expect(registry.list().find((c) => c.id === 'editor.focusNextPane')?.keybindings).toEqual(['⌥⇧⌘→'])
+    expect(registry.list().find((c) => c.id === 'editor.focusPreviousPane')?.keybindings).toEqual(['⌥⇧⌘←'])
+  })
+
+  it('没有编辑器时照样执行成功——退无可退那一句归宿主说，⛔ 不是快捷键哑掉', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    // 🔴 这一条盯的是「聚焦的是一块只读分片」：那种分屏里没有 `EditorController`，
+    // 而历史里可能正躺着一条要回去的条目（从别的标签跳到搜索结果、再切到分片标签）。
+    // 加上 `when: ctx.editor !== null` 的话，用户在大文件里按返回什么也不发生，
+    // 也看不到「没有可返回的位置」那一句——与 `goto.definition` 不设 gate 同一条理由
+    expect(await registry.execute('goto.back')).toBe(true)
+    expect(hooks.gotoBack).toHaveBeenCalledOnce()
+    expect(await registry.execute('goto.forward')).toBe(true)
+    expect(hooks.gotoForward).toHaveBeenCalledOnce()
+    expect(registry.list().find((c) => c.id === 'goto.back')?.enabled).toBe(true)
+    expect(registry.list().find((c) => c.id === 'goto.forward')?.enabled).toBe(true)
   })
 })
 

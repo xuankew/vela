@@ -113,7 +113,8 @@ export function detectPlatform(): Platform {
  * 1. **无修饰键的绑定只允许 `Escape` 与 `F1~F24`。** 允许裸字母意味着一处笔误
  *    （`'p'` 而不是 `'Mod+p'`）就会吞掉用户在编辑器里的正常输入，而且极难察觉。
  * 2. **不支持绑定字面量 `+` 键。** `'Mod++'` 按 `+` 切分会得到空 token，
- *    歧义无法消解；要绑加号用 `'Mod+='`（配合 Shift 即 `+`）。
+ *    歧义无法消解；要绑加号就写 `'Mod+='`，物理加号键（主键盘 Shift+`=`、小键盘 `+`）
+ *    都会命中它，折叠规则见 `matchesKeybinding`。
  */
 export function parseKeybinding(source: string, platform: Platform): Keybinding {
   const tokens = source.trim().split('+')
@@ -220,13 +221,29 @@ export function keyFromEvent(event: KeyEventLike): string | null {
   return KEY_ALIASES[lower] ?? lower
 }
 
+/**
+ * 加号键的两条来路都要能命中 `'Mod+='`：
+ * - 主键盘区：物理键是 `=`，按 Shift 才出 `+`，`code` 是 `Equal`、`key` 是 `'+'`；
+ * - 小键盘：`code` 是 `NumpadAdd`（不在 CODE_ALIASES 里），`key` 直接是 `'+'`。
+ *
+ * 声明串写不出字面量 `+`（`parseKeybinding` 按 `+` 切分，`'Mod++'` 会得到空 token），
+ * 所以规范化的那一侧只有 `'='`。这里把事件侧的 `'+'` 折成 `'='`，并且**只在绑定没声明
+ * Shift 时**把「为了打出加号而按下的那次 Shift」从修饰键比较里剔掉——
+ * 显式写了 `'Mod+Shift+='` 的绑定仍然要求 Shift 在场，语义不被这条折叠吃掉。
+ */
 export function matchesKeybinding(event: KeyEventLike, binding: Keybinding): boolean {
-  const key = keyFromEvent(event)
-  if (key !== binding.key) return false
+  const fromEvent = keyFromEvent(event)
+  if (fromEvent === null) return false
+  const key = fromEvent === '+' ? '=' : fromEvent
+  // 声明侧也折一次：`'Mod+plus'` 经 KEY_ALIASES 会解析成主键 `'+'`，与事件侧折叠后对齐
+  const bindingKey = binding.key === '+' ? '=' : binding.key
+  if (key !== bindingKey) return false
+  const bindingWantsShift = binding.mods.includes('shift')
+  const shift = key === '=' && !bindingWantsShift ? false : event.shiftKey
   return (
     event.ctrlKey === binding.mods.includes('ctrl') &&
     event.altKey === binding.mods.includes('alt') &&
-    event.shiftKey === binding.mods.includes('shift') &&
+    shift === bindingWantsShift &&
     event.metaKey === binding.mods.includes('meta')
   )
 }

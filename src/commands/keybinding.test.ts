@@ -53,7 +53,8 @@ describe('parseKeybinding', () => {
   })
 
   it('不支持绑定字面量 + 键', () => {
-    // 'Mod++' 按 + 切分会得到空 token，歧义无法消解；要绑加号用 'Mod+='
+    // 'Mod++' 按 + 切分会得到空 token，歧义无法消解；要绑加号写 'Mod+='，
+    // 物理加号键（主键盘 Shift+=、小键盘 +）都会命中它，见下面 matchesKeybinding 那条用例
     expect(() => parseKeybinding('Mod++', 'macos')).toThrow()
     expect(parseKeybinding('Mod+=', 'macos').key).toBe('=')
   })
@@ -150,7 +151,8 @@ describe('物理键位（event.code）', () => {
     ).toBe('+')
   })
 
-  it('带 Shift 的标点：key 是 "+" 而 code 是 Equal，按 "=" 匹配', () => {
+  it('物理加号的两条来路都命中 "Mod+="，显式声明 Shift 的绑定仍然要 Shift 在场', () => {
+    // 主键盘区：物理键是 `=`，Shift 才打出 `+`，于是 code 是 Equal、key 是 '+'
     const shiftEqual: KeyEventLike = {
       key: '+',
       code: 'Equal',
@@ -159,8 +161,31 @@ describe('物理键位（event.code）', () => {
       shiftKey: true,
       metaKey: true,
     }
+    expect(matchesKeybinding(shiftEqual, parseKeybinding('Mod+=', 'macos'))).toBe(true)
     expect(matchesKeybinding(shiftEqual, parseKeybinding('Mod+Shift+=', 'macos'))).toBe(true)
-    expect(matchesKeybinding(shiftEqual, parseKeybinding('Mod+=', 'macos'))).toBe(false)
+
+    // 小键盘：NumpadAdd 不在 CODE_ALIASES 里，退回 key，直接就是 '+'
+    const numpadPlus: KeyEventLike = {
+      key: '+',
+      code: 'NumpadAdd',
+      ctrlKey: false,
+      altKey: false,
+      shiftKey: false,
+      metaKey: true,
+    }
+    expect(matchesKeybinding(numpadPlus, parseKeybinding('Mod+=', 'macos'))).toBe(true)
+    expect(matchesKeybinding(numpadPlus, parseKeybinding('Mod+plus', 'macos'))).toBe(true)
+
+    // 折叠只针对 '='：Shift+'-' 是下划线，不该被 'Mod+-' 吃掉
+    const underscore: KeyEventLike = {
+      key: '_',
+      code: 'Minus',
+      ctrlKey: false,
+      altKey: false,
+      shiftKey: true,
+      metaKey: true,
+    }
+    expect(matchesKeybinding(underscore, parseKeybinding('Mod+-', 'macos'))).toBe(false)
   })
 
   it('数字与功能键走规律命名，不必逐个列表', () => {

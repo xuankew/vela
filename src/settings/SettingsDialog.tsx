@@ -7,7 +7,13 @@ import {
   type CodeFontId,
   type FontVariantId,
 } from '../fonts/loader'
-import { DEFAULT_FONT_SIZE, DEFAULT_LETTER_SPACING, DEFAULT_LINE_HEIGHT, FONT_SIZES, type SettingsStore } from './store'
+import {
+  DEFAULT_FONT_SIZE,
+  DEFAULT_LETTER_SPACING,
+  DEFAULT_LINE_HEIGHT,
+  fontSizeChoices,
+  type SettingsStore,
+} from './store'
 import { DEFAULT_THEME, THEME_IDS, THEME_LABELS, type ThemeId } from './theme'
 
 export interface SettingsDialogProps {
@@ -102,7 +108,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
               onChange={(e) => settings.setFontSize(Number(e.currentTarget.value))}
               title="字号（也可用 Cmd/Ctrl + = / - / 0）"
             >
-              {FONT_SIZES.map((s) => (
+              {fontSizeChoices(settings.fontSize()).map((s) => (
                 <option value={String(s)} selected={s === settings.fontSize()}>
                   {s}px
                 </option>

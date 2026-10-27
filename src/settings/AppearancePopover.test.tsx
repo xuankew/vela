@@ -205,6 +205,15 @@ describe('控件落到对的 mutator', () => {
     expect(document.documentElement.style.getPropertyValue('--vela-font-size')).toBe('18px')
   })
 
+  it('无级缩放出的档外值也进 select 候选，下拉不会退回显示第一项', () => {
+    click(toggle())
+    // `Cmd/Ctrl + =` 走的是 stepZoomedFontSize：14 → 17，而 17 不在 FONT_SIZES 里
+    store.stepZoomedFontSize(3)
+    const sel = selectByTitle('字号')
+    expect([...sel.options].map((o) => o.value)).toContain('17')
+    expect(sel.value).toBe('17')
+  })
+
   it('正文字体 select 走 setFontVariant，代码字体 select 走 setCodeFont', () => {
     click(toggle())
     changeSelect(selectByTitle('正文与 UI 字体'), 'screen-r')
