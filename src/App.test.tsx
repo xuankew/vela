@@ -2031,6 +2031,19 @@ describe('全局搜索接线（M2-C）', () => {
     expect(document.activeElement).toBe(findInput())
   })
 
+  /**
+   * 「编辑 › 在文档中查找」是菜单里 ⌘F 那一条的入口。
+   *
+   * 它与上面那条必须落在**不同的面板**上：这一条是 CM6 的 `.cm-search`（只管当前文档），
+   * 上面那一条是项目搜索的 `.find-panel`。两边漂开的话，用户在菜单里点「查找」
+   * 会看到整个项目被搜一遍，而他想要的是这一篇里的下一个匹配
+   */
+  it('菜单「在文档中查找」打开 CM6 那份面板，而不是项目搜索面板', async () => {
+    await menu('edit.find')
+    expect(container.querySelector('.cm-search'), '菜单没把文档内查找面板打开').not.toBeNull()
+    expect(findPanel()).toBeNull()
+  })
+
   it('Mod+Shift+H 一步落到替换模式，而连按第二次不许把那一排收掉', async () => {
     press('H', { ...modInit(), shiftKey: true })
     await flush()

@@ -173,6 +173,7 @@ function routeMenuEvent(
     closeFolder: () => void
     save: (ctx: AppContext) => void
     saveAs: (ctx: AppContext) => void
+    findInEditor: (ctx: AppContext) => void
     findInFiles: () => void
     replaceInFiles: () => void
     formatJson: (ctx: AppContext) => void
@@ -209,6 +210,7 @@ function routeMenuEvent(
   else if (id === 'file.save_as') actions.saveAs(ctx)
   else if (id === 'file.close_folder') actions.closeFolder()
   // Edit
+  else if (id === 'edit.find') actions.findInEditor(ctx)
   else if (id === 'edit.find_in_files') actions.findInFiles()
   else if (id === 'edit.replace_in_files') actions.replaceInFiles()
   else if (id === 'edit.format_json') actions.formatJson(ctx)
@@ -1448,6 +1450,9 @@ export default function App() {
             closeFolder: () => tree.close(),
             save: (c) => void registry.execute('editor.save', c),
             saveAs: (c) => void registry.execute('editor.saveAs', c),
+            // 菜单这一条走的是注册表里那条 `editor.find`（`cmCommand` 包的 `openSearchPanel`），
+            // 不是第二份实现：与 ⌘F 快捷键共用同一份 when 判断与同一个面板
+            findInEditor: (c) => void registry.execute('editor.find', c),
             findInFiles: () => search.show(),
             replaceInFiles: () => search.showReplace(),
             formatJson: (c) => void registry.execute('editor.formatJson', c),

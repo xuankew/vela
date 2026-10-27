@@ -41,6 +41,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &PredefinedMenuItem::copy(app, None)?,
             &PredefinedMenuItem::paste(app, None)?,
             &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, "edit.find", "在文档中查找...", true, Some("CmdOrCtrl+F"))?,
             &MenuItem::with_id(app, "edit.find_in_files", "在文件中查找...", true, Some("CmdOrCtrl+Shift+F"))?,
             &MenuItem::with_id(app, "edit.replace_in_files", "在文件中替换...", true, Some("CmdOrCtrl+Shift+H"))?,
             &PredefinedMenuItem::separator(app)?,
