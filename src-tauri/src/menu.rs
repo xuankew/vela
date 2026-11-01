@@ -101,9 +101,7 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         app,
         "帮助",
         true,
-        &[
-            &MenuItem::with_id(app, "help.about", "关于 Vela", true, Option::<&str>::None)?,
-        ],
+        &[&MenuItem::with_id(app, "help.about", "关于 Vela", true, Option::<&str>::None)?],
     )?;
 
     Menu::with_items(app, &[&file_menu, &edit_menu, &view_menu, &window_menu, &help_menu])

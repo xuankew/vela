@@ -981,7 +981,9 @@ mod tests {
 
         const FMT: &str = r#""format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false"#;
         let tab_json = |path: &str| {
-            format!(r#"{{"path":"{path}",{FMT},"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}}"#)
+            format!(
+                r#"{{"path":"{path}",{FMT},"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}}"#
+            )
         };
         // 两块分屏：第 0 屏显示标签 0，第 1 屏显示标签 2，聚焦第 1 屏。
         // 标签 1 谁都不显示——旧模型里这是合法的孤儿（`mergePane` 就会造出来），
@@ -1018,7 +1020,9 @@ mod tests {
 
         const FMT: &str = r#""format":{"encoding":"utf8","bom":false,"eol":"lf"},"dirty":false,"lossy":false"#;
         let tab_json = |path: &str| {
-            format!(r#"{{"path":"{path}",{FMT},"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}}"#)
+            format!(
+                r#"{{"path":"{path}",{FMT},"draft":null,"selection":[[0,0]],"main":0,"scrollTop":0,"scrollLeft":0}}"#
+            )
         };
         // 7 越界、0 重复出现两次
         let raw = format!(

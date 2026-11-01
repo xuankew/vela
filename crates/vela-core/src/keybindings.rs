@@ -47,7 +47,7 @@ pub struct SaveReport {
 /// 文件存在但解析失败时也返回空配置（静默降级），前端会看到空对象。
 pub fn load(home: &Path) -> LoadedKeybindings {
     let path = home.join(".vela").join("keybindings.json");
-    
+
     match std::fs::read_to_string(&path) {
         Ok(content) => {
             match serde_json::from_str::<UserKeybindings>(&content) {
@@ -55,17 +55,13 @@ pub fn load(home: &Path) -> LoadedKeybindings {
                 Err(_) => {
                     // 解析失败，静默降级为空配置
                     eprintln!("[keybindings] 解析 {} 失败，使用空配置", path.display());
-                    LoadedKeybindings {
-                        keybindings: HashMap::new(),
-                    }
+                    LoadedKeybindings { keybindings: HashMap::new() }
                 }
             }
         }
         Err(_) => {
             // 文件不存在或读不到，返回空配置
-            LoadedKeybindings {
-                keybindings: HashMap::new(),
-            }
+            LoadedKeybindings { keybindings: HashMap::new() }
         }
     }
 }
@@ -76,22 +72,21 @@ pub fn load(home: &Path) -> LoadedKeybindings {
 pub fn save(home: &Path, keybindings: &UserKeybindings) -> Result<SaveReport, std::io::Error> {
     let dir = home.join(".vela");
     std::fs::create_dir_all(&dir)?;
-    
+
     let tmp_path = dir.join("keybindings.json.tmp");
     let final_path = dir.join("keybindings.json");
-    
-    let json = serde_json::to_string_pretty(keybindings)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    
+
+    let json = serde_json::to_string_pretty(keybindings).map_err(std::io::Error::other)?;
+
     // 原子写：先写临时文件，fsync，再 rename
     std::fs::write(&tmp_path, json.as_bytes())?;
-    
+
     // macOS / Linux 上 rename 是原子的
     #[cfg(unix)]
     {
         std::fs::rename(&tmp_path, &final_path)?;
     }
-    
+
     // Windows 上也是原子的（只要目标不在使用中）
     #[cfg(windows)]
     {
@@ -103,7 +98,7 @@ pub fn save(home: &Path, keybindings: &UserKeybindings) -> Result<SaveReport, st
             std::fs::rename(&tmp_path, &final_path)
         })?;
     }
-    
+
     Ok(SaveReport { success: true })
 }
 
@@ -125,14 +120,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".vela");
         std::fs::create_dir_all(&dir).unwrap();
-        
+
         let path = dir.join("keybindings.json");
-        std::fs::write(
-            &path,
-            r#"{"view.togglePreview": "Mod+Shift+P"}"#,
-        )
-        .unwrap();
-        
+        std::fs::write(&path, r#"{"view.togglePreview": "Mod+Shift+P"}"#).unwrap();
+
         let loaded = load(tmp.path());
         assert_eq!(loaded.keybindings.len(), 1);
         assert!(loaded.keybindings.contains_key("view.togglePreview"));
@@ -143,10 +134,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".vela");
         std::fs::create_dir_all(&dir).unwrap();
-        
+
         let path = dir.join("keybindings.json");
         std::fs::write(&path, "not json").unwrap();
-        
+
         let loaded = load(tmp.path());
         assert!(loaded.keybindings.is_empty());
     }
@@ -155,17 +146,14 @@ mod tests {
     fn save_writes_atomic() {
         let tmp = TempDir::new().unwrap();
         let mut kb = UserKeybindings::new();
-        kb.insert(
-            "editor.save".to_string(),
-            json!(["Mod+S", "F2"]),
-        );
-        
+        kb.insert("editor.save".to_string(), json!(["Mod+S", "F2"]));
+
         let report = save(tmp.path(), &kb).unwrap();
         assert!(report.success);
-        
+
         let path = tmp.path().join(".vela").join("keybindings.json");
         assert!(path.exists());
-        
+
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("editor.save"));
     }

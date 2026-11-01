@@ -182,6 +182,7 @@ use vela_core::fs::{
     read_text, read_text_as, store_image as store_image_bytes, write_text_atomic, AssetError, Encoding, FileFormat,
     ReadError, StoredImage, TextFile, WriteError, WriteReport, MAX_IMAGE_BYTES,
 };
+use vela_core::keybindings;
 use vela_core::project::{
     self, merge_stats, query_many, DirEntry, DirListing, EntryKind, FileIndex, FileQuery, GitHead, IndexStats,
     TreeError,
@@ -192,7 +193,6 @@ use vela_core::search::{
 };
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
 use vela_core::settings::{self as settings_store, LoadedSettings, SaveReport, Settings};
-use vela_core::keybindings;
 
 /// 读一个文本文件。
 ///

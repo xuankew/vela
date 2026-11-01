@@ -193,7 +193,7 @@ pub fn read_local_image(doc_path: &Path, ref_raw: &str) -> Result<LocalImage, Lo
 /// 因为 Markdown 本来要求那种写法转义；反过来如果不去，每一个带锚点的引用都会 miss。
 fn clean_ref(raw: &str) -> String {
     let cut = raw.find(['?', '#']).unwrap_or(raw.len());
-    percent_decode(&raw[..cut].trim())
+    percent_decode(raw[..cut].trim())
 }
 
 /// 把 Markdown 里那层百分号编码解回真实的文件名。

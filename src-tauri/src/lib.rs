@@ -82,7 +82,7 @@ pub fn run() {
         // 为什么不用 Tauri 自带的 asset 协议、为什么这个响应刻意不带 CORS 头，
         // 都写在 `imgproto` 的模块文档里
         .register_asynchronous_uri_scheme_protocol(imgproto::SCHEME, imgproto::handle)
-        .menu(|app| menu::build_menu(app))
+        .menu(menu::build_menu)
         .invoke_handler(tauri::generate_handler![
             commands::open_file,
             commands::save_file,
