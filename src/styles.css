@@ -583,6 +583,134 @@ body {
   background: var(--vela-bg-alt);
 }
 
+/* ── M7-6：分组（外观 / 阿里云 OSS）────────────────────────────
+   小标题的权重要低于它下面那些控件：它是「这一组是什么」，不是又一个可点的东西。
+   组与组之间用一条分隔线，不用卡片——卡片会让 OSS 那组看起来比外观那组「更重要」。 */
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings-group + .settings-group {
+  margin-top: 4px;
+  padding-top: 18px;
+  border-top: 1px solid var(--vela-border);
+}
+
+.settings-group-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--vela-fg-dim);
+}
+
+.settings-group-hint {
+  margin: -6px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--vela-fg-dim);
+}
+
+/* 一格 = 标签行 + 可选的说明/结果，纵向贴在一起 */
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 10px;
+  font-family: var(--vela-font-ui);
+  font-size: 13px;
+  background: var(--vela-bg-alt);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  color: var(--vela-fg);
+}
+
+.settings-input:focus {
+  outline: none;
+  border-color: var(--vela-accent);
+}
+
+.settings-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--vela-fg-dim);
+}
+
+.settings-inline {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-action {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vela-fg);
+  background: var(--vela-bg-alt);
+  border: 1px solid var(--vela-border);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.settings-action:hover:enabled {
+  background: var(--vela-bg-panel);
+}
+
+.settings-action:disabled {
+  color: var(--vela-fg-dim);
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* 「清除」是反向操作：同一条尺寸，但去掉边框与底色，只留一行浅灰文字 */
+.settings-action-quiet {
+  color: var(--vela-fg-dim);
+  background: transparent;
+  border-color: transparent;
+  padding: 6px 4px;
+}
+
+.settings-action-quiet:hover:enabled {
+  color: var(--vela-fg);
+  background: transparent;
+}
+
+/* 「已配置」贴在标签后面，只说明钥匙串里有一项，永远不携带任何值 */
+.settings-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--vela-fg-dim);
+  background: var(--vela-bg-alt);
+  border: 1px solid var(--vela-border);
+  border-radius: 999px;
+  vertical-align: 1px;
+}
+
+/* 就地反馈：密钥那一行与「测试上传」下面，成功与失败同一个位置，只换颜色 */
+.settings-result {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--vela-fg-dim);
+  overflow-wrap: anywhere;
+}
+
+.settings-result-bad {
+  color: var(--vela-bad);
+}
+
 /* 快捷键配置对话框（M4-E） */
 .keybindings-dialog {
   display: flex;

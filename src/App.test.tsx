@@ -855,7 +855,7 @@ function replaceSummary(overrides: Partial<ReplaceSummary> = {}): ReplaceSummary
 }
 
 /**
- * 字号 / 字体 / 行高那几组控件都住在「外观设置」对话框里（`SettingsDialog`），默认关着、
+ * 字号 / 字体 / 行高那几组控件都住在「设置」对话框里（`SettingsDialog`），默认关着、
  * 不在 DOM 里。它只有一个入口——「视图 › 设置…」菜单项（`view.settings`），没有快捷键，
  * 所以开它是异步的：取任何 select 之前得先 `await openSettings()`。幂等，已开着就不动。
  */
@@ -4801,7 +4801,7 @@ describe('工具箱与命令面板接线（M3-B-1 / M3-B-2 / M3-B-3 / M3-B-4 / M
 
 describe('分层配置接线（M4-A）', () => {
   async function selectByTitle(prefix: string): Promise<HTMLSelectElement> {
-    // 字体 select 住在「外观设置」对话框里，默认关着、不在 DOM，取之前先把它打开
+    // 字体 select 住在「设置」对话框里，默认关着、不在 DOM，取之前先把它打开
     await openSettings()
     const el = [...container.querySelectorAll('select')].find((s) => s.title.startsWith(prefix))
     if (!el) throw new Error(`找不到 title 以「${prefix}」开头的 select`)
@@ -4917,7 +4917,7 @@ describe('分层配置接线（M4-A）', () => {
     })
   })
 
-  /** 外观设置对话框里那一行步进器（行高 / 字间距）：[−, +] 两个按钮 */
+  /** 「设置」对话框「外观」组里那一行步进器（行高 / 字间距）：[−, +] 两个按钮 */
   async function stepperButtons(label: string): Promise<NodeListOf<HTMLButtonElement>> {
     await openSettings()
     const rows = [...container.querySelectorAll<HTMLElement>('.settings-row')]

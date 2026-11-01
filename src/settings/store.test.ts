@@ -634,7 +634,7 @@ describe('写队列：串行 + 跳过没变化的写', () => {
   })
 })
 
-describe('OSS 四格（M7-5）：这一层只负责**过路**', () => {
+describe('OSS 四格（M7-5 读回 / M7-6 面板可写）：这一层不解释它们', () => {
   it('load 灌进信号时只 trim、不校验（region 填成访问域名照原样留着）', async () => {
     settingsIpc.loadSettings.mockResolvedValue(
       loaded({
@@ -696,5 +696,71 @@ describe('OSS 四格（M7-5）：这一层只负责**过路**', () => {
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
     })
+  })
+
+  it('setOss 一次只改一格，其余三格原样留着', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(
+      loaded({ ossBucket: 'vela-img', ossRegion: 'cn-hangzhou', ossAccessKeyId: 'LTAI5tExampleId', ossPrefix: 'docs' }),
+    )
+    await store.load([])
+    store.setOss({ bucket: 'other-bucket' })
+    await flush()
+    // 🔴 「整份替换」是这里唯一会静默丢数据的写法：面板一次提交一个输入框，
+    // 如果 setOss 拿 patch 当全量，刚在另一个框里填好的 region 就没了
+    expect(store.oss()).toEqual({
+      bucket: 'other-bucket',
+      region: 'cn-hangzhou',
+      accessKeyId: 'LTAI5tExampleId',
+      prefix: 'docs',
+    })
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      ossBucket: 'other-bucket',
+      ossRegion: 'cn-hangzhou',
+    })
+  })
+
+  it('setOss 只 trim、不校验：粘进 region 的访问域名照原样进盘', async () => {
+    store.setOss({ region: '  oss-cn-hangzhou.aliyuncs.com  ', prefix: ' docs/ ' })
+    await flush()
+    // 与 load 那一条同一个口径：改「对」是落地层 `oss.rs::normalize` 的活，
+    // 那里失败会指名哪一格不对；这一层只负责把首尾空白去掉
+    expect(store.oss().region).toBe('oss-cn-hangzhou.aliyuncs.com')
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      ossRegion: 'oss-cn-hangzhou.aliyuncs.com',
+      ossPrefix: 'docs/',
+    })
+  })
+
+  it('空前缀与空 bucket 都能表达：setOss 不把空值打回默认', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ ossBucket: 'vela-img', ossPrefix: 'docs' }))
+    await store.load([])
+    store.setOss({ prefix: '', bucket: '' })
+    await flush()
+    expect(store.oss()).toMatchObject({ prefix: '', bucket: '' })
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({ ossPrefix: '', ossBucket: '' })
+  })
+
+  it('setOss 走同一条写穿队列：改成同一个值不重复写', async () => {
+    store.setOss({ bucket: 'vela-img' })
+    await flush()
+    expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
+    store.setOss({ bucket: 'vela-img' })
+    await flush()
+    // 指纹跳过是 M7-6 之后仍然成立的机制：面板失焦一次就有一次写，
+    // 焦点来回点三下不该产生三次原子写
+    expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
+  })
+
+  it('🔴 setOss 不碰 DOM：四格没有任何 CSS 伴生物', async () => {
+    store.setFontSize(16)
+    store.setTheme('light')
+    await flush()
+    const before = document.documentElement.style.cssText
+    store.setOss({ bucket: 'vela-img', region: 'cn-hangzhou', accessKeyId: 'LTAI5t', prefix: 'docs' })
+    await flush()
+    expect(document.documentElement.style.cssText).toBe(before)
+    expect(darkCalls).toEqual([false])
+    expect(fontLoader.applyFontVariant).not.toHaveBeenCalled()
+    expect(fontLoader.applyCodeFont).not.toHaveBeenCalled()
   })
 })

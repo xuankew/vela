@@ -19,13 +19,14 @@
  *
  * 不管：字体注册表本身（`fonts/loader.ts`）、字号档位清单的**语义**（这里只负责夹）。
  *
- * ## 🔴 四格 OSS 配置在这一层只是**过路**（M7-5）
+ * ## 🔴 四格 OSS 配置在这一层不解释自己（M7-5，M7-6 起可由面板写）
  *
  * `ossBucket` / `ossRegion` / `ossAccessKeyId` / `ossPrefix` 不是偏好，也**不进 DOM**——
- * 没有对应的 CSS 变量，也没有对应的浮层控件（设置面板那一块是 M7-6）。它们出现在这一层
- * 只有一个原因：`save_settings` 是**整份重写**，`currentSettings()` 少带一格，
- * 用户下一次改字号就会把那一格从盘上抹掉。所以「读回来 → 存信号 → 写出去时原样带上」
- * 这条路必须在这儿接通，哪怕这一层自己根本不解释那四格是什么。
+ * 没有对应的 CSS 变量，也没有对应的浮层控件（设置面板里那一组是 M7-6 加的，但它仍然只读写
+ * 这四格，不因它们改任何 DOM）。它们出现在这一层最初只有一个原因：`save_settings` 是
+ * **整份重写**，`currentSettings()` 少带一格，用户下一次改字号就会把那一格从盘上抹掉。
+ * 所以「读回来 → 存信号 → 写出去时原样带上」这条路必须在这儿接通，
+ * 哪怕这一层自己根本不解释那四格是什么。
  *
  * ⚠️ 这一层**不校验**它们（region 填成访问域名照原样存回去）。校验在落地层
  * `src-tauri/src/oss.rs` 的 `normalize`：那里失败会明确说哪一格不对，而配置文件是用户可以
@@ -313,6 +314,17 @@ export interface SettingsStore {
   resetLetterSpacing: () => void
   /** 用户选了主题（亮/暗/跟随系统）：更新 + 应用（`data-theme` + CM6 深浅色）+ 写穿 */
   setTheme: (id: ThemeId) => void
+  /**
+   * 用户改了 OSS 四格里的某几格（M7-6）：**只** `trim()` + 更新信号 + 写穿。
+   *
+   * 🔴 这一层仍然不校验、不解释、不碰 DOM。`trim()` 是这一层唯一动手的地方，而且只去首尾
+   * 空白——bucket 名里带空格永远传不上去，留在信号里只会让面板显示「配好了」而落地层
+   * 一进门就拒。校验归 `src-tauri/src/oss.rs` 的 `normalize`，那里失败会指名哪一格不对。
+   *
+   * ⚠️ 面板按**失焦/回车**提交，不按按键提交：一次原子写带一次 fsync，逐字符写穿等于
+   * 把「填一只 bucket」变成几十次盘上重写。
+   */
+  setOss: (patch: Partial<OssConfig>) => void
 
   /**
    * 从 Rust 读回合并好的配置，sanitize 后灌进信号并应用。**不写穿**。
@@ -342,9 +354,10 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   /**
    * 那四格 OSS 配置（M7-5）。初值 = Rust 的内置默认，见 [`DEFAULT_OSS_PREFIX`]。
    *
-   * 🔴 这一层的角色是**过路**：它不解释这四格、不因它们改任何 DOM，唯一的存在理由是
-   * `save_settings` 整份重写——不带回去就会在下次改字号时把盘上的配置抹掉。
-   * 因此它**没有** `applyXxxVar` 那样的伴生物，也不参与 `applyNow()`。
+   * 🔴 这一层不解释这四格、不因它们改任何 DOM。M7-5 时它存在的唯一理由是 `save_settings`
+   * 整份重写——不带回去就会在下次改字号时把盘上的配置抹掉；M7-6 起面板也能写它
+   * （[`SettingsStore.setOss`]），但那条理由没变，变的只是谁在改。
+   * 因此它照样**没有** `applyXxxVar` 那样的伴生物，也不参与 `applyNow()`。
    */
   const [oss, setOssSignal] = createSignal<OssConfig>({
     bucket: '',
@@ -570,6 +583,23 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     persist()
   }
 
+  /**
+   * 面板改了 OSS 四格里的某几格（M7-6）。
+   *
+   * 逐格 `trim()` 而不是整份替换：面板一次只提交一个输入框，其余那几格必须原样留着，
+   * 否则「改完 bucket 会把手刚填的 region 抹掉」。
+   */
+  function setOss(patch: Partial<OssConfig>): void {
+    const next = { ...oss() }
+    if (patch.bucket !== undefined) next.bucket = patch.bucket.trim()
+    if (patch.region !== undefined) next.region = patch.region.trim()
+    if (patch.accessKeyId !== undefined) next.accessKeyId = patch.accessKeyId.trim()
+    if (patch.prefix !== undefined) next.prefix = patch.prefix.trim()
+    setOssSignal(next)
+    // 与六个偏好键同一条写穿路径：这里不 apply，四格不进 DOM（见文件头）
+    persist()
+  }
+
   /** `Cmd/Ctrl + =/-`：无级缩放，步进 +/- 1px，不写盘，只改 CSS 变量 */
   function stepZoomedFontSize(delta: number): void {
     const base = zoomedFontSize() ?? fontSize()
@@ -606,6 +636,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     stepLetterSpacing,
     resetLetterSpacing,
     setTheme,
+    setOss,
     load,
     applyNow,
   }
