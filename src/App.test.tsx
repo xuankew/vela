@@ -33,6 +33,7 @@ const {
   watchCmd,
   shardCmd,
   assetCmd,
+  ossCmd,
   settingsCmd,
   gitCmd,
 } = vi.hoisted(() => {
@@ -153,6 +154,20 @@ const {
     error: null,
   }
   /**
+   * 云端那一头（M7-7）。`upload_image` 同样走 `tauriCore.invoke`、同样**不 mock `./ipc/oss`**：
+   * 这一条命令的「只收 `dataBase64` 一个键」是整个安全设定的落点（目的地四格一概不收，
+   * 论证在 `src-tauri/src/commands.rs`），只有让真的那一份封装跑起来才能断言到 payload 形状。
+   *
+   * ⚠️ `url` 缺省是那一串**不带签名**的公网地址：正文里写的就是它，而「插进正文的 URL
+   * 与后端答的是同一个」正是接线要钉的东西。`error` 非 null 时按 Rust 的形状原样 reject
+   */
+  const ossCmd: { calls: Record<string, unknown>[]; url: string; error: unknown; hang: boolean } = {
+    calls: [],
+    url: 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png',
+    error: null,
+    hang: false,
+  }
+  /**
    * 分层配置这一头（M4-A）。`load_settings` / `save_settings` 也走 `tauriCore.invoke`。
    *
    * ⚠️ `loaded` 必须是**完整的 `LoadedSettings` 形状**而不是 undefined：App 一挂载，roots
@@ -223,6 +238,7 @@ const {
     watchCmd,
     shardCmd,
     assetCmd,
+    ossCmd,
     settingsCmd,
     gitCmd,
   }
@@ -246,6 +262,7 @@ import { MAX_PANES } from './doc/workspace'
 import type { StoredImage } from './ipc/asset'
 import { REPLACE_DONE_EVENT, REPLACE_FAILED_EVENT, REPLACE_PROGRESS_EVENT, type ReplaceSummary } from './ipc/replace'
 import { SEARCH_BATCH_EVENT, SEARCH_DONE_EVENT, SEARCH_FAILED_EVENT } from './ipc/search'
+import type { Settings } from './ipc/settings'
 import type { ShardHeader } from './ipc/shard'
 import { FILE_CHANGED_EVENT, type FileChangeKind, type WatchStats } from './ipc/watch'
 import { REQUEST_CLOSE_EVENT } from './ipc/windowClose'
@@ -384,6 +401,10 @@ beforeEach(async () => {
   assetCmd.calls = []
   assetCmd.result = null
   assetCmd.error = null
+  ossCmd.calls = []
+  ossCmd.error = null
+  ossCmd.hang = false
+  ossCmd.url = 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png'
   settingsCmd.loaded = {
     settings: {
       fontSize: 14,
@@ -539,6 +560,21 @@ beforeEach(async () => {
       // eslint-disable-next-line @typescript-eslint/only-throw-error
       if (assetCmd.error !== null) throw assetCmd.error
       return assetCmd.result ?? STORED
+    }
+    if (cmd === 'upload_image') {
+      // 🔴 整个 payload 记下来而不是只记 `dataBase64`：这一条命令的**参数清单**是安全设定
+      // 的一部分（目的地四格一概不收，见 `src-tauri/src/commands.rs`），
+      // 多一个键就是给 webview 开一个「把用户的图改道到别人的 bucket」的原语。
+      // 断言 `Object.keys(calls[0])` 恰好等于 `['dataBase64']` 才能把这件事钉住
+      ossCmd.calls.push({ ...(args ?? {}) })
+      // 与 load_session 同一条理由：Rust 的 Err 是被序列化后原样抛出的普通对象，
+      // 包一层 new Error 就会让 describeUploadError 走到「兜底」那条分支上去
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      if (ossCmd.error !== null) throw ossCmd.error
+      // 一条永远不落地：钉「还在等的时候那一行『上传中…』挂着」这一条只能靠挂住，
+      // 而不是靠掐一个不确定的 flush 时机
+      if (ossCmd.hang) return new Promise<string>(() => {})
+      return ossCmd.url
     }
     return undefined
   })
@@ -4449,6 +4485,155 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
     expect(noticeEl()!.className).toBe('notice')
     expect(noticeText()).toContain('40.0 MB')
     expect(noticeText()).toContain('超过上限 32 MB')
+  })
+
+  /**
+   * 云端那一态（M7-7）。四格是从 `load_settings` 那一个出口进来的，所以改完必须**重挂**：
+   * 配置只在启动时读一次，在跑着的 App 上改 `settingsCmd.loaded` 什么都不会发生
+   * （与 `restartWith` 同一条理由）。
+   *
+   * ⚠️ 这一组用真的 `./ipc/oss`：那一个 payload（只有 `dataBase64`）是这条路上最需要
+   * 被真的读一遍的一半，理由与上面「不 mock `./ipc/asset`」逐字相同
+   */
+  describe('云端那一态（M7-7）', () => {
+    const OSS_URL = 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png'
+
+    async function mountWithOss(oss: Partial<Settings>): Promise<void> {
+      dispose()
+      container.remove()
+      settingsCmd.loaded = {
+        settings: {
+          fontSize: 14,
+          fontVariant: 'screen-gb',
+          codeFont: 'maple-cn',
+          lineHeight: 1.75,
+          letterSpacing: 0,
+          theme: 'dark',
+          ossBucket: 'vela-img',
+          ossRegion: 'cn-hangzhou',
+          ossAccessKeyId: 'LTAI-x',
+          ossPrefix: 'assets',
+          ...oss,
+        },
+        report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
+      }
+      mountApp()
+      await flush()
+    }
+
+    it('三格齐：本地落一份、再传一次，正文写的是那一个不带签名的 URL', async () => {
+      await mountWithOss({})
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+
+      paste({ files: [shot()] })
+      await flush()
+      await flush()
+
+      expect(assetCmd.calls.map((c) => c.docPath)).toEqual(['/repo/README.md'])
+      expect(ossCmd.calls).toHaveLength(1)
+      // 🔴 参数清单**恰好**一项。多出一个 `bucket` / `region` / `accessKeyId`，
+      // 就是给 webview 开了一条「把用户粘贴的图改道到别人的 bucket」的路
+      expect(Object.keys(ossCmd.calls[0]!)).toEqual(['dataBase64'])
+      expect(ossCmd.calls[0]!.dataBase64).toBe('iVBORw==')
+      expect(view().state.doc.toString()).toBe(`# 标题\n![](${OSS_URL})`)
+      // 那句「上传中…」被收回了：成功按口径一句话都不说，插进正文的链接就是回话
+      expect(notices()).toEqual([])
+      expect(statusName()).toBe('● README.md')
+    })
+
+    it('只填了两格（缺 region）：一次 upload_image 都不发，走的还是相对路径', async () => {
+      await mountWithOss({ ossRegion: '' })
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+
+      paste({ files: [shot()] })
+      await flush()
+      await flush()
+
+      expect(ossCmd.calls).toEqual([])
+      expect(assetCmd.calls).toHaveLength(1)
+      expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+      expect(notices()).toEqual([])
+    })
+
+    it('传失败时降级：本地那一份已经在正文里指得着，Rust 那句话挂在提示条上', async () => {
+      await mountWithOss({})
+      await openFrom('# 标题\n', '/repo/README.md')
+      ossCmd.error = {
+        kind: 'rejected',
+        status: 403,
+        code: 'InvalidAccessKeyId',
+        message: '这个 AccessKey ID 在阿里云上不存在，去控制台核对一下',
+        request_id: null,
+      }
+      toEnd()
+
+      paste({ files: [shot()] })
+      await flush()
+      await flush()
+
+      // 🔴 不阻塞粘贴：`store_image` 已经发过了，那一行相对链接就是这次的产物
+      expect(assetCmd.calls).toHaveLength(1)
+      expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+      // 显示的是 Rust 按服务端错误码翻好的那一句，⛔ 不是「上传失败，请重试」
+      expect(noticeEl()!.className).toBe('notice error')
+      expect(noticeText()).toContain('这个 AccessKey ID 在阿里云上不存在')
+    })
+
+    it('四格齐但钥匙串里没有密钥：降级那一句是**无色**的，因为它不是故障', async () => {
+      await mountWithOss({})
+      await openFrom('# 标题\n', '/repo/README.md')
+      ossCmd.error = { kind: 'not_configured', reason: '没有拿到 AccessKey Secret，请在设置里填一次。' }
+      toEnd()
+
+      paste({ files: [shot()] })
+      await flush()
+      await flush()
+
+      expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+      expect(noticeEl()!.className).toBe('notice')
+      expect(noticeText()).toContain('请在设置里填一次')
+    })
+
+    it('还在等上传的那一会儿，编辑器上方挂着那一行无色的「上传中…」', async () => {
+      await mountWithOss({})
+      await openFrom('# 标题\n', '/repo/README.md')
+      ossCmd.hang = true
+      toEnd()
+
+      paste({ files: [shot()] })
+      await flush()
+      await flush()
+
+      // 没有进度条、没有百分比、没有取消（M7-7 裁定）：就这一行字，而且它不带故障色——
+      // 「正在等」既不是做成了也不是做坏了
+      expect(noticeEl()!.className).toBe('notice')
+      // `toContain` 而不是 `toBe`：那一个「×」关闭按钮也在 textContent 里（同上面几条的写法）
+      expect(noticeText()).toContain('上传中…')
+      // 链接要等 URL 回来才插：先插相对路径再改成 URL 的话，正文会闪两行
+      expect(view().state.doc.toString()).toBe('# 标题\n')
+    })
+
+    it('一张 12 MB 的图：本地照样落，但一次上传都不发（云端上限 10 MB）', async () => {
+      await mountWithOss({})
+      await openFrom('# 标题\n', '/repo/README.md')
+      const arrayBuffer = vi.fn(() => Promise.resolve(new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer))
+      const big = { size: 12 * 1024 * 1024, type: 'image/png', arrayBuffer } as unknown as File
+      toEnd()
+
+      paste({ files: [big] })
+      await flush()
+      await flush()
+
+      // ⚠️ 两个上限各管各的：32 MiB 那道管「连读都别读」，10 MB 这道只拦云端那一趟。
+      // 这张图落得了本地，就不该因为传不上去而被扔掉
+      expect(assetCmd.calls).toHaveLength(1)
+      expect(ossCmd.calls).toEqual([])
+      expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+      expect(noticeEl()!.className).toBe('notice')
+      expect(noticeText()).toContain('超过上限 10 MB')
+    })
   })
 })
 

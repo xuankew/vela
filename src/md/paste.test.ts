@@ -4,11 +4,19 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
 
 import { MAX_IMAGE_BYTES } from '../ipc/asset'
+import { MAX_UPLOAD_BYTES } from '../ipc/oss'
+import type { OssConfig } from '../settings/store'
+import { bytesToBase64 } from '../util/base64'
 import { acceptsPastedImage, imageMarkdown, landPastedImage, type PasteTarget } from './paste'
 
 /**
  * 这一层刻意不认识 CM6，所以整份用例跑在 node 环境里：两个假回调 + 一个 mock 掉的
  * `invoke` 就是它的全部外部世界。CM6 那半截在 `src/editor/paste.test.ts`。
+ *
+ * ⚠️ M7-7 起的云端那一态**不 mock** `../ipc/oss` 里那个 `uploadImage`，而是把 `cloud.upload`
+ * 换成一个假函数：这一层与「怎么传」之间只有那一个注入点，钉住注入点比钉住实现更准，
+ * 而线上形状（`upload_image` 只收 `dataBase64`）由 `src/App.test.tsx` 与 `../ipc/oss.test.ts`
+ * 各钉一条。
  */
 
 const GOLDEN = {
@@ -30,18 +38,42 @@ function png(bytes: Uint8Array<ArrayBuffer> = TINY_PNG, name = 'shot.png'): File
   return new File([bytes], name, { type: 'image/png' })
 }
 
-/** 记录两个回调收到的东西，其余什么都不做 */
-function target(path: string | null): PasteTarget & { inserted: string[]; notices: [string, string][] } {
+/**
+ * 记录两个回调收到的东西，其余什么都不做。
+ *
+ * `oss` 传了就顺手把云端那一态接上（`cloud.upload` 是一个可以被每条用例改答案的假函数，
+ * `clear` 同理）；不传就是 M3-A-7 那条路——下面那一批用例走的全是这一支
+ */
+function target(
+  path: string | null,
+  oss?: OssConfig,
+): PasteTarget & {
+  inserted: string[]
+  notices: [string, string][]
+  upload: ReturnType<typeof vi.fn>
+  clear: ReturnType<typeof vi.fn>
+} {
   const inserted: string[] = []
   const notices: [string, string][] = []
+  const upload = vi.fn(() => Promise.resolve(OSS_URL))
+  const clear = vi.fn()
   return {
     path,
     insert: (text) => inserted.push(text),
     notify: (text, level) => notices.push([text, level]),
+    ...(oss === undefined ? {} : { cloud: { oss: () => oss, upload } }),
+    clear,
     inserted,
     notices,
+    upload,
   }
 }
+
+/** 三格齐的一份配置。`prefix` 那一格不参与「配没配」的判断，见 `ossConfigured` 那段注释 */
+const OSS: OssConfig = { bucket: 'vela-img', region: 'cn-hangzhou', accessKeyId: 'LTAI-x', prefix: 'assets' }
+
+/** Rust `upload_image` 交回来的那一个**不带签名**的 URL：与本地那一份同一个哈希、同一个名字 */
+const OSS_URL = 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png'
 
 beforeEach(() => {
   invoke.mockReset()
@@ -171,5 +203,187 @@ describe('landPastedImage', () => {
     await expect(landPastedImage(broken, t)).resolves.toBeUndefined()
     expect(t.inserted).toEqual([])
     expect(t.notices).toEqual([['读不出来', 'error']])
+  })
+
+  it('一次粘贴只读一次文件', async () => {
+    // 🔴 云端那一步复用本地那一份字节。各读一遍 = 两次把整张图解码进内存，
+    // 而 `file.arrayBuffer()` 每次都是一趟真的读取
+    const arrayBuffer = vi.fn(() => Promise.resolve(TINY_PNG.buffer))
+    const file = { size: 67, arrayBuffer } as unknown as File
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(file, t)
+    expect(arrayBuffer).toHaveBeenCalledTimes(1)
+    expect(t.upload).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('云端那一态（M7-7）', () => {
+  it('三格齐：本地落一份、再传一次，正文写回来的那个 URL', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(png(), t)
+    expect(invoke).toHaveBeenCalledTimes(1) // 只有 store_image；上传走的是注入的那个假函数
+    expect(t.upload).toHaveBeenCalledTimes(1)
+    expect(t.inserted).toEqual([`![](${OSS_URL})`])
+    expect(t.notices).toEqual([['上传中…', 'plain']])
+    expect(t.clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('递给上传的字节与递给本地的是同一份', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(png(), t)
+    const local = invoke.mock.calls[0] as [string, { dataBase64: string }]
+    expect(local[0]).toBe('store_image')
+    expect(t.upload.mock.calls[0]![0]).toEqual(TINY_PNG)
+    expect(local[1].dataBase64).toBe(bytesToBase64(TINY_PNG))
+  })
+
+  it('没接云端时一个字都不改：不上传、不说「上传中…」、也不收回', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md')
+    await landPastedImage(png(), t)
+    expect(t.upload).not.toHaveBeenCalled()
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices).toEqual([])
+    expect(t.clear).not.toHaveBeenCalled()
+  })
+
+  it('三格里任何一格是空的都不走云端', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    for (const key of ['bucket', 'region', 'accessKeyId'] as const) {
+      const t = target('/notes/a.md', { ...OSS, [key]: '' })
+      await landPastedImage(png(), t)
+      expect(t.upload, key).not.toHaveBeenCalled()
+      expect(t.inserted, key).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    }
+  })
+
+  it('空前缀**不是**「没配」：那是「就把图放在 bucket 根上」那个合法选择', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', { ...OSS, prefix: '' })
+    await landPastedImage(png(), t)
+    expect(t.upload).toHaveBeenCalledTimes(1)
+    expect(t.inserted).toEqual([`![](${OSS_URL})`])
+  })
+
+  it('本地那一份先落：磁盘写不进去时一次上传都不会发', async () => {
+    // 🔴 顺序是整个降级能力的前提——先落盘、后上传，失败时正文里那行相对链接才指得着什么
+    invoke.mockRejectedValue({ kind: 'io', reason: 'PermissionDenied', message: '没有写权限' })
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(png(), t)
+    expect(t.upload).not.toHaveBeenCalled()
+    expect(t.inserted).toEqual([])
+    expect(t.notices).toEqual([['没有写权限', 'error']])
+  })
+
+  it('未命名草稿即使云端配好也先拒：不落盘也不上传', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target(null, OSS)
+    await landPastedImage(png(), t)
+    expect(invoke).not.toHaveBeenCalled()
+    expect(t.upload).not.toHaveBeenCalled()
+    expect(t.notices).toEqual([['这份文档还没有路径。先存一次（⌘S），图片要落在它旁边的 assets/ 里', 'plain']])
+  })
+
+  it('超过云端 10 MB：本地照样落、插相对路径，但一次上传都不发', async () => {
+    // ⚠️ 32 MiB 以内、10 MB 以外那张图**不该被丢掉**：它落得了本地，只是上不了云。
+    // 这一条钉的就是「上限从 32MB 收到 10MB」收的是云端那一趟，不是这次粘贴
+    invoke.mockResolvedValue(GOLDEN)
+    const big = { size: MAX_UPLOAD_BYTES + 1, arrayBuffer: () => Promise.resolve(TINY_PNG.buffer) } as unknown as File
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(big, t)
+    expect(t.upload).not.toHaveBeenCalled()
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices).toEqual([['这张图有 10.0 MB，超过上限 10 MB', 'plain']])
+    expect(t.clear).not.toHaveBeenCalled()
+  })
+
+  it('云端开着时 32 MiB 那道闸门仍然在最前面', async () => {
+    const arrayBuffer = vi.fn(() => Promise.resolve(TINY_PNG.buffer))
+    const huge = { size: MAX_IMAGE_BYTES + 1, arrayBuffer } as unknown as File
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(huge, t)
+    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(invoke).not.toHaveBeenCalled()
+    expect(t.upload).not.toHaveBeenCalled()
+    expect(t.notices).toEqual([['这张图有 32.0 MB，超过上限 32 MB', 'plain']])
+  })
+
+  it('OSS 回了 403：降级写相对路径，用 Rust 那句话，标成 error', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    t.upload.mockRejectedValue({
+      kind: 'rejected',
+      status: 403,
+      code: 'InvalidAccessKeyId',
+      message: '这个 AccessKey ID 在阿里云上不存在，去控制台核对一下',
+      request_id: null,
+    })
+    await expect(landPastedImage(png(), t)).resolves.toBeUndefined()
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices).toEqual([
+      ['上传中…', 'plain'],
+      ['这个 AccessKey ID 在阿里云上不存在，去控制台核对一下', 'error'],
+    ])
+    expect(t.clear).not.toHaveBeenCalled()
+  })
+
+  it('断网：同样降级，同样把原因说出口', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    t.upload.mockRejectedValue({ kind: 'network', reason: 'Connect', message: '连不上 OSS 的服务器' })
+    await landPastedImage(png(), t)
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices[1]).toEqual(['连不上 OSS 的服务器', 'error'])
+  })
+
+  it('钥匙串里没有密钥（Rust 的 not_configured）：降级，但档位是 plain', async () => {
+    // 三格齐、密钥没配是**能走到**的一支：`ossConfigured` 只看那三格（密钥前端读不到），
+    // 权威那一句由 Rust 说。它不是故障，是「你还没做那一步」——与「先存一次」同一档
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    t.upload.mockRejectedValue({ kind: 'not_configured', reason: '没有拿到 AccessKey Secret，请在设置里填一次。' })
+    await landPastedImage(png(), t)
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices[1]).toEqual(['没有拿到 AccessKey Secret，请在设置里填一次。', 'plain'])
+  })
+
+  it('上传那一步抛的是 Error（前端自己那道上限拦的）也照样降级，不往外抛', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    t.upload.mockRejectedValue(new Error('这张图有 12.0 MB，超过上限 10 MB'))
+    await expect(landPastedImage(png(), t)).resolves.toBeUndefined()
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices[1]).toEqual(['这张图有 12.0 MB，超过上限 10 MB', 'error'])
+  })
+
+  it('后端回了不认识的东西也只说一句话，不抛', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    t.upload.mockRejectedValue('boom')
+    await expect(landPastedImage(png(), t)).resolves.toBeUndefined()
+    expect(t.inserted).toEqual(['![](assets/pasted-ad48c1765eb1b87d.png)'])
+    expect(t.notices[1]).toEqual(['boom', 'error'])
+  })
+
+  it('四格是在上传那一刻才读的：改了设置下一次粘贴就换路线', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const oss = { ...OSS }
+    const t = target('/notes/a.md', oss)
+    await landPastedImage(png(), t)
+    expect(t.upload).toHaveBeenCalledTimes(1)
+    oss.bucket = ''
+    await landPastedImage(png(), t)
+    expect(t.upload).toHaveBeenCalledTimes(1)
+    expect(t.inserted).toHaveLength(2)
+  })
+
+  it('成功之后不再补一句「传上去了」：链接就是回话', async () => {
+    invoke.mockResolvedValue(GOLDEN)
+    const t = target('/notes/a.md', OSS)
+    await landPastedImage(png(), t)
+    expect(t.notices.filter((n) => n[0] !== '上传中…')).toEqual([])
   })
 })

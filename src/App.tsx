@@ -41,6 +41,7 @@ import { createQuickOpen, type Commit } from './goto/store'
 import { symbolTable, wordUnderCaret } from './goto/syntax'
 import { attachFileDrop, handleDroppedPaths } from './ipc/dragDrop'
 import { describeFsError, saveFile } from './ipc/fs'
+import { uploadImage } from './ipc/oss'
 import { queryProject } from './ipc/project'
 import { attachReplaceListeners } from './ipc/replace'
 import { attachSearchListeners } from './ipc/search'
@@ -972,7 +973,8 @@ export default function App() {
   }
 
   /**
-   * ⌘V 进来一张图（M3-A-7）：把它落到文档旁边的 `assets/` 里，光标处插一行相对链接。
+   * ⌘V 进来一张图（M3-A-7，M7-7 起有两条落点）：先落到文档旁边的 `assets/`，
+   * 没配云端就在光标处插一行相对链接，配了云端再传一次 OSS、插那一个不带签名的 URL。
    *
    * 🔴 返回值必须是同步的，而落地是异步的：paste 处理器的返回值决定 CM6 要不要
    * `preventDefault`，那一刻之后再想说「我接了」已经来不及。于是这里答的只是
@@ -1005,6 +1007,12 @@ export default function App() {
       // 都对：正文里多了一行，那一行必须跟着 ⌘S 落盘
       insert: (text) => view.dispatch(view.state.replaceSelection(text)),
       notify: (text, level) => setEditorNotice({ level, text }),
+      // 云端那一态（M7-7）。四格读的是**用户全局**配置那一个信号，`upload_image` 一个
+      // 目的地参数都不收（`commands.rs` 里那条 🔴：收了就等于把「请求打到哪台主机」交给
+      // webview）。⚠️ 这里只答「三格齐不齐」，不答「能不能传成」——密钥只住钥匙串、
+      // 前端读不到，缺它的那一句由 Rust 的 `not_configured` 原样说回来
+      cloud: { oss: () => settings.oss(), upload: uploadImage },
+      clear: () => setEditorNotice(null),
     })
     return true
   }
