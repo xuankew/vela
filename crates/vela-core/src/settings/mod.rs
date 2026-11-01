@@ -107,7 +107,8 @@ pub const DEFAULT_THEME: &str = "dark";
 /// 内置默认的 OSS 对象名前缀：`assets`。
 ///
 /// 与本地那一份的落地目录同名（[`crate::fs::asset::ASSET_DIR`]），于是一篇文章的图在
-/// 本地镜像里叫 `assets/pasted-<hash>.png`、在 bucket 里叫 `assets/<hash>.png`，
+/// 本地叫 `assets/pasted-<hash>.png`、在 bucket 里也叫 `assets/pasted-<hash>.png`
+/// （名字由 [`crate::fs::object_naming`] 与本地共用同一个函数算出，前缀那一层就是这一格），
 /// 人在 bucket 管理器里看见的层级与在磁盘上看见的是同一层。
 ///
 /// 留一个可改的默认值而不是写死：一个 bucket 常常服务多个用途（站点图、附件、备份），

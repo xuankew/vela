@@ -70,8 +70,14 @@ function isAssetError(value: unknown): value is AssetError {
   return typeof value === 'object' && value !== null && typeof (value as { kind?: unknown }).kind === 'string'
 }
 
-/** 与 `describeFsError` 的 `too_large` 同一个口径：MB 一位小数，上限取整 */
-function tooBigText(bytes: number, limit: number): string {
+/**
+ * 「这张图有 X，超过上限 Y」那一句（与 `describeFsError` 的 `too_large` 同一个口径：
+ * MB 一位小数，上限取整）。
+ *
+ * ⚠️ 导出是因为有第二个消费者：`./oss.ts` 的 `describeUploadError` 处理 `too_big` 用的是
+ * 同一种形状（本地 32 MiB 与云端 10 MB 是两个不同的数字，但那一句怎么说只有一个口径）。
+ */
+export function tooBigText(bytes: number, limit: number): string {
   return `这张图有 ${(bytes / 1048576).toFixed(1)} MB，超过上限 ${(limit / 1048576).toFixed(0)} MB`
 }
 

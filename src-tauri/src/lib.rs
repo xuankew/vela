@@ -1,10 +1,14 @@
 mod commands;
 mod imgproto;
 mod menu;
-// ⚠️ 这一层要 `pub`：它的消费方 `upload_image` 是 M7-3（下一个提交）才接上的，
-// 而 `mod oss;` 那种私有声明会让门禁把「暂时还没人调」当成死代码报错。
-// `vela_lib` 本身就是 crate-type 里的 `rlib`，公开出去不改变任何东西。
-pub mod oss;
+// M7-2 那一版这一层还没有调用方，所以要 `pub` 躲开 `dead_code`（`-D warnings`）。
+// M7-3 把 [`commands::upload_image`] 接上之后不需要了：改回私有实测过门禁是干净的，
+// 而少一个公开模块就少一个「以后有人往里加只给测试用的 pub 项」的借口
+mod oss;
+// ⚠️ 同样要 `pub`，但理由不是「还没人调」：`SecretError::Keychain` 只由 macOS 那一份
+// 后端构造，而门禁的 rust job 在 ubuntu 上跑 `clippy --all-targets -D warnings`。
+// 私有模块里的 `pub` 枚举按 crate 内可见性算，那一边就会报「variant is never constructed」。
+pub mod secrets;
 mod shard;
 mod watcher;
 
@@ -91,6 +95,10 @@ pub fn run() {
             commands::open_file,
             commands::save_file,
             commands::store_image,
+            // M7-3 唯一一条会出站的命令。🔴 它的参数只有 base64 字节：目的地那四格
+            // 只从用户全局配置读，密钥只在进程内从钥匙串读，两个方向都不过 IPC。
+            // ⚠️ 它同样没有注册进 M5 冻结的那份 `vela.*` 插件桥（第三方插件不该拿到出站能力）
+            commands::upload_image,
             commands::list_dir,
             commands::create_entry,
             commands::rename_entry,
@@ -102,6 +110,12 @@ pub fn run() {
             commands::save_session,
             commands::load_settings,
             commands::save_settings,
+            // M7-4 密钥那一格：写、删、只问「配没配」。
+            // 🔴 这三条里没有任何一条回得来密钥的值，也⛔不要注册成能被插件桥摸到的
+            // 命令——M5 冻结的那份 `vela.*` API 面里没有它们，这是有意的
+            secrets::set_oss_secret,
+            secrets::delete_oss_secret,
+            secrets::oss_secret_status,
             commands::load_keybindings,
             commands::save_keybindings,
             commands::start_search,

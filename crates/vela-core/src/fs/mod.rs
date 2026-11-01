@@ -46,7 +46,7 @@ mod write;
 
 use serde::{Deserialize, Serialize};
 
-pub use asset::{store_image, AssetError, StoredImage, ASSET_DIR, MAX_IMAGE_BYTES};
+pub use asset::{object_naming, store_image, AssetError, ObjectNaming, StoredImage, ASSET_DIR, MAX_IMAGE_BYTES};
 pub use encoding::{decode, decode_as, encode, Decoded, Encoding};
 pub use eol::{apply_eol, detect_eol, normalize_to_lf, LineEnding};
 pub use local_image::{read_local_image, LocalImage, LocalImageError};

@@ -232,6 +232,24 @@ interface CommandInfo {
 - ❌ 操作窗口（关闭/最小化等）
 - ❌ 访问网络（当前无网络 API）
 
+### 🔴 重新实现这套桥时，这四条命令**不要**放进来
+
+M7 之后 Rust 侧多了四条命令，它们**刻意**不在 `vela.*` 面上，而且不是「以后逐步解除」的限制：
+
+| 命令 | 不放进来的理由 |
+|---|---|
+| `upload_image` | 全 App 唯一一条**出站**命令。给它就等于给插件一个「用用户的 OSS 配置往外发数据」的原语 |
+| `set_oss_secret` | 写钥匙串 |
+| `delete_oss_secret` | 删钥匙串 |
+| `oss_secret_status` | 只回一个布尔，但它与上面两条构成完整读写面 |
+
+⚠️ 还有一条与 `vela.settings.save()` 有关：`Settings` 里那四格 OSS 键（bucket / region / AccessKey ID /
+前缀）如果插件能写，它就能把用户粘贴的图**改道到别人的 bucket**——签名仍然带着用户自己的 AccessKey ID 发出去。
+M7-5 已经在**项目层**挡掉这一格（`settings::resolve` 忽略项目层写的 OSS 键），但用户全局层是 `save_settings`
+直接写的。所以重新实现时，`settings.save()` 要么过滤掉这四格，要么让上面那四条命令继续留在桥面外——
+两个都做最稳。论证写在 `crates/vela-core/src/settings/mod.rs` 的 `oss_bucket` 文档与 `src-tauri/src/commands.rs`
+的模块文档（「`upload_image` 是这十五个之外新添的一条」那一节）。
+
 ---
 
 ## 版本协商

@@ -23,6 +23,7 @@
 //! | 读文件内容（**分片**） | `open_large` | 任意绝对路径 |
 //! | 写文件内容 | `save_file` | 任意绝对路径 |
 //! | **写图片字节**（粘贴落地） | `store_image` | 文档路径，目录由它推出 |
+//! | **传图片到 OSS**（⚠️ 唯一一条**出站**的） | `upload_image` | 只有 base64 字节：目的地四格只从用户全局配置读，密钥只从钥匙串读 |
 //! | **枚举**目录 | `list_dir` | `(root, rel)` |
 //! | **创建** | `create_entry` | `(root, rel, kind)` |
 //! | **改名** | `rename_entry` | `(root, rel, new_name)` |
@@ -155,10 +156,25 @@
 //! ⚠️ `store_image` 不改变这个判断：它能写的只有 `assets/pasted-*.{png,jpg,gif,webp,bmp}`
 //! 这一种名字，写不进 `.md`、写不进 `.zshrc`，也覆盖不了任何已有文件（撞名就换后缀）。
 //!
+//! ### `upload_image` 是这十五个**之外**新添的一条，而它换了一类能力
+//!
+//! 上面那张表算的是「谁能碰到磁盘」。M7-3 的 [`upload_image`] 一个字节都不落盘，
+//! 所以它不在这笔账里；它是**第一条会主动往外发请求的命令**，于是信任边界要多加一句：
+//! 一段注入的脚本从此可以把用户配好的那一个 bucket 当免费图床，烧他的流量与请求数。
+//! 三条缓解都在它的签名里：目的地（bucket / region / AccessKey ID / 前缀）一个参数都不收、
+//! 只从**用户全局配置**读（项目层写来的那四格被 `settings::resolve` 忽略），
+//! 名字由内容哈希定，`AccessKeySecret` 只在进程内从钥匙串取、⛔ 不过 IPC 也不回来。
+//! M5 开放第三方插件时这一条要跟着重读：它需要的不是「路径授权」，而是「能不能出站」。
+//!
+//! M7-4 那三条钥匙串命令（`set_oss_secret` / `delete_oss_secret` / `oss_secret_status`）
+//! 同样不在磁盘这笔账里——它们碰的是钥匙串，且**没有任何一条回得来密钥的值**
+//! （论证见 `src/secrets.rs` 开头那条 🔴）。⚠️ 它们也刻意**没有**注册进 M5 冻结的那份
+//! `vela.*` 插件桥：第三方插件 UI 若能调它们，就能往用户自己的 bucket 那一项里覆盖密钥。
+//!
 //! ### M7-9 起这张表**外面**还有一个入口：`vela-img` 协议，而它不加新能力
 //!
-//! `.register_asynchronous_uri_scheme_protocol(...)` 不走 `invoke_handler`，所以它不在这
-//! 十五个里，也不受 `capabilities` 约束——一个能读盘的原语。⚠️ 但它**没有让上面那条
+//! `.register_asynchronous_uri_scheme_protocol(...)` 不走 `invoke_handler`，所以它不在这张
+//! 账里，也不受 `capabilities` 约束——一个能读盘的原语。⚠️ 但它**没有让上面那条
 //! 信任边界变松**：它能读的范围是「`doc` 参数那个目录里面」，而一个能自己拼
 //! `vela-img://localhost/?doc=…&ref=…` 的脚本本来就能 `invoke("open_file")` 读任意文件。
 //! 它挡的是另一件事，也是唯一需要挡的那件事：**一份别人写的 `.md` 在正文里放
@@ -179,8 +195,8 @@ use base64::Engine as _;
 use serde::Serialize;
 use tauri::{command, AppHandle, Emitter, Manager, State};
 use vela_core::fs::{
-    read_text, read_text_as, store_image as store_image_bytes, write_text_atomic, AssetError, Encoding, FileFormat,
-    ReadError, StoredImage, TextFile, WriteError, WriteReport, MAX_IMAGE_BYTES,
+    object_naming, read_text, read_text_as, store_image as store_image_bytes, write_text_atomic, AssetError, Encoding,
+    FileFormat, ObjectNaming, ReadError, StoredImage, TextFile, WriteError, WriteReport, MAX_IMAGE_BYTES,
 };
 use vela_core::keybindings;
 use vela_core::project::{
@@ -193,6 +209,12 @@ use vela_core::search::{
 };
 use vela_core::session::{self as session_store, Session, SessionError, SessionReport, SESSION_FILE_NAME};
 use vela_core::settings::{self as settings_store, LoadedSettings, SaveReport, Settings};
+
+// M7-3 `upload_image` 要的那几样。放在最后一组是因为它们是本 crate 的兄弟模块，
+// 而上面那一串全是外部依赖——`oss.rs` 与 `secrets.rs` 的文档里都写了「调用方是
+// `commands.rs` 的 `upload_image`」，这一组 `use` 就是那句话在代码里的落点
+use crate::oss::{object_key, put_object, OssTarget, UploadError, MAX_UPLOAD_BYTES};
+use crate::secrets::load_access_key_secret;
 
 /// 读一个文本文件。
 ///
@@ -259,6 +281,88 @@ pub async fn store_image(doc_path: String, data_base64: String) -> Result<Stored
     // 与 `save_file` 同一档：阻塞 IO 直接跑在异步运行时上。
     // 一次哈希 + 一次原子写入，图片的现实中位数在几百 KB，毫秒量级
     store_image_bytes(Path::new(&doc_path), &bytes)
+}
+
+/// 把剪贴板里的一张图片传到阿里云 OSS，成功返回**要写进正文的那个 URL**（M7-3）。
+///
+/// ## 🔴 签名里没有 bucket，也没有 region、AccessKey ID、前缀
+///
+/// 那四格决定的是「这个请求打到哪个主机、签在哪个桶上」，而 `Authorization` 正是照着
+/// 主机与 key 签出来的。收了它们就等于给 webview 一个「带着我们自己的有效凭证，
+/// 往任意主机发任意字节」的原语：一份别人写的 `.md` 在预览里注入一个 `<script>`，
+/// 就能把用户的密钥签好的请求送到攻击者的服务器上，或者干脆往**别人的**桶里写。
+/// 所以这四格只从**用户全局配置**读，前端一个参数都给不了——
+/// 而 [`settings_store::resolve`] 又明确把项目层写来的这四格全部忽略，
+/// 克隆来的仓库同样改不了它们（两条防线，动机不同，见 `Settings::oss_bucket` 的文档）。
+///
+/// ## 🔴 密钥不过 IPC，两个方向都不过
+///
+/// 它由 [`crate::secrets::load_access_key_secret`] 在进程内取，只进 `Authorization` 头。
+/// 进前端的只有两样：成功时那一个 URL 字符串，失败时那一个 [`crate::oss::UploadError`]
+/// （七个变体里没有任何一个带得上密钥，论证在 `oss.rs` 那一侧）。
+/// ⛔ 不要为了「面板上想看看密钥填得对不对」给它加参数，也不要加一条能读密钥的命令。
+///
+/// ## ⚠️ 这是**第一条会出站的命令**
+///
+/// 上面那张表从头到尾讲的是「谁能碰到磁盘」，而这一条碰的是网络。目的地改不了，
+/// 但一段注入的脚本仍然能拿用户配好的那一个 bucket 当免费图床，烧他的流量与请求数。
+/// 挡它的是三件事：[`crate::oss::MAX_UPLOAD_BYTES`] 那一个 10 MB 上限、
+/// 名字由内容哈希定（正文里指不到 bucket 的别的东西）、以及「四格不齐 + 钥匙串里没密钥」
+/// 时这条路压根走不通（M7-7 会让它降级成本地 `assets/`）。⚠️ 这条新能力要进真机回归清单。
+///
+/// ## 名字与 `Content-Type` 由字节自己决定
+///
+/// [`object_naming`] 与本地 `assets/` 那一份共用同一条哈希命名规则，MIME 由魔数推出。
+/// 后者会进签名（`content-type` 是默认参与签名的头），所以它只能在这里定一次；
+/// 前者保证同一张图粘两遍在 bucket 里是同一个 key，服务端覆盖同一份字节。
+///
+/// ## 顺序
+///
+/// 先按 base64 的长度挡一道，再解码，再起名字，再读配置与钥匙串，最后交给 [`put_object`]
+/// （它自己查 10 MB 上限与那四格）。
+///
+/// ⚠️ 读钥匙串排在「四格齐不齐」之前，所以一个只填了 region 的配置也会先弹一次授权框。
+/// 这一刻通常已经过去了：设置面板一打开就调 [`crate::secrets::oss_secret_status`]，
+/// 而那是同一次读——第一次的弹窗发生在「打开面板」那一步，不是「点测试上传」那一步
+#[command]
+pub async fn upload_image(app: AppHandle, data_base64: String) -> Result<String, UploadError> {
+    // 与 `store_image` 同一招：上限管的是**解出来**的字节数，而解码要先把整份摊开。
+    // 一张 100 MB 的图不该先进内存 100 MB、再去撞那个 10 MB 的上限。
+    // 4/3 是 base64 的膨胀率，多留 8 字节给 padding；报出去的 bytes 是按膨胀率估的，
+    // 但「已经超限」这件事是确定的
+    const MAX_B64_LEN: usize = MAX_UPLOAD_BYTES as usize / 3 * 4 + 8;
+    if data_base64.len() > MAX_B64_LEN {
+        return Err(UploadError::TooBig { bytes: data_base64.len() as u64 * 3 / 4, limit: MAX_UPLOAD_BYTES });
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|e| UploadError::BadData { reason: e.to_string() })?;
+    // 不是图 / 零字节：`reason` 是 vela-core 那句现成的中文（SVG 那条尤其要说清）。
+    // 这里刻意不查大小——两条路上限本来就是两个数，见 `object_naming` 的文档
+    let ObjectNaming { object_name, content_type } =
+        object_naming(&bytes).map_err(|e| UploadError::BadImage { reason: e.to_string() })?;
+
+    let home = home_dir(&app).map_err(|e| UploadError::NotConfigured { reason: e.to_string() })?;
+    // 第二个参数是 `None`：连项目层那个文件都不打开。那四格本来就不接受项目层的值，
+    // 少一次读盘，也少一处「将来 `resolve` 那份清单被人改了」的可能
+    let settings = settings_store::load(&home, None).settings;
+    // `Ok(None)` → 空串：让 `oss::normalize` 去说那句「没有拿到 AccessKey Secret，请在设置里填一次。」
+    // ——那句话本来就写在落地层，不在这里再编第二句。`Err` 那一句则由 `SecretError::message` 给出
+    let secret = load_access_key_secret()
+        .map_err(|e| UploadError::NotConfigured { reason: e.message().to_owned() })?
+        .unwrap_or_default();
+    let target = OssTarget {
+        bucket: &settings.oss_bucket,
+        region: &settings.oss_region,
+        access_key_id: &settings.oss_access_key_id,
+        access_key_secret: &secret,
+        // Vela 只走长期 AK；STS 临时令牌这一版不支持（也没有地方填）。
+        // ⚠️ 不要图省事把它接成「前端再传一个参数」：那一条会进签名，也进 `x-oss-security-token`
+        security_token: None,
+    };
+    let key = object_key(&settings.oss_prefix, &object_name);
+    // 上限与四格的检查在 `put_object` 里面（同步部分收在 `preflight`，所以它全测到了）
+    put_object(&target, &key, content_type, bytes).await
 }
 
 /// 列出 `root` 下 `rel` 这一层的目录内容（**只有一层**，PLAN.md §3.4 M2-A）。

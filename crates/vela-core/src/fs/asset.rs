@@ -311,6 +311,48 @@ pub fn store_image(doc_path: &Path, bytes: &[u8]) -> Result<StoredImage, AssetEr
     })
 }
 
+/// 一张图片进 OSS 时该用的对象名与 `Content-Type`（M7-3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectNaming {
+    /// `pasted-<16 位十六进制>.<ext>`：与本地 `assets/` 里那一份**同一个名字**。
+    ///
+    /// ⚠️ 不含前缀目录（`assets/` 那一层在 OSS 上换成了配置里的 `ossPrefix`），
+    /// 拼 key 是命令层的事，见 `src-tauri/src/commands.rs` 的 `upload_image`
+    pub object_name: String,
+    /// 由魔数推出的 MIME。
+    ///
+    /// 🔴 这一个值会进签名（`content-type` 默认参与 OSS V4 签名），所以它**只能在这里定一次**，
+    /// ⛔ 不能由前端传进来：前端传的那个串与签名看到的串必须一字不差，而签名在这边算
+    pub content_type: &'static str,
+}
+
+/// 算出 [`ObjectNaming`]。
+///
+/// ## 为什么这个名字要留在 vela-core，而不是命令层一句 `format!`
+///
+/// 它与本地那一份**必须同源**。两边各写一遍 `pasted-{:016x}`，其中一边哪天改了哈希、
+/// 前缀或扩展名表，症状是「本地一份、云端两份」——而正文里那一个链接指向谁，
+/// 完全取决于当时是哪一边起的名。这种漂移没有任何一步会报错。
+///
+/// ## 为什么这里不查大小
+///
+/// 两条路上限本来就是两个数：本地 32 MiB（[`MAX_IMAGE_BYTES`]）、云端 10 MB
+/// （`src-tauri/src/oss.rs` 的 `MAX_UPLOAD_BYTES`）。在这里夹本地那一个，
+/// 会让一张 12 MB 的图连「试着传一下」的机会都没有，而它是传得上去的。
+///
+/// ## 为什么同一个内容第二次上传不产生第二份对象
+///
+/// 名字是内容的哈希，不是时间戳。同一张图粘两遍 → 同一个 key → 服务端覆盖同一份字节，
+/// URL 也还是那一个。⚠️ 这一点与本地那一条**刻意不同**：本地撞名要换 `-1` 后缀，
+/// 因为那里两份可能字节不同；而这里同名必然同内容。
+pub fn object_naming(bytes: &[u8]) -> Result<ObjectNaming, AssetError> {
+    if bytes.is_empty() {
+        return Err(AssetError::Empty);
+    }
+    let kind = ImageKind::sniff(bytes).ok_or_else(|| AssetError::Unsupported { reason: unsupported_reason(bytes) })?;
+    Ok(ObjectNaming { object_name: candidate_name(&file_stem(bytes), kind, 0), content_type: kind.mime() })
+}
+
 /// 文件名主干：`pasted-<16 位十六进制>`，不含扩展名。
 ///
 /// ⚠️ 私有：前端拿到的是 `StoredImage::rel`，已经是完整相对路径了。
@@ -729,6 +771,58 @@ mod tests {
         let hex = stem.strip_prefix("pasted-").unwrap();
         assert_eq!(hex.len(), 16, "{stem}");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{stem}");
+    }
+
+    #[test]
+    fn 云端那个名字与本地那一份同源() {
+        // 🔴 这一条是 `object_naming` 存在的全部理由：同一个字节在两条路上必须起同一个名字。
+        // 不是比一个手写的字符串常量，而是**两边各算一次再比**——将来谁改了前缀、
+        // 哈希宽度或扩展名表，这一条会直接红，而「本地一份、云端两份」在界面上是静默的
+        let naming = object_naming(TINY_PNG).unwrap();
+        assert_eq!(naming.object_name, format!("{}.png", file_stem(TINY_PNG)));
+        let dir = tempfile::tempdir().unwrap();
+        let stored = store_image(&dir.path().join("a.md"), TINY_PNG).unwrap();
+        assert_eq!(stored.rel, format!("{ASSET_DIR}/{}", naming.object_name), "两条路起了两个名字");
+        // 不带本地那条撞名后缀：`pasted-<hash>.png`，没有 `-1`。云端同名必然同内容，
+        // 服务端覆盖同一份字节就是正确行为（与本地那条「先比字节再换后缀」刻意不同）
+        assert!(!naming.object_name.contains("-1.png"), "{}", naming.object_name);
+    }
+
+    #[test]
+    fn mime_由魔数给出而不是由前端报() {
+        // 这一个值会进 OSS 的 `content-type`，而它是默认参与 V4 签名的头：
+        // 前端传一个进来就会变成「签的与发的不是同一个串」，症状是 403
+        assert_eq!(object_naming(TINY_PNG).unwrap().content_type, "image/png");
+        assert_eq!(object_naming(b"\xff\xd8\xff\xe0....").unwrap().content_type, "image/jpeg");
+        assert_eq!(object_naming(b"GIF89a....").unwrap().content_type, "image/gif");
+        assert_eq!(object_naming(b"RIFF\0\0\0\0WEBPVP8 ").unwrap().content_type, "image/webp");
+        assert_eq!(object_naming(b"BM........").unwrap().content_type, "image/bmp");
+    }
+
+    #[test]
+    fn 云端命名不拿本地那个上限卡人() {
+        // 两条路上限本来就是两个数：本地 `MAX_IMAGE_BYTES`（32 MiB）、云端 10 MB
+        // （`src-tauri/src/oss.rs` 的 `MAX_UPLOAD_BYTES`）。一张 33 MiB 的图在本地那条路上
+        // 会被拒，在云端这条路上**不该**在这里被拒——它只是随后被云端那一道挡下
+        let mut big = TINY_PNG.to_vec();
+        big.resize(MAX_IMAGE_BYTES + 1, 0);
+        assert!(matches!(store_image(Path::new("/notes/a.md"), &big), Err(AssetError::TooBig { .. })));
+        assert_eq!(object_naming(&big).unwrap().content_type, "image/png", "在起名这一步就夹了本地的数");
+    }
+
+    #[test]
+    fn 不是图与空字节给出的是那两句现成的话() {
+        // `upload_image` 把这两句直接转成 `bad_image.reason`，所以「云端说的」与
+        // 「本地说的」必须是同一句话——M7-7 降级那条路上，两种说法是两件事
+        let empty = object_naming(b"").unwrap_err();
+        assert!(matches!(empty, AssetError::Empty), "{empty:?}");
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>x</script></svg>";
+        let bad = object_naming(svg).unwrap_err();
+        assert!(matches!(bad, AssetError::Unsupported { .. }), "{bad:?}");
+        assert!(bad.to_string().contains("SVG"), "{bad}");
+        // 与本地那条路的文案逐字相同
+        let local = store_image(Path::new("/notes/a.md"), svg).unwrap_err();
+        assert_eq!(bad.to_string(), local.to_string());
     }
 
     fn names_in(dir: &Path) -> Vec<String> {

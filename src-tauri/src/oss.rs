@@ -140,6 +140,32 @@ fn normalize<'a>(target: &OssTarget<'a>) -> Result<Normalized<'a>, String> {
     Ok(Normalized { bucket, region, access_key_id, access_key_secret, security_token })
 }
 
+/// 配置里的 `ossPrefix` 与 [`vela_core::fs::object_naming`] 给的名字拼成 bucket 里的对象名。
+///
+/// `("assets", "pasted-ad48….png")` → `assets/pasted-ad48….png`；前缀为空 → 只剩名字。
+///
+/// ## 为什么首尾的 `/` 要清掉，而不是原样拼
+///
+/// `"assets/"` 是那一格里最自然的一种填法——用户照着控制台里的「路径」粘，末尾就带一个斜杠。
+/// 直接拼会得到 `assets//pasted-….png`：OSS 把中间那一段存成一个**空名字的路径段**，
+/// bucket 管理器里多出一个怪目录，而删它必须带上那个双斜杠的完整 key。
+/// 归一之后「签名的、发出去的、控制台里看见的」才是同一个 key。
+///
+/// ## ⚠️ 这里**不**防 `..`，也不夹中间的双斜杠
+///
+/// 两件事都不构成危险：OSS 的 key 是一个扁平字符串，服务端没有目录穿越这回事；
+/// 而这一格只从**用户全局层**读（`vela_core::settings::resolve` 把项目层的四格全部忽略），
+/// 能改它的只有用户自己，写坏的也只可能是他自己的 bucket。
+/// 中间的双斜杠是用户真打了两个斜杠，替他合并一次等于在配置之外偷偷改值——与
+/// `Settings::oss_region` 那条「照原样存回去，在真要用它的那一步报错」同一条纪律。
+pub fn object_key(prefix: &str, object_name: &str) -> String {
+    let prefix = prefix.trim().trim_matches('/');
+    if prefix.is_empty() {
+        return object_name.to_owned();
+    }
+    format!("{prefix}/{object_name}")
+}
+
 /// 对象在公网上的地址，也是**成功时要写进正文的那一串**。
 ///
 /// 只有 `https://{bucket}.oss-{region}.aliyuncs.com` 一种形式：自定义域名（CNAME）与
@@ -395,19 +421,28 @@ fn xml_field(body: &str, tag: &str) -> Option<String> {
 /// ⚠️ 这一句没法单测：`reqwest::Error` 没有公开的构造器，测试里造不出一个「超时」。
 /// 所以它的分支只能靠读——分类顺序是有意的：`is_timeout()` 对「整个调用超了」和
 /// 「连接超了」都成立，而这里要的那句人话是「30 秒没传完」，必须先判 timeout。
+///
+/// ## 为什么这里带一句中文，而不是让前端自己翻
+///
+/// `reason` 是给程序分支的（M7-7 的「哪种失败就降级成本地」读它），`message` 是给用户看的。
+/// 前端那份 `describeUploadError` 对七个 `kind` 全是透传——只要它开始按 `reason` 编文案，
+/// 「30 秒」这个数字就同时活在两个地方了，而 `UPLOAD_TIMEOUT` 改一次、文案不会跟着改。
+/// 那句 `err.to_string()` 仍然留在括号里：它是这一类失败里唯一能区分「DNS 挂了」与
+/// 「TLS 握手挂了」的信息，而我们没有第二份那样的信息。
 fn network_error(err: reqwest::Error) -> UploadError {
-    let reason = if err.is_timeout() {
-        "Timeout"
+    let (reason, lead) = if err.is_timeout() {
+        ("Timeout", format!("{} 秒内没把这张图传完。", UPLOAD_TIMEOUT.as_secs()))
     } else if err.is_connect() {
-        "Connect"
+        // DNS、拒绝连接、TLS 握手都走这一条：它们在用户那边是同一件事「这条网络不通」
+        ("Connect", "连不上 OSS 的域名。检查有没有网，以及那个 bucket 的 region 是不是填对了。".to_owned())
     } else if err.is_body() {
-        "Body"
+        ("Body", "图片的字节没能发完。".to_owned())
     } else if err.is_decode() {
-        "Decode"
+        ("Decode", "OSS 的响应读不完。".to_owned())
     } else {
-        "Other"
+        ("Other", "请求没能走到 OSS。".to_owned())
     };
-    UploadError::Network { reason: reason.to_owned(), message: err.to_string() }
+    UploadError::Network { reason: reason.to_owned(), message: format!("{lead}（{inner}）", inner = err) }
 }
 
 /// 上传失败的原因。
@@ -415,8 +450,11 @@ fn network_error(err: reqwest::Error) -> UploadError {
 /// 与 [`vela_core::fs::AssetError`] 同一套路数：`#[serde(tag = "kind")]` 让前端按类型分支，
 /// 而不是去 `message` 里找关键字。
 ///
-/// 🔴 五个变体里没有任何一个可能带 AccessKeySecret：`Rejected` 只装服务端回的那几样，
-/// `Network` 只装 reqwest 的原话（URL 与 errno 一类），`BadSignTime` 只装一句形状抱怨。
+/// 🔴 七个变体里没有任何一个可能带 AccessKeySecret。前五个的来源（服务端回的、reqwest 原话、
+/// 签名层的形状抱怨）压根没机会碰到密钥；新加的两条由 [`vela_core::fs::object_naming`] 与
+/// base64 解码器给出，那两条路连配置的影子都看不见。`NotConfigured` 的 `reason` 现在可能
+/// 装着 [`crate::secrets::SecretError`] 的那句中文（见 `SecretError::message`），而那四个变体
+/// 里也没有密钥——钥匙串的错误只带 OSStatus 与苹果对那个码的描述，输入**只有码本身**。
 /// 以后要加字段，先想清楚它会不会经过签名那一段。
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -427,6 +465,20 @@ pub enum UploadError {
     /// 超过 [`MAX_UPLOAD_BYTES`]。与本地那条 `TooBig` 同形（`bytes`/`limit`），
     /// 所以前端已有的那句「这张图有 X，超过上限 Y」能直接复用
     TooBig { bytes: u64, limit: u64 },
+    /// 递过来的 base64 解不开。
+    ///
+    /// ⚠️ **这一条永远是我们自己的 bug**，不是用户做错了什么：编码器只有
+    /// `src/util/base64.ts` 那一个，而这里跟 `commands::store_image` 一样只认标准字母表 + padding。
+    /// 与 [`vela_core::fs::AssetError::BadData`] 同一个 `kind` 名，同一种含义
+    /// ——两个模块各自写一句「解不开」，将来文案会漂，而名字一致至少让前端能认出来
+    BadData { reason: String },
+    /// 字节不是一种认得的图片格式，或者是零字节。
+    ///
+    /// `reason` 是 [`vela_core::fs::AssetError`] 的 `Display` 已经写好的那一句中文（SVG 那条
+    /// 尤其重要：它是白名单里唯一需要单独解释的）。⛔ 不要在这里再编一句自己的文案：
+    /// 格式判定只有 [`vela_core::fs::object_naming`] 一处，本地与云端必须给同一句话——
+    /// M7-7 的「云端失败就降级成本地」那条路上，两种说法会让用户以为发生了两件事
+    BadImage { reason: String },
     /// 签名层拒掉了这一条请求。
     ///
     /// ⚠️ 现实里只可能是「签名时刻的形状不对」，而 [`datetime_now`] 生成的串永远合法，
@@ -437,7 +489,9 @@ pub enum UploadError {
     /// `message` 是按 code 翻出的一句中文，`request_id` 用于报障
     Rejected { status: u16, code: Option<String>, message: String, request_id: Option<String> },
     /// 请求没走到 OSS。`reason` 是给程序分支的分类（Timeout/Connect/Body/Decode/Other/ClientInit），
-    /// `message` 是 reqwest 的原话
+    /// `message` 是一句中文 + 括号里的 reqwest 原话（那一条是唯一能区分 DNS 与 TLS 的信息）。
+    /// ⚠️ 「30 秒」那个数字来自 [`UPLOAD_TIMEOUT`]，只在 [`network_error`] 里念一次——
+    /// 前端不许再按 `reason` 编一遍，否则常量改了文案不会跟着改
     Network { reason: String, message: String },
 }
 
@@ -788,6 +842,47 @@ mod tests {
         // 前端 M7-7 那句「30 秒没传完」是从这里念出去的，所以数字不许只写在一边
         assert_eq!(UPLOAD_TIMEOUT, Duration::from_secs(30));
         assert_eq!(MAX_UPLOAD_BYTES, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn 前缀拼成_key_时首尾斜杠不算一层目录() {
+        // 控制台里的「路径」粘过来就带一个尾斜杠，直接拼会多出一个空名字的路径段
+        for prefix in ["assets", "assets/", "  assets  ", "/assets/", "assets//", "/assets"] {
+            assert_eq!(object_key(prefix, "pasted-1.png"), "assets/pasted-1.png", "前缀是「{prefix}」");
+        }
+        // 空前缀 = 堆在 bucket 根上，那是用户自己选的形状（设置里那一格明说可以留空）
+        for empty in ["", "   ", "/", "///"] {
+            assert_eq!(object_key(empty, "pasted-1.png"), "pasted-1.png", "前缀是「{empty}」");
+        }
+        // 中间的双斜杠是用户真打了两个斜杠，不替他合并（同 `Settings::oss_region` 那条纪律）
+        assert_eq!(object_key("a//b", "x.png"), "a//b/x.png");
+        // 拼出来的这一个 key 同时进签名与 URL，两边必须是同一个字符串
+        assert_eq!(
+            object_url(&prepared(), &object_key("assets/", "pasted-1.png")),
+            "https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-1.png"
+        );
+    }
+
+    #[test]
+    fn 新加的两条失败也上得了线() {
+        // 与 `src/ipc/oss.ts` 的 `UploadError` 对照（手写镜像，没有代码生成）。
+        // `bad_data` 与本地那条 `AssetError.bad_data` 同一个名字、同一个含义，
+        // 前端认得出它是「我们自己的 bug」而不是用户做错了什么
+        let cases = [
+            (
+                UploadError::BadData { reason: "InvalidInputLength".to_owned() },
+                r#"{"kind":"bad_data","reason":"InvalidInputLength"}"#,
+            ),
+            (
+                UploadError::BadImage {
+                    reason: "SVG 不支持：它是 XML，能带脚本，而预览走的是 innerHTML".to_owned()
+                },
+                r#"{"kind":"bad_image","reason":"SVG 不支持：它是 XML，能带脚本，而预览走的是 innerHTML"}"#,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(serde_json::to_string(&err).unwrap(), expected);
+        }
     }
 
     #[test]
