@@ -544,3 +544,79 @@ describe('MarkdownPreview：本地图片走 vela-img 协议（M7-9）', () => {
     expect(p.localSpans()).toHaveLength(0)
   })
 })
+
+/**
+ * M7-11：点一张图看大图。
+ *
+ * 遮罩自己在 `ImageLightbox.test.tsx` 里逐条钉过了，这里钉的是**接线与归属**：
+ * 谁被算作「一张图」（占位不算、被链接包着的不算）、弹出来的是不是同一份 `src`、
+ * 换文档时必须关，以及同文档重画时**不**关。
+ *
+ * ⚠️ 与 M7-9 同一条限制：大图**看着多大**在 jsdom 里不可知，这里只验属性
+ */
+describe('MarkdownPreview：点图看大图（M7-11）', () => {
+  const PIC = '# 甲\n\n![截图](assets/a.png)\n'
+  const zoomImg = () => container.querySelector<HTMLImageElement>('.img-zoom')
+  const zoomBackdrop = () => container.querySelector<HTMLElement>('.img-zoom-backdrop')
+  const zoomPath = () => container.querySelector<HTMLElement>('.img-zoom-path')?.textContent
+
+  it('点一张显示出来的本地图 → 弹大图，用的就是预览里那一份 src', () => {
+    const p = mount(PIC, '/notes/a.md')
+    p.imgs()[0]!.click()
+    expect(zoomImg()?.getAttribute('src')).toBe('vela-img://localhost/?doc=%2Fnotes%2Fa.md&ref=assets%2Fa.png')
+    expect(zoomPath()).toBe('assets/a.png')
+  })
+
+  it('⛔ 大图不写任何东西：点下去之后源文档一个字没变', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const before = p.text()
+    p.imgs()[0]!.click()
+    expect(zoomBackdrop()).not.toBeNull()
+    expect(p.text()).toBe(before)
+  })
+
+  it('点占位（那张图没显示出来）不弹：它压根不是一张 `<img>`', () => {
+    const p = mount(PIC, null)
+    expect(p.localSpans()).toHaveLength(1)
+    p.localSpans()[0]!.click()
+    expect(zoomBackdrop()).toBeNull()
+  })
+
+  it('点被链接包住的图不弹——那一次点击归链接', () => {
+    const p = mount('[![截图](assets/a.png)](https://e.com/post)\n', '/notes/a.md')
+    expect(p.imgs()).toHaveLength(1)
+    p.imgs()[0]!.click()
+    expect(zoomBackdrop()).toBeNull()
+  })
+
+  it('🔴 换文档就把大图关掉：遮罩盖着整个正文区，挂着一张别人家的图最坏', () => {
+    const p = mount(PIC, '/notes/a.md')
+    p.imgs()[0]!.click()
+    expect(zoomBackdrop()).not.toBeNull()
+    // 换到另一块编辑器（另一份文档），走的正是 `createPanelRefresh` 那条「换实例立刻重画」的路
+    p.setSource({ view: makeView('# 乙\n\n![另一张](assets/b.png)\n'), path: '/notes/b.md' })
+    expect(zoomBackdrop()).toBeNull()
+  })
+
+  it('同一份文档重画不关大图：改正文与换文档是两件事', () => {
+    const p = mount(PIC, '/notes/a.md')
+    p.imgs()[0]!.click()
+    p.retype('# 甲\n\n![截图](assets/a.png)\n\n补了一句。\n')
+    p.bump()
+    p.settle()
+    expect(zoomBackdrop()).not.toBeNull()
+    expect(zoomPath()).toBe('assets/a.png')
+  })
+
+  it('按 `Esc` 之后遮罩从 DOM 上摘干净，不留一块透明的层挡点击', () => {
+    const p = mount(PIC, '/notes/a.md')
+    p.imgs()[0]!.click()
+    container
+      .querySelector<HTMLElement>('.img-zoom-dialog')!
+      .dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    expect(zoomBackdrop()).toBeNull()
+    // 「摘干净」的标准是预览还点得动：再点一次图，会重新弹一张
+    p.imgs()[0]!.click()
+    expect(zoomBackdrop()).not.toBeNull()
+  })
+})

@@ -3395,6 +3395,89 @@ body.tab-dragging {
   font-size: 0.72em;
 }
 
+/* ---------- 预览里点图看大图（M7-11）---------- */
+
+/* 🔴 `z-index: 9` 是这一层唯一需要想清楚的数，比 `.modal-backdrop` 的 10 低一档：
+   大图开着的时候还可能冒出一张确认单（关掉脏标签要问一次、全局替换的确认），
+   那一张**必须压在大图上面**，否则用户看不见它在问什么。取同层的 10 也能碰巧对——
+   对话框渲染在 App 的末尾、大图在 `.body-row` 里，后来的赢——但那是靠 DOM 顺序活着，
+   而这两处分属两个文件，谁也不会想到去维护那个顺序。
+   9 也仍然盖得住编辑区：CM6 那些 300 / 500 的浮层被 `.editor-host` 的 `z-index: 0`
+   关在编辑器格子内部（M4-P），逃不到根上下文里来比大小。 */
+.img-zoom-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 比 `.modal-backdrop` 那 0.65 更暗一档：这里背景上没有需要读的东西，
+     而一张半透明的 PNG 压在 UI 上会看着像 UI 的一部分 */
+  background: rgba(0, 0, 0, 0.8);
+  z-index: 9;
+}
+
+/* 图与那一行路径一起装进一张面板卡：底给透明 PNG，字给主题色。
+   ⚠️ 说明文字不直接压在黑遮罩上——`--vela-fg-dim` 是按面板底调的，
+   落在 rgba 黑上的对比度没人验过（本仓库的规矩是不猜半透明叠色的实际效果） */
+.img-zoom-dialog {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 92vw;
+  padding: 8px;
+  background: var(--vela-bg-panel);
+  border: 1px solid var(--vela-border);
+  border-radius: 6px;
+  outline: none;
+  /* 它带 `tabindex="-1"` 且每次打开都被聚焦，默认的焦点环压在这张卡上没有意义；
+     键盘用户进来的路径是 `Tab` → 关闭按钮，那个环在按钮上 */
+}
+
+.img-zoom {
+  /* 等比缩到窗口内用 `max-*` 而不是 `width` / `height`：一张 40px 的表情包不该被放大到糊 */
+  max-width: 90vw;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 3px;
+}
+
+.img-zoom-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 90vw;
+  font-family: var(--vela-font-ui);
+  font-size: 11px;
+  color: var(--vela-fg-dim);
+}
+
+/* 正文里那串引用 / 那个 URL。`break-all` 是必要的：一条 200 字符的 OSS 签名 URL
+   不换行的话会把这张卡撑到屏幕外面，而那正是「点一下想看图，结果界面坏了」 */
+.img-zoom-path {
+  overflow-wrap: break-all;
+  text-align: left;
+}
+
+.img-zoom-path.failed {
+  color: var(--vela-bad);
+}
+
+.img-zoom-close {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  background: none;
+  border: none;
+  color: var(--vela-fg-dim);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.img-zoom-close:hover {
+  color: var(--vela-fg);
+  background: var(--vela-bg-alt);
+}
+
 /* ────────────── JSON 预览面板（M4-D）────────────────────── */
 
 .json-preview-panel {

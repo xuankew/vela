@@ -44,6 +44,21 @@
  * 因为它的语义与文档位置是**一对一**的（一个 `data-pos` 就是那三个字符），
  * 而「点一下把这条打勾」在纯文本编辑器里做起来反而难得多
  *
+ * ## ⚠️ 点图看大图：这块面板上的第二个手势，但它一个字都不写（M7-11）
+ *
+ * 勾选框改正文，大图只读。它把**同一份 `src`** 交给一个全屏的 `<img>`，走的还是 M7-9
+ * 那条 `vela-img` 校验，不新增任何图片来源。判断「这一次点击该不该弹」全在
+ * `./ImageLightbox.tsx` 的 `zoomOf` 里（被链接包住的图归链接，占位 `span` 压根不是图），
+ * 这一层只负责把命中的那一份记下来，并在**换文档**时把它关掉。
+ *
+ * 🔴 大图渲染在 `<section class="md-preview">` 里面，于是它跟着这一栏活：关预览、关标签、
+ * 组件被换掉，遮罩一起没了。⛔ 别把它挪到 App 顶层「让它更稳」——那样每一处会关掉文档的
+ * 地方都得负责关它，漏一处的症状是「屏幕上一张不属于当前文档的图」
+ *
+ * ⚠️ 已知欠账：这个手势**只有鼠标能做**。要让键盘也点得开，得给每张 `<img>` 加 `tabindex`，
+ * 而一篇贴了二十张图的笔记会因此多出二十次 `Tab`——那要先回答「预览里键盘该怎么走」，
+ * 而这一栏目前的答案就是上面那句「除了勾选框，一个都不能」
+ *
  * ## ⚠️ 阅读模式：这一栏可能是屏幕上唯一的一栏
  *
  * `previewMode.ts` 的 `only` 档把 `.body` 藏起来，于是这块面板吃掉整个正文区。
@@ -64,6 +79,7 @@
 
 import { createEffect, createSignal, onCleanup, onMount, Show, untrack } from 'solid-js'
 import { createPanelRefresh, type FollowedEditor, type PanelRefreshSource } from './panel'
+import { ImageLightbox, zoomOf, type ZoomTarget } from './ImageLightbox'
 import { restorePlaceholder, rewriteLocalImages } from './localImage'
 import { previewHtml } from './preview'
 import { atBottom, collectAnchors, fractionalLine, topForLine, type LineAnchor } from './scrollSync'
@@ -94,6 +110,17 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   /** 面板顶上那句话。null = 没什么要说的 */
   const [note, setNote] = createSignal<string | null>(null)
 
+  /**
+   * 点开的那张大图，连同它属于**哪一份文档**（`path`；还没落盘的那份是空串）。
+   *
+   * 🔴 那个 `path` 不是装饰：大图是一块盖住整个正文区的遮罩，而切标签、切分屏都不会
+   * 让这一层以外的任何东西重画。不带归属的话用户体验是「我换了文件，屏幕上还挂着
+   * 上一份文档的一张图」——而那张图的 URL 在新文档里很可能指到另一个文件
+   * （`assets/pasted-<哈希>.png` 不会撞，但 `img/logo.png` 这种名字两个目录里都可以有）。
+   * 所以 `render()` 每次比一次，不是同一份文档就直接关
+   */
+  const [zoom, setZoom] = createSignal<{ target: ZoomTarget; path: string } | null>(null)
+
   const alone = () => props.alone()
 
   /**
@@ -119,6 +146,20 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   // 与大纲面板共用同一份——那条规矩的两个方向都错得很难看，见那个模块的文件头。
   // ⚠️ 递整个 `props` 而不是拆成三个访问器，理由写在 `PanelRefreshSource` 上
   createPanelRefresh(props, render)
+
+  /**
+   * 大图认的那份「文档身份」：这份文档的绝对路径，没落盘的缓冲区是空串。
+   *
+   * 用路径而不是标签 id，是因为 `props.source()` 递过来的就只有这一份可比的标量；而它的
+   * 目的只是「换了一份就关」，两个未落盘的草稿共用一个空串不算错——那种文档里压根没有
+   * 本地图片（`localImage.ts` 对 `path: null` 一张都不换）。
+   *
+   * 🔴 这一句是 `render()` 与点击处**共用**的：两处各写一遍 `?? ''` 迟早一边算成空串、
+   * 另一边算成 `undefined`，于是「换文档就关」会安静地失效
+   */
+  function pathOf(src: FollowedEditor | null): string {
+    return src?.path ?? ''
+  }
 
   /**
    * 算一遍、按需写 DOM、然后把预览滚到编辑器现在的位置。
@@ -147,6 +188,11 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
       html = result.html
       text = result.partial ? '文档太大，只预览了前面一部分' : html === '' ? '这份文档还是空的' : null
     }
+
+    // M7-11：不是同一份文档了就把大图关掉。⚠️ `untrack` 不是防循环，是防「点开大图」
+    // 这一次 `setZoom` 反过来把整个重画流程再触发一遍（见 `./panel.ts` 那份调度）
+    const open = untrack(zoom)
+    if (open !== null && open.path !== pathOf(src)) setZoom(null)
 
     setNote(text)
     if (html !== rendered) {
@@ -308,7 +354,14 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
 
   function onBodyClick(event: MouseEvent) {
     const box = taskBoxOf(event.target)
-    if (box !== null) toggleTask(box)
+    if (box !== null) {
+      toggleTask(box)
+      return
+    }
+    // M7-11：点一张已经显示出来的图 → 看大图。判断「该不该弹」全在 `zoomOf` 里
+    // （被链接包住的图归链接、占位 `span` 不算图），这里只管把命中的那一份记下来
+    const target = zoomOf(event.target)
+    if (target !== null) setZoom({ target, path: pathOf(untrack(() => props.source())) })
   }
 
   function onBodyKeyDown(event: KeyboardEvent) {
@@ -346,6 +399,17 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
       <div class="md-preview-scroll" ref={scrollEl}>
         <div class="md-preview-body" ref={bodyEl} onClick={onBodyClick} onKeyDown={onBodyKeyDown} />
       </div>
+      {/* M7-11：大图。渲染在这一栏里面（`.md-preview` 带 `overflow: hidden`，但那一条裁不到它——
+          `position: fixed` 的包含块是视口，只有带 transform / filter / contain 的祖先才会改写
+          包含块，这一条链上没有：见 `src/styles.css` 那一段与 M4-P 那条 `z-index: 0`）。
+          做成这样而不是 Portal 的理由与 `.modal-backdrop` 一样：它跟着这一栏活——
+          关预览、关标签、组件被换掉，大图一起没了，没有一个地方需要负责去「顺手关掉它」。
+          ⚠️ `keyed` 是为了让「一次打开 = 一次挂载」这件事由结构保证：`ImageLightbox` 在挂载
+          那一刻记下「该把焦点还给谁」，而那张图没到位时才会亮出红色那句——两张不同的图之间
+          不换节点的话，这两份状态都会跟着上一张图 */}
+      <Show when={zoom()} keyed>
+        {(open) => <ImageLightbox target={open.target} onClose={() => setZoom(null)} />}
+      </Show>
     </section>
   )
 }
