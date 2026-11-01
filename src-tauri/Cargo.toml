@@ -55,3 +55,7 @@ serde_json = { workspace = true }
 # M2-E：`ProjectIndexCache` 的缓存策略要有真的目录树才能测（见 `commands.rs` 的
 # `每次_index_project_都重建`）。许可证已核实，见根 `Cargo.toml`：MIT OR Apache-2.0
 tempfile = { workspace = true }
+# `imgproto` 的测试要按前端 `encodeURIComponent` 的样子把参数拼进 URL。
+# 许可证 MIT OR Apache-2.0，且 2.3.2 本来就在 `Cargo.lock` 里（`url` 的传递依赖），
+# 所以这一行不往锁文件里加任何新东西。只在测试里用：生产代码拼 URL 的是前端
+percent-encoding = "2"

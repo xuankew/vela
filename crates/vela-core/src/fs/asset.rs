@@ -41,13 +41,16 @@
 //! ⛔ HEIC / AVIF 同样不在：WKWebView 的支持时有时无，GitHub 也不渲染 HEIC，
 //! 落一个到处都显示不出来的文件比直接拒绝更糟。
 //!
-//! ## ⚠️ 落地的图片在 Vela 自己的预览里**不会显示**
+//! ## ⚠️ 落地的图片过去在 Vela 自己的预览里**不显示**，M7-9 起显示
 //!
-//! 这不是 bug，是 M3-A 那条安全边界的直接后果：`src/md/render.ts` 把本地图片映射成
-//! `<span class="md-img-local">` 占位符，从不输出 `<img>`——因为 `file:` 不在允许的
-//! scheme 里。要让它显示，得启用 Tauri 的 asset protocol，那是一次**主动扩大攻击面**，
-//! M3-A-7 刻意不做。粘完的链接在 GitHub / Typora / 导出的 HTML 里都能用，
-//! 在 Vela 里是一个占位符。这句话必须原样告诉用户（见 PLAN.md 的 M3-A-7 实施修正）。
+//! `src/md/render.ts` 把本地图片映射成 `<span class="md-img-local">` 占位符，从不输出
+//! `<img>`——因为 `file:` 不在允许的 scheme 里，而 webview 的 base 也不是文档目录。
+//! M7-9 补的是「解析」那一步：占位符由组件层换成 `<img>`，`src` 走应用自己的
+//! `vela-img` 协议（`src-tauri/src/imgproto.rs` + `fs::local_image`），
+//! 由 Rust 校验「目标 canonical 之后确实在文档自己那个目录里」再回字节。
+//! ⛔ 这条路**不是** Tauri 的 asset 协议：那一个的 scope 写在 `tauri.conf.json` 里、
+//! 随构建固定，而 Vela 的文档可以打开在磁盘任何位置，要让任意文档旁边的 `assets/`
+//! 可显示就得把 scope 放开成 `**` 那种宽度——等于把整个磁盘交给预览。
 
 use std::fs;
 use std::io::ErrorKind;
@@ -81,10 +84,15 @@ const MAX_SUFFIX: u32 = 32;
 /// 认得的图片格式。**不上线**：`StoredImage` 里没有它，前端要的是 `rel` 那个完整相对路径，
 /// 单独回一个「格式」只会多一处两边要对齐的枚举值。
 ///
-/// ⚠️ 变体与 `ext` **必须一一对应**：扩展名是从魔数推出来的，不是从文件名或 MIME 抄来的，
-/// 所以「认成 PNG 就一定写 `.png`」是这一层的不变量。
+/// ⚠️ 但它是 `pub(crate)` 而不是私有的：读那一条路（`super::local_image`）要拿同一个
+/// 白名单来回一个 MIME。**「能粘进来的格式」与「能显示出来的格式」必须是同一个集合**，
+/// 否则会出现「落得进去、预览里显示不出来」这种要用户自己去猜的缝
+///
+/// ⚠️ 变体与 `ext` / `mime` **必须一一对应**：扩展名与 MIME 都是从魔数推出来的，
+/// 不是从文件名或前端声明抄来的，所以「认成 PNG 就一定写 `.png`、就一定回
+/// `image/png`」是这一层的不变量
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageKind {
+pub(crate) enum ImageKind {
     Png,
     Jpeg,
     Gif,
@@ -93,7 +101,7 @@ enum ImageKind {
 }
 
 impl ImageKind {
-    fn ext(self) -> &'static str {
+    pub(crate) fn ext(self) -> &'static str {
         match self {
             ImageKind::Png => "png",
             ImageKind::Jpeg => "jpg",
@@ -103,12 +111,23 @@ impl ImageKind {
         }
     }
 
+    /// 响应头里那个 `Content-Type`。⛔ 不是从文件后缀推的，见上面那条不变量
+    pub(crate) fn mime(self) -> &'static str {
+        match self {
+            ImageKind::Png => "image/png",
+            ImageKind::Jpeg => "image/jpeg",
+            ImageKind::Gif => "image/gif",
+            ImageKind::Webp => "image/webp",
+            ImageKind::Bmp => "image/bmp",
+        }
+    }
+
     /// 只看开头几个字节认格式。认不出来返回 `None`——**不猜**。
     ///
     /// 「猜不出来就当成 PNG」这种写法会在用户粘了个 PDF 的时候安静地写出一份
     /// 后缀是 `.png`、内容是 PDF 的文件，然后预览与 GitHub 都显示破图，
     /// 而没有任何一步报过错。
-    fn sniff(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn sniff(bytes: &[u8]) -> Option<Self> {
         if starts_with(bytes, b"\x89PNG\r\n\x1a\n") {
             return Some(ImageKind::Png);
         }
@@ -360,7 +379,11 @@ fn compare_with_existing(dest: &Path, bytes: &[u8]) -> Existing {
 ///
 /// 带上开头的字节，是因为「我粘的明明是一张图」与「Vela 说这不是图」之间
 /// 唯一的线索就是那几个字节——是 SVG、是 PDF、还是一个截断的下载。
-fn unsupported_reason(bytes: &[u8]) -> String {
+///
+/// ⚠️ `pub(crate)`：读那一条路（`super::local_image`）在「正文引用了一个不是图片的文件」
+/// 时要说同一句话。两处的现场不同（一边是剪贴板字节、一边是磁盘上的字节），
+/// 但话术必须一致，否则用户会以为是两条不同的规则
+pub(crate) fn unsupported_reason(bytes: &[u8]) -> String {
     if looks_like_svg(bytes) {
         return "SVG 不支持：它是 XML，能带脚本，而预览走的是 innerHTML".to_owned();
     }

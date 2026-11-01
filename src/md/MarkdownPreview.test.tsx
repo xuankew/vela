@@ -141,6 +141,13 @@ function mount(doc: string, path: string | null, alone = false) {
      * 但它已经不在文档里，于是「点完焦点还在不在」这类断言会拿到一个假答案
      */
     tasks: () => [...body.querySelectorAll<HTMLElement>('.md-task')],
+    /**
+     * 预览里真的渲染出来的 `<img>`（外链的与本地换成功的都算），按出现顺序。
+     * 同样必须**现查**，理由与 `tasks()` 一样：每次重画 `innerHTML` 都换掉了整批节点
+     */
+    imgs: () => [...body.querySelectorAll('img')],
+    /** 还没换成 `<img>` 的本地图片占位（M7-9）。它们都是有原因的：见 `./localImage.ts` 文件头 */
+    localSpans: () => [...body.querySelectorAll<HTMLElement>('.md-img-local')],
     note: () => panel.querySelector('.md-preview-note')?.textContent ?? null,
     /** 那句限定是不是「怎么退出阅读模式」——它与文档级的那一句共用一个位置，但**不是警告色** */
     hinted: () => panel.querySelector('.md-preview-note.hint') !== null,
@@ -466,5 +473,74 @@ describe('MarkdownPreview：点勾选框回写源文档（M3-A-5）', () => {
     p.setSource(null)
     expect(p.tasks()).toHaveLength(0)
     expect(p.text(), '摘掉 source 不该动文档').toBe(TWO)
+  })
+})
+
+/**
+ * M7-9：本地图片不再是占位。
+ *
+ * 换的动作本身在 `localImage.test.ts` 里逐条钉过了，这里只钉**接线**的四件事：
+ * 换在 `measure()` 之前、文档没路径时不换、加载失败换回占位、以及外链那条路不受影响。
+ *
+ * ⚠️ 这里验不了图**真的显示出来了**：jsdom 不发请求，`<img>` 的 `load` / `error` 全靠派发。
+ * 真实加载、真实尺寸、真实排版归真机
+ */
+describe('MarkdownPreview：本地图片走 vela-img 协议（M7-9）', () => {
+  const PIC = '# 甲\n\n![截图](assets/a.png)\n'
+
+  it('文档有路径时占位被换成 <img>，src 里带着那份文档的路径', () => {
+    const p = mount(PIC, '/notes/a.md')
+    expect(p.localSpans(), '占位没被换掉').toHaveLength(0)
+    const img = container.querySelector<HTMLImageElement>('.md-preview-body img')!
+    expect(img).not.toBeNull()
+    // 与 `src-tauri/src/imgproto.rs` 的 `SCHEME` 与两个参数名对得上。这里读的是
+    // `getAttribute` 而不是 `.src`：后者会被 jsdom 按 document 的 base 解析一遍
+    expect(img.getAttribute('src')).toBe('vela-img://localhost/?doc=%2Fnotes%2Fa.md&ref=assets%2Fa.png')
+    expect(img.dataset.path).toBe('assets/a.png')
+    expect(img.alt).toBe('截图')
+  })
+
+  // 🔴 换必须在 `measure()` **之前**：那一量表的是每个 `data-line` 元素离内容顶部多远，
+  // 换晚了就等于量了一份「图片那部分还不存在」的表——症状是同步滚动越滚越偏。
+  // jsdom 量不出偏移（几何恒为 0），所以这条钉的是**属性还在、顺序没乱**，真正的像素归真机
+  it('换图不会把锚点表里的块弄丢', () => {
+    const p = mount('# 甲\n\n![截图](assets/a.png)\n\n乙。\n', '/notes/a.md')
+    expect(p.anchored()).toEqual(['1', '3', '5'])
+    expect(p.imgs()).toHaveLength(1)
+  })
+
+  it('文档还没落盘时保持占位：那句 title 是用户唯一的线索', () => {
+    const p = mount(PIC, null)
+    expect(p.imgs()).toHaveLength(0)
+    const span = p.localSpans()[0]!
+    expect(span.dataset.path).toBe('assets/a.png')
+    expect(span.title).toBe('assets/a.png')
+  })
+
+  it('加载失败回到占位，而不是留一张裂图让用户以为文件丢了', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const img = container.querySelector<HTMLImageElement>('.md-preview-body img')!
+    // `error` 不冒泡，但会走捕获相——组件挂在 `.md-preview-body` 上的就是捕获监听
+    img.dispatchEvent(new Event('error'))
+    expect(p.imgs()).toHaveLength(0)
+    expect(p.localSpans()[0]?.dataset.path).toBe('assets/a.png')
+  })
+
+  it('外链 <img> 的成败不由这一层管：失败了也不换成占位', () => {
+    const p = mount('![外链](https://e.com/a.png)\n', '/notes/a.md')
+    const img = container.querySelector<HTMLImageElement>('.md-preview-body img')!
+    expect(img.getAttribute('src')).toBe('https://e.com/a.png')
+    img.dispatchEvent(new Event('error'))
+    expect(p.imgs(), '外链那张被换掉了').toHaveLength(1)
+    expect(p.localSpans()).toHaveLength(0)
+  })
+
+  it('重画之后仍然换：防抖窗口里那份也是 <img>', () => {
+    const p = mount(PIC, '/notes/a.md')
+    p.retype('# 甲\n\n![另一张](assets/b.png)\n')
+    p.bump()
+    p.settle()
+    expect(p.imgs()[0]?.dataset.path).toBe('assets/b.png')
+    expect(p.localSpans()).toHaveLength(0)
   })
 })

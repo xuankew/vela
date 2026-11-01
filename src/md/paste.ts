@@ -20,14 +20,19 @@ import { describeAssetError, MAX_IMAGE_BYTES, storeImage, type StoredImage } fro
  * 行为）。所以草稿会**被接住**，然后在下面第一条拒绝里说清「先存一次」——
  * 静默什么都不做是这里最坏的结局：用户按了 ⌘V，光标闪了一下，没有任何解释。
  *
- * ## ⚠️ 落地的图片在 Vela 自己的预览里**不会显示**
+ * ## ⚠️ 落地的图片在预览里显示得出来，但走的不是 `file:`（M7-9 接上的）
  *
- * 这是 M3-A 那条安全边界的直接后果，不是这一层的 bug：`src/md/render.ts` 把本地图片
- * 映射成 `<span class="md-img-local">` 占位符，从不输出 `<img>`——因为 `file:` 不在
- * 允许的 scheme 里，而 `tauri.conf.json` 的 `csp` 是 `null`。要让它显示得启用 Tauri 的
- * asset protocol，那是一次主动扩大攻击面，M3-A-7 刻意不做。
- * 链接在 GitHub / Typora / 任何别的渲染器里都能用。**这句话必须原样告诉用户**
- * （见 PLAN.md 的 M3-A-7 实施修正）。
+ * `src/md/render.ts` 那一层仍然只给 `http(s)` 出 `<img>`，本地路径一律先出
+ * `<span class="md-img-local">` 占位——因为 webview 的 base 是应用自己的源，
+ * `src="assets/a.png"` 必然 404，而 `file:` 压根不在允许的 scheme 里。
+ * 真正让它显示出来的是组件层那一次事后替换（`./localImage.ts` + 应用自己的 `vela-img`
+ * 协议），⛔ 不是 Tauri 自带的 asset 协议：那一个的 scope 随构建固定，放开到能覆盖
+ * 「任意文档旁边的 `assets/`」就等于把整个磁盘交给预览。
+ *
+ * 🔴 所以这一层递出去的那个相对链接现在有**三处**能用：Vela 的预览、GitHub / Typora、
+ * 导出的 HTML。而 M3-A-7 当时那句「在 Vela 里是一个占位符、必须原样告诉用户」已经过期——
+ * 占位符如今只是**失败时的落点**（图不在文档目录里、太大、不是一种图片，或者这份文档
+ * 还没落盘所以没有目录可参照）。
  */
 
 /** 落地成功后要插进正文的那一行 */

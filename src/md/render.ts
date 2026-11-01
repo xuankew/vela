@@ -157,7 +157,9 @@ export function escapeHtml(text: string): string {
  * 「打开一个别人给的 `.md`」再开一条读任意文件的通道。
  * ⛔ `data:` 也不放行：`data:text/html` 能执行脚本，而为了放行图片去区分
  * `data:image/svg+xml`（**同样能执行脚本**）与 `data:image/png`，换来的是一份
- * 必须永远维护正确的名单。本地图片走 [`LOCAL_IMAGE_CLASS`]，由组件层用 asset 协议解析。
+ * 必须永远维护正确的名单。本地图片走 [`LOCAL_IMAGE_CLASS`]，由组件层换成走应用自己
+ * `vela-img` 协议的 `<img>`（`./localImage.ts`），⛔ 不是走 Tauri 自带的 asset 协议——
+ * 那一个的 scope 随构建固定，放开到能覆盖「任意文档旁边的 `assets/`」就等于交出整个磁盘。
  */
 export function safeUrl(raw: string): string | null {
   const url = raw.replace(CONTROL_AND_SPACE, '')
@@ -834,12 +836,17 @@ class Renderer {
   /**
    * `![替代文字](目标)`。
    *
-   * ⚠️ **只有 `http(s)` 的目标才真的出 `<img>`。** 本地路径出不了，原因不在这一层：
+   * ⚠️ **只有 `http(s)` 的目标才在这里直接出 `<img>`。** 本地路径出不了，原因不在这一层：
    * webview 的 base URL 是应用自己的源（`tauri://localhost` / `http://tauri.localhost`），
-   * 不是文档所在目录，所以 `src="assets/a.png"` 会 404。要让它工作得走 Tauri 的 asset
-   * 协议并在 `tauri.conf.json` 里开 scope——那是 M3-A-7（图片粘贴落地）要一并解决的事。
-   * 在那之前这里输出一个带 `data-path` 的占位 `span`，组件层可以据实说「本地图片还没接上」，
-   * ⛔ 而不是画一个裂图图标让用户以为是文件丢了。
+   * 不是文档所在目录，所以 `src="assets/a.png"` 会 404。真的那条路是应用自己的
+   * `vela-img` 协议，而它的 URL 里必须带**当前文档的绝对路径**——那一个这一层不知道，
+   * 也不该知道（`renderMarkdown` 的入口只有一份正文与一棵树）。
+   *
+   * 🔴 所以这里输出一个带 `data-path` 的占位 `span`，由 `./localImage.ts` 事后换成 `<img>`。
+   * **占位不是历史遗留，它一直是失败时的落点**：图不在文档目录里（403）、太大（413）、
+   * 不是一种图片（415）或者这份文档还没落盘（没有目录可参照）时，换回去的就是它——
+   * 一个带 `title=原始路径` 的虚线词，而不是一个让用户以为文件丢了裂图图标。
+   * ⛔ 别把它顺手改成 `<img src>`：路径没有经过 `safeUrl`，`file:` 与 `data:` 就是这么漏进来的。
    */
   private image(node: SyntaxNode): string {
     const url = node.getChild('URL')

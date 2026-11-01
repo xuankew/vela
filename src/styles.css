@@ -3345,7 +3345,9 @@ body.tab-dragging {
   cursor: not-allowed;
 }
 
-/* 本地图片的占位（render.ts 刻意不把 `file:` / 相对路径交给 `<img>`）。
+/* 本地图片没能显示出来时的落点（M7-9）。`render.ts` 给本地路径出的是这个占位，
+   `localImage.ts` 把它换成走 `vela-img` 协议的 `<img>`，而**换不成的那些**换回来还是它：
+   文档还没落盘、图在文档目录外面、太大、或者压根不是图片。
    虚线下边框 + help 光标：`title` 里写着原始路径，那是它唯一的出口 */
 .md-preview-body .md-img-local {
   color: var(--vela-fg-dim);

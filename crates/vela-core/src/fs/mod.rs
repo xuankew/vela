@@ -26,10 +26,20 @@
 //! 没有编码、没有行尾、没有 `FileFormat`，也不做归一化。它复用的是 `write_bytes_atomic`
 //! 那一份原子写入，但**目标路径由文档自己推出来**，命令层压根不收目录参数——
 //! 理由与它带来的那条限制（`assets/` 不可配置）都写在 `asset` 的模块文档里。
+//!
+//! ## `local_image` 是这一层里唯一**按引用读二进制**的一条路（M7-9）
+//!
+//! 与 `read` 那条最关键的区别：`read` 收的是「用户已经通过对话框选中过的绝对路径」，
+//! 而那一个路径来自系统选择器；`local_image` 收的是**文档正文里写的一个引用字符串**，
+//! 它可能出自别人发给你的一份 `.md`。所以它自带的边界是「canonical 之后必须在文档自己
+//! 那个目录里」＋「认魔数，不认后缀」。它不是 Tauri 的 command，走的是应用自己的
+//! `vela-img` 协议（`src-tauri/src/imgproto.rs`）——那条路上没有 serde 这一步，
+//! 字节直接当响应体发出去
 
 mod asset;
 mod encoding;
 mod eol;
+mod local_image;
 mod read;
 mod shard;
 mod write;
@@ -39,6 +49,7 @@ use serde::{Deserialize, Serialize};
 pub use asset::{store_image, AssetError, StoredImage, ASSET_DIR, MAX_IMAGE_BYTES};
 pub use encoding::{decode, decode_as, encode, Decoded, Encoding};
 pub use eol::{apply_eol, detect_eol, normalize_to_lf, LineEnding};
+pub use local_image::{read_local_image, LocalImage, LocalImageError};
 pub use read::{read_text, read_text_as, ReadError, MAX_INLINE_BYTES};
 pub use shard::{
     open_shard, LineIndex, Shard, ShardHeader, ShardPage, ANCHOR_STRIDE, MAX_PAGE_BYTES, MAX_PAGE_LINES,

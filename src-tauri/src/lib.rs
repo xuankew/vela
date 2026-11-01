@@ -1,4 +1,5 @@
 mod commands;
+mod imgproto;
 mod menu;
 mod shard;
 mod watcher;
@@ -77,6 +78,10 @@ pub fn run() {
         // （⚠️ 它是这四份里唯一一个**必须有人来收尾**的：一个条目就是一个 fd，
         // 而 fd 不会因为没人再提它就自己关掉）
         .manage(shard::ShardRegistry::default())
+        // M7-9 的自定义协议：预览里的本地图片由 Rust 校验后直接回字节。
+        // 为什么不用 Tauri 自带的 asset 协议、为什么这个响应刻意不带 CORS 头，
+        // 都写在 `imgproto` 的模块文档里
+        .register_asynchronous_uri_scheme_protocol(imgproto::SCHEME, imgproto::handle)
         .menu(|app| menu::build_menu(app))
         .invoke_handler(tauri::generate_handler![
             commands::open_file,

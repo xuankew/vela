@@ -28,6 +28,10 @@
  * 对任何注入脚本都可见）。⛔ **不要在这里拼接任何额外的 HTML**，也不要为了「让它更好看」
  * 把某个字符串原样塞进去——要加东西就去 `render.ts` 加，那边有一整套用例看着。
  *
+ * ⚠️ M7-9 把那一条边界**擦得更清楚**而不是放宽了：本地图片换成的那个 `<img>` 是
+ * `./localImage.ts` 用 `createElement` + 赋属性造出来的，一个 HTML 字符串都没拼，
+ * 所以「谁负责转义」这件事仍然只由 `render.ts` 一处回答。
+ *
  * ## ⚠️ 这一块不再是纯只读的（M3-A-5）
  *
  * 点预览里的勾选框会把 `[ ]` ↔ `[x]` **写回源文档**：走的是一次普通编辑事务，
@@ -60,6 +64,7 @@
 
 import { createEffect, createSignal, onCleanup, onMount, Show, untrack } from 'solid-js'
 import { createPanelRefresh, type FollowedEditor, type PanelRefreshSource } from './panel'
+import { restorePlaceholder, rewriteLocalImages } from './localImage'
 import { previewHtml } from './preview'
 import { atBottom, collectAnchors, fractionalLine, topForLine, type LineAnchor } from './scrollSync'
 
@@ -147,6 +152,10 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     if (html !== rendered) {
       rendered = html
       bodyEl.innerHTML = html
+      // M7-9：`render.ts` 给本地图片出的是占位 `span`，这里换成走 `vela-img` 协议的 `<img>`。
+      // ⚠️ 必须在 `measure()` **之前**换：那一张表量的是每个 `data-line` 元素离内容顶部多远，
+      // 换在之后就会量出一份没有算进图片那部分高度的表
+      rewriteLocalImages(bodyEl, src?.path ?? null)
       measure()
     }
     if (src !== null) follow(src)
@@ -213,13 +222,39 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
    * 而这一栏的宽度只跟着窗口与分屏数走，`resize` 已经够
    */
   function onResize() {
+    relayout()
+  }
+
+  /**
+   * 图片是**异步**到位的：它一落地，刚才那份锚点表就整体偏移了——占位 `span` 只有一行字高，
+   * 而一张图可能是半屏。所以每次加载完成都重量一遍再对齐一次。
+   *
+   * ⚠️ 监听挂在容器上、走**捕获相**：`load` 与 `error` 都不冒泡，但都会经过捕获路径，
+   * 于是容器上一个监听就够。不给每张 `<img>` 各挂一个的理由与勾选框那条一样——
+   * 那些元素每次重画都会被整体换掉，挂上去的没人负责重挂
+   */
+  function relayout() {
     measure()
     const src = untrack(() => props.source())
     if (src !== null) follow(src)
   }
 
-  onMount(() => window.addEventListener('resize', onResize))
-  onCleanup(() => window.removeEventListener('resize', onResize))
+  function onImgError(event: Event) {
+    // 换回占位（那张裂图会让用户以为文件丢了，而原因可能只是它不在文档目录里），
+    // 换成了才算数：不是本地图的 `error` 不触发重量
+    if (restorePlaceholder(event.target)) relayout()
+  }
+
+  onMount(() => {
+    bodyEl?.addEventListener('load', relayout, true)
+    bodyEl?.addEventListener('error', onImgError, true)
+    window.addEventListener('resize', onResize)
+  })
+  onCleanup(() => {
+    bodyEl?.removeEventListener('load', relayout, true)
+    bodyEl?.removeEventListener('error', onImgError, true)
+    window.removeEventListener('resize', onResize)
+  })
 
   // ───────────────────────── 点勾选框回写源文档（M3-A-5）─────────────────────────
 

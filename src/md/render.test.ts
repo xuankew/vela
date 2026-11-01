@@ -645,8 +645,11 @@ describe('图片', () => {
   })
 
   it('⚠️ 本地路径出占位 span 而不是裂图', () => {
-    // webview 的 base URL 是应用自己的源，不是文档目录，所以相对路径必然 404。
-    // 画一个裂图会让用户以为是文件丢了；如实说「本地图片还没接上」才对
+    // webview 的 base URL 是应用自己的源，不是文档目录，所以相对路径必然 404，
+    // 而这一层拿不到文档路径（它只有一份正文与一棵树）。M7-9 之后那个占位由
+    // `./localImage.ts` 换成走 `vela-img` 协议的 `<img>`，**换不成的那些**（文档没落盘、
+    // 图跑出目录、太大、不是图片）就以它的样子给用户看——画一个裂图会让人以为文件丢了，
+    // 而 `title` 里那句原始路径是他唯一的线索
     const output = html('![图](assets/a.png)')
     expect(output).not.toContain('<img')
     expect(output).toContain(`class="${LOCAL_IMAGE_CLASS}"`)

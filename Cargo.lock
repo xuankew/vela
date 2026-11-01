@@ -4481,6 +4481,7 @@ dependencies = [
  "base64 0.22.1",
  "notify",
  "notify-debouncer-full",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tauri",

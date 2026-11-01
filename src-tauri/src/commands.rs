@@ -154,6 +154,16 @@
 //! 在它之前，一次 XSS 最坏能改掉用户正在看的文件；在它之后，最坏能改掉整个文件夹。
 //! ⚠️ `store_image` 不改变这个判断：它能写的只有 `assets/pasted-*.{png,jpg,gif,webp,bmp}`
 //! 这一种名字，写不进 `.md`、写不进 `.zshrc`，也覆盖不了任何已有文件（撞名就换后缀）。
+//!
+//! ### M7-9 起这张表**外面**还有一个入口：`vela-img` 协议，而它不加新能力
+//!
+//! `.register_asynchronous_uri_scheme_protocol(...)` 不走 `invoke_handler`，所以它不在这
+//! 十五个里，也不受 `capabilities` 约束——一个能读盘的原语。⚠️ 但它**没有让上面那条
+//! 信任边界变松**：它能读的范围是「`doc` 参数那个目录里面」，而一个能自己拼
+//! `vela-img://localhost/?doc=…&ref=…` 的脚本本来就能 `invoke("open_file")` 读任意文件。
+//! 它挡的是另一件事，也是唯一需要挡的那件事：**一份别人写的 `.md` 在正文里放
+//! `![](/etc/passwd)`**。那种攻击里正文只能决定 `ref`，而 `doc` 是前端从当前文档的真实
+//! 路径填进去的，于是它出不了那个目录。完整的口径在 `src/imgproto.rs` 文件头。
 //! （M2-C 已经有了第一份 managed state，见 [`TaskRegistry`]；M2-E 又加了第二份，
 //! 见 [`ProjectIndexCache`]；M2-G 加了第三份，见 `watcher::WatcherState`；
 //! M2-H 加了第四份，见 `shard::ShardRegistry`。
