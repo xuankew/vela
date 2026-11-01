@@ -48,7 +48,7 @@
  *
  * 勾选框改正文，大图只读。它把**同一份 `src`** 交给一个全屏的 `<img>`，走的还是 M7-9
  * 那条 `vela-img` 校验，不新增任何图片来源。判断「这一次点击该不该弹」全在
- * `./ImageLightbox.tsx` 的 `zoomOf` 里（被链接包住的图归链接，占位 `span` 压根不是图），
+ * `./imageActions.ts` 的 `zoomOf` 里（被链接包住的图归链接，占位 `span` 压根不是图），
  * 这一层只负责把命中的那一份记下来，并在**换文档**时把它关掉。
  *
  * 🔴 大图渲染在 `<section class="md-preview">` 里面，于是它跟着这一栏活：关预览、关标签、
@@ -58,6 +58,20 @@
  * ⚠️ 已知欠账：这个手势**只有鼠标能做**。要让键盘也点得开，得给每张 `<img>` 加 `tabindex`，
  * 而一篇贴了二十张图的笔记会因此多出二十次 `Tab`——那要先回答「预览里键盘该怎么走」，
  * 而这一栏目前的答案就是上面那句「除了勾选框，一个都不能」
+ *
+ * ## ⚠️ 右键那张图：第三个手势，同样一个字都不写（M7-12）
+ *
+ * 一项菜单：本地图片是「复制路径」（正文 `![](...)` 里那串引用），外链图是「复制链接」。
+ * 判据与大图共用 `./imageActions.ts`，但**不共用「在不在链接里」那一条**——右键不导航，
+ * 没得抢，理由写在那儿。菜单本体是 `../project/TreeMenu.tsx`，四个宿主共用一份关闭路径。
+ *
+ * 🔴 为什么不用 webview 原生的那一份：它在图上给的是「拷贝图像地址」，而本地图片的地址是
+ * `vela-img://…`——复制出去是一条**谁都打不开**的死链，粘进正文还能把文档弄坏。
+ * 认不出来的那种图（`data:`、没有 `data-path` 的奇形怪状）**不调 `preventDefault`**，
+ * 把原生的留给用户，比弹一份空的或全灰的诚实
+ *
+ * ⚠️ 这一层也不给「打开链接」「在 Finder 里显示」：前者点在图外面的链接文字上就能做，
+ * 后者需要绝对路径，而绝对路径的归一化只有一个权威（见 `./imageActions.ts` 最后那一节）
  *
  * ## ⚠️ 阅读模式：这一栏可能是屏幕上唯一的一栏
  *
@@ -78,8 +92,11 @@
  */
 
 import { createEffect, createSignal, onCleanup, onMount, Show, untrack } from 'solid-js'
+import { writeClipboard } from '../editor/clipboard'
+import { TreeMenu } from '../project/TreeMenu'
 import { createPanelRefresh, type FollowedEditor, type PanelRefreshSource } from './panel'
-import { ImageLightbox, zoomOf, type ZoomTarget } from './ImageLightbox'
+import { copyTargetOf, zoomOf, type CopyTarget, type ZoomTarget } from './imageActions'
+import { ImageLightbox } from './ImageLightbox'
 import { restorePlaceholder, rewriteLocalImages } from './localImage'
 import { previewHtml } from './preview'
 import { atBottom, collectAnchors, fractionalLine, topForLine, type LineAnchor } from './scrollSync'
@@ -120,6 +137,15 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
    * 所以 `render()` 每次比一次，不是同一份文档就直接关
    */
   const [zoom, setZoom] = createSignal<{ target: ZoomTarget; path: string } | null>(null)
+
+  /**
+   * 右键一张图弹出来的那份菜单：复制什么、在哪儿弹、以及它属于**哪一份文档**。
+   *
+   * 这一份是**那一次右键的快照**，三个都得存着：坐标是当时光标的位置（菜单不能跟着重画飘），
+   * `path` 用来在换文档时把它关掉——那份 DOM 已经整块没了，菜单还指着上一份文档的一张图。
+   * ⛔ 不存 `TreeMenu` 自己算出来的 clamp 结果，那一个是它内部的事
+   */
+  const [imgMenu, setImgMenu] = createSignal<{ target: CopyTarget; x: number; y: number; path: string } | null>(null)
 
   const alone = () => props.alone()
 
@@ -191,8 +217,13 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
 
     // M7-11：不是同一份文档了就把大图关掉。⚠️ `untrack` 不是防循环，是防「点开大图」
     // 这一次 `setZoom` 反过来把整个重画流程再触发一遍（见 `./panel.ts` 那份调度）
+    // M7-12 同一句管着右键菜单：它指着的是**上一份文档里的一张图**，那份 DOM 已经被
+    // `innerHTML` 整块换掉了。⚠️ 不能只靠 `TreeMenu` 自己那条「宿主滚动就关」——
+    // 真实窗口里 `follow()` 会滚，但没到文末的那次换文档可能一像素都不动
     const open = untrack(zoom)
     if (open !== null && open.path !== pathOf(src)) setZoom(null)
+    const menu = untrack(imgMenu)
+    if (menu !== null && menu.path !== pathOf(src)) setImgMenu(null)
 
     setNote(text)
     if (html !== rendered) {
@@ -364,6 +395,36 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     if (target !== null) setZoom({ target, path: pathOf(untrack(() => props.source())) })
   }
 
+  /**
+   * 右键一张图 → 那份只有一项的菜单（M7-12）。
+   *
+   * 🔴 认不出来的那张图**不调 `preventDefault`**：`copyTargetOf` 返回 null 意味着
+   * 「这一层不知道该复制什么」，那就把 webview 自己的那份菜单留给用户，而不是弹一份空的或全灰的。
+   * 与 `App.tsx` 那条「只读大文件分片不接编辑器菜单，留原生的比弹一份全灰的好」同一条判断
+   *
+   * ⚠️ 挂在 `.md-preview` 这一层而不是 `.md-preview-body`：大图（`ImageLightbox`）是这一栏的
+   * 子节点，右键它靠冒泡走到同一个处理里，用户不需要知道那两个是两层
+   */
+  function onImageContextMenu(event: MouseEvent) {
+    const target = copyTargetOf(event.target)
+    if (target === null) return
+    event.preventDefault()
+    setImgMenu({ target, x: event.clientX, y: event.clientY, path: pathOf(untrack(() => props.source())) })
+  }
+
+  /**
+   * 复制那一路。成功**不说话**：文件树那条「复制路径」也是这个口径（`rootTree.ts` 的
+   * `copyPath` 成功返回 `null`），而剪贴板里的东西用户自己 ⌘V 就能验，多一行提示只会让那一栏变响。
+   *
+   * 🔴 失败必须说：`navigator.clipboard` 在非安全上下文里直接抛，症状是「点了没反应」。
+   * 头部那一行本来就是警告色，正好用它
+   */
+  function copyImageTarget(text: string) {
+    void writeClipboard(text).then((ok) => {
+      if (!ok) setNote('复制不了——拿不到系统剪贴板')
+    })
+  }
+
   function onBodyKeyDown(event: KeyboardEvent) {
     if (event.key !== ' ' && event.key !== 'Enter') return
     const box = taskBoxOf(event.target)
@@ -375,7 +436,7 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   }
 
   return (
-    <section class="md-preview" aria-label="Markdown 预览">
+    <section class="md-preview" aria-label="Markdown 预览" onContextMenu={onImageContextMenu}>
       <div class="md-preview-head">
         {/* 「阅读模式」而不只是「预览」：这一档下编辑区被藏起来了，而 `Mod+F` 那类命令
             还在往那块看不见的编辑器上作用。标题是用户唯一能拿到的「我不在编辑态」的信号，
@@ -409,6 +470,25 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
           不换节点的话，这两份状态都会跟着上一张图 */}
       <Show when={zoom()} keyed>
         {(open) => <ImageLightbox target={open.target} onClose={() => setZoom(null)} />}
+      </Show>
+      {/* M7-12：右键那张图的那一项菜单。宿主用 `../project/TreeMenu.tsx`（第四个宿主），
+          四条关闭路径与贴边 clamp 都在那一层，⛔ 这里不再自己写一份。
+          ⚠️ 一项菜单看着多余，但**不用 webview 原生的那一份**是有理由的：它在图上给的是
+          「拷贝图像地址」，而本地图片的地址是 `vela-img://…`——复制出去是一条谁都打不开的死链
+          （`./imageActions.ts` 那条红字）。`z-index` 10 也正好盖住上面那张遮罩（9）
+          ⚠️ `keyed`：一次右键 = 一次挂载，菜单项的文字与坐标都由那一次右键决定，
+          不会出现「内容换成了另一张图的，位置还留在上一个光标上」 */}
+      <Show when={imgMenu()} keyed>
+        {(menu) => (
+          <TreeMenu
+            x={menu.x}
+            y={menu.y}
+            items={[{ action: 'copy', label: menu.target.label }]}
+            onPick={() => copyImageTarget(menu.target.text)}
+            onClose={() => setImgMenu(null)}
+            keepFocus
+          />
+        )}
       </Show>
     </section>
   )

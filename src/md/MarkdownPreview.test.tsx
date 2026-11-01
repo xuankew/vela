@@ -620,3 +620,136 @@ describe('MarkdownPreview：点图看大图（M7-11）', () => {
     expect(zoomBackdrop()).not.toBeNull()
   })
 })
+
+/**
+ * M7-12：右键那张图 → 那一项菜单。
+ *
+ * 判据（认不认这张图、给哪串字）在 `imageActions.test.ts` 里逐条钉过了，遮罩带不带
+ * `data-path` 在 `ImageLightbox.test.tsx` 里钉过了。这里钉的是**接线**：事件挂在哪一层、
+ * 复制出去的那一串到底是什么，以及失败那句话说不说。
+ *
+ * 🔴 这一组里最值钱的是那两条「剪贴板里出现了什么」：`vela-img:` 漏进剪贴板不会有任何
+ * 自动信号——菜单照常弹、复制「成功」、直到用户把一串谁都打不开的死链粘进别的文档才发现
+ *
+ * ⚠️ 菜单**长什么样、贴不贴边**不在这里验：`TreeMenu` 那份组件测试管它，而 jsdom 里
+ * `getBoundingClientRect` 恒为 0，坐标断言只能钉住「没超出窗口」那半个
+ */
+describe('MarkdownPreview：右键那张图复制链接（M7-12）', () => {
+  const PIC = '# 甲\n\n![截图](assets/a.png)\n'
+  const EXTERNAL = '![外链](https://e.com/a.png)\n'
+
+  const menuItem = () => container.querySelector<HTMLElement>('.tree-menu-item')
+  const menuLabel = () => menuItem()?.textContent ?? null
+
+  /** `writeText` 的成功与失败在测试里都得由外面给：jsdom 压根没有 `navigator.clipboard` */
+  function mockClipboard(write: (text: string) => Promise<void>) {
+    const writeText = vi.fn(write)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    return writeText
+  }
+
+  /** 那一次 `writeClipboard` 里的两个 await 都走完 */
+  async function flush(): Promise<void> {
+    for (let i = 0; i < 4; i++) await Promise.resolve()
+  }
+
+  function contextMenu(el: Element): MouseEvent {
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 120, clientY: 90 })
+    el.dispatchEvent(event)
+    return event
+  }
+
+  afterEach(() => {
+    delete (navigator as { clipboard?: unknown }).clipboard
+  })
+
+  it('右键本地图片 → 弹「复制路径」那一项，而且不弹大图', () => {
+    const p = mount(PIC, '/notes/a.md')
+    expect(contextMenu(p.imgs()[0]!).defaultPrevented).toBe(true)
+    expect(menuLabel()).toBe('复制路径')
+    // 两个手势各管各的：右键不该顺手把遮罩也叫出来
+    expect(container.querySelector('.img-zoom-backdrop')).toBeNull()
+  })
+
+  it('🔴 点了那一项，进剪贴板的是正文里那串引用——不是 `vela-img:`', async () => {
+    const p = mount(PIC, '/notes/a.md')
+    const writeText = mockClipboard(async () => {})
+    contextMenu(p.imgs()[0]!)
+    menuItem()!.click()
+    await flush()
+    expect(writeText).toHaveBeenCalledWith('assets/a.png')
+  })
+
+  it('右键外链图片 → 那一项写「复制链接」，复制的是那个地址', async () => {
+    const p = mount(EXTERNAL, '/notes/a.md')
+    const writeText = mockClipboard(async () => {})
+    contextMenu(p.imgs()[0]!)
+    expect(menuLabel()).toBe('复制链接')
+    menuItem()!.click()
+    await flush()
+    expect(writeText).toHaveBeenCalledWith('https://e.com/a.png')
+  })
+
+  it('右键大图得到同一个结果：大图那张 `<img>` 认得出自己是哪张（靠 `data-path` 传过去）', async () => {
+    const p = mount(PIC, '/notes/a.md')
+    const writeText = mockClipboard(async () => {})
+    p.imgs()[0]!.click() // 先开大图
+    const zoomImg = container.querySelector<HTMLImageElement>('.img-zoom')!
+    expect(contextMenu(zoomImg).defaultPrevented).toBe(true)
+    expect(menuLabel()).toBe('复制路径')
+    menuItem()!.click()
+    await flush()
+    expect(writeText).toHaveBeenCalledWith('assets/a.png')
+  })
+
+  it('⚠️ 包在链接里的图照样能右键（左键那条归链接，右键没得抢）', () => {
+    const p = mount('[![截图](assets/a.png)](https://e.com/post)\n', '/notes/a.md')
+    expect(contextMenu(p.imgs()[0]!).defaultPrevented).toBe(true)
+    expect(menuLabel()).toBe('复制路径')
+  })
+
+  it('🔴 认不出来的那些不抢原生菜单：不弹我们的，也不 `preventDefault`', () => {
+    const p = mount(PIC, null) // 没落盘 → 还是占位 `span`，压根不是 `<img>`
+    expect(contextMenu(p.localSpans()[0]!).defaultPrevented).toBe(false)
+    expect(menuItem()).toBeNull()
+    // 正文里的普通文字同理：右键一段话要的是 webview 那份带「复制」原生的菜单
+    const text = container.querySelector<HTMLElement>('.md-preview-body p')!
+    expect(contextMenu(text).defaultPrevented).toBe(false)
+    expect(menuItem()).toBeNull()
+  })
+
+  it('成功不说话（那一栏本来就是警告色），失败必须说', async () => {
+    const p = mount(PIC, '/notes/a.md')
+    mockClipboard(async () => {})
+    contextMenu(p.imgs()[0]!)
+    menuItem()!.click()
+    await flush()
+    expect(p.note(), '复制成功不需要提示').toBeNull()
+
+    mockClipboard(() => Promise.reject(new Error('not a secure context')))
+    contextMenu(p.imgs()[0]!)
+    menuItem()!.click()
+    await flush()
+    expect(p.note()).toBe('复制不了——拿不到系统剪贴板')
+  })
+
+  it('🔴 换文档就把菜单关掉：它指着的是上一份文档里的一张图', () => {
+    const p = mount(PIC, '/notes/a.md')
+    contextMenu(p.imgs()[0]!)
+    expect(menuItem()).not.toBeNull()
+    p.setSource({ view: makeView('# 乙\n\n![另一张](assets/b.png)\n'), path: '/notes/b.md' })
+    expect(menuItem(), '文档都换了，菜单还挂在屏幕上').toBeNull()
+  })
+
+  it('点完一项菜单自己收掉（`TreeMenu` 在 `onPick` 之后一定调 `onClose`）', async () => {
+    const p = mount(PIC, '/notes/a.md')
+    mockClipboard(async () => {})
+    contextMenu(p.imgs()[0]!)
+    menuItem()!.click()
+    expect(menuItem()).toBeNull()
+    await flush()
+    // 收掉了还能再叫出来：那份现场没有被上一次点击留在半开的状态里
+    contextMenu(p.imgs()[0]!)
+    expect(menuLabel()).toBe('复制路径')
+  })
+})

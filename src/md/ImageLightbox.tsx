@@ -22,44 +22,26 @@
  *
  * ## 🔴 被链接包住的图不抢这次点击
  *
- * `[![alt](img.png)](https://example.com)` 在预览里就是一个可点的链接。`zoomOf` 在
- * `closest('a')` 上返回 null，于是点击归链接。⛔ 别改成「先弹大图、大图里再放一个打开链接」：
- * 那会让同一个手势在「带链接的图」与「不带的图」上有两种结果，而用户看不出来为什么。
+ * `[![alt](img.png)](https://example.com)` 在预览里就是一个可点的链接。判据在
+ * `./imageActions.ts` 的 `zoomOf` 里，`closest('a')` 上返回 null，于是点击归链接。
+ * 那一个文件同时说了右键那一条为什么**不**用同一个守卫（右键不导航，没得抢），
+ * 两条判据分开写在那里，⛔ 不要合并成一条
+ *
+ * ## ⚠️ 右键菜单不在这一层，但这一层负责让那张图认得出自己
+ *
+ * 大图没有自己的菜单宿主：`ImageLightbox` 把正文那串引用挂回 `<img>` 的 `data-path` 上，
+ * 事件一路冒泡到 `.md-preview`，由宿主那一份菜单接住。于是**右键大图**与右键预览里那一张
+ * 得到同一个结果。⛔ 不要在这一层再建一个 `TreeMenu`：两个宿主意味着两份关闭路径要守，
+ * 而这一层连焦点陷阱都故意没做
  *
  * ## ⚠️ 一层已知的 a11y 欠账：没有焦点陷阱
  *
  * `Tab` 从关闭按钮走出去会掉到遮罩后面的界面里。做陷阱要回答「哪些元素算这个对话框的」，
  * 而这里只有两个（对话框本身与 `×`）。`role="dialog"` 不带 `aria-modal` 是刻意的：
- * 声明了模态却守不住焦点，比不声明更误导读屏器——与 `SettingsDialog` 同一口径。
+ * 声明了模态却守不住焦点，比不声明更误导读屏器——与 `SettingsDialog` 同一口径
  */
 import { createSignal, onCleanup, onMount, Show } from 'solid-js'
-
-/** 一次点击命中的那张图：显示用的 URL，与那句给人看的路径 */
-export interface ZoomTarget {
-  /** 直接塞进 `<img src>` 的那个字符串，与预览里那一张一模一样 */
-  src: string
-  /** 底部那一行。本地图是正文里写的原样引用，外链是那个 URL */
-  label: string
-}
-
-/**
- * 这次点击该不该弹大图；该的话给出目标，不该就 null。
- *
- * 🔴 `src` 读的是 `getAttribute('src')` 而不是 `.src`：后者会拿文档的 base URL 去解析，
- * 于是 `vela-img://…` 在某些实现里被改写成别的形状。这里要的是**原样那串**，
- * 因为 Rust 那一边按原样校验（见 `src-tauri/src/imgproto.rs`）
- *
- * ⚠️ `label` 优先取 `data-path`：那是 `render.ts` 写进占位、`localImage.ts` 搬到 `<img>` 上的
- * 正文原样引用（`assets/pasted-….png`）。用户想知道的是「正文里指的是哪个文件」，
- * 而不是应用自己编出来的协议 URL
- */
-export function zoomOf(target: EventTarget | null): ZoomTarget | null {
-  if (!(target instanceof HTMLImageElement)) return null
-  if (target.closest('a') !== null) return null
-  const src = target.getAttribute('src')
-  if (src === null || src === '') return null
-  return { src, label: target.dataset.path ?? src }
-}
+import type { ZoomTarget } from './imageActions'
 
 export interface ImageLightboxProps {
   target: ZoomTarget
@@ -111,7 +93,17 @@ export function ImageLightbox(props: ImageLightboxProps) {
         ref={dialogEl}
         onKeyDown={onKeyDown}
       >
-        <img class="img-zoom" src={props.target.src} alt={props.target.label} onError={() => setFailed(true)} />
+        {/* `data-path` 原样挂回来（`null` 时 Solid 直接不写这个属性）：宿主 `.md-preview` 上那份
+            右键菜单靠它认图，于是**右键大图**与右键预览里那一张得到同一个结果。⛔ 别省这一句：
+            省了之后大图上的右键会走 webview 的原生菜单，而那里「拷贝图像地址」交出去的是
+            `vela-img://…`——一条外面谁都打不开的死链接（论证见 `./imageActions.ts` 那条红字） */}
+        <img
+          class="img-zoom"
+          src={props.target.src}
+          data-path={props.target.ref}
+          alt={props.target.label}
+          onError={() => setFailed(true)}
+        />
         <div class="img-zoom-foot">
           {/* 加载失败时那句要说的是「这一张出不来」，而路径还是得给——它是用户唯一的线索 */}
           <span class="img-zoom-path" classList={{ failed: failed() }}>

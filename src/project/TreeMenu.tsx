@@ -53,10 +53,11 @@ export interface TreeMenuProps<A = TreeMenuAction> {
  * 有固定的层级与生命周期），不是一个跟着光标弹出的上下文菜单；而 Web 这一侧没有
  * 任何原生的「弹一个自定义菜单」的东西。菜单一共几项、形状固定，自己写只是几十行。
  *
- * ## 三个宿主
+ * ## 四个宿主
  *
- * 文件树（`Sidebar.tsx`，`A = TreeMenuAction`）、标签条（`doc/TabStrip.tsx`）与
- * 编辑器正文（`App.tsx`，剪切/复制/粘贴/全选 + 折叠全部/展开全部），各自定义自己那一个
+ * 文件树（`Sidebar.tsx`，`A = TreeMenuAction`）、标签条（`doc/TabStrip.tsx`）、
+ * 编辑器正文（`App.tsx`，剪切/复制/粘贴/全选 + 折叠全部/展开全部）与 Markdown 预览里那张图
+ * （`md/MarkdownPreview.tsx`，M7-12：一项「复制路径 / 复制链接」），各自定义自己那一个
  * 动作联合。共用的是这一层**唯一有价值的那部分**：贴边 clamp、四条关闭路径、
  * 分隔线与灰项——都是「改坏了不报错、只是菜单赖在屏幕上或飘走」的微妙逻辑，
  * 写第二份就会漂移。
