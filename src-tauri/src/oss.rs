@@ -13,6 +13,17 @@
 //! ⚠️ 同理 [`put_headers`] 的返回里可能带一条 `x-oss-security-token`（用了 STS 临时令牌时）。
 //! 那一条与 secret 同级敏感：别打日志，更别原样回给前端。
 //!
+//! ## 🔴 预签名那一条路（M7-8）：签名地址只住 DOM，不住正文
+//! [`put_object`] 交回的是**不带签名**那一个地址，写进正文的是它。[`presign_batch`] 交回的
+//! 是另一个带 15 分钟有效期的地址，而它唯一的去处是前端的 `img.src`：一个有时效的访问凭证
+//! 一旦进了正文，就跟着那份文档一起同步、备份、被贴到别处，而有效期变成一句谎话——
+//! 写进去的那一天它就过期了，读到的人还以为那个链接是坏的。
+//! ⛔ 所以这一层的两条路不许互换返回值，也不许有人「为了省事让正文写签名地址」。
+//!
+//! ⚠️ 签名地址里带着 AccessKey **ID**（`x-oss-credential` 那一段）与一串签名。ID 不是秘密
+//! （它就在设置面板那一格里），签名则是那 15 分钟里的读取凭证。它不进日志、不进 `Debug`、
+//! 也不进任何一条错误文案——这一层唯一把它交出去的地方是它的返回值
+//!
 //! ## 为什么刻意不跟跳转
 //! bucket 与 region 不是同一对时，OSS 回的是**跳转**（`PermanentRedirect`）而不是一个错误码。
 //! 默认策略会跟着跳，于是两件坏事同时发生：`Authorization` 被原样发给跳转目标，而用户最后
@@ -47,7 +58,9 @@ use std::fmt::{self, Debug};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use percent_encoding::percent_decode_str;
 use serde::Serialize;
+use tauri::Url;
 use vela_core::oss::{self, Credentials, SignContext};
 
 /// 一次 PUT 的总超时，含把整个 body 发完。
@@ -63,6 +76,17 @@ pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// 超过它的图在 OSS 分支会降级成本地 `assets/`（M7-7 的决定），所以这一个上限
 /// **不该**让用户看到「传不上去就没图了」。
 pub const MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 预览里那一张云端图片的临时签名地址的有效期：15 分钟（M7-8）。
+///
+/// 为什么是这一个数：它是 OSS 预签名 URL 的**默认**时长，也是 [`crate::oss`] 里
+/// `RequestTimeTooSkewed` 那句话里的那一个「15 分钟」——本机钟只要对得上，
+/// 一个按此刻签出来的地址在整个有效期内都不会因为时钟漂移被服务端拒。
+///
+/// ⚠️ 前端那份（`src/ipc/oss.ts` 的 `PRESIGN_TTL_MS`）是同一个数字的另一半，
+/// 它拿来做缓存的过期时刻。改这一个数要一起改，否则「缓存里还留着、服务端已经拒了」
+/// 那一整段时间预览里全是裂图。钉子是 `有效期与前端那份缓存时长同为一个数`
+pub const PRESIGN_TTL_SECONDS: i64 = 900;
 
 /// 一次上传所需的全部配置。
 ///
@@ -175,7 +199,16 @@ pub fn object_key(prefix: &str, object_name: &str) -> String {
 /// ⚠️ `key` 走 [`oss::uri_encode`] 且**保留 `/`**——这与签名层的 canonical URI 用的是
 /// 同一个函数，所以不会出现「签的是 `%20`，发出去的是 `+`」这种只在真机炸的错。
 fn object_url(target: &Normalized<'_>, key: &str) -> String {
-    format!("https://{}.oss-{}.aliyuncs.com/{}", target.bucket, target.region, oss::uri_encode(key, true))
+    format!("https://{}/{}", object_host(target.bucket, target.region), oss::uri_encode(key, true))
+}
+
+/// bucket 那一个虚拟主机名：`vela-img.oss-cn-hangzhou.aliyuncs.com`。
+///
+/// 拼它的有两处：写进正文的那个地址（[`object_url`]）与预览里认地址的那一条
+/// （[`presign_batch`]）。**共用这一个函数**是因为它们一旦不一致，症状是
+/// 「刚传上去的那张图在自己的预览里显示不出来」，而那句 403 只出现在 webview 的网络面板里
+fn object_host(bucket: &str, region: &str) -> String {
+    format!("{bucket}.oss-{region}.aliyuncs.com")
 }
 
 /// 现在这一刻的 UTC 时刻串：`20231216T162057Z`。
@@ -317,7 +350,7 @@ fn ensure_crypto_provider() -> Result<(), String> {
 ///
 /// 返回的是不带签名的标准 OSS 地址。这是刻意的：bucket 是私读的，那个地址在浏览器里直接
 /// 打开会 403，但它是**稳定的**，能写进 Markdown 也能被别的工具认出来。预览里要真看见图，
-/// 走 M7-8 那条临时签名地址（与 `vela-img` 同一个「只在 Vela 里能用」的思路）。
+/// 走 [`presign_batch`] 那一条临时签名地址（与 `vela-img` 同一个「只在 Vela 里能用」的思路）。
 ///
 /// ⛔ 不要改成返回签名地址：那一个带有效期，把这种串钉进正文，等于把一个有时效的访问凭证
 /// 永久写进一份会同步、会备份、会被贴到别处的文档里。
@@ -352,6 +385,166 @@ pub async fn put_object(
     let header_id = resp.headers().get("x-oss-request-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
     let body = resp.text().await.unwrap_or_default();
     Err(rejected(status.as_u16(), header_id, &body))
+}
+
+/// 预览里那一张云端图片的临时签名地址（M7-8）。
+///
+/// `url` 是正文里那一串**不带签名**的地址，也是 DOM 上当前的 `src`；前端拿它回来定位是哪一张。
+/// `signed_url` 是 15 分钟内有效的 GET 地址，`reason` 是没签成时那句给用户看的中文。
+///
+/// ⚠️ 没有派生 `Debug`：这个值里揣着一条读取凭证，`{:?}` 一旦写进日志或 panic 文案，
+/// 那 15 分钟里谁拿到日志谁就能读那一个对象。`Serialize` 是它唯一的出口
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresignedImage {
+    pub url: String,
+    pub signed_url: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// 一批地址里有没有**任何一条**落在用户那一个桶、那一个前缀底下。
+///
+/// 命令先问这一句，再去读钥匙串。为什么要有这一个小函数：一份从网上存下来的 `.md` 里
+/// 有十几张别人站点的图是常态，而预览每改一次正文都会重问一次——那种文档一次都不该去碰
+/// 钥匙串（`any` 走的是与 [`presign_batch`] 完全同一套命中判定，所以两者不会给出不一致的答案）
+pub fn any_cloud_object(target: &OssTarget<'_>, prefix: &str, urls: &[String]) -> bool {
+    let Some(host) = loose_host(target) else { return false };
+    let key_prefix = prefix.trim().trim_matches('/');
+    urls.iter().any(|raw| object_key_of(&host, key_prefix, raw).is_some())
+}
+
+/// 只在「配置还不成形」时用来做命中判定的主机名。
+///
+/// 为什么不用 [`normalize`] 先把配置查一遍：一份从网上存下来的 `.md` 里有十几张别人站点的图
+/// 是常态，那种文档**一次都不该去读钥匙串**。所以这里只看 bucket 与 region 两格去拼主机名，
+/// 拼不出主机名（任一格为空）就当整批没命中，安静返回。
+///
+/// ⚠️ region 填成了访问域名时这里会拼出一个怪主机名，于是没有一张图命中、也就没有一句提示。
+/// 那一种手滑该说话的地方是设置面板与粘贴那一路（[`normalize`] 的那句话），不是预览
+fn loose_host(target: &OssTarget<'_>) -> Option<String> {
+    let bucket = target.bucket.trim();
+    let region = target.region.trim();
+    if bucket.is_empty() || region.is_empty() {
+        return None;
+    }
+    Some(object_host(bucket, region))
+}
+
+/// 一条 `img.src` 是不是**用户那一个桶**里的对象；是则给出它在桶里的对象名。
+///
+/// 四样都要对上，缺一个返回 `None`（那张图原样留着，公开桶照常显示）：
+/// 1. `https`。明文那一档不签：我们交出去的是一条带着凭证的请求，不该发给一个明文端口
+/// 2. 主机名逐字等于 [`object_host`] 拼出来的那一个。这是整个判据里唯一要紧的一条——
+///    它保证签名只会作用在**用户自己配的那一个桶**上，正文里写别的域名签不出任何东西
+/// 3. 没有查询参数。签名覆盖的是那一个对象；正文里多出来的那几个参数我们不猜它的意图
+///    （`?x-oss-process=…` 那一类），留原样比替它签一个更诚实
+/// 4. 对象名落在配置的前缀下面（前缀为空 = 桶根，那一格本来就允许留空）
+///
+/// 🔴 路径要**百分号解码**一次再交给签名层：URL 里那一段是 [`object_url`] 用
+/// `uri_encode(key, true)` 编出来的，而签名算的是 `/{bucket}/{key}` 里那个**原样**的对象名
+/// （[`oss::canonical_request`] 自己会再编一次）。不解码的话中文目录里的图片、
+/// 以及一切名字里带空格的对象，签出来的都是一个错的签名——403，而且只在真机上
+fn object_key_of(host: &str, prefix: &str, raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "https" || url.host_str()? != host || url.query().is_some() {
+        return None;
+    }
+    let encoded = url.path().strip_prefix('/')?;
+    let key = percent_decode_str(encoded).decode_utf8().ok()?;
+    if key.is_empty() {
+        return None;
+    }
+    if prefix.is_empty() {
+        return Some(key.into_owned());
+    }
+    key.starts_with(&format!("{prefix}/")).then(|| key.into_owned())
+}
+
+/// 一条 GET 的预签名地址：与 [`put_headers`] 同一套凭证，但**一条头都不签**。
+///
+/// 🔴 `headers` 与 `additional_headers` 都传空，`query` 也传空——因为发这个请求的是
+/// 浏览器的 `<img>`：它不带 `content-type`，也不带任何 `x-oss-*`。签名里多一条头
+/// 就等于签的是另一个请求，服务端复现不出来，症状是「预览里每一张云端图都 403」。
+/// 那一条规矩写在 [`oss::presigned_query`] 的文档里，这里是它唯一的用处
+fn presigned_get(target: &Normalized<'_>, key: &str, datetime: &str) -> Result<String, String> {
+    let creds = Credentials {
+        access_key_id: target.access_key_id,
+        access_key_secret: target.access_key_secret,
+        security_token: target.security_token,
+    };
+    let ctx = SignContext {
+        method: "GET",
+        bucket: target.bucket,
+        key,
+        region: target.region,
+        datetime,
+        headers: &[],
+        query: &[],
+        additional_headers: &[],
+        credentials: &creds,
+    };
+    let query = oss::presigned_query(&ctx, PRESIGN_TTL_SECONDS).map_err(|e| e.to_string())?;
+    Ok(format!("{}?{query}", object_url(target, key)))
+}
+
+/// 给预览里那几张云端图片签一批临时地址（M7-8）。
+///
+/// ## 🔴 参数里只有地址，没有目的地
+///
+/// 与 [`put_object`] 那一条完全同一姿势：bucket / region / AccessKey ID / 前缀一个参数都不收，
+/// 全部从**用户全局配置**读（`commands.rs` 里那个调用点）。这里收的是**字符串数组**，
+/// 看着像给了前端一个「想签哪个就签哪个」的入口，其实不是：[`object_key_of`] 只认
+/// 用户自己那一个桶、且只认配置那一个前缀底下的对象，别的域名一律返回空数组。
+///
+/// ## ⚠️ 剩下的那条边界要说清楚
+///
+/// 一段能在预览里执行脚本的代码，仍然可以拿着这个命令读**用户自己桶里**那 15 分钟——
+/// 但它读得到的只有「前缀下面、且它猜得到名字」的那些，而读到的东西最终是画在用户自己的
+/// 屏幕上（前端只把它赋给 `img.src`）。要外泄还得跨过同源策略：OSS 默认不给 `Cors` 头，
+/// ⚠️ 除非用户在自己的 bucket 上配了一条放行任意源的 CORS 规则。这一条要进真机回归清单
+///
+/// ## 顺序：先挑命中，再读钥匙串
+///
+/// 见 [`loose_host`]。一批地址里一张都没命中时，这条命令连配置都不完整读一遍
+///
+/// `secret_failed` 是**钥匙串读不出来**时的那句话（`secrets::SecretError::message`），
+/// 由调用方递进来。为什么要单独带这一条，而不是把读失败也归成「密钥是空串」：
+/// 🔴 [`crate::secrets`] 文件头那条写了——把「填了但读不出来」说成「还没填」，
+/// 用户会一遍遍重填一个本来正确的密钥。它只在「命中了但至少一格是空的」之外起作用，
+/// 也就是配置本身没毛病、只是密钥那一步坏了的时候才被拿出来顶掉 [`normalize`] 那句
+pub fn presign_batch(
+    target: &OssTarget<'_>,
+    prefix: &str,
+    urls: &[String],
+    secret_failed: Option<&str>,
+) -> Vec<PresignedImage> {
+    let Some(host) = loose_host(target) else { return Vec::new() };
+    let key_prefix = prefix.trim().trim_matches('/');
+    let matched: Vec<(String, String)> =
+        urls.iter().filter_map(|raw| object_key_of(&host, key_prefix, raw).map(|key| (raw.clone(), key))).collect();
+    if matched.is_empty() {
+        return Vec::new();
+    }
+    // 命中了才去要完整配置。这里失败的那句话是要给用户看的（「没有拿到 AccessKey Secret，
+    // 请在设置里填一次。」就在 [`normalize`] 里），而它指向的正是设置面板那一格
+    let prepared = match normalize(target) {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            let reason = secret_failed.map_or(reason, str::to_owned);
+            return matched
+                .into_iter()
+                .map(|(url, _)| PresignedImage { url, signed_url: None, reason: Some(reason.clone()) })
+                .collect();
+        }
+    };
+    let datetime = datetime_now();
+    matched
+        .into_iter()
+        .map(|(url, key)| match presigned_get(&prepared, &key, &datetime) {
+            Ok(signed) => PresignedImage { url, signed_url: Some(signed), reason: None },
+            Err(reason) => PresignedImage { url, signed_url: None, reason: Some(reason) },
+        })
+        .collect()
 }
 
 /// 一次非 2xx 的响应 → 给人看的失败。
@@ -896,5 +1089,246 @@ mod tests {
         // 第二次拿到的必须是同一个：连接池复用这件事不许靠调用方记得传
         let second = client().unwrap();
         assert!(std::ptr::eq(first, second), "两次 build 出了两个 client");
+    }
+
+    // ===== 预览里的临时签名地址（M7-8）=====
+
+    /// 正文里那一串不带签名的地址：`put_object` 成功时交回的就是它（`base()` 那一份配置拼出来的）
+    const CLOUD: &str = "https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png";
+
+    fn sign(prefix: &str, urls: &[&str]) -> Vec<PresignedImage> {
+        let owned: Vec<String> = urls.iter().map(|u| (*u).to_owned()).collect();
+        // 第 4 个参数是「钥匙串读不出来」那句话；这一组里除了专门测它的那一条，都当它没发生
+        presign_batch(&base(), prefix, &owned, None)
+    }
+
+    /// 命中那一张的签名地址；没命中就 panic，省得每条断言都写一遍解包
+    fn only_signed(prefix: &str, url: &str) -> String {
+        let got = sign(prefix, &[url]);
+        assert_eq!(got.len(), 1, "「{url}」没被认出来");
+        got[0].signed_url.clone().unwrap_or_else(|| panic!("「{url}」没签出来：{:?}", got[0].reason))
+    }
+
+    /// 查询参数里那一条的值
+    fn param(url: &str, name: &str) -> Option<String> {
+        let query = url.split_once('?')?.1;
+        query
+            .split('&')
+            .find(|pair| pair.split('=').next() == Some(name))
+            .and_then(|pair| pair.split_once('=').map(|(_, v)| v.to_owned()))
+    }
+
+    #[test]
+    fn 只认用户自己那一个桶的地址() {
+        // 🔴 这一条是整个命令的边界：主机名逐字对上配置里那一个桶才签，别的域名一个字节都签不出来。
+        // 正文里的外链图（别人的站点、别人的桶）走的都是这一支
+        for other in [
+            "https://e.com/assets/pasted-ad48c1765eb1b87d.png",
+            "https://other-bucket.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png",
+            // 同一个桶但在别的 region：主机名不是配置那一个，签名也不该签给它
+            "https://vela-img.oss-cn-shanghai.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png",
+            // 前缀凑上了也不行，主机名才是那一条判据
+            "https://oss-cn-hangzhou.aliyuncs.com/vela-img/assets/pasted-ad48c1765eb1b87d.png",
+        ] {
+            assert!(sign("assets", &[other]).is_empty(), "居然签了：{other}");
+        }
+        assert_eq!(sign("assets", &[CLOUD]).len(), 1);
+    }
+
+    #[test]
+    fn 前缀外的对象不签_空前缀就是桶根() {
+        assert!(sign("assets", &["https://vela-img.oss-cn-hangzhou.aliyuncs.com/other/a.png"]).is_empty());
+        assert!(sign("assets", &["https://vela-img.oss-cn-hangzhou.aliyuncs.com/assetsx/a.png"]).is_empty());
+        // `assets//a.png` 那种双斜杠的路径也在前缀底下，`starts_with` 认它
+        assert_eq!(sign("assets", &["https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets//a.png"]).len(), 1);
+        // 空前缀 = 桶根（设置里那一格明说可以留空），这时候桶根上那张要能签
+        assert_eq!(sign("", &["https://vela-img.oss-cn-hangzhou.aliyuncs.com/pasted-1.png"]).len(), 1);
+        // 首尾斜杠与空格都不算一层目录：与 `object_key` 同一个归一
+        assert_eq!(sign("  assets/ ", &[CLOUD]).len(), 1);
+    }
+
+    #[test]
+    fn 明文与带查询参数的一律不签() {
+        // 明文那一档签出去的是「带着凭证的请求发给一个明文端口」，不做
+        let plain = CLOUD.replace("https://", "http://");
+        assert!(sign("assets", &[&plain]).is_empty());
+        // 带参数的我们不猜它的意图（`?x-oss-process=…` 那一类），留原样比替它签一个更诚实：
+        // 公开桶那张照常显示，私读那张本来就是裂图，签错了反而让人以为已经尽力了
+        for with_query in [
+            &format!("{CLOUD}?x=1"),
+            &format!("{CLOUD}?"),
+            "https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/a.png?x-oss-process=image/resize,w_200",
+        ] {
+            assert!(sign("assets", &[with_query]).is_empty(), "居然签了：{with_query}");
+        }
+    }
+
+    #[test]
+    fn 形状不对的输入不签也不报错() {
+        // 这一条命令没有失败这条路：认不出来就是「没命中」，返回空数组。
+        // 认得出来的那些才有 `reason`
+        for junk in ["", "assets/a.png", "https://", "not a url", "https://vela-img.oss-cn-hangzhou.aliyuncs.com/"] {
+            assert!(sign("assets", &[junk]).is_empty(), "居然签了：{junk}");
+        }
+    }
+
+    #[test]
+    fn 路径解码之后才是签名用的对象名() {
+        // 🔴 URL 里那一段是 `uri_encode(key, true)` 编出来的，而签名算的是 `/{bucket}/{key}`
+        // 里那个**原样**的名字（`oss::canonical_request` 会再编一次）。不解码的话
+        // 带空格与中文的对象签出来的是一个错的签名，而 403 只在真机上看得见
+        let encoded = "https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/2026/%E6%88%AA%20%E5%9B%BE%201.png";
+        // 把查询段去掉，剩下的必须与递进来的那一条逐字相同：解一次、编一次刚好回到原样
+        assert_eq!(only_signed("assets", encoded).split_once('?').unwrap().0, encoded);
+        // 文件名里带一个真百分号的对象（`a%20b.png` 这一个**名字本身**）要编两次才进 URL。
+        // 这里只解一次——解两次会把用户自己写的那个 `%20` 当成编码痕迹吃掉，
+        // 于是签到了另一个对象上，症状还是那一张 403
+        let doubled = "https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/a%2520b.png";
+        assert_eq!(only_signed("assets", doubled).split_once('?').unwrap().0, doubled);
+    }
+
+    #[test]
+    fn 签出去的那一条是不带任何头的读取请求() {
+        let signed = only_signed("assets", CLOUD);
+        assert_eq!(param(&signed, "x-oss-signature-version").as_deref(), Some("OSS4-HMAC-SHA256"));
+        // TTL 就在参数里，用户与排查的人都看得见
+        assert_eq!(param(&signed, "x-oss-expires").as_deref(), Some("900"));
+        let credential = param(&signed, "x-oss-credential").unwrap();
+        // 日期那一段由 `datetime_now()` 给，所以只钉头尾两段确定的事
+        assert!(credential.starts_with("LTAI5tExampleId%2F"), "{credential}");
+        assert!(credential.ends_with("%2Fcn-hangzhou%2Foss%2Faliyun_v4_request"), "{credential}");
+        // 签名是最后追加的那一条，且是 64 位小写十六进制
+        let signature = param(&signed, "x-oss-signature").unwrap();
+        assert_eq!(signature.len(), 64, "{signature}");
+        assert!(signature.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{signature}");
+        // 🔴 浏览器的 `<img>` 不带 `content-type`，也不带任何 `x-oss-*`，所以签名里不许有头：
+        // 多一条就是另一个请求，服务端复现不出来 → 每张图都 403
+        assert_eq!(param(&signed, "x-oss-additional-headers"), None);
+        assert_eq!(param(&signed, "x-oss-security-token"), None, "没填令牌却签进了参数里");
+        // 时刻那一条参数也在（服务端按它算有效期）
+        assert!(oss::sign_date(&param(&signed, "x-oss-date").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn 令牌签进参数而不是头() {
+        let with_token = OssTarget { security_token: Some(" sts-token "), ..base() };
+        let owned = [CLOUD.to_owned()];
+        let mut got = presign_batch(&with_token, "assets", &owned, None);
+        let signed = got.remove(0).signed_url.unwrap_or_default();
+        assert_eq!(param(&signed, "x-oss-security-token").as_deref(), Some("sts-token"));
+    }
+
+    #[test]
+    fn 有效期与前端那份缓存时长同为一个数() {
+        // `src/ipc/oss.ts` 的 `PRESIGN_TTL_MS` 是这一个数字的另一半：前端拿它算缓存过期时刻。
+        // 只改这边、那边还按 15 分钟缓存，症状是「预览里的云端图过一阵子全裂」
+        assert_eq!(PRESIGN_TTL_SECONDS, 900);
+        assert_eq!(PRESIGN_TTL_SECONDS, 15 * 60);
+    }
+
+    #[test]
+    fn 配置不齐时命中那一张带着后端那句原话() {
+        // 四格齐、钥匙串里没有密钥：这时候**要**说话，而那句话就在 `normalize` 里，
+        // 它指向的正是设置面板那一格。前端原样显示，⛔ 不要另编一句
+        let no_secret = OssTarget { access_key_secret: "  ", ..base() };
+        let owned = [CLOUD.to_owned()];
+        let got = presign_batch(&no_secret, "assets", &owned, None);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].signed_url.is_none());
+        assert!(got[0].reason.clone().unwrap_or_default().contains("AccessKey Secret"), "{:?}", got[0].reason);
+    }
+
+    #[test]
+    fn 钥匙串坏了时那句话顶掉设置里没填() {
+        // 🔴 这一条守的是 `crate::secrets` 文件头那三态：「填了但读不出来」不能说成「还没填」，
+        // 否则用户会一遍遍重填一个本来正确的密钥。这里缺的是 AccessKey ID 那一格，
+        // 于是 [`normalize`] 会给一句「设置里没有填 …」，而真正坏掉的那一步在钥匙串
+        let owned = [CLOUD.to_owned()];
+        let got = presign_batch(
+            &OssTarget { access_key_id: "", ..base() },
+            "assets",
+            &owned,
+            Some("拿不到钥匙串里那一份：访问被拒绝。"),
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].signed_url, None);
+        assert_eq!(got[0].reason.as_deref(), Some("拿不到钥匙串里那一份：访问被拒绝。"));
+
+        // 反方向的半个：配置齐时 `secret_failed` 压根轮不上，一张照常签出来。
+        // 这一半防止有人把那一个参数改成「无论如何都返回失败」
+        let ok = presign_batch(&base(), "assets", &owned, Some("不该被看到那句"));
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].reason, None);
+        assert!(ok[0].signed_url.clone().unwrap_or_default().contains("x-oss-signature="));
+    }
+
+    #[test]
+    fn 四格全空时一张都不签_也就不碰钥匙串() {
+        // 🔴 这一条钉的是顺序，不是结果：一份从网上存下来的 `.md` 里全是别人站点的图，
+        // 那种文档一次都不该去读钥匙串（第一次读还会弹授权框）。bucket 是空的 →
+        // 连主机名都拼不出来 → 整批没命中 → 空数组，也就没有一句多余的提示
+        let none = OssTarget { bucket: "", region: "", access_key_id: "", access_key_secret: "", security_token: None };
+        assert!(presign_batch(&none, "assets", &[CLOUD.to_owned(), "https://e.com/a.png".to_owned()], None).is_empty());
+    }
+
+    #[test]
+    fn 一批里只签命中的那几张() {
+        let got = sign("assets", &["https://e.com/a.png", CLOUD, "https://e.com/b.png", CLOUD]);
+        // 重复的那一条签两次（`url` 是前端拿来对位的键，两条一样不影响它赋值）
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].url, CLOUD);
+        assert_eq!(got[1].url, CLOUD);
+        assert_eq!(got[0].signed_url, got[1].signed_url, "同一张图两次签出两个地址：那一条时刻不该分开取");
+    }
+
+    #[test]
+    fn 签名地址与序列化出去的都没有密钥() {
+        // 🔴 与 `我们编的失败文案里没有密钥` 同一条硬约束的可执行版本，只是换了一整条新路子：
+        // 预签名把 AK ID、时刻、scope 都摊进了查询串，最容易顺手把 secret 也拼进去的就是这里
+        let secret = "SECRET-VALUE-DO-NOT-LEAK";
+        let token = "STS-VALUE-DO-NOT-LEAK";
+        let owned = [CLOUD.to_owned()];
+        let mut got = presign_batch(&OssTarget { security_token: Some(token), ..base() }, "assets", &owned, None);
+        let signed = got.remove(0).signed_url.unwrap_or_default();
+        assert!(!signed.contains(secret), "密钥漏进了签名地址：{signed}");
+        assert!(!serde_json::to_string(&signed).unwrap().contains(secret));
+        // ⚠️ 令牌**在**签名地址里（`x-oss-security-token=`），这不是漏：服务端要靠它验签，
+        // 预签名 GET 的规矩就是这样。正因为这一串是「一份能读的凭证」，它才只住 DOM、
+        // 有 15 分钟就作废（`presign_batch` 的模块文档那条 ⚠️ 说的是同一件事）
+        assert!(signed.contains(token), "配了令牌却没签进参数：{signed}");
+        // 没配密钥那一路的整份返回值（含 `reason`）也搜一遍
+        let broken = serde_json::to_string(&presign_batch(
+            &OssTarget { access_key_secret: "", ..base() },
+            "assets",
+            &owned,
+            None,
+        ))
+        .unwrap();
+        assert!(!broken.contains(secret), "{broken}");
+    }
+
+    #[test]
+    fn 三个字段的前端形状钉死() {
+        // 与 `src/ipc/oss.ts` 的 `PresignedImage` 对照（手写镜像，没有代码生成）。
+        // 🔴 是 camelCase 的 `signedUrl`，不是 `signed_url`：这一条与上面 `UploadError`
+        // 那一条**不一样**（那一个是 `rename_all = "snake_case"` 挂在枚举上的），
+        // 搞混的症状是前端读出来一个 `undefined`，而预览里的图安静地不显示
+        let json = serde_json::to_string(&PresignedImage {
+            url: CLOUD.to_owned(),
+            signed_url: Some("https://x?y=1".to_owned()),
+            reason: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"url":"https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png","signedUrl":"https://x?y=1","reason":null}"#
+        );
+        let failed = serde_json::to_string(&PresignedImage {
+            url: "u".to_owned(),
+            signed_url: None,
+            reason: Some("设置里没有填 bucket。".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(failed, r#"{"url":"u","signedUrl":null,"reason":"设置里没有填 bucket。"}"#);
     }
 }

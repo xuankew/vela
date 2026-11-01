@@ -19,6 +19,14 @@
  * 凭证永久写进一份会同步、会备份、会被贴到别处的文档里，等于把访问权固化成漏洞。
  * 预览里要真看见图，走 M7-8 那条临时签名地址。
  *
+ * ## 🔴 本模块的第二条路（M7-8）：签名地址只住 DOM
+ *
+ * [`presignOssImages`] 交回的那一串与上面那一条**形状相同、性质完全不同**：它带着
+ * AccessKey ID、时刻与一串签名，是 15 分钟内能读那个对象的凭证。⛔ 它不进正文、
+ * 不进剪贴板、不进日志，唯一的去处是 `img.src` 这一个 DOM 属性；给用户看、给用户复制的
+ * 永远是无签名那一条（`src/md/ossImage.ts` 把它留在 `data-oss-src` 上，
+ * `src/md/imageActions.ts` 从那里读）。两条路各自守一条用例，⛔ 不要互换返回值
+ *
  * ## 文案全在 Rust，这里只做一件事
  *
  * 七个 `kind` 里只有 `too_big` 需要前端拼句子（数字要格式化成 MB），其余六个原样透传
@@ -113,4 +121,44 @@ export function describeUploadError(err: unknown): string {
 export async function uploadImage(bytes: Uint8Array): Promise<string> {
   if (bytes.length > MAX_UPLOAD_BYTES) throw new Error(tooBigText(bytes.length, MAX_UPLOAD_BYTES))
   return invoke<string>('upload_image', { dataBase64: bytesToBase64(bytes) })
+}
+
+/**
+ * Rust `oss::PRESIGN_TTL_SECONDS`（900 秒）换算成毫秒。
+ *
+ * 🔴 这一个数字**不是**「签名地址能用多久」，是「前端敢把它缓存多久」的那一半：
+ * 缓存的时长必须明显短于 TTL（提前量在 `src/md/ossImage.ts`）。按 900 整缓存的话，
+ * 压着边界换上去那一张在屏幕上只剩几秒可活，症状是「预览里的云端图隔一阵子裂一张」
+ */
+export const PRESIGN_TTL_MS = 900 * 1000
+
+/** Rust `oss::PresignedImage`，`#[serde(rename_all = "camelCase")]` */
+export interface PresignedImage {
+  /** 正文里那一串**不带签名**的地址，也是这一条结果的对位键 */
+  url: string
+  /** 带 15 分钟有效期的读取地址；没签出来是 null */
+  signedUrl: string | null
+  /** 没签出来的那句话，由 Rust 写好，原样给用户看 */
+  reason: string | null
+}
+
+/**
+ * 给预览里那几张云端图片签一批临时地址（M7-8）。
+ *
+ * ## 🔴 参数只有地址，目的地那四格照旧一个都不收
+ *
+ * 与 [`uploadImage`] 同一条纪律。收一串地址看着像开了个「想签哪个签哪个」的口子，其实没有：
+ * Rust 那一边只认**用户自己那一个桶**、且只认配置那一个前缀底下的对象，别的域名回一个空数组
+ * （完整论证在 `src-tauri/src/oss.rs` 的 `presign_batch`）。
+ *
+ * ## 这一条不 reject
+ *
+ * 失败是**那一张图上的一个 `reason`**，不是一条被拒的 Promise。两个理由都是硬的：
+ * 预览每改一次正文就重问一次，一次配置或网络的坏消息不该变成一处未处理的 rejection；
+ * 而一批里可能只有那一张坏了，一条错误讲不清哪一张
+ */
+export async function presignOssImages(urls: string[]): Promise<PresignedImage[]> {
+  // 空数组不发 IPC：那一次往返换回来必然是空数组，而它每敲一个字都会发生一次
+  if (urls.length === 0) return []
+  return invoke<PresignedImage[]>('presign_oss_images', { urls })
 }

@@ -16,6 +16,8 @@ import type { ZoomTarget } from './imageActions'
  *    `dialogEl.focus()` 是 `Esc` 能生效的**前提**，不是礼貌。这一条只有真挂到 DOM 上才测得出来。
  * 3. ⚠️ **大图要把正文那串引用挂回自己的 `data-path`**，宿主那份右键菜单靠它认图
  *    （下面那一条用例钉的是「别把 `vela-img:` 留给 webview 原生菜单」）
+ * 4. 🔴 **M7-8 起大图还要挂 `data-oss-src`**：云端那一张在预览里的 `src` 是一份 15 分钟的
+ *    读取凭证，会走出应用外面的那两样（剪贴板与底部那一行）只许用不带签名的地址
  */
 
 let container: HTMLElement
@@ -46,8 +48,16 @@ const LOCAL: ZoomTarget = {
   src: 'vela-img://localhost/?doc=%2Fa.md&ref=b.png',
   label: 'assets/b.png',
   ref: 'assets/b.png',
+  unsigned: null,
 }
-const EXTERNAL: ZoomTarget = { src: 'https://e.com/a.png', label: 'a.png', ref: null }
+const EXTERNAL: ZoomTarget = { src: 'https://e.com/a.png', label: 'a.png', ref: null, unsigned: null }
+/** M7-8：预览里那张云端图的 `src` 是签名地址，而 `label` 与复制出去的都是无签名那一条 */
+const CLOUD: ZoomTarget = {
+  src: 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-1.png?x-oss-date=20231216T162057Z&x-oss-signature=abc',
+  label: 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-1.png',
+  ref: null,
+  unsigned: 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-1.png',
+}
 
 describe('ImageLightbox：那张遮罩', () => {
   it('图、说明与关闭按钮各就各位', () => {
@@ -62,6 +72,17 @@ describe('ImageLightbox：那张遮罩', () => {
   it('⚠️ 本地图把正文那串引用挂在自己的 `data-path` 上——右键大图才认得它是哪张图', () => {
     const l = mountLightbox(LOCAL)
     expect(l.img().dataset.path).toBe('assets/b.png')
+  })
+
+  it('🔴 云端那张把**不带签名**的地址挂在 `data-oss-src` 上，底部那一行显示的也是它', () => {
+    // 剪贴板与那一行都会走到应用外面，而 `src` 里那一份是 15 分钟的读取凭证。
+    // ⛔ 这条挂了之后 `copyTargetOf` 就只可能读到 `data-oss-src`（对照 imageActions.test.ts）
+    const l = mountLightbox(CLOUD)
+    expect(l.img().dataset.ossSrc).toBe(CLOUD.unsigned)
+    expect(l.path().textContent).toBe('https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-1.png')
+    expect(l.path().textContent).not.toContain('x-oss-signature')
+    // 显示用的还是预览里那一个地址：换掉就等于对同一张图再发一次请求
+    expect(l.img().getAttribute('src')).toBe(CLOUD.src)
   })
 
   it('外链大图不带 `data-path`：那一串冒充成文档内的引用就会把「复制链接」说成「复制路径」', () => {

@@ -99,6 +99,11 @@ pub fn run() {
             // 只从用户全局配置读，密钥只在进程内从钥匙串读，两个方向都不过 IPC。
             // ⚠️ 它同样没有注册进 M5 冻结的那份 `vela.*` 插件桥（第三方插件不该拿到出站能力）
             commands::upload_image,
+            // M7-8 预览里那几张云端图片的临时签名地址。🔴 参数只有 `img.src` 那一串地址：
+            // 目的地那四格与密钥的取法与 `upload_image` 完全一致，两个方向都不过 IPC。
+            // ⚠️ 它**不出站**（只算一个签名），但交回的那一条是有 15 分钟有效期的读取凭证，
+            // 所以前端只把它写进 DOM 属性、绝不进正文也不进剪贴板，见 `src-tauri/src/oss.rs`
+            commands::presign_oss_images,
             commands::list_dir,
             commands::create_entry,
             commands::rename_entry,

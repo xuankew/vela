@@ -23,6 +23,14 @@
  * 菜单上写的也是「复制路径」而不是「复制链接」。⚠️ 这一条没有自动检查，只有
  * `imageActions.test.ts` 里那一句断言守着：**任何一路都不许把 `vela-img:` 交出去**。
  *
+ * ## 🔴 M7-8 起「正文那一串」有三种，判据只有一个：这东西会不会离开这一层
+ *
+ * 本地图片给 `data-path`（正文 `![](...)` 里那串引用）、云端图片给 `data-oss-src`
+ * （那一个**不带签名**的地址）、别的外链才给 `src`。⚠️ 三种里只有**显示**那一路用 `src`：
+ * 预览里那张云端图的 `src` 此刻是一份 15 分钟的读取凭证，而剪贴板与大图底部那一行都会
+ * 走到应用外面去（完整论证在 `./ossImage.ts` 文件头那条 🔴）。
+ * 这一条也没有自动检查，只有 `imageActions.test.ts` 里那两句断言守着
+ *
  * ## ⚠️ 大图上右键也要能给同一个结果，所以 `ZoomTarget` 多带了一个 `ref`
  *
  * 遮罩里那张 `<img>` 是宿主这一栏的子节点，右键靠冒泡走到同一个处理里。它只认 `data-path`，
@@ -53,6 +61,14 @@ export interface ZoomTarget {
    * 只留 `label` 不够：外链那一个恰好等于 URL，挂上去会把「复制链接」说成「复制路径」
    */
   ref: string | null
+  /**
+   * 这一张是**用户自己 bucket** 里的图片时，那一个不带签名的地址；否则 null。
+   *
+   * 🔴 它是 M7-8 那条例外的另一半：`src` 此刻可能是一份 15 分钟的读取凭证，而会离开
+   * 这一层的东西（大图底部那一行、右键复制出去的那一串）⛔ 只许用这一个。
+   * 由 `./ossImage.ts` 挂在 `data-oss-src` 上
+   */
+  unsigned: string | null
 }
 
 /** 一次右键要复制的东西，与菜单上那一项的名字 */
@@ -90,16 +106,31 @@ function refOf(img: HTMLImageElement): string | null {
   return raw === undefined || raw === '' ? null : raw
 }
 
+/**
+ * 云端图片那一个**不带签名**的地址，由 `./ossImage.ts` 挂在 `data-oss-src` 上；别的图没有它。
+ *
+ * 🔴 它是 M7-8 那条「签名地址只住 DOM」的出口：两个手势里凡是**会离开这一层**的东西
+ * （大图底部那一行、剪贴板）都读它，⛔ 不读 `src`——那时 `src` 里是一份 15 分钟的读取凭证。
+ * 只有真正显示用的那一个 `<img src>` 才用 `src`
+ *
+ * ⚠️ 空串同样按「没有」算，与 [`refOf`] 一条理由
+ */
+function unsignedOf(img: HTMLImageElement): string | null {
+  const raw = img.dataset.ossSrc
+  return raw === undefined || raw === '' ? null : raw
+}
+
 /** 左键：该不该弹大图 */
 export function zoomOf(target: EventTarget | null): ZoomTarget | null {
   const img = imageOf(target)
   if (img === null || img.closest('a') !== null) return null
   const src = srcOf(img)
   if (src === null) return null
+  const unsigned = unsignedOf(img)
   // `label` 优先取引用：用户想知道的是「正文里指的是哪个文件」，
-  // 而不是应用自己编出来的协议 URL
+  // 而不是应用自己编出来的协议 URL；云端那一张则是那一个不带签名的地址
   const ref = refOf(img)
-  return { src, label: ref ?? src, ref }
+  return { src, label: ref ?? unsigned ?? src, ref, unsigned }
 }
 
 /**
@@ -111,6 +142,11 @@ export function copyTargetOf(target: EventTarget | null): CopyTarget | null {
   if (img === null) return null
   const ref = refOf(img)
   if (ref !== null) return { text: ref, label: '复制路径' }
+  // 🔴 云端那张复制出去的是 `data-oss-src` 那一个**不带签名**的地址：剪贴板会走到应用外面，
+  // 而签名地址是一份 15 分钟的读取凭证，贴进聊天窗口、贴进另一篇文档就等于把访问权发出去了。
+  // 公开桶那张本来就没有签名地址，于是这一句拿到 null，走下面那一条
+  const unsigned = unsignedOf(img)
+  if (unsigned !== null) return { text: unsigned, label: '复制链接' }
   const src = srcOf(img)
   if (src === null) return null
   // ⛔ 只放 `http(s)`：`vela-img:` 是应用内部的事（上面那条红字），而 `data:` 那串

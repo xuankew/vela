@@ -15,7 +15,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
 
-import { describeUploadError, MAX_UPLOAD_BYTES, uploadImage } from './oss'
+import {
+  describeUploadError,
+  PRESIGN_TTL_MS,
+  presignOssImages,
+  type PresignedImage,
+  MAX_UPLOAD_BYTES,
+  uploadImage,
+} from './oss'
 
 /** 一段够 sniff 用的 PNG 魔数（真字节在 `src/util/base64.test.ts` 那边测） */
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d])
@@ -129,5 +136,48 @@ describe('Rust → 前端 的七个 kind', () => {
 
   it('未认识的 kind 也有一句返回，而不是 undefined', () => {
     expect(describeUploadError({ kind: 'from-the-future' })).toBe('[object Object]')
+  })
+})
+
+/**
+ * M7-8：`presign_oss_images` 的前端契约。
+ *
+ * Rust 侧的对照在 `src-tauri/src/oss.rs` 的 `三个字段的前端形状钉死`（手写镜像，没有代码生成）
+ */
+describe('presign_oss_images 的形状', () => {
+  it('只有一个参数对象，里面只有 urls', async () => {
+    invoke.mockResolvedValue([])
+    await presignOssImages(['https://b.oss-cn-hangzhou.aliyuncs.com/assets/a.png'])
+    const [cmd, args] = invoke.mock.calls[0] as [string, Record<string, unknown>]
+    expect(cmd).toBe('presign_oss_images')
+    // 🔴 与 `upload_image` 同一条纪律：目的地那四格传进来，就等于把「往任意主机签一条读取
+    // 凭证」交给 webview。多一个键就红
+    expect(Object.keys(args)).toEqual(['urls'])
+    expect(args.urls).toEqual(['https://b.oss-cn-hangzhou.aliyuncs.com/assets/a.png'])
+  })
+
+  it('一张都没有时不发 IPC（那一次往返换回来必然是空数组，而它每个字符都会发生）', async () => {
+    expect(await presignOssImages([])).toEqual([])
+    expect(invoke).not.toHaveBeenCalled()
+  })
+
+  it('🔴 返回的是数组，一条都不 reject：失败长在那一张的 `reason` 上', async () => {
+    invoke.mockResolvedValue([{ url: 'u', signedUrl: null, reason: '设置里没有填 bucket。' }])
+    const got = await presignOssImages(['u'])
+    expect(got[0]?.signedUrl).toBeNull()
+    expect(got[0]?.reason).toBe('设置里没有填 bucket。')
+  })
+
+  it('三个字段是 camelCase，与 Rust 那个 `rename_all = "camelCase"` 逐字对上', () => {
+    // ⚠️ 这一条与上面 `UploadError` 那一组**不一样**：那一个是挂在枚举上的 snake_case。
+    // 混了的形状是前端读出 `undefined`，预览里那张图安静地不换
+    const wire = '{"url":"u","signedUrl":"https://x?s=1","reason":null}'
+    const got = JSON.parse(wire) as PresignedImage
+    expect(got.signedUrl).toBe('https://x?s=1')
+    expect('signed_url' in got).toBe(false)
+  })
+
+  it('TTL 与 Rust 那个 `PRESIGN_TTL_SECONDS` 是同一个数字的两种单位', () => {
+    expect(PRESIGN_TTL_MS).toBe(900 * 1000)
   })
 })

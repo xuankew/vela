@@ -93,14 +93,17 @@ export function ImageLightbox(props: ImageLightboxProps) {
         ref={dialogEl}
         onKeyDown={onKeyDown}
       >
-        {/* `data-path` 原样挂回来（`null` 时 Solid 直接不写这个属性）：宿主 `.md-preview` 上那份
+        {/* `data-path` 原样挂回来（`null` 时 Solid 直接不写这个属性）：宿主 `.md-preview-body` 上那份
             右键菜单靠它认图，于是**右键大图**与右键预览里那一张得到同一个结果。⛔ 别省这一句：
             省了之后大图上的右键会走 webview 的原生菜单，而那里「拷贝图像地址」交出去的是
-            `vela-img://…`——一条外面谁都打不开的死链接（论证见 `./imageActions.ts` 那条红字） */}
+            `vela-img://…`——一条外面谁都打不开的死链接（论证见 `./imageActions.ts` 那条红字）。
+            M7-8 起 `data-oss-src` 同一条理由：云端那一张在预览里的 `src` 是一份 15 分钟的
+            读取凭证，⛔ 大图上的右键与底部那一行都只许用那一个不带签名的地址 */}
         <img
           class="img-zoom"
           src={props.target.src}
           data-path={props.target.ref}
+          data-oss-src={props.target.unsigned}
           alt={props.target.label}
           onError={() => setFailed(true)}
         />

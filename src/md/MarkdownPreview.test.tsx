@@ -7,8 +7,23 @@ import { EditorView } from '@codemirror/view'
 import { createSignal } from 'solid-js'
 import { render } from 'solid-js/web'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { clearOssImageCache } from './ossImage'
 import { MarkdownPreview } from './MarkdownPreview'
 import { PANEL_DEBOUNCE_MS, type FollowedEditor } from './panel'
+
+/**
+ * M7-8 那一条签名地址的路默认「一条都不认」：这一份用例集钉的是**接线**，
+ * 而那一次 IPC 的真实形状（缓存、提前量、失败重签）在 `./ossImage.test.ts` 里逐条钉过。
+ *
+ * ⚠️ 不 mock 的话这里连绿色都拿不到：jsdom 没有 Tauri 的 IPC，真的 `invoke` 当场抛，
+ * 于是每一次带外链图的渲染都会在头部挂上一句「预览出了点问题」，把 M7-11/M7-12 那两组
+ * 读 `p.note()` 的用例一起改掉——那不是它们想验的东西
+ */
+const { presignOssImages } = vi.hoisted(() => ({ presignOssImages: vi.fn() }))
+vi.mock('../ipc/oss', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../ipc/oss')>()
+  return { ...real, presignOssImages }
+})
 
 /**
  * 预览面板的接线测试：`props` → 渲染 → `innerHTML` → 提示文案，整条链真的跑起来。
@@ -169,6 +184,11 @@ beforeEach(() => {
   // 会连带变成一个时序谜团（`doc/sessionSync.ts:52` 那条注释说的就是这件事，
   // 而它当时的结论是「改用可注入的定时器」——这里能直接冻是因为只需要窄化 `toFake`）
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  // 默认「一张都不认」，见文件头那一条 mock 的理由。`mockReset` 会把实现清成
+  // 「返回 undefined」，而 `.then` 立刻炸在这一句上，所以每次都要重新钉返回值
+  presignOssImages.mockReset()
+  presignOssImages.mockResolvedValue([])
+  clearOssImageCache()
 })
 
 afterEach(() => {
@@ -751,5 +771,148 @@ describe('MarkdownPreview：右键那张图复制链接（M7-12）', () => {
     // 收掉了还能再叫出来：那份现场没有被上一次点击留在半开的状态里
     contextMenu(p.imgs()[0]!)
     expect(menuLabel()).toBe('复制路径')
+  })
+})
+
+/**
+ * M7-8：预览里那几张「用户自己 bucket」里的图片换成临时签名地址。
+ *
+ * 缓存、提前量、失败重签那三件事在 `./ossImage.test.ts` 里逐条钉过，这里只钉**接线**：
+ * 换发生在渲染之后、正文一个字节都不动、那句话落在头部哪一行、以及两个手势交出去的
+ * 仍然是不带签名的那一串
+ *
+ * 🔴 这一组里最值钱的是那两条「正文与剪贴板里不许出现签名」：签名地址进正文不会有任何
+ * 自动信号——图照常显示、上传照常成功，直到那份文档被同步到别处、有效期过了，
+ * 读到的人以为那条链接是坏的
+ *
+ * ⚠️ jsdom 不发请求，所以「图**真的**显示出来了」在这里验不了，归真机
+ */
+describe('MarkdownPreview：云端图片换临时签名 src（M7-8）', () => {
+  // 与 Rust 的 `object_url` 同一个形状（`{bucket}.oss-{region}.aliyuncs.com/{前缀}/{名字}`），
+  // 也就是 M7-7 粘贴上去、M7-3 写进正文的那一串。这里再钉一次它**进了签名也不变**：
+  // 正文里永远是无签名那一条
+  const PLAIN = 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-1.png'
+  const SIGNED = `${PLAIN}?x-oss-date=20231216T162057Z&x-oss-expires=900&x-oss-signature=deadbeef`
+  const HEADING = `# 甲\n\n![云端](${PLAIN})\n`
+  const ONE = `![云端](${PLAIN})\n`
+
+  const img = () => container.querySelector<HTMLImageElement>('.md-preview-body img')!
+
+  /** 那一次 `rewriteCloudImages` 里的 await 都走完（mock 的 promise + `Promise.all` + 外层 `.then`） */
+  async function flush(): Promise<void> {
+    for (let i = 0; i < 8; i++) await Promise.resolve()
+  }
+
+  function contextMenu(el: Element): MouseEvent {
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 120, clientY: 90 })
+    el.dispatchEvent(event)
+    return event
+  }
+
+  it('渲染之后才换：`innerHTML` 那一步出来的还是无签名那一条', async () => {
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: SIGNED, reason: null }])
+    const p = mount(HEADING, '/notes/a.md')
+    // 🔴 同步看到的还是正文里那一串：换是异步的（要过一次 IPC），而 `render.ts` 那一步
+    // 压根不知道有这件事。谁要是把签名拼进 `html`，这一条立刻红
+    expect(p.bodyHtml()).toContain(`src="${PLAIN}"`)
+    expect(p.bodyHtml()).not.toContain('x-oss-signature')
+    await flush()
+    expect(img().getAttribute('src')).toBe(SIGNED)
+    expect(img().dataset.ossSrc).toBe(PLAIN)
+  })
+
+  it('🔴 签名绝不落进正文：换完之后再读一次编辑器，还是那串原样引用', async () => {
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: SIGNED, reason: null }])
+    const p = mount(ONE, '/notes/a.md')
+    await flush()
+    expect(img().getAttribute('src')).toBe(SIGNED)
+    expect(p.text()).toBe(ONE)
+    expect(p.text()).not.toContain('x-oss-')
+  })
+
+  it('认不出来的（没配 OSS、别人的桶）一个字都不换，也一句都不说', async () => {
+    presignOssImages.mockResolvedValue([])
+    const p = mount(ONE, '/notes/a.md')
+    await flush()
+    expect(img().getAttribute('src')).toBe(PLAIN)
+    expect(p.note()).toBeNull()
+  })
+
+  it('⚠️ 配不上时那句是 Rust 的原话，而且不算「可有可无的那一句」', async () => {
+    // 那句「没有拿到 AccessKey Secret，请在设置里填一次」在 `src-tauri/src/oss.rs` 的
+    // `normalize` 里；前端一份就是措辞漂移的起点（同 `describeUploadError` 那一条）
+    presignOssImages.mockResolvedValue([
+      { url: PLAIN, signedUrl: null, reason: '没有拿到 AccessKey Secret，请在设置里填一次。' },
+    ])
+    const p = mount(ONE, '/notes/a.md')
+    await flush()
+    expect(p.note()).toBe('没有拿到 AccessKey Secret，请在设置里填一次。')
+    // 阅读模式那句让位：签名地址换不上就是那张图显示不出来的原因，比「怎么退出」更要紧
+    expect(p.hinted()).toBe(false)
+    expect(img().getAttribute('src')).toBe(PLAIN)
+  })
+
+  it('🔴 阅读模式那句让位，但文档级的那一句仍然优先', async () => {
+    // `headNote` 那一句排序：`note`（文档级真话）> `cloudNote` > 阅读模式怎么退出
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: null, reason: '设置里没有填 bucket。' }])
+    const p = mount(ONE, '/notes/a.md', true)
+    await flush()
+    expect(p.note()).toBe('设置里没有填 bucket。')
+    p.setSource({ view: makeView(''), path: '/notes/empty.md' })
+    expect(p.note(), '空文档那句该压过云端那句').toBe('这份文档还是空的')
+  })
+
+  it('本地图片那条协议不递进这一层：`vela-img` 不是 http(s)', async () => {
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: SIGNED, reason: null }])
+    mount(`# 甲\n\n![本地](assets/a.png)\n\n![云端](${PLAIN})\n`, '/notes/a.md')
+    await flush()
+    expect(presignOssImages).toHaveBeenCalledTimes(1)
+    expect(presignOssImages.mock.calls[0]?.[0]).toEqual([PLAIN])
+  })
+
+  it('🔴 右键那张云端图，复制出去的是不带签名的地址', async () => {
+    const writeText = vi.fn(async () => {})
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: SIGNED, reason: null }])
+    mount(ONE, '/notes/a.md')
+    await flush()
+    contextMenu(img())
+    container.querySelector<HTMLElement>('.tree-menu-item')!.click()
+    await flush()
+    expect(writeText).toHaveBeenCalledWith(PLAIN)
+    delete (navigator as { clipboard?: unknown }).clipboard
+  })
+
+  it('🔴 点那张云端图看大图：底部那一行与挂回来的属性都不带签名', async () => {
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: SIGNED, reason: null }])
+    mount(ONE, '/notes/a.md')
+    await flush()
+    img().click()
+    const zoom = container.querySelector<HTMLImageElement>('.img-zoom')!
+    expect(zoom.getAttribute('src')).toBe(SIGNED)
+    expect(zoom.dataset.ossSrc).toBe(PLAIN)
+    expect(container.querySelector<HTMLElement>('.img-zoom-path')!.textContent).toBe(PLAIN)
+  })
+
+  it('⚠️ 那张图加载失败（压着 TTL 才发请求）→ 组件重签一次并换上新地址', async () => {
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: SIGNED, reason: null }])
+    mount(ONE, '/notes/a.md')
+    await flush()
+    const fresh = `${PLAIN}?x-oss-date=20231216T170000Z&x-oss-signature=beef`
+    presignOssImages.mockResolvedValue([{ url: PLAIN, signedUrl: fresh, reason: null }])
+    img().dispatchEvent(new Event('error'))
+    await flush()
+    expect(presignOssImages).toHaveBeenCalledTimes(2)
+    expect(img().getAttribute('src')).toBe(fresh)
+  })
+
+  it('卸载之后在飞的那一次不写头部：面板已经没了，那句话没有读的人', async () => {
+    let release: (v: unknown) => void = () => {}
+    presignOssImages.mockImplementation(() => new Promise((resolve) => (release = resolve)))
+    const p = mount(ONE, '/notes/a.md')
+    p.unmount()
+    release([{ url: PLAIN, signedUrl: null, reason: '设置里没有填 bucket。' }])
+    await flush()
+    expect(p.note()).toBeNull()
   })
 })

@@ -98,6 +98,7 @@ import { createPanelRefresh, type FollowedEditor, type PanelRefreshSource } from
 import { copyTargetOf, zoomOf, type CopyTarget, type ZoomTarget } from './imageActions'
 import { ImageLightbox } from './ImageLightbox'
 import { restorePlaceholder, rewriteLocalImages } from './localImage'
+import { resignAfterError, rewriteCloudImages } from './ossImage'
 import { previewHtml } from './preview'
 import { atBottom, collectAnchors, fractionalLine, topForLine, type LineAnchor } from './scrollSync'
 
@@ -126,6 +127,18 @@ const TASK_MARKER = /^\[[ xX]\]$/
 export function MarkdownPreview(props: MarkdownPreviewProps) {
   /** 面板顶上那句话。null = 没什么要说的 */
   const [note, setNote] = createSignal<string | null>(null)
+
+  /**
+   * 云端图片签不出来时的那句话（M7-8）。null = 没什么要说的
+   *
+   * 它与 `note` 分开存，因为两者**可以同时成立**：一份「只预览了前面一部分」的长文档里
+   * 也有一张没配上密钥的图。分开存才能让 `headNote` 那一句真话优先的排序说清楚谁先谁后，
+   * 合成一个信号就要在写的时候决定丢哪一句
+   *
+   * 🔴 这一句是 Rust 的原话（`src-tauri/src/oss.rs` 的 `reason`），前端一个字都不改写。
+   * 落点选头部那一行而不是 toast：预览每改一次正文就重问一次，toast 会被刷成一串
+   */
+  const [cloudNote, setCloudNote] = createSignal<string | null>(null)
 
   /**
    * 点开的那张大图，连同它属于**哪一份文档**（`path`；还没落盘的那份是空串）。
@@ -160,13 +173,21 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
    * 而为了一个提示把 `commands/keybinding.ts` 拽进这个懒加载块也不划算（理由见 `./panel.ts`
    * 文件头那条「不要为了借一层包装去依赖别的层」）。所以这里说的是**菜单项的名字**
    */
-  const headNote = () => note() ?? (alone() ? '再按一次切换预览可回到编辑' : null)
+  const headNote = () => note() ?? cloudNote() ?? (alone() ? '再按一次切换预览可回到编辑' : null)
   let scrollEl: HTMLDivElement | undefined
   let bodyEl: HTMLDivElement | undefined
   /** 当前这份渲染结果的行号锚点。每次改 `bodyEl.innerHTML` 之后重量一遍 */
   let anchors: LineAnchor[] = []
   /** 上一次真的写进 DOM 的那份 HTML。null = 还没写过 */
   let rendered: string | null = null
+  /**
+   * 第几次重画。云端图片那一次签名是**异步**回来的，而防抖窗口里可能已经又画了一次
+   *
+   * 🔴 回调里比一次号，是因为过期那一次写回来的不只是「一句已经不该存在的话」，
+   * 还有**上一份文档里那张图的签名地址**——DOM 元素早被 `innerHTML` 换掉了，
+   * 而那一句限定会一直挂到下一次重画。`onCleanup` 里也加一，是为了让卸载后回来的那一次同样作废
+   */
+  let paintSeq = 0
 
   // 「换文档立刻渲染、改正文防抖」与卸载时取消在飞的那一次，全在 `./panel.ts` 里，
   // 与大纲面板共用同一份——那条规矩的两个方向都错得很难看，见那个模块的文件头。
@@ -235,6 +256,21 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
       rewriteLocalImages(bodyEl, src?.path ?? null)
       measure()
     }
+    // M7-8：用户自己 bucket 里那几张图的 `src` 换成 15 分钟的临时签名地址。
+    //
+    // 🔴 这一层是那句「不许拼 HTML」的**有界例外**，而界就在 `./ossImage.ts` 的文件头里：
+    // `render.ts` 出来的 HTML 一个字不改，只动 `img.src` 这一个 DOM 属性（外加对位用的
+    // `data-oss-src`）。⛔ 签名地址不许往 `html` 那一步走，也⛔不许写进 `props.source()`
+    // 那一份正文——它是一份有有效期的读取凭证，正文会跟着文档同步、备份、被贴到别处
+    //
+    // ⚠️ 放在 `if` **外面**，而且每次重画都问一次：缓存命中时它是一个纯同步的属性赋值，
+    // 不发请求。放里面会漏掉「HTML 没变但签名过期了」那一种（一份挂着不动的长文档，
+    // 十几分钟后往下滚），而那一种的形态是裂图
+    const seq = ++paintSeq
+    void rewriteCloudImages(bodyEl).then((cloud) => {
+      // 过期那一次重画的结果连一句话都不该写回来，理由见 `paintSeq` 那一条
+      if (seq === paintSeq) setCloudNote(cloud)
+    })
     if (src !== null) follow(src)
   }
 
@@ -319,7 +355,18 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   function onImgError(event: Event) {
     // 换回占位（那张裂图会让用户以为文件丢了，而原因可能只是它不在文档目录里），
     // 换成了才算数：不是本地图的 `error` 不触发重量
-    if (restorePlaceholder(event.target)) relayout()
+    if (restorePlaceholder(event.target)) {
+      relayout()
+      return
+    }
+    // M7-8：云端那张失败通常是签名过期（`loading="lazy"` 的图可能十几分钟后才发请求）。
+    // 重签一次，每个元素只有一次，上限在 `resignAfterError` 里
+    const img = event.target
+    if (img instanceof HTMLImageElement) {
+      void resignAfterError(img).then((retried) => {
+        if (retried) relayout()
+      })
+    }
   }
 
   onMount(() => {
@@ -328,6 +375,8 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     window.addEventListener('resize', onResize)
   })
   onCleanup(() => {
+    // 让任何还在飞的签名结果作废：DOM 马上就没有了，而那次 `.then` 里只有一个信号写
+    paintSeq++
     bodyEl?.removeEventListener('load', relayout, true)
     bodyEl?.removeEventListener('error', onImgError, true)
     window.removeEventListener('resize', onResize)
@@ -442,9 +491,12 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
             还在往那块看不见的编辑器上作用。标题是用户唯一能拿到的「我不在编辑态」的信号，
             所以它必须换一个字，而不是只把提示塞进右边那句限定里 */}
         <span class="md-preview-title">{alone() ? '阅读模式' : '预览'}</span>
+        {/* ⚠️ `hint` 那一档是「怎么退出阅读模式」那一种**可有可无**的话，浅一号。
+            M7-8 那句「云端图片签不出来」不是：它说的是用户正在看的这份文档有点事没成，
+            与文档级的那几句同一档——所以判据是「两个真话都没说」，不是「`note` 是空」 */}
         <Show when={headNote()}>
           {(text) => (
-            <span class="md-preview-note" classList={{ hint: note() === null }}>
+            <span class="md-preview-note" classList={{ hint: note() === null && cloudNote() === null }}>
               {text()}
             </span>
           )}

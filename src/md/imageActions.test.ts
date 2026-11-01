@@ -16,9 +16,20 @@ import { copyTargetOf, zoomOf } from './imageActions'
  *    复制出去的是一串谁都打不开的死链，粘进正文还能把文档弄坏。
  * 3. ⚠️ **左键让链接，右键不让**。这两条判据故意不同，所以它们各有一组用例；
  *    把它们合成一条守卫的话，链接里的图就再也复制不了地址了
+ * 4. 🔴 **M7-8 起 `src` 不一定是能给人看的那一串**：预览里那张云端图的 `src` 是一份
+ *    15 分钟的读取凭证，所以「会离开这一层的东西」（剪贴板、大图底部那一行）读的是
+ *    `data-oss-src`。这一条漏掉的形态是把一条临时授权粘进别人的聊天窗口
  */
 
 const LOCAL_URL = 'vela-img://localhost/?doc=%2Fnotes%2Fa.md&ref=assets%2Fpasted-0123.png'
+
+/**
+ * M7-8：预览里那张云端图的 `src` 此刻是签名地址，`data-oss-src` 里才是正文那一串。
+ * 主机名抄自 `src-tauri/src/oss.rs` 的 `object_url` 拼出来的形状（命不命中由 Rust 判，
+ * 所以这里要的只是一个形状正确的样本）
+ */
+const OSS_PLAIN = 'https://vela-img.oss-cn-hangzhou.aliyuncs.com/assets/pasted-ad48c1765eb1b87d.png'
+const OSS_SIGNED = `${OSS_PLAIN}?x-oss-credential=LTAI5tExampleId%2F20231216%2Fcn-hangzhou%2Foss%2Faliyun_v4_request&x-oss-signature=deadbeef`
 
 /** 造一张「已经在预览里显示出来」的图；本地图片由 `localImage.ts` 挂上 `data-path` */
 function imageEl(attrs: Record<string, string>, wrapInLink = false): HTMLElement {
@@ -35,13 +46,39 @@ function localImg(): HTMLImageElement {
   return imageEl({ src: LOCAL_URL, 'data-path': 'assets/pasted-0123.png' }) as HTMLImageElement
 }
 
+/** 已经换过签名地址的那一张（`ossImage.ts` 的产物） */
+function cloudImg(): HTMLImageElement {
+  return imageEl({ src: OSS_SIGNED, 'data-oss-src': OSS_PLAIN }) as HTMLImageElement
+}
+
 describe('zoomOf：哪一次点击算「点了一张图，要看大图」', () => {
   it('本地图片给出原样的 vela-img URL，而那一行说明与 `ref` 用的是正文里那串引用', () => {
     expect(zoomOf(localImg())).toEqual({
       src: LOCAL_URL,
       label: 'assets/pasted-0123.png',
       ref: 'assets/pasted-0123.png',
+      unsigned: null,
     })
+  })
+
+  it('🔴 云端那张：显示用签名地址，那一行说明与挂回大图的都是不带签名的地址', () => {
+    // 那一个遮罩底部的一行会被人复制、贴进别处，而签名地址是一份 15 分钟的读取凭证
+    expect(zoomOf(cloudImg())).toEqual({ src: OSS_SIGNED, label: OSS_PLAIN, ref: null, unsigned: OSS_PLAIN })
+    expect(zoomOf(cloudImg())?.label).not.toContain('x-oss-')
+  })
+
+  it('公开桶那张（没换过签名地址）没有 `unsigned`：`src` 本身就是正文那一串', () => {
+    const img = imageEl({ src: OSS_PLAIN }) as HTMLImageElement
+    expect(zoomOf(img)?.unsigned).toBeNull()
+    expect(zoomOf(img)?.label).toBe(OSS_PLAIN)
+  })
+
+  it('⚠️ `src` 读的是 `data-oss-src` 那一个属性，不是 `.src`', () => {
+    // jsdom 里 `.src` 会给那串签名地址重新编码一遍（`%2F` 变 `/`），而那与签名的字节
+    // 不是同一个东西。这一条与上面那条「读属性不读 `.src`」是同一个坑的两个方向
+    const img = imageEl({ src: 'https://e.com/a.png', 'data-oss-src': 'https://e.com/a%20b.png' }) as HTMLImageElement
+    expect(zoomOf(img)?.label).toBe('https://e.com/a%20b.png')
+    expect(copyTargetOf(img)?.text).toBe('https://e.com/a%20b.png')
   })
 
   it('⚠️ `src` 读属性不读 `.src`：后者会被文档 base 解析改写', () => {
@@ -95,6 +132,19 @@ describe('copyTargetOf：右键那张图要复制什么', () => {
   it('🔴 没有 `data-path` 的本地图片什么都不复制——`vela-img:` 绝不能进剪贴板', () => {
     const img = imageEl({ src: LOCAL_URL }) as HTMLImageElement
     expect(copyTargetOf(img)).toBeNull()
+  })
+
+  it('🔴 云端那张复制出去的是不带签名的地址——一份 15 分钟的读取凭证不进剪贴板', () => {
+    // 剪贴板会走到应用外面：粘进聊天窗口、粘进另一篇文档、被同步工具带走，
+    // 而那一串在有效期内对任何拿到它的人都读得通（论证见 `./ossImage.ts` 文件头那条 🔴）
+    expect(copyTargetOf(cloudImg())).toEqual({ text: OSS_PLAIN, label: '复制链接' })
+    expect(copyTargetOf(cloudImg())?.text).not.toContain('x-oss-')
+  })
+
+  it('⚠️ 包在链接里的云端图右键照样给不带签名的那一条', () => {
+    const a = imageEl({ src: OSS_SIGNED, 'data-oss-src': OSS_PLAIN }, true)
+    const img = a.querySelector('img') as HTMLImageElement
+    expect(copyTargetOf(img)?.text).toBe(OSS_PLAIN)
   })
 
   it('🔴 `data:` 那种内联图也不给：一串 base64 复制出去既没用又长得要命', () => {

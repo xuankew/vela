@@ -24,6 +24,7 @@
 //! | 写文件内容 | `save_file` | 任意绝对路径 |
 //! | **写图片字节**（粘贴落地） | `store_image` | 文档路径，目录由它推出 |
 //! | **传图片到 OSS**（⚠️ 唯一一条**出站**的） | `upload_image` | 只有 base64 字节：目的地四格只从用户全局配置读，密钥只从钥匙串读 |
+//! | **签一条临时读取地址**（⚠️ 不出站，但交回一份 15 分钟的读取凭证） | `presign_oss_images` | 只有 `img.src` 那一串地址：目的地与密钥同上，且只认用户那一个桶、那一个前缀 |
 //! | **枚举**目录 | `list_dir` | `(root, rel)` |
 //! | **创建** | `create_entry` | `(root, rel, kind)` |
 //! | **改名** | `rename_entry` | `(root, rel, new_name)` |
@@ -171,6 +172,19 @@
 //! （论证见 `src/secrets.rs` 开头那条 🔴）。⚠️ 它们也刻意**没有**注册进 M5 冻结的那份
 //! `vela.*` 插件桥：第三方插件 UI 若能调它们，就能往用户自己的 bucket 那一项里覆盖密钥。
 //!
+//! ### M7-8 的 [`presign_oss_images`] 也不在磁盘这笔账里，但它换了另一类东西
+//!
+//! 它一个字节不落盘、⚠️ 也**不出站**（算一个签名而已，发请求的是浏览器的 `<img>`），
+//! 所以 [`upload_image`] 那一句「唯一一条出站的」依然成立。它要单独记一笔的理由在别处：
+//! 它是**第一条交回「能读用户桶里对象」的东西**的命令，而那一串有 15 分钟有效。
+//! 三道闸都在它自己身上：① 参数只有地址，目的地那四格与密钥的取法与 `upload_image`
+//! 完全一致；② [`crate::oss::object_key_of`] 只认**用户自己那一个桶**、且只认配置那一个
+//! 前缀底下的对象，别的域名返回空数组；③ 交回的 `signedUrl` 前端只写进 DOM 属性，
+//! ⛔ 不进正文、不进剪贴板（`src/md/ossImage.ts` 与 `src/md/imageActions.ts` 各钉一条）。
+//! ⚠️ 剩下的那条边界要说清楚：一段能在预览里执行脚本的代码，仍能拿它读**用户自己桶里**
+//! 那 15 分钟——前提是它猜得到对象名，而读到之后还得跨过同源策略（OSS 默认不给 `Cors` 头）。
+//! 这一条归真机回归清单，与 `src-tauri/src/oss.rs` 的 `presign_batch` 那条 ⚠️ 是同一条。
+//!
 //! ### M7-9 起这张表**外面**还有一个入口：`vela-img` 协议，而它不加新能力
 //!
 //! `.register_asynchronous_uri_scheme_protocol(...)` 不走 `invoke_handler`，所以它不在这张
@@ -213,7 +227,9 @@ use vela_core::settings::{self as settings_store, LoadedSettings, SaveReport, Se
 // M7-3 `upload_image` 要的那几样。放在最后一组是因为它们是本 crate 的兄弟模块，
 // 而上面那一串全是外部依赖——`oss.rs` 与 `secrets.rs` 的文档里都写了「调用方是
 // `commands.rs` 的 `upload_image`」，这一组 `use` 就是那句话在代码里的落点
-use crate::oss::{object_key, put_object, OssTarget, UploadError, MAX_UPLOAD_BYTES};
+use crate::oss::{
+    any_cloud_object, object_key, presign_batch, put_object, OssTarget, PresignedImage, UploadError, MAX_UPLOAD_BYTES,
+};
 use crate::secrets::load_access_key_secret;
 
 /// 读一个文本文件。
@@ -365,8 +381,73 @@ pub async fn upload_image(app: AppHandle, data_base64: String) -> Result<String,
     put_object(&target, &key, content_type, bytes).await
 }
 
-/// 列出 `root` 下 `rel` 这一层的目录内容（**只有一层**，PLAN.md §3.4 M2-A）。
+/// 给预览里那些指向**用户自己那个 bucket** 的图片地址签一批 15 分钟有效的临时 GET 地址（M7-8）。
 ///
+/// ## 它为什么存在
+///
+/// 正文里写的是不带签名的标准 OSS 地址（那一个稳定、能同步、能被别的工具认出来），
+/// 而私读的 bucket 会把这样一个地址在 `<img>` 里拒成 403——预览里就是一张裂图。
+/// 这一条命令补的是「看得见」，⛔ 补的不是「把签名地址写进正文」：那条红线在
+/// [`crate::oss`] 文件头那一节，两个返回值不互换。前端那一层（`src/md/ossImage.ts`）
+/// 只把它赋给 `img.src`，一个 HTML 字符串都不拼。
+///
+/// ## 🔴 参数只有地址，而且目的地仍然一个都不收
+///
+/// 与 [`upload_image`] 同一姿势：bucket / region / AccessKey ID / 前缀只从**用户全局配置**读，
+/// 密钥只从钥匙串读。看着像给了前端一个「想签哪个签哪个」的入口，其实判据在
+/// [`crate::oss::object_key_of`] 里——主机名必须逐字等于配置那一个桶、且对象名在配置那一个
+/// 前缀底下，别的域名一张都不签。⛔ 不要为了「想让预览显示别处的图」放开那一条判据，
+/// 那等于把「带着我们的凭证访问任意主机」交给一份别人发来的 `.md`
+///
+/// ## 它不出站，而它读的东西也少得可以
+///
+/// 这一条**不发请求**（发请求的是 webview 里那张 `<img>`），所以它不在上面那张
+/// 「谁能碰到磁盘」的账里，也不给 [`upload_image`] 那条「唯一一条出站的」添第二个：
+/// 出站的是浏览器，我们只是算了一个签名。⚠️ 但它确实**读钥匙串**，所以顺序是硬要求：
+/// 先拿配置里那两格拼一个主机名问一句「有没有一张是我们桶里的」（[`any_cloud_object`]，
+/// 那一步用不到密钥），一张都没有就直接返回——一份网上存下来的 `.md` 里全是别人站点的图，
+/// 而预览每改一次正文都会重问一次，那种文档一次都不该去碰钥匙串。命中了才读密钥，
+/// 顺序与判据都在 [`crate::oss`] 里，⛔ 不要把这两步并成一步
+///
+/// ## ⚠️ 失败不是一条错误，而是那一张图上的一个 `reason`
+///
+/// 认不出来 = 返回里没有那一条（那张图原样留着，公开桶照常显示）；认出来但配不齐 =
+/// 那一条带 `reason`，一句指向设置面板的中文。整条命令**不返回 `Err`**：
+/// 预览每改一次正文就会重跑一次，那种后台的、用户没主动发起的失败没有一处能弹 toast，
+/// 硬要弹就成了刷屏。那句话的落点是 `MarkdownPreview` 头部那一行限定
+#[command]
+pub async fn presign_oss_images(app: AppHandle, urls: Vec<String>) -> Vec<PresignedImage> {
+    let Ok(home) = home_dir(&app) else {
+        // 连主目录都算不出来 = 没有配置可读，也就没有任何一个桶能被命中。
+        // 这里**不**报错：这一条是预览的后台一步，报错没有落点（见上面那节 ⚠️）
+        return Vec::new();
+    };
+    // 第二个参数是 `None`：与 [`upload_image`] 同一句理由，那四格本来就不接受项目层的值
+    let settings = settings_store::load(&home, None).settings;
+    // 🔴 先问「有没有一张是我们桶里的」，再去读钥匙串。这一步用不到密钥，所以那一个字段
+    // 是空串——它只参与主机名与前缀的判定（`oss::loose_host` 那一节讲了为什么）
+    let probe = OssTarget {
+        bucket: &settings.oss_bucket,
+        region: &settings.oss_region,
+        access_key_id: &settings.oss_access_key_id,
+        access_key_secret: "",
+        security_token: None,
+    };
+    if !any_cloud_object(&probe, &settings.oss_prefix, &urls) {
+        return Vec::new();
+    }
+    // 三态各归各处（[`crate::secrets`] 文件头那条 🔴）：`Ok(Some)` 是密钥、`Ok(None)` 是空的，
+    // 交给 `oss::normalize` 去说「没有拿到」，`Err` 那一句则原样顶掉它——
+    // 说错这一句，用户会一遍遍重填一个本来正确的密钥
+    let (secret, secret_failed) = match load_access_key_secret() {
+        Ok(loaded) => (loaded.unwrap_or_default(), None),
+        Err(err) => (String::new(), Some(err.message().to_owned())),
+    };
+    let target = OssTarget { access_key_secret: &secret, ..probe };
+    presign_batch(&target, &settings.oss_prefix, &urls, secret_failed.as_deref())
+}
+
+/// 列出 `root` 下 `rel` 这一层的目录内容（**只有一层**，PLAN.md §3.4 M2-A）。
 /// `root` 来自 dialog 插件的 `directory: true`，前端没有任何输入框能填它；`rel` 来自
 /// 上一次列举返回的 `DirEntry::rel`，空字符串表示 root 本身。
 ///
