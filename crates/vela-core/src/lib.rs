@@ -5,8 +5,8 @@
 //! 它外面薄薄一层适配器，住在 `src-tauri/` 里。
 //!
 //! 模块划分见 PLAN.md §2.5。已落地：`fs`（M1-B）、`session`（M1-F）、`project`（M2-A/M2-B/M2-E）、
-//! `search`（M2-C/M2-D）、`watcher`（M2-G）、`settings`（M4-A 分层配置）。其余模块等真正用到时再加，
-//! 不预先建一堆空目录当装饰。
+//! `search`（M2-C/M2-D）、`watcher`（M2-G）、`settings`（M4-A 分层配置）、`oss`（M7-1 阿里云 V4 签名）。
+//! 其余模块等真正用到时再加，不预先建一堆空目录当装饰。
 //!
 //! ⚠️ `watcher` 是个**例外**：它名字底下那件事（起一个 `notify` 的 watcher）压根不在这里，
 //! 在 `src-tauri` 里。这一层只留「该盯哪些目录」、「两份计划之间要动哪些订阅」与
@@ -22,6 +22,7 @@
 
 pub mod fs;
 pub mod keybindings;
+pub mod oss;
 pub mod project;
 pub mod search;
 pub mod session;

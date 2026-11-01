@@ -24,6 +24,11 @@ serde.workspace = true
 # M1-F 起是运行时依赖：会话存档就是 Rust 侧自己序列化出来的 JSON。
 # 在那之前它只服务于「线上契约」黄金 JSON 测试
 serde_json.workspace = true
+# M7-1 阿里云 OSS V4 签名（`oss.rs`）。三条许可证均已核实，见根 `Cargo.toml`：
+# 全是 MIT OR Apache-2.0，其中 `sha2` 与 `hex` 本来就在 `Cargo.lock` 里
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
