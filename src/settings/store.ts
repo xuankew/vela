@@ -9,7 +9,7 @@
  *
  * ## 这一层管什么、不管什么
  *
- * 管：五个值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
+ * 管：六个偏好值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
  * 用户全局层。还管「从 Rust 读回来的值不一定合法」这件事——配置文件可能被手改成任何
  * 字符串，`fontSize` 可能是 17 这种档外值，`fontVariant` 可能是一个不存在的 ID，
  * `lineHeight` 可能是一个区间外的数或 NaN。**sanitize 归这一层**：读到不认识的字体 ID
@@ -19,10 +19,26 @@
  *
  * 不管：字体注册表本身（`fonts/loader.ts`）、字号档位清单的**语义**（这里只负责夹）。
  *
+ * ## 🔴 四格 OSS 配置在这一层只是**过路**（M7-5）
+ *
+ * `ossBucket` / `ossRegion` / `ossAccessKeyId` / `ossPrefix` 不是偏好，也**不进 DOM**——
+ * 没有对应的 CSS 变量，也没有对应的浮层控件（设置面板那一块是 M7-6）。它们出现在这一层
+ * 只有一个原因：`save_settings` 是**整份重写**，`currentSettings()` 少带一格，
+ * 用户下一次改字号就会把那一格从盘上抹掉。所以「读回来 → 存信号 → 写出去时原样带上」
+ * 这条路必须在这儿接通，哪怕这一层自己根本不解释那四格是什么。
+ *
+ * ⚠️ 这一层**不校验**它们（region 填成访问域名照原样存回去）。校验在落地层
+ * `src-tauri/src/oss.rs` 的 `normalize`：那里失败会明确说哪一格不对，而配置文件是用户可以
+ * 手改的东西，读的时候偷偷改「对」等于程序在瞎猜。
+ *
+ * 🔴 `ossAccessKeySecret` **不在**这一层、不在 `Settings`、不在 `~/.vela/settings.json`。
+ * 它只住 macOS 钥匙串，前端唯一的可见信息是「有没有配过」那一个布尔值。
+ *
  * ## 🔴 项目层在 v1 是「接好线但空转」的
  *
- * 五个键全是**个人偏好**，只认「内置默认 + 用户全局」。打开一个带 `.vela/settings.json`
- * 的仓库**不会**改掉你的字号——Rust 的 `resolve` 已经把项目层的偏好键丢进
+ * 十个键（六个偏好 + 四格 OSS 账号配置）全只认「内置默认 + 用户全局」。打开一个带
+ * `.vela/settings.json` 的仓库**不会**改掉你的字号，**也不会**把你粘贴的图改道到别人的
+ * bucket——Rust 的 `resolve` 已经把项目层写的键丢进
  * `report.ignoredProjectKeys` 了。这一层把那份 `report` 原样暴露出去（[`SettingsStore.report`]），
  * 由 `App.tsx` 决定要不要据此说一句「这个仓库想改你的字号，但字号只认全局」。
  * ⚠️ 于是 `load` 在 roots 变化时**仍然要重跑**：v1 里合并出的配置不随 roots 变（项目层
@@ -158,6 +174,57 @@ function sanitizeLetterSpacing(n: number): number {
   return sanitizeStepper(n, LETTER_SPACING_MIN, LETTER_SPACING_MAX, DEFAULT_LETTER_SPACING)
 }
 
+/**
+ * 内置默认的 OSS 对象名前缀。与 Rust `settings::DEFAULT_OSS_PREFIX` 同值——
+ * 两边各写一份、由 `wire_contract.rs` 的 `内置默认配置被钉住` 与 `src/ipc/settings.test.ts`
+ * 各钉一条（同 `DEFAULT_FONT_SIZE` 的做法）。
+ *
+ * 为什么默认不是空串：空前缀 = 把传上去的图堆在 bucket 根上，与同一只 bucket 里别的
+ * 东西混在一起。`assets` 与本地那一份的落地目录同名（`crates/vela-core/src/fs/asset.rs`
+ * 的 `ASSET_DIR`），于是一篇文章的图在磁盘上叫 `assets/pasted-<hash>.png`、在 bucket 里
+ * 叫 `assets/<hash>.png`，是同一层。
+ *
+ * ⚠️ 但 sanitize **不会**把用户显式填的空串换成它：空前缀是「就要放在根上」那个选择，
+ * 能表达就该保留。这一条只在「盘上压根没这个键」（Rust 给回内置默认）时生效。
+ */
+export const DEFAULT_OSS_PREFIX = 'assets'
+
+/**
+ * 那四格 OSS 配置在**前端**的形状（M7-5）。
+ *
+ * ⚠️ 字段名与 `Settings` 上的 wire 名差一个 `oss` 前缀：`ossBucket` → `bucket`。这个类型
+ * 只在这一层与设置面板之间流动，从不被序列化——`currentSettings()` 负责拼回 wire 名。
+ * 如果哪天直接把它塞进 `invoke` 的 payload，Rust 会报「缺 `ossBucket`」，不会静默。
+ */
+export interface OssConfig {
+  bucket: string
+  region: string
+  accessKeyId: string
+  prefix: string
+}
+
+/**
+ * 从合并好的配置里取出那四格，只 `trim()`。
+ *
+ * 🔴 这里**不校验**任何东西（region 填成访问域名也照原样过一遍）：配置文件用户可以手改，
+ * 读的时候偷偷改「对」等于程序在瞎猜，而下一次写穿会把用户没打算改的**内容**抹掉。
+ * 报错的活儿在落地层（`src-tauri/src/oss.rs` 的 `normalize`），那里会指名是哪一格不对。
+ *
+ * ⚠️ `trim()` 自己也是一次「改了用户没打算改的字节」——只剩空白这一种，而且是故意的：
+ * 带空格的 bucket 名永远传不上去，留在盘上只会让人以为配好了。由 `store.test.ts` 的
+ * 「只 trim、不校验」那条钉住（`setTheme` 之后写出去的 payload 里是 trim 过的值）。
+ *
+ * `prefix` 的空串**不**替换成 [`DEFAULT_OSS_PREFIX`]，理由写在那条常量的文档里。
+ */
+function ossFromSettings(s: Settings): OssConfig {
+  return {
+    bucket: s.ossBucket.trim(),
+    region: s.ossRegion.trim(),
+    accessKeyId: s.ossAccessKeyId.trim(),
+    prefix: s.ossPrefix.trim(),
+  }
+}
+
 export interface SettingsStoreOptions {
   /**
    * 出问题时说一句话（配置读不回来、写不下去）。没注入就什么都不说。
@@ -208,9 +275,17 @@ export interface SettingsStore {
    */
   readonly theme: Accessor<ThemeId>
   /**
+   * 那四格 OSS 配置（已 `trim()`，**未**校验）。M7-5。
+   *
+   * 🔴 这一层不解释它们，只负责把它们从盘上带回来、再原样带回去。读它的是设置面板
+   * （M7-6）与粘贴落地的那条分支判定（M7-7）；「配没配好」（三格齐 + 钥匙串里有 secret）
+   * 归它们判，不归这一层。
+   */
+  readonly oss: Accessor<OssConfig>
+  /**
    * 最近一次 [`SettingsStore.load`] 的账单；`null` = 还没 load 过。
    * `report().ignoredProjectKeys` 非空表示当前仓库的 `.vela/settings.json` 试图改偏好键、
-   * 已被忽略（v1 里五个键全是偏好类，所以它写的任何键都会落在这儿）。
+   * 已被忽略（v1 里十个键全只认用户全局，所以它写的任何键都会落在这儿）。
    */
   readonly report: Accessor<SettingsReport | null>
 
@@ -264,6 +339,19 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   const [lineHeight, setLineHeightSignal] = createSignal(DEFAULT_LINE_HEIGHT)
   const [letterSpacing, setLetterSpacingSignal] = createSignal(DEFAULT_LETTER_SPACING)
   const [theme, setThemeSignal] = createSignal<ThemeId>(DEFAULT_THEME)
+  /**
+   * 那四格 OSS 配置（M7-5）。初值 = Rust 的内置默认，见 [`DEFAULT_OSS_PREFIX`]。
+   *
+   * 🔴 这一层的角色是**过路**：它不解释这四格、不因它们改任何 DOM，唯一的存在理由是
+   * `save_settings` 整份重写——不带回去就会在下次改字号时把盘上的配置抹掉。
+   * 因此它**没有** `applyXxxVar` 那样的伴生物，也不参与 `applyNow()`。
+   */
+  const [oss, setOssSignal] = createSignal<OssConfig>({
+    bucket: '',
+    region: '',
+    accessKeyId: '',
+    prefix: DEFAULT_OSS_PREFIX,
+  })
   const [report, setReport] = createSignal<SettingsReport | null>(null)
 
   /** 写队列的尾巴。所有写挂在它后面，于是任意时刻最多一个写在飞（见文件头） */
@@ -339,6 +427,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   }
 
   function currentSettings(): Settings {
+    const c = oss()
     return {
       fontSize: fontSize(),
       fontVariant: fontKey(),
@@ -346,6 +435,11 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
       lineHeight: lineHeight(),
       letterSpacing: letterSpacing(),
       theme: theme(),
+      // 🔴 四格原样带回：`save_settings` 整份重写，少带一格就等于把盘上那格抹掉
+      ossBucket: c.bucket,
+      ossRegion: c.region,
+      ossAccessKeyId: c.accessKeyId,
+      ossPrefix: c.prefix,
     }
   }
 
@@ -402,6 +496,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setLineHeightSignal(sanitizeLineHeight(s.lineHeight))
     setLetterSpacingSignal(sanitizeLetterSpacing(s.letterSpacing))
     setThemeSignal(sanitizeThemeId(s.theme))
+    // 四格 OSS 配置只装进信号，不应用、不写穿（这一层不解释它们，见文件头）
+    setOssSignal(ossFromSettings(s))
     setReport(loaded.report)
     applyNow()
   }
@@ -496,6 +592,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     lineHeight,
     letterSpacing,
     theme,
+    oss,
     report,
     setFontVariant,
     setCodeFont,

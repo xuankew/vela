@@ -174,6 +174,10 @@ const {
         lineHeight: 1.75,
         letterSpacing: 0,
         theme: 'dark',
+        ossBucket: '',
+        ossRegion: '',
+        ossAccessKeyId: '',
+        ossPrefix: 'assets',
       },
       report: {
         userLayer: { status: 'absent' },
@@ -388,6 +392,10 @@ beforeEach(async () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: 'assets',
     },
     report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   }
@@ -4850,6 +4858,10 @@ describe('分层配置接线（M4-A）', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: 'assets',
     })
   })
 
@@ -4864,6 +4876,10 @@ describe('分层配置接线（M4-A）', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: 'assets',
     })
   })
 
@@ -4877,6 +4893,10 @@ describe('分层配置接线（M4-A）', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: 'assets',
     })
   })
 
@@ -4890,6 +4910,10 @@ describe('分层配置接线（M4-A）', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: 'assets',
     })
   })
 
@@ -4932,6 +4956,12 @@ describe('分层配置接线（M4-A）', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      // 🔴 「恢复默认」只打回六个**偏好**，那四格 OSS 配置照原样带走：它们不是偏好，
+      // 重置字号不该顺手把人配好的 bucket 也清了
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: 'assets',
     })
   })
 
@@ -4943,6 +4973,11 @@ describe('分层配置接线（M4-A）', () => {
         codeFont: 'inherit',
         lineHeight: 2,
         letterSpacing: 0.05,
+        theme: 'dark',
+        ossBucket: 'vela-img',
+        ossRegion: 'cn-hangzhou',
+        ossAccessKeyId: 'LTAI5tExampleId',
+        ossPrefix: 'docs',
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -4953,6 +4988,23 @@ describe('分层配置接线（M4-A）', () => {
     expect((await codeFontSelect()).value).toBe('inherit')
     // 装回只读、不写穿：一次启动不该因为「读到了盘上的值」再存一遍
     expect(settingsCmd.saved).toEqual([])
+
+    // 🔴 但下一次用户改动必须把那四格原样带回去：`save_settings` 整份重写，
+    // 少带一格 = 用户配好的 OSS 配置在他调字号时静默消失（M7-5 存在的全部理由）
+    changeSelect(await fontSizeSelect(), '20')
+    await flush()
+    expect(settingsCmd.saved.at(-1)).toEqual({
+      fontSize: 20,
+      fontVariant: 'system-mono',
+      codeFont: 'inherit',
+      lineHeight: 2,
+      letterSpacing: 0.05,
+      theme: 'dark',
+      ossBucket: 'vela-img',
+      ossRegion: 'cn-hangzhou',
+      ossAccessKeyId: 'LTAI5tExampleId',
+      ossPrefix: 'docs',
+    })
   })
 
   it('盘上的字体 ID 不认识时退回注册表默认，档外字号退回默认档', async () => {
@@ -4963,6 +5015,11 @@ describe('分层配置接线（M4-A）', () => {
         codeFont: '不存在的字体',
         lineHeight: 1.75,
         letterSpacing: 0,
+        theme: 'dark',
+        ossBucket: '',
+        ossRegion: '',
+        ossAccessKeyId: '',
+        ossPrefix: 'assets',
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -4981,6 +5038,11 @@ describe('分层配置接线（M4-A）', () => {
           codeFont: 'maple-cn',
           lineHeight: 1.75,
           letterSpacing: 0,
+          theme: 'dark',
+          ossBucket: '',
+          ossRegion: '',
+          ossAccessKeyId: '',
+          ossPrefix: 'assets',
         },
         report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
       },

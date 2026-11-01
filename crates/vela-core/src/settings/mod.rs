@@ -9,17 +9,21 @@
 //!
 //! 合并顺序是「后一层盖前一层」，但 🔴 **不是每一层都能写每一个键**，见下面「可写层」。
 //!
-//! ## 🔴「哪一层能改哪些键」：v1 六个键都是偏好类，项目层写了也忽略
+//! ## 🔴「哪一层能改哪些键」：十个键**全都**只认用户全局
 //!
 //! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题是**个人偏好**，只认「内置默认 + 用户全局」两层。
 //! 打开一个带 `.vela/settings.json` 的仓库**不会**突然改掉你的字号——那样太突兀，
 //! 而且一个克隆来的仓库不该有这种权力（它连你的磁盘都能碰到，见 `commands.rs` 的信任面那张表）。
 //!
-//! 于是 v1 里项目层被**读、被解析、但不生效**：`resolve` 把项目层里的偏好键丢进
-//! `SettingsReport.ignored_project_keys`，前端据此说一句「仓库想改你的字号，但字号只认全局」。
-//! ⚠️ 这意味着 v1 的项目层是**接好线但空转**的——它要等第一个 project-safe 键
-//! （M3-A-7 推来的 asset 落地目录 / 命名，那是**路径值**、必须挡越界，正是这道门的用武之地）
-//! 进来才真的有东西可配。这道门现在就搭好、现在就测，免得到时候临时加、加错。
+//! M7-5 加进来的四格 OSS 配置（`ossBucket` / `ossRegion` / `ossAccessKeyId` / `ossPrefix`）
+//! **不是**偏好类，却落在同一扇门后面，动机换成更硬的一条：仓库若能改这四格，它就能把你
+//! 粘贴的图**改道到别人的 bucket**。签名在 Rust 侧算、`Authorization` 里带着我们的 AccessKey ID，
+//! 改道至少泄露一次派生签名。于是「项目层写了也忽略」这一条对两种动机都成立，
+//! 记账也共用同一个 [`SettingsReport::ignored_project_keys`]。
+//!
+//! ⚠️ 这意味着 v1 的项目层是**接好线但空转**的——它要等第一个 project-safe 键进来才真的有
+//! 东西可配（`resolve` 里那条分支就是给它留的）。这道门现在就搭好、现在就测，
+//! 免得到时候临时加、加错。
 //!
 //! ## 与 `session` 的存储为什么分开放
 //!
@@ -100,6 +104,16 @@ pub const DEFAULT_LETTER_SPACING: f64 = 0.0;
 /// 一次没人要求的改动。想要跟随系统的用户自己选。
 pub const DEFAULT_THEME: &str = "dark";
 
+/// 内置默认的 OSS 对象名前缀：`assets`。
+///
+/// 与本地那一份的落地目录同名（[`crate::fs::asset::ASSET_DIR`]），于是一篇文章的图在
+/// 本地镜像里叫 `assets/pasted-<hash>.png`、在 bucket 里叫 `assets/<hash>.png`，
+/// 人在 bucket 管理器里看见的层级与在磁盘上看见的是同一层。
+///
+/// 留一个可改的默认值而不是写死：一个 bucket 常常服务多个用途（站点图、附件、备份），
+/// 用户要的是「Vela 传的图都在我自己那一个前缀下」，这只需要改这一格。
+pub const DEFAULT_OSS_PREFIX: &str = "assets";
+
 /// 合并之后的**最终配置**：每个键都是具体值，没有 `Option`。
 ///
 /// 这是 `load` 交出去、`save` 收进来的形状。前端拿到它直接往信号里灌，
@@ -127,6 +141,34 @@ pub struct Settings {
     /// 主题选择（`'light' | 'dark' | 'system'`，M4-C）。**偏好类**。
     /// Rust 视为不透明字符串，前端校验（同 `font_variant`）。
     pub theme: String,
+    /// OSS bucket 名（M7-5，PLAN.md §3.5「图片粘贴自动落地」的云端分支）。
+    ///
+    /// 🔴 **不是偏好类，但同样只认用户全局**：理由与偏好类相反却更硬——一个克隆来的
+    /// 仓库如果能改这一格，它就能把你粘贴的图**改道到别人的 bucket**。签名在 Rust 侧算、
+    /// `Authorization` 里带着我们的 AccessKey ID，改道至少泄露一次派生签名。所以这四格
+    /// OSS 键与六个偏好键走同一条「项目层写了也忽略」的门（见 [`resolve`]）。
+    ///
+    /// 空 = 没配。`src-tauri/src/commands.rs` 的 `upload_image` 与前端 `src/md/paste.ts` 的
+    /// `landPastedImage` 都用「四格齐不齐 + 钥匙串里有没有 secret」判断走不走云端，**没有**一个
+    /// `enabled` 开关：用户裁定是「配了就走阿里云，没配就走本地」（PLAN.md 决策 2），多一个开关
+    /// 只会让「配了但开关是关的」成为一种需要解释的状态。
+    pub oss_bucket: String,
+    /// OSS 地域，只写 `cn-hangzhou` 那一段（不带 `oss-` 前缀、不带域名）。
+    ///
+    /// ⚠️ Rust 这一层**不校验形状**：粘进整串访问域名是常见手滑，但拒绝它是落地层的活
+    /// （`src-tauri/src/oss.rs` 的 `normalize`），那里失败会明确说哪一格不对。配置文件是
+    /// 用户可以手改的东西，读它的时候把内容改「对」会让用户以为程序在瞎猜；照原样存回去、
+    /// 在真要用它的那一步报错，才是这条路的形状。
+    pub oss_region: String,
+    /// AccessKey ID（RAM 子账号的那一串）。
+    ///
+    /// 🔴 这一格**可以**明文存在配置文件里，`access_key_secret` 不行——ID 不是凭证，
+    /// 它只指明「用哪对密钥签名」，拿到它什么也做不了（阿里云的鉴权要的是 HMAC 结果，
+    /// 而算那个结果需要 secret）。完整推理与「为什么没有 `oss_access_key_secret` 这个字段」
+    /// 写在 `src-tauri/src/oss.rs` 的模块文档「AccessKeySecret 的走向」一节。
+    pub oss_access_key_id: String,
+    /// 对象名前缀（`assets` 那一段，不带首尾斜杠）。见 [`DEFAULT_OSS_PREFIX`]。
+    pub oss_prefix: String,
 }
 
 impl Default for Settings {
@@ -139,6 +181,10 @@ impl Default for Settings {
             line_height: DEFAULT_LINE_HEIGHT,
             letter_spacing: DEFAULT_LETTER_SPACING,
             theme: DEFAULT_THEME.to_owned(),
+            oss_bucket: String::new(),
+            oss_region: String::new(),
+            oss_access_key_id: String::new(),
+            oss_prefix: DEFAULT_OSS_PREFIX.to_owned(),
         }
     }
 }
@@ -162,6 +208,12 @@ pub struct SettingsLayer {
     pub line_height: Option<f64>,
     pub letter_spacing: Option<f64>,
     pub theme: Option<String>,
+    /// M7-5 那四格 OSS 配置。与上面六个键同一条规则：**只有用户全局层能写**。
+    /// `None` = 这一层没写这一格，留给下一层（最终落到内置默认，见 [`Settings::default`]）。
+    pub oss_bucket: Option<String>,
+    pub oss_region: Option<String>,
+    pub oss_access_key_id: Option<String>,
+    pub oss_prefix: Option<String>,
 }
 
 /// 一层配置文件在读取时的下场。
@@ -184,9 +236,10 @@ pub enum LayerStatus {
 pub struct SettingsReport {
     pub user_layer: LayerStatus,
     pub project_layer: LayerStatus,
-    /// 项目层试图写「仅全局」的偏好键、因而被忽略的键名（wire 名，前端可直接引用）。
+    /// 项目层试图写「仅全局」的键、因而被忽略的键名（wire 名，前端可直接引用）。
     ///
-    /// v1 里六个键全是偏好类，所以项目层写的任何键都会落在这里。前端可以据此说一句
+    /// v1 里十个键全是仅全局类（六个偏好 + 四格 OSS 账号配置），所以项目层写的任何键
+    /// 都会落在这里。前端可以据此说一句
     /// 「这个仓库的 `.vela/settings.json` 想改你的 <键>，但 <键> 只认用户全局，已忽略」。
     pub ignored_project_keys: Vec<String>,
 }
@@ -250,9 +303,9 @@ fn read_layer(path: &Path) -> (Option<SettingsLayer>, LayerStatus) {
 
 /// 把两层文件内容合并成最终配置，并记账项目层被忽略的键。
 ///
-/// 🔴 **可写层门在这里**：v1 六个键都是偏好类，只有 `user`（用户全局）能盖过内置默认；
-/// `project`（项目级）里的同名键一律**丢弃并记账**。将来加 project-safe 键时，
-/// 就在这个函数里给那个键加一条「也接受 project」的分支——门已经在这儿了，不用临时搭。
+/// 🔴 **可写层门在这里**：v1 十个键都只认全局，只有 `user`（用户全局）能盖过内置默认；
+/// `project`（项目级）里的同名键一律**丢弃并记账**。将来第一个 project-safe 键进来时，
+/// 就在这个函数里给它加一条「也接受 project」的分支——门已经在这儿了，不用临时搭。
 pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<String>) {
     // 内置默认层
     let mut settings = Settings::default();
@@ -276,8 +329,21 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     if let Some(v) = user.theme {
         settings.theme = v;
     }
+    if let Some(v) = user.oss_bucket {
+        settings.oss_bucket = v;
+    }
+    if let Some(v) = user.oss_region {
+        settings.oss_region = v;
+    }
+    if let Some(v) = user.oss_access_key_id {
+        settings.oss_access_key_id = v;
+    }
+    if let Some(v) = user.oss_prefix {
+        settings.oss_prefix = v;
+    }
 
-    // 项目层：v1 没有 project-safe 键，偏好键写了也忽略，只记账给前端一句话
+    // 项目层：v1 没有 project-safe 键，十个键写了都忽略，只记账给前端一句话。
+    // 前六个是偏好（「别改我的字号」），后四格是账号配置（「别把我的图改道到别人的 bucket」）
     let mut ignored_project_keys = Vec::new();
     if project.font_size.is_some() {
         ignored_project_keys.push("fontSize".to_owned());
@@ -296,6 +362,21 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     }
     if project.theme.is_some() {
         ignored_project_keys.push("theme".to_owned());
+    }
+    // M7-5 那四格同样只认用户全局，但**理由与上面六个不同**：六个是「别让仓库改你的偏好」，
+    // 这四格是「别让仓库把你的图改道到别人的 bucket」。同一个门，两种动机，
+    // 所以记账用的还是同一个 `ignoredProjectKeys`（前端的文案会说「只认用户全局」，两句都成立）
+    if project.oss_bucket.is_some() {
+        ignored_project_keys.push("ossBucket".to_owned());
+    }
+    if project.oss_region.is_some() {
+        ignored_project_keys.push("ossRegion".to_owned());
+    }
+    if project.oss_access_key_id.is_some() {
+        ignored_project_keys.push("ossAccessKeyId".to_owned());
+    }
+    if project.oss_prefix.is_some() {
+        ignored_project_keys.push("ossPrefix".to_owned());
     }
 
     (settings, ignored_project_keys)
@@ -457,7 +538,7 @@ mod tests {
 
     #[test]
     fn 未知键被忽略而不让整层作废() {
-        // forward-compat：将来才有的键不该让只认六个键的这一版读不动。
+        // forward-compat：将来才有的键不该让只认十个键的这一版读不动。
         // theme 在 M4-C 之后已是**已知**键，正好顺带钉住「用户层写的 theme 生效」
         let home = tempfile::tempdir().unwrap();
         write_user(home.path(), r#"{"fontSize":18,"theme":"light","将来才有的键":123}"#);
@@ -477,6 +558,10 @@ mod tests {
             line_height: 2.0,
             letter_spacing: 0.05,
             theme: "light".into(),
+            oss_bucket: "vela-img".into(),
+            oss_region: "cn-hangzhou".into(),
+            oss_access_key_id: "LTAI5tExampleId".into(),
+            oss_prefix: "docs/notes".into(),
         };
         let report = save(home.path(), &settings).unwrap();
         assert_eq!(report.bytes_written, fs::read(user_settings_path(home.path())).unwrap().len() as u64);
@@ -541,8 +626,8 @@ mod tests {
     }
 
     #[test]
-    fn 存下来的文件是干净的六个键_json() {
-        // 整份重写：只含这六个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
+    fn 存下来的文件是干净的十个键_json() {
+        // 整份重写：只含这十个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
         let home = tempfile::tempdir().unwrap();
         save(home.path(), &Settings::default()).unwrap();
         let text = fs::read_to_string(user_settings_path(home.path())).unwrap();
@@ -552,7 +637,62 @@ mod tests {
         assert!(text.contains("\"lineHeight\": 1.75"), "{text}");
         assert!(text.contains("\"letterSpacing\": 0.0"), "{text}");
         assert!(text.contains("\"theme\": \"dark\""), "{text}");
+        assert!(text.contains("\"ossBucket\": \"\""), "{text}");
+        assert!(text.contains("\"ossRegion\": \"\""), "{text}");
+        assert!(text.contains("\"ossAccessKeyId\": \"\""), "{text}");
+        // 前缀不是空串：空前缀等于把对象堆在 bucket 根上，默认值替用户做了那个选择
+        assert!(text.contains("\"ossPrefix\": \"assets\""), "{text}");
         assert!(!text.contains("null"), "不该写 null 键：{text}");
+        // 🔴 这一条是「secret 不进配置文件」那条硬约束的可执行版本：整份文件里
+        // 不许出现任何长得像 secret 的键。`ossAccessKeyId` 里有 "AccessKey" 但没有 "Secret"，
+        // 所以搜 "Secret" 不会被它误命中
+        assert!(!text.contains("Secret"), "配置文件里出现了 secret：{text}");
+    }
+
+    #[test]
+    fn oss_四格走用户全局层并能往返() {
+        // 用户配好阿里云 = 这四格齐了。Rust 侧**不校验形状**（region 填成域名也照原样存回来），
+        // 拒绝它的活儿在落地层（`src-tauri/src/oss.rs` 的 `normalize`）
+        let home = tempfile::tempdir().unwrap();
+        write_user(
+            home.path(),
+            r#"{"ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs"}"#,
+        );
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.oss_bucket, "vela-img");
+        assert_eq!(loaded.settings.oss_region, "cn-hangzhou");
+        assert_eq!(loaded.settings.oss_access_key_id, "LTAI5tExampleId");
+        assert_eq!(loaded.settings.oss_prefix, "docs");
+        // 没写的偏好键仍留给内置默认：四格 OSS 不该顺手改动别的键
+        assert_eq!(loaded.settings.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn 没配_oss_时给出空三格与_assets_前缀() {
+        // 「配了就走云端，没配就走本地」那个二态判定的下侧就是这三格空串。
+        // 前端与 Rust 都靠它，所以把它钉死——默认值一旦改成非空，
+        // 「没配」就再也判不出来，粘贴会去尝试一条注定失败的上传
+        let home = tempfile::tempdir().unwrap();
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.oss_bucket, "");
+        assert_eq!(loaded.settings.oss_region, "");
+        assert_eq!(loaded.settings.oss_access_key_id, "");
+        assert_eq!(loaded.settings.oss_prefix, DEFAULT_OSS_PREFIX);
+    }
+
+    #[test]
+    fn 项目层想改_bucket_也被忽略并记账() {
+        // 🔴 这一条守的不是「别改我的偏好」，而是「别把我粘贴的图改道到别人的 bucket」：
+        // 克隆一个仓库、打开它、然后每次粘贴都往陌生人的 bucket 传——签名里带着我们的
+        // AccessKey ID，至少泄露一次派生签名。与主题那条同一个门，两种动机
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"ossBucket":"mine"}"#);
+        write_project(root.path(), r#"{"ossBucket":"someone-else","ossAccessKeyId":"LTAI5tAttackerId"}"#);
+        let loaded = load(home.path(), Some(root.path()));
+        assert_eq!(loaded.settings.oss_bucket, "mine", "项目层不该把上传目标换掉");
+        assert_eq!(loaded.settings.oss_access_key_id, "", "项目层写的 AccessKey ID 不该生效");
+        assert_eq!(loaded.report.ignored_project_keys, vec!["ossBucket".to_owned(), "ossAccessKeyId".to_owned()]);
     }
 
     #[test]

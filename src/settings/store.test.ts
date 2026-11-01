@@ -39,6 +39,7 @@ import {
   DEFAULT_FONT_SIZE,
   DEFAULT_LETTER_SPACING,
   DEFAULT_LINE_HEIGHT,
+  DEFAULT_OSS_PREFIX,
   FONT_SIZES,
   fontSizeChoices,
   LETTER_SPACING_MAX,
@@ -63,6 +64,10 @@ function loaded(settings: Partial<Settings> = {}, report: Partial<SettingsReport
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: DEFAULT_OSS_PREFIX,
       ...settings,
     },
     report: {
@@ -146,13 +151,15 @@ beforeEach(() => {
 })
 
 describe('初始状态', () => {
-  it('六个信号都停在内置默认，report 是 null', () => {
+  it('六个偏好信号停在内置默认，OSS 四格停在内置默认，report 是 null', () => {
     expect(store.fontKey()).toBe(DEFAULT_VARIANT)
     expect(store.codeFontKey()).toBe(DEFAULT_CODE_FONT)
     expect(store.fontSize()).toBe(DEFAULT_FONT_SIZE)
     expect(store.lineHeight()).toBe(DEFAULT_LINE_HEIGHT)
     expect(store.letterSpacing()).toBe(DEFAULT_LETTER_SPACING)
     expect(store.theme()).toBe(DEFAULT_THEME)
+    // 首屏（还没 load 过）时 OSS 三格是空的、只有前缀有默认值：与 Rust `Settings::default()` 同形
+    expect(store.oss()).toEqual({ bucket: '', region: '', accessKeyId: '', prefix: DEFAULT_OSS_PREFIX })
     expect(store.report()).toBeNull()
   })
 
@@ -299,6 +306,10 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: DEFAULT_OSS_PREFIX,
     })
   })
 
@@ -314,6 +325,10 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: DEFAULT_OSS_PREFIX,
     })
   })
 
@@ -329,6 +344,10 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       lineHeight: 1.75,
       letterSpacing: 0,
       theme: 'dark',
+      ossBucket: '',
+      ossRegion: '',
+      ossAccessKeyId: '',
+      ossPrefix: DEFAULT_OSS_PREFIX,
     })
   })
 
@@ -612,5 +631,70 @@ describe('写队列：串行 + 跳过没变化的写', () => {
     store.setFontSize(16)
     await flush()
     expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('OSS 四格（M7-5）：这一层只负责**过路**', () => {
+  it('load 灌进信号时只 trim、不校验（region 填成访问域名照原样留着）', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(
+      loaded({
+        ossBucket: ' vela-img ',
+        ossRegion: 'oss-cn-hangzhou.aliyuncs.com',
+        ossAccessKeyId: ' LTAI5t ',
+        ossPrefix: 'docs/',
+      }),
+    )
+    await store.load([])
+    // 🔴 `oss-cn-hangzhou.aliyuncs.com` 是**错的**（该只写 `cn-hangzhou`），但这一层不猜、
+    // 不改「对」：报错的活儿在 `src-tauri/src/oss.rs` 的 `normalize`，那里会指名是哪一格不对
+    expect(store.oss()).toEqual({
+      bucket: 'vela-img',
+      region: 'oss-cn-hangzhou.aliyuncs.com',
+      accessKeyId: 'LTAI5t',
+      prefix: 'docs/',
+    })
+
+    // trim 的代价，钉住以防有人「顺手」去掉它：下一次写穿会把盘上的空白抹掉。
+    // 这是有意的（配置文件不该长期留着无意义的空白），但它是**改了用户没打算改的字节**，
+    // 所以改动只能来自 trim，不能来自校验式的猜测
+    store.setTheme('light')
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      ossBucket: 'vela-img',
+      ossRegion: 'oss-cn-hangzhou.aliyuncs.com',
+    })
+  })
+
+  it('用户显式填的空前缀不被打回默认：空串 = 「就要放在根上」', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ ossPrefix: '' }))
+    await store.load([])
+    // 把空前缀换成 `assets` 等于替用户做一个他没做的选择：空前缀是「就要放在根上」
+    expect(store.oss().prefix).toBe('')
+  })
+
+  it('🔴 改字号写穿时把四格原样带回：少带一格 = 把盘上那格抹掉', async () => {
+    // `save_settings` 是**整份重写**。这一条是 M7-5 存在的理由：用户在设置面板配好四格，
+    // 第二天调一次字号，如果 currentSettings() 没带那四格，配置就静默消失了
+    settingsIpc.loadSettings.mockResolvedValue(
+      loaded({ ossBucket: 'vela-img', ossRegion: 'cn-hangzhou', ossAccessKeyId: 'LTAI5tExampleId', ossPrefix: 'docs' }),
+    )
+    await store.load([])
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+
+    store.setFontSize(16)
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toEqual({
+      fontSize: 16,
+      fontVariant: 'screen-gb',
+      codeFont: 'maple-cn',
+      lineHeight: 1.75,
+      letterSpacing: 0,
+      theme: 'dark',
+      ossBucket: 'vela-img',
+      ossRegion: 'cn-hangzhou',
+      ossAccessKeyId: 'LTAI5tExampleId',
+      ossPrefix: 'docs',
+    })
   })
 })
