@@ -44,6 +44,25 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# M7-2 OSS 上传落地层（`src-tauri/src/oss.rs`）。许可证已核实（闭源硬约束，见 PLAN.md）：
+#   reqwest 0.13.5 = MIT OR Apache-2.0，time 0.3.55 = MIT OR Apache-2.0，
+#   rustls 0.23.45 = Apache-2.0 OR ISC OR MIT；`license` 字段都从各自 `.crate` 包里的
+#   `Cargo.toml`（reqwest 那份读的是 `Cargo.toml.orig`）读出来，不是凭印象写的。
+# 🔴 三条都**不往 Cargo.lock 里加任何新东西**：reqwest 与 rustls 本来就在（tauri 核心与
+#   tauri-plugin-updater 都依赖它们），time 也在（updater 依赖）。
+# ⚠️ 为什么 reqwest 用 `rustls-no-provider` 而不是默认的 `default-tls`：后者等于 `rustls`，
+#   而那一个会打开 `__rustls-aws-lc-rs` 把 aws-lc-rs/aws-lc-sys 拉进来——一把全新的、
+#   几百 KB 的 C 密码学后端，且不在本机注册表缓存里（`--offline` 直接解析失败）。
+#   本仓库的锁里 rustls 只带 `ring`（与 tauri-plugin-updater 的声明一字不差），
+#   所以走「no-provider + 我们自己装 ring 的 provider」那一条，签名请求与自动更新共用同一套。
+#   代价是 reqwest 在**没装 provider 时会 panic**（见 `src-tauri/src/oss.rs` 的 `client`），
+#   所以 `rustls` 这一行不是可选的便利，是那一句 `install_default()` 的出处。
+# ⚠️ `reqwest` 的 `rust-version` 是 1.85，比本工作区声明的 1.77.2 高。这不是新约束：
+#   锁文件里那一份早就被 tauri 拉进来了，本机工具链是 1.97.1。
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+time = { version = "0.3", default-features = false, features = ["std"] }
+
 # profile 只在 workspace 根生效，写在成员包里 cargo 会直接忽略并告警
 [profile.release]
 codegen-units = 1

@@ -46,6 +46,12 @@ notify = "8.2"
 notify-debouncer-full = "0.6"
 # 文件 IO 的真正实现住在框架无关的 vela-core 里，这一层只是 Tauri command 适配器
 vela-core = { path = "../crates/vela-core" }
+# M7-2 阿里云 OSS 上传（`src/oss.rs`）：一条 HTTPS PUT + 一个 UTC 时刻串。
+# 三条依赖都只把**已经在锁文件里**的东西声明成直接依赖，理由（含那句 `install_default`
+# 为什么必须有 `rustls` 这一行）记在根 `Cargo.toml` 的 M7-2 那段
+reqwest = { workspace = true }
+rustls = { workspace = true }
+time = { workspace = true }
 # `tauri::generate_context!()` 宏需要 serde_json（编译期生成 tauri.conf.json 的 JSON 解析）
 serde_json = { workspace = true }
 

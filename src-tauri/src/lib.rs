@@ -1,6 +1,10 @@
 mod commands;
 mod imgproto;
 mod menu;
+// ⚠️ 这一层要 `pub`：它的消费方 `upload_image` 是 M7-3（下一个提交）才接上的，
+// 而 `mod oss;` 那种私有声明会让门禁把「暂时还没人调」当成死代码报错。
+// `vela_lib` 本身就是 crate-type 里的 `rlib`，公开出去不改变任何东西。
+pub mod oss;
 mod shard;
 mod watcher;
 

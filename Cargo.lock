@@ -4492,6 +4492,8 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "percent-encoding",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",
@@ -4499,6 +4501,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-updater",
  "tempfile",
+ "time",
  "trash",
  "vela-core",
 ]
