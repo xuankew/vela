@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest'
-import { copyTargetOf, zoomOf } from './imageActions'
+import { copyTargetOf, markZoomableImages, zoomOf } from './imageActions'
 
 /**
- * 预览里对一张图的**两个手势**各自认不认这次命中。
+ * 预览里对一张图的**三个手势**各自认不认这次命中：左键看大图、右键复制、键盘 Enter / 空格。
  *
- * 这一层全是纯判断，所以这一份文件是整个 M7-11 / M7-12 里最值钱的用例：那两个组件的测试
- * 只能钉住「挂上了 DOM」，而「什么情况下弹、弹出来给的是哪串字」由这两个函数决定。
+ * 这一层全是纯判断（`markZoomableImages` 也只读 DOM、不发请求），所以这一份文件是整个
+ * M7-11 / M7-12 里最值钱的用例：那两个组件的测试只能钉住「挂上了 DOM」，
+ * 而「什么情况下弹、弹出来给的是哪串字」由这几个函数决定。
  *
- * 三条要紧的：
+ * 四条要紧的：
  *
  * 1. 🔴 **`src` 读的是属性而不是 `.src`**。后者会拿文档 base 去解析，`vela-img://…`
  *    在有些实现里会被改写成别的形状，而 Rust 那一边按原样那串校验。
@@ -19,6 +20,9 @@ import { copyTargetOf, zoomOf } from './imageActions'
  * 4. 🔴 **M7-8 起 `src` 不一定是能给人看的那一串**：预览里那张云端图的 `src` 是一份
  *    15 分钟的读取凭证，所以「会离开这一层的东西」（剪贴板、大图底部那一行）读的是
  *    `data-oss-src`。这一条漏掉的形态是把一条临时授权粘进别人的聊天窗口
+ *
+ * ⚠️ 键盘那一条（M7-11 认下的欠账）**复用左键的判据**，所以它这一组用例钉的不是新规矩，
+ * 而是「一处判据、两个消费者」这件事本身没被写坏
  */
 
 const LOCAL_URL = 'vela-img://localhost/?doc=%2Fnotes%2Fa.md&ref=assets%2Fpasted-0123.png'
@@ -109,6 +113,57 @@ describe('zoomOf：哪一次点击算「点了一张图，要看大图」', () =
   it('`data-path` 是空串时不算引用（不能拿一个空的 `ref` 去冒充本地图片）', () => {
     const img = imageEl({ src: LOCAL_URL, 'data-path': '' }) as HTMLImageElement
     expect(zoomOf(img)?.ref).toBeNull()
+  })
+})
+
+describe('markZoomableImages：哪些图标成键盘也停得下来（M7-11 欠账一）', () => {
+  /** 造一小块预览正文。⚠️ 必须是**挂在同一个根上**的：这个函数走的是一次 DOM 扫描 */
+  function root(...children: HTMLElement[]): HTMLElement {
+    const el = document.createElement('div')
+    el.append(...children)
+    return el
+  }
+
+  it('标的是 `tabindex` + `role` + 一句念得出来的名字', () => {
+    const el = imageEl({ src: 'https://e.com/a.png', alt: '一张截图' }) as HTMLImageElement
+    markZoomableImages(root(el))
+    expect(el.getAttribute('tabindex')).toBe('0')
+    expect(el.getAttribute('role')).toBe('button')
+    // `role="button"` 顶掉了 `img` 的语义，名字里必须带着替代文字，
+    // 否则读屏器念出来的是「按钮」加一串 URL
+    expect(el.getAttribute('aria-label')).toBe('看大图：一张截图')
+  })
+
+  it('⛔ 被链接包住的图不标：那一次点击归链接，多一个按了没反应的焦点是在骗人', () => {
+    const a = imageEl({ src: 'https://e.com/a.png', alt: '一张截图' }, true)
+    const el = a.querySelector('img')!
+    markZoomableImages(root(a))
+    expect(el.hasAttribute('tabindex')).toBe(false)
+    expect(el.hasAttribute('role')).toBe(false)
+  })
+
+  it('没有 `src` 的图不标（它压根没显示出来）；占位 `span` 不是 `<img>`，扫都扫不到', () => {
+    const bare = imageEl({ alt: '一张截图' }) as HTMLImageElement
+    const span = document.createElement('span')
+    span.className = 'md-img-local'
+    markZoomableImages(root(bare, span))
+    expect(bare.hasAttribute('tabindex')).toBe(false)
+    expect(span.hasAttribute('tabindex')).toBe(false)
+  })
+
+  it('🔴 标出来的那一批与 `zoomOf` 认的那一批是**同一批**——一处判据，两个消费者', () => {
+    // 这一条是这组用例里最值钱的：分开写两份判据的话，「能 Tab 停下来」与「点得开」会各自漂，
+    // 而症状是安静的（多一个按了没反应的停点，或者少一个键盘到不了的图）
+    const zoomable = imageEl({ src: LOCAL_URL, 'data-path': 'assets/pasted-0123.png', alt: '甲' })
+    const cloud = imageEl({ src: OSS_SIGNED, 'data-oss-src': OSS_PLAIN, alt: '乙' })
+    const linked = imageEl({ src: 'https://e.com/a.png', alt: '丙' }, true)
+    const bare = imageEl({ alt: '丁' })
+    const r = root(zoomable, cloud, linked, bare)
+    markZoomableImages(r)
+    for (const el of [...r.querySelectorAll('img')]) {
+      expect(el.hasAttribute('tabindex'), `${el.getAttribute('alt')} 该不该停得下来`).toBe(zoomOf(el) !== null)
+    }
+    expect([...r.querySelectorAll('img[tabindex]')]).toHaveLength(2)
   })
 })
 

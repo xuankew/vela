@@ -642,6 +642,102 @@ describe('MarkdownPreview：点图看大图（M7-11）', () => {
 })
 
 /**
+ * M7-11 认下的第一笔欠账：大图此前**只有鼠标能开**，键盘用户完全看不到图。
+ *
+ * 这里钉的是接线（哪一些图被标了、按下去弹不弹），判据本身在 `imageActions.test.ts`。
+ * 最值钱的是那两条「⛔ 不标 / 不弹」：链接里的图归链接那一次点击，多一个停得下来却
+ * 按不动的焦点是骗人；以及那条「走一整圈」——关掉之后焦点必须回到刚才那张图上，
+ * 否则键盘用户每看一张都要从文档开头重新 `Tab` 一遍。
+ *
+ * ⚠️ 焦点环**看不看得见**钉不住：jsdom 不解析 CSS（`css: false`），
+ * 那一条在 `src/styles.css` 的 `img[tabindex]:focus-visible` 上，得靠眼睛
+ */
+describe('MarkdownPreview：键盘也能开大图（M7-11 欠账一）', () => {
+  const PIC = '# 甲\n\n![截图](assets/a.png)\n'
+  const zoomBackdrop = () => container.querySelector<HTMLElement>('.img-zoom-backdrop')
+  const zoomDialog = () => container.querySelector<HTMLElement>('.img-zoom-dialog')
+
+  function key(el: Element, k: string): KeyboardEvent {
+    const ev = new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true })
+    el.dispatchEvent(ev)
+    return ev
+  }
+
+  it('本地图片换成 <img> 之后被标成停得下来，名字是那句替代文字', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const img = p.imgs()[0]!
+    expect(img.getAttribute('tabindex')).toBe('0')
+    expect(img.getAttribute('role')).toBe('button')
+    expect(img.getAttribute('aria-label')).toBe('看大图：截图')
+  })
+
+  it('外链图片同样标', () => {
+    const p = mount('![外链](https://e.com/a.png)\n', '/notes/a.md')
+    expect(p.imgs()[0]!.getAttribute('tabindex')).toBe('0')
+  })
+
+  it('⛔ 被链接包住的图不标：那一次点击归链接', () => {
+    const p = mount('[![截图](assets/a.png)](https://e.com/post)\n', '/notes/a.md')
+    expect(p.imgs()).toHaveLength(1)
+    expect(p.imgs()[0]!.hasAttribute('tabindex')).toBe(false)
+  })
+
+  it('占位（那张图没显示出来）不标：它压根不是 `<img>`', () => {
+    const p = mount(PIC, null)
+    expect(p.localSpans()).toHaveLength(1)
+    expect(p.localSpans()[0]!.hasAttribute('tabindex')).toBe(false)
+  })
+
+  it('回车开大图，弹的与鼠标那一下是同一份', () => {
+    const p = mount(PIC, '/notes/a.md')
+    key(p.imgs()[0]!, 'Enter')
+    expect(zoomBackdrop()).not.toBeNull()
+    expect(container.querySelector('.img-zoom-path')?.textContent).toBe('assets/a.png')
+  })
+
+  it('空格也开，并且**拦掉**空格默认的滚一屏', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const ev = key(p.imgs()[0]!, ' ')
+    expect(ev.defaultPrevented, '不拦的话大图盖在一屏已经滚走的正文上面').toBe(true)
+    expect(zoomBackdrop()).not.toBeNull()
+  })
+
+  it('⛔ 链接里的图上按回车什么都不做，也不吃默认行为', () => {
+    const p = mount('[![截图](assets/a.png)](https://e.com/post)\n', '/notes/a.md')
+    const ev = key(p.imgs()[0]!, 'Enter')
+    expect(zoomBackdrop()).toBeNull()
+    expect(ev.defaultPrevented, '吃掉默认行为就等于连链接自己的回车一起吃掉').toBe(false)
+  })
+
+  it('别的键既不弹也不吃默认行为', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const ev = key(p.imgs()[0]!, 'a')
+    expect(ev.defaultPrevented).toBe(false)
+    expect(zoomBackdrop()).toBeNull()
+  })
+
+  it('🔴 走一整圈：回车开、`Esc` 关，焦点回到**刚才那张图**上', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const img = p.imgs()[0]!
+    // 真窗口里这一下是「点图」自带的（那张图现在带着 `tabindex`），jsdom 的 `click()` 不搬焦点
+    img.focus()
+    key(img, 'Enter')
+    expect(document.activeElement, '焦点没收进遮罩的话 `Esc` 作用不到这一层').toBe(zoomDialog())
+    key(zoomDialog()!, 'Escape')
+    expect(zoomBackdrop()).toBeNull()
+    expect(document.activeElement, '丢回 body 就得从文档开头重新 Tab 一遍').toBe(img)
+  })
+
+  it('重画之后仍然标着：那一批节点是整块换过的', () => {
+    const p = mount(PIC, '/notes/a.md')
+    p.retype('# 甲\n\n![截图](assets/a.png)\n\n补了一句。\n')
+    p.bump()
+    p.settle()
+    expect(p.imgs()[0]!.getAttribute('tabindex')).toBe('0')
+  })
+})
+
+/**
  * M7-12：右键那张图 → 那一项菜单。
  *
  * 判据（认不认这张图、给哪串字）在 `imageActions.test.ts` 里逐条钉过了，遮罩带不带

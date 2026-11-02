@@ -3487,6 +3487,14 @@ body.tab-dragging {
   max-width: 100%;
 }
 
+/* 点得开大图的那一些图（`md/imageActions.ts` 的 `markZoomableImages` 给它们加了
+   `tabindex="0"` + `role="button"`）。⚠️ 选择器挑的是**带 tabindex 的**：被链接包住的图
+   与加载失败换回去的占位 `span` 都没有这个属性，也就都不该有这一圈——前者那一次点击归链接 */
+.md-preview-body img[tabindex]:focus-visible {
+  outline: 2px solid var(--vela-accent);
+  outline-offset: 2px;
+}
+
 .md-preview-body table {
   margin: 0 0 0.9em;
   border-collapse: collapse;

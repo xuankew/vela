@@ -1,5 +1,9 @@
 /**
- * 预览里对**一张图**能做的两个手势各自认不认这次点击（PLAN.md §3.7 M7-11 与 M7-12）。
+ * 预览里对**一张图**认不认这一次手势（PLAN.md §3.7 M7-11 与 M7-12）。
+ *
+ * 手势是三个：左键看大图、右键复制、以及键盘走到那张图上按 Enter / 空格
+ * （最后一个是 M7-11 认下的欠账，见下面的 [`markZoomableImages`]）。
+ * 前两个各自认不认，判据**不共用**；第三个直接复用左键那一个。
  *
  * ## 为什么是两个判据，而不是一个
  *
@@ -37,7 +41,7 @@
  * 所以 `ImageLightbox` 把 `ref` 原样挂回自己的 `data-path` 上——挂 `label` 不行，
  * 外链图的 `label` 就等于 URL，会冒充成一串文档内的引用，把「复制链接」说成「复制路径」。
  *
- * 🟡 下面那三个小读取函数（`imageOf` / `srcOf` / `refOf`）是两个手势共用的：
+ * 🟡 下面那四个小读取函数（`imageOf` / `srcOf` / `refOf` / `unsignedOf`）是几个手势共用的：
  * 每条规矩只有一个落点，所以「属性而不是 `.src`」这类红字只写一次
  *
  * ## ⚠️ 为什么不做「复制绝对路径」
@@ -131,6 +135,36 @@ export function zoomOf(target: EventTarget | null): ZoomTarget | null {
   // 而不是应用自己编出来的协议 URL；云端那一张则是那一个不带签名的地址
   const ref = refOf(img)
   return { src, label: ref ?? unsigned ?? src, ref, unsigned }
+}
+
+/**
+ * 把「点得开大图」的那一些图标成键盘也停得下来（M7-11 认下的第一笔欠账）。
+ *
+ * 🔴 判据就是 [`zoomOf`] 本身，⛔ 不要在这儿重写一遍「在不在链接里」「有没有 src」：
+ * 一处判据的两个消费者才保证**能 Tab 停下来的**与**点得开的**是同一批图。分成两份的
+ * 症状是安静的——链接里的图片多出一个停不下来的焦点，或者反过来键盘能停但按了没反应
+ *
+ * ⚠️ 调用点在 `MarkdownPreview` 的 `render()` 里、`rewriteLocalImages` **之后**：
+ * 本地图片在那一步之前还是占位 `span`，早一步扫就一张都扫不到
+ *
+ * ⚠️ 没有「把上一次的标记擦掉」那一支：`render()` 每次都是 `bodyEl.innerHTML = html`
+ * 整块重建，节点是新的。真要加清理就得先回答「哪些属性算这一层写的」，
+ * 而这个问题在这里不存在
+ *
+ * 🟡 代价是明写的：一篇贴了二十张图的笔记因此多出二十次 `Tab`。换来的是一件事——
+ * 键盘用户此前**完全看不到图**（那一层没有任何别的入口）。要减这个代价得先回答
+ * 「预览里键盘该怎么走」，那是这一栏更大的一题，不是这一句能顺手解决的
+ */
+export function markZoomableImages(root: HTMLElement): void {
+  for (const img of root.querySelectorAll('img')) {
+    if (zoomOf(img) === null) continue
+    img.setAttribute('tabindex', '0')
+    img.setAttribute('role', 'button')
+    // `role="button"` 顶掉了 `img` 那个语义，所以名字里要把替代文字带上，
+    // 否则读屏器念出来的是「按钮」加一串 URL。`alt` 在这里不会是空的：
+    // `render.ts:856` 空替代文字统一写成「图片」，本地图片那一支原样搬（`localImage.ts:74`）
+    img.setAttribute('aria-label', `看大图：${img.alt}`)
+  }
 }
 
 /**

@@ -55,9 +55,10 @@
  * 组件被换掉，遮罩一起没了。⛔ 别把它挪到 App 顶层「让它更稳」——那样每一处会关掉文档的
  * 地方都得负责关它，漏一处的症状是「屏幕上一张不属于当前文档的图」
  *
- * ⚠️ 已知欠账：这个手势**只有鼠标能做**。要让键盘也点得开，得给每张 `<img>` 加 `tabindex`，
- * 而一篇贴了二十张图的笔记会因此多出二十次 `Tab`——那要先回答「预览里键盘该怎么走」，
- * 而这一栏目前的答案就是上面那句「除了勾选框，一个都不能」
+ * ⚠️ 键盘也能开：`markZoomableImages`（`./imageActions.ts`）给点得开的那一些图加 `tabindex`，
+ * `onBodyKeyDown` 上的 Enter / 空格与鼠标那一下共用 `zoomOf` 与 `openZoom`。代价是明写的——
+ * 一篇贴了二十张图的笔记多出二十次 `Tab`；换的是键盘用户此前**完全看不到图**。
+ * 这一层依旧不给别的键：预览里能按的仍然只有勾选框与图片上的那两个
  *
  * ## ⚠️ 右键那张图：第三个手势，同样一个字都不写（M7-12）
  *
@@ -95,7 +96,7 @@ import { createEffect, createSignal, onCleanup, onMount, Show, untrack } from 's
 import { writeClipboard } from '../editor/clipboard'
 import { TreeMenu } from '../project/TreeMenu'
 import { createPanelRefresh, type FollowedEditor, type PanelRefreshSource } from './panel'
-import { copyTargetOf, zoomOf, type CopyTarget, type ZoomTarget } from './imageActions'
+import { copyTargetOf, markZoomableImages, zoomOf, type CopyTarget, type ZoomTarget } from './imageActions'
 import { ImageLightbox } from './ImageLightbox'
 import { restorePlaceholder, rewriteLocalImages } from './localImage'
 import { resignAfterError, rewriteCloudImages } from './ossImage'
@@ -254,6 +255,10 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
       // ⚠️ 必须在 `measure()` **之前**换：那一张表量的是每个 `data-line` 元素离内容顶部多远，
       // 换在之后就会量出一份没有算进图片那部分高度的表
       rewriteLocalImages(bodyEl, src?.path ?? null)
+      // M7-11 欠账一：把点得开大图的那一些图标成键盘也停得下来。⚠️ 必须在
+      // `rewriteLocalImages` **之后**——本地图片在那一步之前还是占位 `span`，早一步扫一张都扫不到。
+      // 判据是 `zoomOf` 本身，所以「能 Tab 停下来的」与「点得开的」是同一批图（见 `./imageActions.ts`）
+      markZoomableImages(bodyEl)
       measure()
     }
     // M7-8：用户自己 bucket 里那几张图的 `src` 换成 15 分钟的临时签名地址。
@@ -432,6 +437,16 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     if (hadFocus) bodyEl?.querySelector<HTMLElement>(`.md-task[data-pos="${pos}"]`)?.focus()
   }
 
+  /**
+   * 把命中的那一张记下来，`<Show keyed>` 于是挂载一块大图。
+   *
+   * ⚠️ 鼠标与键盘走的是同一个函数：那一份 `path`（归属，见 `zoom` 那条）漏掉一处的症状是
+   * 「换了文件，屏幕上还挂着上一份文档的一张图」
+   */
+  function openZoom(target: ZoomTarget) {
+    setZoom({ target, path: pathOf(untrack(() => props.source())) })
+  }
+
   function onBodyClick(event: MouseEvent) {
     const box = taskBoxOf(event.target)
     if (box !== null) {
@@ -441,7 +456,7 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     // M7-11：点一张已经显示出来的图 → 看大图。判断「该不该弹」全在 `zoomOf` 里
     // （被链接包住的图归链接、占位 `span` 不算图），这里只管把命中的那一份记下来
     const target = zoomOf(event.target)
-    if (target !== null) setZoom({ target, path: pathOf(untrack(() => props.source())) })
+    if (target !== null) openZoom(target)
   }
 
   /**
@@ -477,11 +492,22 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   function onBodyKeyDown(event: KeyboardEvent) {
     if (event.key !== ' ' && event.key !== 'Enter') return
     const box = taskBoxOf(event.target)
-    if (box === null) return
-    // 🔴 空格对一个 `tabindex` 元素的默认行为是**滚动页面**：不拦的话「打勾」与「滚一屏」
-    // 同时发生，而滚完那一屏之后用户已经找不到刚才点的是哪一条了
+    if (box !== null) {
+      // 🔴 空格对一个 `tabindex` 元素的默认行为是**滚动页面**：不拦的话「打勾」与「滚一屏」
+      // 同时发生，而滚完那一屏之后用户已经找不到刚才点的是哪一条了
+      event.preventDefault()
+      toggleTask(box)
+      return
+    }
+    // M7-11 欠账一：键盘走到一张图上按 Enter / 空格 → 看大图，与鼠标那一下同一个判据、
+    // 同一个函数。⛔ 别在这儿重写一遍「在不在链接里」：链接里的图压根没有 `tabindex`
+    // （`markZoomableImages` 用的就是 `zoomOf`），于是 `zoomOf` 在这儿也一定回 null——
+    // 那一次按键什么都不做，链接自己的 Enter 由 webview 处理
+    const target = zoomOf(event.target)
+    if (target === null) return
+    // 与上面那一条同一个理由：空格不拦就滚一屏，而大图正好盖在那一屏上面
     event.preventDefault()
-    toggleTask(box)
+    openZoom(target)
   }
 
   return (
@@ -507,8 +533,9 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
       </div>
       {/* ⚠️ 这一层刻意**不可聚焦**（没有 tabindex）：点一下预览之后焦点会掉到 body 上，
           接着打字打进了空气里。真做成可聚焦的话就得回答「预览里能按哪些键」，
-          而 v1 的答案是「除了勾选框上的空格与回车，一个都不能」。
-          要选中预览里的文字复制是另一回事，那个不受影响 */}
+          而这一栏的答案是「只有勾选框与图片上的空格与回车」——那两处的 `tabindex`
+          是给具体控件的（勾选框见 `render.ts` 的 `taskMarker`，图片见 `markZoomableImages`），
+          不是给这一层的。要选中预览里的文字复制是另一回事，那个不受影响 */}
       <div class="md-preview-scroll" ref={scrollEl}>
         <div class="md-preview-body" ref={bodyEl} onClick={onBodyClick} onKeyDown={onBodyKeyDown} />
       </div>

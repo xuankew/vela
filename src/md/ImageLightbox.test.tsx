@@ -8,12 +8,13 @@ import type { ZoomTarget } from './imageActions'
  * 那张遮罩本身。判断「这一次点击该不该弹」的用例在 `./imageActions.test.ts`——
  * 那个函数现在不属于这一层，两个手势的判据住在一起才比「谁用到大图谁自己写一份」好。
  *
- * 三条要紧的：
+ * 四条要紧的：
  *
  * 1. 🔴 **`src` 原样传进去，一个字节都不改**。这一层不碰字节（不读文件、不换 URL、
  *    不拼 HTML），所以大图天然继承 M7-9 那条 `vela-img` 校验边界。
- * 2. ⚠️ **焦点是自己进来的**：点一张图不会让任何东西可聚焦，所以 `onMount` 里那一句
- *    `dialogEl.focus()` 是 `Esc` 能生效的**前提**，不是礼貌。这一条只有真挂到 DOM 上才测得出来。
+ * 2. ⚠️ **焦点是自己进来的，而且进来之后出不去**：`onMount` 里那一句 `dialogEl.focus()`
+ *    是 `Esc` 能生效的**前提**，不是礼貌；`Tab` 那一条陷阱是 `aria-modal="true"` 的另一半
+ *    （声明了模态却守不住焦点比不声明更误导读屏器）。两条都只有真挂到 DOM 上才测得出来。
  * 3. ⚠️ **大图要把正文那串引用挂回自己的 `data-path`**，宿主那份右键菜单靠它认图
  *    （下面那一条用例钉的是「别把 `vela-img:` 留给 webview 原生菜单」）
  * 4. 🔴 **M7-8 起大图还要挂 `data-oss-src`**：云端那一张在预览里的 `src` 是一份 15 分钟的
@@ -93,6 +94,29 @@ describe('ImageLightbox：那张遮罩', () => {
   it('🔴 挂载即把焦点收进来，否则 `Esc` 压根作用不到这一层', () => {
     const l = mountLightbox(EXTERNAL)
     expect(document.activeElement).toBe(l.dialog())
+  })
+
+  it('🔴 `aria-modal` 与焦点陷阱一起上：`Tab` 走不出去，落在 `×` 上', () => {
+    const l = mountLightbox(EXTERNAL)
+    expect(l.dialog().getAttribute('aria-modal')).toBe('true')
+    l.dialog().focus()
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    l.dialog().dispatchEvent(tab)
+    expect(tab.defaultPrevented, '不拦的话浏览器接着就把焦点送到遮罩后面那一堆界面里去了').toBe(true)
+    expect(document.activeElement).toBe(l.close())
+    // 已经在唯一那一格上时再按也出不去：这一层只有 `×` 一个可聚焦控件
+    const again = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    l.close().dispatchEvent(again)
+    expect(again.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(l.close())
+  })
+
+  it('`Shift+Tab` 同一个结果：只有一格，没有「上一格」可去', () => {
+    const l = mountLightbox(EXTERNAL)
+    const ev = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })
+    l.dialog().dispatchEvent(ev)
+    expect(ev.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(l.close())
   })
 
   it('按 `Esc` 关', () => {

@@ -31,14 +31,20 @@
  *
  * 大图没有自己的菜单宿主：`ImageLightbox` 把正文那串引用挂回 `<img>` 的 `data-path` 上，
  * 事件一路冒泡到 `.md-preview`，由宿主那一份菜单接住。于是**右键大图**与右键预览里那一张
- * 得到同一个结果。⛔ 不要在这一层再建一个 `TreeMenu`：两个宿主意味着两份关闭路径要守，
- * 而这一层连焦点陷阱都故意没做
+ * 得到同一个结果。⛔ 不要在这一层再建一个 `TreeMenu`：两个宿主意味着两份关闭路径要守
  *
- * ## ⚠️ 一层已知的 a11y 欠账：没有焦点陷阱
+ * ## ⚠️ 焦点陷阱：这一层只有一个可聚焦控件，所以「困住」等于「不许走出去」
  *
- * `Tab` 从关闭按钮走出去会掉到遮罩后面的界面里。做陷阱要回答「哪些元素算这个对话框的」，
- * 而这里只有两个（对话框本身与 `×`）。`role="dialog"` 不带 `aria-modal` 是刻意的：
- * 声明了模态却守不住焦点，比不声明更误导读屏器——与 `SettingsDialog` 同一口径
+ * `Tab` / `Shift+Tab` 一律 `preventDefault` 并把焦点交给 `×`。⚠️ 这不是一个通用的循环陷阱
+ * （没有「第一格 / 最后一格」那套判断），因为对话框里的可聚焦控件**只有一个**：
+ * 那张 `<img>` 没有 `tabindex`，说明那一行是纯文本。真往里加控件（下载、翻页）的那天，
+ * 这一句必须换成一个按顺序走的循环——而那一天也正是上面「不做图片浏览器」那条被推翻的那天
+ *
+ * 🔴 陷阱与 `aria-modal="true"` 是一起上的：声明了模态却守不住焦点，比不声明更误导读屏器。
+ * M7-11 那时只写了 `role="dialog"` 并把这笔欠账明写在文件头，现在两半都补齐了。
+ * ⚠️ 但这**不是**全应用已经铺开的口径：其余四个 `aria-modal="true"` 的对话框
+ * （`NameDialog` / `DiscardDialog` / `ReplaceConfirm` / `FileConflictDialog`）都只做
+ * 「挂载即把焦点收进来」那一句，没有 Tab 陷阱。⛔ 别照着这一层去推断那四个也守住了
  */
 import { createSignal, onCleanup, onMount, Show } from 'solid-js'
 import type { ZoomTarget } from './imageActions'
@@ -51,14 +57,19 @@ export interface ImageLightboxProps {
 export function ImageLightbox(props: ImageLightboxProps) {
   let backdropEl: HTMLDivElement | undefined
   let dialogEl: HTMLDivElement | undefined
+  let closeEl: HTMLButtonElement | undefined
   /** 那张大图没到位（图被移走了、URL 过期了、或者协议那道校验把它拒了） */
   const [failed, setFailed] = createSignal(false)
   /** 打开之前那个拿着焦点的元素；关掉之后还给它的（见 `focusBack`） */
   const owner: Element | null = document.activeElement
 
   onMount(() => {
-    // ⛔ 焦点必须进来，否则 `Esc` 那条 `onKeyDown` 压根不会作用在这个组件上：
-    // 点预览里的一张图不会让任何元素可聚焦（`<img>` 默认不可聚焦，而这一栏也没有 tabindex）
+    // ⛔ 焦点必须进来，否则 `Esc` 那条 `onKeyDown` 压根不会作用在这个组件上。
+    // M7-11 欠账一还清之后，打开大图的那一次点击**是**有焦点可留的（那张预览图带着
+    // `tabindex="0"`），而它在遮罩外面：不把焦点收进来的话 `Esc` 会一路走到
+    // `.md-preview-body` 那个只认空格与回车、并且只认勾选框与图片的处理里，什么都不发生。
+    // ⚠️ 收进来顺带让 `owner` 记下的是那张图，于是关掉之后焦点回到**刚才那张**上——
+    // 键盘用户接着 `Tab` 就是下一张，不必从头再走一遍
     dialogEl?.focus()
   })
 
@@ -77,6 +88,14 @@ export function ImageLightbox(props: ImageLightboxProps) {
   }
 
   function onKeyDown(event: KeyboardEvent): void {
+    if (event.key === 'Tab') {
+      // 🔴 焦点陷阱。`Tab` 的默认行为就是移焦点，所以「拦住 + 自己交出去」两步都得做：
+      // 只 `preventDefault` 焦点会原地不动（那也算困住，但用户按了没反馈），
+      // 只 `focus()` 不拦的话浏览器接着还会再走一格。理由见文件头那一节
+      event.preventDefault()
+      closeEl?.focus()
+      return
+    }
     if (event.key !== 'Escape') return
     event.preventDefault()
     props.onClose()
@@ -88,6 +107,7 @@ export function ImageLightbox(props: ImageLightboxProps) {
       <div
         class="img-zoom-dialog"
         role="dialog"
+        aria-modal="true"
         aria-label="图片大图"
         tabindex={-1}
         ref={dialogEl}
@@ -114,7 +134,13 @@ export function ImageLightbox(props: ImageLightboxProps) {
             <Show when={failed()}>这张图加载不出来：</Show>
             {props.target.label}
           </span>
-          <button class="img-zoom-close" onClick={() => props.onClose()} title="关闭大图（Esc）" aria-label="关闭大图">
+          <button
+            class="img-zoom-close"
+            ref={closeEl}
+            onClick={() => props.onClose()}
+            title="关闭大图（Esc）"
+            aria-label="关闭大图"
+          >
             ×
           </button>
         </div>
