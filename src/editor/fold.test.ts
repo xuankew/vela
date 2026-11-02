@@ -3,8 +3,28 @@ import { json } from '@codemirror/lang-json'
 import { foldAll, foldedRanges, syntaxTreeAvailable, unfoldAll, unfoldEffect } from '@codemirror/language'
 import { EditorState } from '@codemirror/state'
 import { EditorView } from '@codemirror/view'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { foldWholeDocument } from './fold'
+
+/**
+ * 「某几轮 `forceParsing` 一个字符都没推进」的开关：设了就假装那几轮空转。
+ * 真机上这由负载决定，测试里只能人工造出来——见文件末尾那条回归用例
+ */
+const forceParsingStalls = vi.hoisted(() => ({ remaining: 0 }))
+
+vi.mock('@codemirror/language', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@codemirror/language')>()
+  return {
+    ...actual,
+    forceParsing: (...args: Parameters<typeof actual.forceParsing>) => {
+      if (forceParsingStalls.remaining > 0) {
+        forceParsingStalls.remaining -= 1
+        return false
+      }
+      return actual.forceParsing(...args)
+    },
+  }
+})
 
 /**
  * 「折叠全部」要覆盖整篇，而不只是解析到的那一屏。
@@ -29,6 +49,7 @@ let views: EditorView[] = []
 afterEach(() => {
   for (const view of views) view.destroy()
   views = []
+  forceParsingStalls.remaining = 0
 })
 
 /** 300 个成员的数组，每个成员 4 行：1202 行的 JSON，远超任何一屏 */
@@ -116,5 +137,21 @@ describe('foldWholeDocument', () => {
     const v = view(bigJson(), false)
     expect(await foldWholeDocument(v)).toBe(false)
     expect(rangesOf(v)).toEqual([])
+  })
+
+  /**
+   * 回归：某一轮 `forceParsing` 空转（一个字符都没推进）**不代表**推不动。
+   * 给 1ms 时间片时实测常见这种轮次，下一轮却照样往前推；早先的实现一见到
+   * 「没进展」就停手，于是负载高的机器上（CI）只折了前半截，`fold.test.ts:71` 偶发红
+   */
+  it('中途有一两轮空转，仍然折满整篇', async () => {
+    const doc = bigJson()
+    const v = view(doc)
+    // 先钉住前提：初始只解析到视口附近，整篇确实得靠循环推完
+    expect(syntaxTreeAvailable(v.state, doc.length)).toBe(false)
+
+    forceParsingStalls.remaining = 2
+    expect(await foldWholeDocument(v)).toBe(true)
+    expect(syntaxTreeAvailable(v.state, doc.length)).toBe(true)
   })
 })

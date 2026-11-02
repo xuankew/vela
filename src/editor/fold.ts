@@ -41,6 +41,16 @@ const PARSE_STEP_MS = 25
 const PARSE_BUDGET_MS = 2000
 
 /**
+ * 连续多少轮「一个字符都没往前推」才认输。
+ *
+ * 一轮没进展**不等于**卡死：`forceParsing` 的时间片偶尔整个花在一小段上、
+ * 树长一个字都不动，下一轮却照样往前推（给 1ms 时间片时实测经常如此）。
+ * 早先这里一见到「没进展」就停手，于是负载高的机器上会只折了前半截——
+ * CI 上就这么偶发红过（`fold.test.ts:71`）
+ */
+const STALLED_ROUNDS_LIMIT = 3
+
+/**
  * 整篇里所有可折叠的区间，**含每一层嵌套**。
  *
  * `foldNodeProp` 的值就是库自己给节点算折叠区间的那个函数（`syntaxFolding` 在同文件 :1252
@@ -77,12 +87,16 @@ export async function foldWholeDocument(view: EditorView): Promise<boolean> {
     const length = view.state.doc.length
     const deadline = performance.now() + PARSE_BUDGET_MS
     let parsedTo = syntaxTree(view.state).length
+    let stalled = 0
     while (!syntaxTreeAvailable(view.state, length) && performance.now() < deadline) {
       forceParsing(view, length, PARSE_STEP_MS)
       const now = syntaxTree(view.state).length
-      // 这一轮没往前走就别再等：等下去也不会走完，而预算是会被耗光的
-      if (now <= parsedTo) break
-      parsedTo = now
+      if (now > parsedTo) {
+        parsedTo = now
+        stalled = 0
+      } else if (++stalled >= STALLED_ROUNDS_LIMIT) {
+        break
+      }
       // 让出主线程。等待期间用户完全可能改文档、甚至关掉这个标签——两种都要停下来：
       // 前者会让「折的是用户没点的那份」，后者会往一个已销毁的 view 上 dispatch
       await new Promise((resolve) => setTimeout(resolve, 0))
