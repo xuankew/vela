@@ -4394,7 +4394,7 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
    * 派发在 `contentDOM` 上，于是走的是 CM6 自己的事件分发链，
    * 连带验住「插件的处理器排在内置处理器之前」那半个前提
    */
-  function paste(data: { files?: File[]; text?: string }, index = 0): void {
+  function paste(data: { files?: File[]; text?: string; types?: string[] }, index = 0): void {
     const v = views()[index]
     if (!v) throw new Error(`没有第 ${index} 块分屏`)
     const event = new Event('paste', { bubbles: true, cancelable: true })
@@ -4403,6 +4403,9 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
         getData: (format: string) => (format === 'text/plain' ? (data.text ?? '') : ''),
         files: data.files ?? [],
         items: [],
+        // ⚠️ 不给就**整个成员都不存在**，与「给了一个空数组」不是一回事：
+        // M7-13 那条兜底认的是 `types`，而真引擎上这个成员长什么样只有真机知道
+        ...(data.types === undefined ? {} : { types: data.types }),
       },
     })
     v.contentDOM.dispatchEvent(event)
@@ -4672,6 +4675,126 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
       expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
       expect(noticeEl()!.className).toBe('notice')
       expect(noticeText()).toContain('超过上限 10 MB')
+    })
+  })
+
+  /**
+   * 「剪贴板里有图、但这个引擎没把它包成 File」那一支（M7-13）。
+   *
+   * 🔴 这一组钉的是**接线**，不是判据：「什么时候算引擎没交出来」在 `editor/paste.test.ts`
+   * 的 `clipboardHoldsAnImage` / `imagePaste` 那两组里。这一层只问三件事——
+   * 兜底读到的图有没有走**同一条**落地逻辑（另起一份落盘代码是最容易写错的地方，
+   * 那样大小闸门、云端那一态、降级那一句会全部漏掉）、读不到时有没有说出口、
+   * 以及主路径上**不该**多读一次剪贴板。
+   *
+   * ⚠️ jsdom 里没有 `navigator.clipboard`，所以这里自己装一个。真机上它开不开放、
+   * 在 WKWebView 里开放到什么程度，**只有真机知道**——这一组的绿灯说的不是
+   * 「用户的截图能落地」，而是「读到了就一定会落地、读不到就一定会说话」
+   */
+  describe('引擎没交出文件那一支（M7-13）', () => {
+    const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+    let readCalls = 0
+    let readImpl: () => Promise<readonly unknown[]>
+
+    beforeEach(() => {
+      readCalls = 0
+      readImpl = async () => [{ types: ['image/png'], getType: async () => new Blob([PNG_BYTES]) }]
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: {
+          read: async () => {
+            readCalls += 1
+            return readImpl()
+          },
+        },
+      })
+    })
+
+    afterEach(() => {
+      delete (navigator as { clipboard?: unknown }).clipboard
+    })
+
+    it('兜底读到了图：走同一条落地逻辑，落盘、插相对链接、一句话都不说', async () => {
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+
+      paste({ types: ['image/png', 'Files'] })
+      await flush()
+      await flush()
+      await flush()
+
+      expect(readCalls).toBe(1)
+      expect(assetCmd.calls.map((c) => c.docPath)).toEqual(['/repo/README.md'])
+      // 🔴 字节真的是从剪贴板那一份来的：base64 与主路径那一条逐字相同，
+      // 说明兜底没有自己另编一份，也没有把 Blob 递成空
+      expect(assetCmd.calls[0]?.dataBase64).toBe('iVBORw==')
+      expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+      expect(noticeEl()).toBeNull()
+    })
+
+    it('兜底被拒：说一句话、带上原始类型，正文一个字都不动、一次盘都不落', async () => {
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+      readImpl = async () => {
+        throw Object.assign(new Error('The request is not allowed.'), { name: 'NotAllowedError' })
+      }
+
+      paste({ types: ['image/png'] })
+      await flush()
+      await flush()
+
+      expect(readCalls).toBe(1)
+      expect(assetCmd.calls).toEqual([])
+      expect(view().state.doc.toString()).toBe('# 标题\n')
+      // `error` 档：用户什么都做对了，是我们没做成——不是「你还没做那一步」那一类
+      expect(noticeEl()!.className).toBe('notice error')
+      expect(noticeText()).toContain('NotAllowedError')
+      // 🔴 原始 types 必须出现在这句话里：它是「WebKit 到底把截图交成了什么形状」
+      // 唯一的取证入口，而这一支存在的理由就是把那次静默变成一句可复述的话
+      expect(noticeText()).toContain('image/png')
+    })
+
+    it('这个 webview 没开放 read()：也说一句话，而不是静默', async () => {
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+      delete (navigator as { clipboard?: unknown }).clipboard
+
+      paste({ types: ['image/tiff'] })
+      await flush()
+      await flush()
+
+      expect(assetCmd.calls).toEqual([])
+      expect(noticeEl()!.className).toBe('notice error')
+      expect(noticeText()).toContain('没有开放 navigator.clipboard.read()')
+      expect(noticeText()).toContain('image/tiff')
+    })
+
+    it('🔴 主路径（引擎交出了 File）一次剪贴板都不多读', async () => {
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+
+      paste({ files: [shot()], types: ['Files', 'image/png'] })
+      await flush()
+      await flush()
+
+      // 兜底是「拿不到字节时的第二条路」，⛔ 不是「每次粘贴都再读一遍剪贴板」：
+      // 那会在 WebKit 上多弹一次授权，而授权弹窗反复出现按本项目口径就是缺陷
+      expect(readCalls).toBe(0)
+      expect(assetCmd.calls).toHaveLength(1)
+      expect(view().state.doc.toString()).toBe('# 标题\n![](assets/pasted-ad48c1765eb1b87d.png)')
+    })
+
+    it('纯文字粘贴不触发兜底：正文照常粘进来', async () => {
+      await openFrom('# 标题\n', '/repo/README.md')
+      toEnd()
+
+      paste({ text: '一段话', types: ['text/plain'] })
+      await flush()
+      await flush()
+
+      expect(readCalls).toBe(0)
+      expect(assetCmd.calls).toEqual([])
+      expect(view().state.doc.toString()).toBe('# 标题\n一段话')
     })
   })
 })

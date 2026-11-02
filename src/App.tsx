@@ -35,6 +35,7 @@ import { createWorkspace, type DiscardDecision, type Pane } from './doc/workspac
 import { copySelection, cutSelection, pasteInto, writeClipboard } from './editor/clipboard'
 import { EditorPane } from './editor/EditorPane'
 import { languageFor } from './editor/language'
+import { readClipboardImage } from './editor/paste'
 import { clickAction, definitionAt } from './goto/definition'
 import { createNavHistory, type NavEntry } from './goto/history'
 import { createQuickOpen, type Commit } from './goto/store'
@@ -47,7 +48,7 @@ import { attachReplaceListeners } from './ipc/replace'
 import { attachSearchListeners } from './ipc/search'
 import { attachWindowCloseGuard } from './ipc/windowClose'
 import { linkNeedle, linkTargets } from './md/linkPath'
-import { acceptsPastedImage, landPastedImage } from './md/paste'
+import { acceptsPastedImage, landPastedImage, type PasteTarget } from './md/paste'
 import { MarkdownToolbar } from './md/MarkdownToolbar'
 import type { FollowedEditor } from './md/panel'
 import { nextPreviewMode, type PreviewMode } from './md/previewMode'
@@ -988,8 +989,12 @@ export default function App() {
    * **收到 paste 事件的那块分屏**，而 `activeTab()` 读的是焦点跟踪的结果，
    * 两者在「焦点还没跟上」的时序下会不是同一个标签——图片落到隔壁文档的目录里，
    * 链接插在另一份文档里，两边都错而且错得对不上
+   *
+   * 🔴 `file` 是 `null` 表示「剪贴板里有图，但这个引擎没把它包成 `File`」（M7-13）。
+   * 那一刻**仍然要答 true**：默认粘贴插不出任何东西，而拦住才有机会说那句解释。
+   * 真机上的形状见 `src/editor/paste.ts` 文件头那条 🔴
    */
-  function pasteImageInto(file: File, view: EditorView): boolean {
+  function pasteImageInto(file: File | null, view: EditorView, types: readonly string[]): boolean {
     const tab = ws.tabOfView(view)
     // 找不到对应标签只可能是分片只读视图（它没有 CM6 实例，压根不会发 paste 事件），
     // 兜住是为了类型收窄，不是为了兜某个真实场景
@@ -1000,7 +1005,7 @@ export default function App() {
       setEditorNotice({ level: 'plain', text: '这份文档不是 Markdown，图片不会落地成 assets/' })
       return false
     }
-    void landPastedImage(file, {
+    const target: PasteTarget = {
       path,
       // `replaceSelection` 而不是手拼 `changes`：多光标时每个光标各插一份链接，
       // 而那正是按 ⌘V 的预期。它是一次普通编辑事务，进撤销栈、把文档标脏——
@@ -1013,8 +1018,46 @@ export default function App() {
       // 前端读不到，缺它的那一句由 Rust 的 `not_configured` 原样说回来
       cloud: { oss: () => settings.oss(), upload: uploadImage },
       clear: () => setEditorNotice(null),
-    })
+    }
+    if (file === null) {
+      void landImageFromClipboard(target, types)
+      return true
+    }
+    void landPastedImage(file, target)
     return true
+  }
+
+  /**
+   * 绕开 paste 事件再读一次系统剪贴板（M7-13 的兜底）。
+   *
+   * 🔴 **必须还在那一次 paste 手势里**：`navigator.clipboard.read()` 在 WebKit 上要用户授权，
+   * 脱离了手势就是 `NotAllowedError`。所以这里 `await` 的是紧跟着的第一件事，
+   * ⛔ 中间不要插任何等用户操作、等定时器、或等另一趟 IPC 的步骤。
+   *
+   * ⚠️ 读到之后就交回 [`landPastedImage`]，与主路径**共用同一条落地逻辑**：
+   * 大小闸门、`store_image`、云端那一态、降级那一句，一份都不重写。
+   * 差别只在「字节从哪来」，⛔ 不要在这里另起一份落盘代码。
+   *
+   * 🔴 读不到时**必须说一句话**，而且带上引擎报的原始 `types`。这一支的旧行为是
+   * 完全静默（`pickPastedImage` 回 null → 钩子回 false → 默认粘贴插不出东西），
+   * 用户看到的是「按了 ⌘V，光标闪了一下」。那句解释永远好过一次静默，
+   * 而 `types` 是「WebKit 到底把截图交成了什么形状」唯一的取证入口
+   */
+  async function landImageFromClipboard(target: PasteTarget, types: readonly string[]): Promise<void> {
+    const read = await readClipboardImage()
+    if (read.kind === 'file') {
+      await landPastedImage(read.file, target)
+      return
+    }
+    // `error` 而不是 `plain`：用户什么都做对了（截了图、按了 ⌘V），是我们没做成。
+    // 与「先存一次」「这张图太大」那两档不是一类事（`src/md/paste.ts` 的 `degradeLevel`）
+    const detail = read.kind === 'no_image' ? '读到了剪贴板，但里面没有一项是图片' : read.reason
+    // `types` 到这里必然非空：进这一支的前提就是 `clipboardHoldsAnImage` 从里面认出了一项
+    target.notify(
+      `剪贴板里有图片，但这个 webview 没把它交出来，改走 navigator.clipboard.read() 也没读到：${detail}。` +
+        `剪贴板类型：${types.join(', ')}`,
+      'error',
+    )
   }
 
   /**
