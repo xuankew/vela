@@ -46,6 +46,9 @@
  */
 
 import type { SyntaxNode, Tree } from '@lezer/common'
+// 只用来解析**脚注正文**：正文是另一段独立的 Markdown，得有自己的树。
+// 与编辑器同一份解析器配置，⛔ 不是又引了一个解析器
+import { markdownLanguage } from '@codemirror/lang-markdown'
 // 🔴 方向是 render → table，⛔ 不能反过来：对齐表格是**首屏命令**（`Mod+Shift+A`），
 // 而这一份渲染器在 M3-C 里要变成预览专用的懒加载块。让 table 反过来 import render 的话，
 // 按一下对齐就把 41 kB 的渲染器拖进首屏
@@ -89,6 +92,7 @@ export const ALLOWED_TAGS: readonly string[] = [
   'th',
   'td',
   'span',
+  'section',
 ]
 
 /** 协议不在白名单里的链接目标用这个类名，理由见 [`safeUrl`] */
@@ -259,10 +263,124 @@ function lineOf(starts: Uint32Array, pos: number): number {
   return low + 1
 }
 
+/**
+ * 扫出所有脚注定义。理由见 [`FOOTNOTE_DEF`]：不能从树上认。
+ *
+ * 续行规则（GitHub 那套的近似）：缩进 4 格或一个制表符的行属于正文；空行只有在
+ * **后面还跟着缩进行**时才算正文里的空行，否则它就是定义之外的分隔。
+ * 同标签定义重复时第一份生效——与链接定义一致。
+ */
+function extractFootnotes(source: string, starts: Uint32Array): Map<string, FootnoteDef> {
+  const defs = new Map<string, FootnoteDef>()
+  const lineEnd = (index: number) => (index + 1 < starts.length ? starts[index + 1]! - 1 : source.length)
+  const lineText = (index: number) => source.slice(starts[index], lineEnd(index))
+
+  let fence: string | null = null
+  let previousDefinitionEnd = -1
+  for (let index = 0; index < starts.length; index++) {
+    const text = lineText(index)
+    const fenceMatch = FENCE_LINE.exec(text)
+    if (fence !== null) {
+      if (fenceMatch !== null && fenceMatch[1]![0] === fence[0] && fenceMatch[1]!.length >= fence.length) {
+        fence = null
+      }
+      continue
+    }
+    if (fenceMatch !== null) {
+      fence = fenceMatch[1]!
+      continue
+    }
+
+    const match = FOOTNOTE_DEF.exec(text)
+    // 定义要起一个块：开头、空行之后，或者紧跟在上一条定义后面。写在一段正文
+    // 中间（没有空行）的那一行按 CommonMark 是段落的一部分，⛔ 不当定义
+    const startsBlock = index === 0 || BLANK_LINE.test(lineText(index - 1)) || index === previousDefinitionEnd + 1
+    if (match === null || !startsBlock) continue
+
+    const body: string[] = [match[2] ?? '']
+    let last = index
+    let next = index + 1
+    while (next < starts.length) {
+      const following = lineText(next)
+      const indented = INDENTED_LINE.exec(following)
+      if (indented !== null) {
+        body.push(indented[1] ?? '')
+        last = next
+        next++
+        continue
+      }
+      if (BLANK_LINE.test(following)) {
+        let lookahead = next + 1
+        while (lookahead < starts.length && BLANK_LINE.test(lineText(lookahead))) lookahead++
+        if (lookahead < starts.length && INDENTED_LINE.test(lineText(lookahead))) {
+          body.push('')
+          last = next
+          next++
+          continue
+        }
+      }
+      break
+    }
+
+    const key = footnoteKey(match[1] ?? '')
+    if (key !== '' && !defs.has(key)) {
+      defs.set(key, { body: body.join('\n').replace(/\s+$/, ''), from: starts[index]!, to: lineEnd(last) })
+    }
+    previousDefinitionEnd = last
+    index = last
+  }
+  return defs
+}
+
 /** 引用式链接的定义：标签（已归一化）→ 目标与标题 */
 interface LinkDef {
   readonly url: string
   readonly title: string
+}
+
+/**
+ * 脚注定义：`[^标签]: 正文`。
+ *
+ * `from` / `to` 是**定义占的字符范围**（含续行）。渲染时整段跳过——定义不是内容，
+ * 与 `LinkReference` 同一个道理。
+ */
+interface FootnoteDef {
+  readonly body: string
+  readonly from: number
+  readonly to: number
+}
+
+/** 一份文档里脚注的编号与锚点状态。嵌套渲染（脚注正文）共用同一份 */
+interface FootnoteState {
+  readonly defs: Map<string, FootnoteDef>
+  /** 标签 → 编号。编号按**正文里第一次引用**的顺序发，不是定义的顺序 */
+  readonly numbers: Map<string, number>
+  /** 已经发出去的编号，按出现顺序。文末那一节照这个顺序排 */
+  readonly order: string[]
+  /** 标签 → 引用次数。重复引用要各有各的锚点 id */
+  readonly occurrences: Map<string, number>
+}
+
+/**
+ * 识别脚注定义的那一行。
+ *
+ * 🔴 **不从语法树上认**：Lezer 把 `[^1]: 脚注内容` 当成 `LinkReference`（目标是
+ * 「脚注内容」这个词），一旦定义里有空格（`[^1]: 这是 一段 定义`）连 `LinkReference`
+ * 都不是，只是一段普通 `Paragraph`。按树的形状去认，能认的那一种刚好是最没用的那种。
+ */
+const FOOTNOTE_DEF = /^ {0,3}\[\^([^\]\n]+)\]:[ \t]*(.*)$/
+
+/** 脚注正文的续行：缩进 4 格或一个制表符 */
+const INDENTED_LINE = /^(?: {4}|\t)(.*)$/
+
+const BLANK_LINE = /^[ \t]*$/
+
+/** 围栏代码的开头/结尾。代码块里写 `[^1]: …` 是示例，⛔ 不能当成定义 */
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})/
+
+/** 标签归一化。脚注标签和链接标签同一套口径：大小写不敏感、空白折叠 */
+function footnoteKey(label: string): string {
+  return label.trim().replace(/\s+/g, ' ').toLowerCase()
 }
 
 /**
@@ -332,17 +450,32 @@ class Renderer {
   private readonly starts: Uint32Array
   private readonly refs = new Map<string, LinkDef>()
   private readonly slugs = new Map<string, number>()
+  /** 脚注状态。嵌套渲染（脚注正文）共用主文档那一份，编号才不会从 1 重来 */
+  private readonly notes: FootnoteState
 
+  /**
+   * `nested` 只在一处为 true：渲染脚注正文。它让嵌套那一层**不**再收集定义、
+   * **不**再追加文末那一节，也**不**给没出现过的标签发新编号
+   */
   constructor(
     private readonly source: string,
     tree: Tree,
+    notes?: FootnoteState,
+    private readonly nested = false,
   ) {
     this.starts = buildLineStarts(source)
+    this.notes = notes ?? {
+      defs: extractFootnotes(source, this.starts),
+      numbers: new Map(),
+      order: [],
+      occurrences: new Map(),
+    }
     this.collectRefs(tree)
   }
 
   render(tree: Tree): string {
-    return this.blocks(tree.topNode)
+    const body = this.blocks(tree.topNode)
+    return this.nested ? body : body + this.footnotesSection()
   }
 
   // ───────────────────────── 通用遍历 ─────────────────────────
@@ -396,6 +529,63 @@ class Renderer {
     return lineOf(this.starts, node.from)
   }
 
+  /** 这个位置是不是落在某条脚注定义里（定义本身不是内容） */
+  private insideFootnoteDef(pos: number): boolean {
+    // ⚠️ 定义范围是**主文档**的偏移量；脚注正文那一层的位置是另一套坐标系，
+    // 拿它去比会把正文里某一段误判成定义
+    if (this.nested) return false
+    for (const def of this.notes.defs.values()) {
+      if (pos >= def.from && pos <= def.to) return true
+    }
+    return false
+  }
+
+  // ───────────────────────── 脚注 ─────────────────────────
+
+  /**
+   * 给一个标签发编号，按**正文里第一次引用**的顺序。
+   *
+   * `null` = 嵌套渲染里碰见一个全文没引用过的标签：不发新编号（那会把文末那一节
+   * 越写越长），按字面量显示。
+   */
+  private footnoteNumber(key: string): number | null {
+    const known = this.notes.numbers.get(key)
+    if (known !== undefined) return known
+    if (this.nested) return null
+    const number = this.notes.order.length + 1
+    this.notes.numbers.set(key, number)
+    this.notes.order.push(key)
+    return number
+  }
+
+  private footnoteRef(key: string, number: number): string {
+    const count = (this.notes.occurrences.get(key) ?? 0) + 1
+    this.notes.occurrences.set(key, count)
+    // 重复引用各有各的锚点 id，回跳只回第一处。id 里只有数字，⛔ 不塞用户写的标签
+    const id = count === 1 ? `fnref-${number}` : `fnref-${number}-${count}`
+    return `<sup class="md-fn-ref"><a id="${id}" href="#fn-${number}">${number}</a></sup>`
+  }
+
+  /** 文末那一节。顺序是**编号**顺序，不是定义在文档里的顺序 */
+  private footnotesSection(): string {
+    if (this.notes.order.length === 0) return ''
+    const items = this.notes.order.map((key) => {
+      const def = this.notes.defs.get(key)
+      const number = this.notes.numbers.get(key)
+      if (def === undefined || number === undefined) return ''
+      const back = `<a class="md-fn-back" href="#fnref-${number}" title="返回正文">↩</a>`
+      return `<li id="fn-${number}">${this.footnoteBody(def.body)}${back}</li>`
+    })
+    return `<section class="md-footnotes"><hr><ol>${items.join('')}</ol></section>`
+  }
+
+  /** 脚注正文按独立的一份 Markdown 渲染；编号与主文档共用，脚注之间互相引用才不会错位 */
+  private footnoteBody(body: string): string {
+    if (body.trim() === '') return ''
+    const tree = markdownLanguage.parser.parse(body)
+    return new Renderer(body, tree, this.notes, true).render(tree)
+  }
+
   /**
    * 先扫一遍收集 `[label]: url` 定义。
    *
@@ -411,6 +601,9 @@ class Renderer {
       if (label === null) continue
       const key = normalizeLabel(this.gapsOf(label))
       if (key === '') continue
+      // `[^1]: …` 在树里也长成 `LinkReference`，但那是**脚注定义**。
+      // 收进 refs 的话 `[^1]` 会被渲染成一条指向「脚注正文」的死链
+      if (key.startsWith('^')) continue
       // `[ref]: <>` 这种空目标也建一条：不建的话后面查不到，会退化成「原样显示方括号」
       this.refs.set(key, {
         url: url === null ? '' : this.text(url),
@@ -440,6 +633,8 @@ class Renderer {
   }
 
   private block(node: SyntaxNode): string {
+    // 脚注定义不是内容：`[^1]: 正文` 那一块（含续行）在预览里一个字都不出现
+    if (this.insideFootnoteDef(node.from)) return ''
     // 🔴 记号节点必须在这里就拦掉。`blocks` 把**每一个**子节点都交给 `block`，
     // 而 `Blockquote` 的直接子节点里就有 `QuoteMark`（实测：`> 引用\n> 第二行` 的
     // Blockquote 子节点是 QuoteMark + Paragraph）——落到下面的 default 分支就会被
@@ -556,6 +751,8 @@ class Renderer {
   private listItem(item: SyntaxNode, tight: boolean): string {
     let body = ''
     for (const child of this.children(item)) {
+      // 紧列表里的段落走的是 `inline` 而不是 `block`，抑制不能只写在 `block` 里
+      if (this.insideFootnoteDef(child.from)) continue
       switch (child.name) {
         case 'ListMark':
           break
@@ -792,6 +989,16 @@ class Renderer {
           if (seenTarget || MARK_NODES.has(child.name)) break
           html += this.inlineNode(child)
           plain += this.plainText(child)
+      }
+    }
+
+    // 脚注引用：`[^标签]` 在树里就是一个没有目标的 `Link`。⚠️ 带目标的 `[^1](x)`
+    // 是普通链接，⛔ 不抢；没有同名定义的 `[^标签]` 落到下面按字面量显示
+    if (url === null && refLabel === null && plain.startsWith('^')) {
+      const key = footnoteKey(plain.slice(1))
+      if (this.notes.defs.has(key)) {
+        const number = this.footnoteNumber(key)
+        if (number !== null) return this.footnoteRef(key, number)
       }
     }
 

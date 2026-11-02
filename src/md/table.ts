@@ -280,8 +280,43 @@ function childrenOf(node: SyntaxNode): SyntaxNode[] {
   return out
 }
 
+/** 一根竖线的范围。插入/删除列时要贴着它下刀，零长度与位置信息都得留着 */
+export interface PipeSpan {
+  from: number
+  to: number
+}
+
 /**
- * 一行里的那些单元格文本，**已经 trim 过**。
+ * 一行里以竖线为界切出来的一段，也就是一个单元格的**几何**。
+ *
+ * `text` 与对齐用的是同一份（见 `rowParts`），但 `from` / `to` 是给编辑用的：
+ * Tab 跳格要选中内容、删除列要贴着两侧竖线删。⚠️ 空单元格的 `from === to`，
+ * 光标该落在段里的哪个位置由调用方按「两侧竖线之间」另算——见 `tableEdit.ts` 的 `caretOf`
+ */
+export interface RowSegment {
+  /** 段的两端：两侧竖线之间，含内边距的空白 */
+  from: number
+  to: number
+  /** 段里 `TableCell` 的文本（已 trim、已拼接）。空格子为空串 */
+  text: string
+  /** 段前面那根竖线；行首没有外侧竖线时为 null */
+  before: PipeSpan | null
+  /** 段后面那根竖线；行尾没有外侧竖线时为 null */
+  after: PipeSpan | null
+}
+
+export interface RowParts {
+  segments: RowSegment[]
+  /**
+   * 这一行首尾有没有外侧竖线。插入行时要照着它拼新行，否则一张 `a|b` 的表里
+   * 会突然冒出一行 `|  |  |`
+   */
+  leadingPipe: boolean
+  trailingPipe: boolean
+}
+
+/**
+ * 一行按竖线切出来的那些段。
  *
  * 🔴 不能数 `TableCell` 子节点的个数：实测（真的 `markdownLanguage.parser`）
  * `|  甲  |   |` 这一行只有一个 `TableCell`——**空单元格压根没有节点**。
@@ -291,28 +326,34 @@ function childrenOf(node: SyntaxNode): SyntaxNode[] {
  * ⚠️ 首尾那两段只有在**没有**外侧竖线时才是单元格：`a|b` 是两格，`| a | b |` 也是两格，
  * 而 `| a | b |` 的首尾各有一个空段，留着的话每行都会多出两列
  */
-function cellsOf(row: SyntaxNode, slice: (from: number, to: number) => string): string[] {
+export function rowParts(row: SyntaxNode, slice: (from: number, to: number) => string): RowParts {
   const kids = childrenOf(row)
-  const segments: SyntaxNode[][] = [[]]
-  let leadingPipe = false
-  let trailingPipe = false
-  kids.forEach((kid, index) => {
+  const raw: RowSegment[] = []
+  let segFrom = row.from
+  let before: PipeSpan | null = null
+  let cells: string[] = []
+
+  for (const kid of kids) {
     if (kid.name !== 'TableDelimiter') {
-      segments[segments.length - 1]!.push(kid)
-      return
+      if (kid.name === 'TableCell') cells.push(slice(kid.from, kid.to).trim())
+      continue
     }
-    if (index === 0) leadingPipe = true
-    if (index === kids.length - 1) trailingPipe = true
-    segments.push([])
-  })
-  const inner = leadingPipe ? segments.slice(1) : segments
-  const kept = trailingPipe ? inner.slice(0, -1) : inner
-  return kept.map((segment) =>
-    segment
-      .filter((node) => node.name === 'TableCell')
-      .map((node) => slice(node.from, node.to).trim())
-      .join(''),
-  )
+    const pipe = { from: kid.from, to: kid.to }
+    raw.push({ from: segFrom, to: kid.from, text: cells.join(''), before, after: pipe })
+    segFrom = kid.to
+    before = pipe
+    cells = []
+  }
+  raw.push({ from: segFrom, to: row.to, text: cells.join(''), before, after: null })
+
+  const leadingPipe = kids[0]?.name === 'TableDelimiter'
+  const trailingPipe = kids[kids.length - 1]?.name === 'TableDelimiter'
+  const inner = leadingPipe ? raw.slice(1) : raw
+  return {
+    segments: trailingPipe ? inner.slice(0, -1) : inner,
+    leadingPipe,
+    trailingPipe,
+  }
 }
 
 /**
@@ -358,7 +399,7 @@ export function alignTable(table: SyntaxNode, slice: (from: number, to: number) 
       continue
     }
     if (child.name === 'TableHeader' || child.name === 'TableRow') {
-      parts.push({ node: child, cells: cellsOf(child, slice) })
+      parts.push({ node: child, cells: rowParts(child, slice).segments.map((segment) => segment.text) })
     }
   }
 

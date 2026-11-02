@@ -257,6 +257,71 @@ describe('保存与另存为', () => {
     expect(state.clears).toBe(0)
   })
 
+  it('edits 只数用户真敲的改动：打开与恢复草稿都不算', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    expect(doc.edits()).toBe(0)
+
+    // 启动恢复：正文整个换过、文档是脏的，但那不是用户敲的
+    doc.restoreDraft({ path: '/a.txt', text: '上次的草稿', format: DEFAULT_FORMAT, dirty: true, lossy: false })
+    expect(doc.dirty()).toBe(true)
+    expect(doc.edits()).toBe(0)
+
+    state.text = '改一改'
+    doc.markChanged()
+    expect(doc.edits()).toBe(1)
+  })
+
+  // 🔴 写盘是异步的。用户在 await 那几毫秒里敲的字落在磁盘上的是**旧**字节，
+  // 这时候把 dirty 清掉，那几笔改动就会被一次成功的保存标成「已保存」，
+  // 而自动存盘之后也不会再来碰它——这是自动存盘引入之后最容易丢数据的一条缝
+  it('写盘期间又敲了字：存完保留脏标记，也不清 gutter', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '第一版'
+    doc.markChanged()
+
+    let finish: (report: WriteReport) => void = () => {}
+    ipc.saveFile.mockReturnValueOnce(
+      new Promise<WriteReport>((resolve) => {
+        finish = resolve
+      }),
+    )
+    const saving = doc.save()
+    // 写还悬着的时候用户又敲了一个字
+    state.text = '第一版，又加了一句'
+    doc.markChanged()
+    finish(OK_REPORT)
+    await saving
+
+    expect(doc.dirty()).toBe(true)
+    expect(state.clears).toBe(0)
+  })
+
+  it('写盘期间改了保存格式：同样保留脏标记——那个决定还没落盘', async () => {
+    const { doc, state } = harness()
+    ipc.openFile.mockResolvedValue(textFile())
+    await doc.openAt('/a.txt')
+    state.text = '第一版'
+    doc.markChanged()
+
+    let finish: (report: WriteReport) => void = () => {}
+    ipc.saveFile.mockReturnValueOnce(
+      new Promise<WriteReport>((resolve) => {
+        finish = resolve
+      }),
+    )
+    const saving = doc.save()
+    doc.changeFormat({ encoding: 'gbk' })
+    finish(OK_REPORT)
+    await saving
+
+    expect(doc.dirty()).toBe(true)
+    expect(state.clears).toBe(0)
+  })
+
   it('无路径时 save 落到另存为：用对话框拿路径再写', async () => {
     const { doc, state } = harness()
     state.text = '新内容'

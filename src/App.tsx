@@ -22,6 +22,7 @@ import { attachKeybindingDispatch } from './commands/dispatch'
 import { detectPlatform } from './commands/keybinding'
 import { createCommandPalette } from './commands/palette'
 import { createCommandRegistry, type AppContext } from './commands/registry'
+import { createAutoSave } from './doc/autoSave'
 import { DiscardDialog } from './doc/DiscardDialog'
 import { FileConflictDialog } from './doc/FileConflictDialog'
 import { createFileWatch } from './doc/fileWatch'
@@ -51,8 +52,17 @@ import { linkNeedle, linkTargets } from './md/linkPath'
 import { acceptsPastedImage, landPastedImage, type PasteTarget } from './md/paste'
 import { MarkdownToolbar } from './md/MarkdownToolbar'
 import type { FollowedEditor } from './md/panel'
+import { PreviewResize } from './md/PreviewResize'
 import { nextPreviewMode, type PreviewMode } from './md/previewMode'
 import { alignTableAt } from './md/table'
+import {
+  tableCellAt,
+  tableDeleteColumn,
+  tableDeleteRow,
+  tableInsertColumnRight,
+  tableInsertRowBelow,
+  tableLayoutAt,
+} from './md/tableEdit'
 import { createProjectTree } from './project/store'
 import { Sidebar, type TreeNotice } from './project/Sidebar'
 import { clampSidebarWidth, SidebarResize } from './project/SidebarResize'
@@ -156,8 +166,21 @@ interface EditorNotice {
  * 而「注册表里有、行为却是浏览器给的那一份」以后还得防两边漂开。
  * 折叠那两项相反——它们本来就已经是命令（`commands/builtins.ts` 的 `editor.foldAll` /
  * `editor.unfoldAll`），菜单这一条是**调用**它们，不是第二份实现
+ *
+ * 表格那四项（M7-14）只在右键落在表格里时出现，动作实现在 `md/tableEdit.ts`：
+ * 这一层只负责把**右键那一刻的位置**递过去，不重新算一遍表格几何
  */
-type EditorMenuAction = 'cut' | 'copy' | 'paste' | 'selectAll' | 'foldAll' | 'unfoldAll'
+type EditorMenuAction =
+  | 'cut'
+  | 'copy'
+  | 'paste'
+  | 'selectAll'
+  | 'foldAll'
+  | 'unfoldAll'
+  | 'tableRowBelow'
+  | 'tableRowDelete'
+  | 'tableColumnRight'
+  | 'tableColumnDelete'
 
 /**
  * 菜单事件路由：把 Rust 侧转发的菜单 ID 映射到前端的命令执行。
@@ -175,6 +198,8 @@ function routeMenuEvent(
     closeFolder: () => void
     save: (ctx: AppContext) => void
     saveAs: (ctx: AppContext) => void
+    /** M7-15：菜单里那条「导出 PDF…」。动作与快捷键同一条命令（`registry.execute`） */
+    exportPdf: () => void
     findInEditor: (ctx: AppContext) => void
     findInFiles: () => void
     replaceInFiles: () => void
@@ -210,6 +235,7 @@ function routeMenuEvent(
   else if (id === 'file.recent') actions.openRecentProject()
   else if (id === 'file.save') actions.save(ctx)
   else if (id === 'file.save_as') actions.saveAs(ctx)
+  else if (id === 'file.export_pdf') actions.exportPdf()
   else if (id === 'file.close_folder') actions.closeFolder()
   // Edit
   else if (id === 'edit.find') actions.findInEditor(ctx)
@@ -368,6 +394,15 @@ export default function App() {
   const fileWatch = createFileWatch({ workspace: ws, onWarn: setSessionWarning })
 
   /**
+   * 自动存盘（见 `doc/autoSave.ts`）：停手 1.5s 之后把脏文档写回原路径。
+   *
+   * 必须排在 `fileWatch` 之后：`blocked` 要问的就是它——冲突还没答复的标签不许自动写，
+   * 否则那个「覆盖还是保留」的问题会被定时器替用户答掉。与 `fileWatch` 一样建在组件体内，
+   * 它内部的 effect 才会跟着组件一起 dispose
+   */
+  createAutoSave({ workspace: ws, blocked: (id) => fileWatch.hasConflict(id) })
+
+  /**
    * 侧边栏可见性。默认关：空窗口里多一条 220px 的竖栏只会把正文区挤窄，
    * 而「还没有项目」时它里面什么也没有。
    *
@@ -425,6 +460,31 @@ export default function App() {
   const [previewMode, setPreviewMode] = createSignal<PreviewMode>('off')
 
   /**
+   * 预览栏宽（px）。`null` = 还没拖过，与编辑区等分。
+   *
+   * 与 `sidebarWidth` 不同，这里**不**在 window resize 时重新夹：预览栏用的是
+   * `flex: 0 1 <width>` + 两侧的 min-width（`styles.css` 的 `.body-row.preview-resized`），
+   * 窗口缩小时浏览器先把预览压回下限、再守编辑区的下限。于是这里存的是
+   * 「用户选的那一份」，不是「此刻画出来的那一份」——拖动时组件先量 DOM
+   * （见 `md/PreviewResize.tsx` 的 `currentWidth`），不会从旧值跳一下。
+   *
+   * 同样刻意不进会话存档，理由与 `previewMode` 相同：它是给这一次阅读配的尺寸
+   */
+  const [previewWidth, setPreviewWidth] = createSignal<number | null>(null)
+
+  /** `.body-row` 的引用：拖动夹取要知道编辑区+预览此刻能分到多宽（别的面板占掉的不能算） */
+  let bodyRowEl: HTMLDivElement | undefined
+
+  function previewSplitTotal(): number {
+    const row = bodyRowEl
+    const editor = row?.querySelector<HTMLElement>(':scope > .body')
+    const preview = row?.querySelector<HTMLElement>(':scope > .md-preview')
+    const total = (editor?.clientWidth ?? 0) + (preview?.clientWidth ?? 0)
+    // 量不到（jsdom、或者还没排版）时退回整窗宽：夹取宁松勿紧，下限那一侧仍然守得住
+    return total > 0 ? total : window.innerWidth
+  }
+
+  /**
    * JSON 预览那一栏的可见性（M4-D）。默认关，与 Markdown 预览同一条理由：
    * 一份不是 JSON 的文档，旁边挂一条报错的面板只是把正文区挤窄。
    *
@@ -434,13 +494,6 @@ export default function App() {
    * 同样刻意不进会话存档，理由写在上面 `previewMode` 那条注释里
    */
   const [jsonPreviewVisible, setJsonPreviewVisible] = createSignal(false)
-
-  /**
-   * Markdown 工具栏的可见性（M4-F）。默认关，用户可通过 View 菜单或编辑器上方的按钮切换。
-   *
-   * 与预览面板独立：工具栏答「编辑时有没有快捷按钮」，预览答「渲染出来是什么样」。
-   */
-  const [mdToolbarVisible, setMdToolbarVisible] = createSignal(false)
 
   /**
    * 设置对话框的可见性（菜单触发，见 `view.settings`）。
@@ -490,20 +543,32 @@ export default function App() {
   }
 
   /**
+   * 这份文档此刻有没有预览可看。`.ts` 与只读大文件分片都没有——前者本就没有渲染器，
+   * 后者没有 CM6 实例，预览拿不到正文。
+   *
+   * 两处判据同源：`followedEditor()` 正是预览自己决定「有没有正文可渲染」用的那一个
+   * （`MarkdownPreview` 的 `src === null` 那一支），语言那一半取自 `languageFor`，
+   * 与 `md/preview.ts` 判 `unsupported` 用的是同一个函数
+   */
+  const previewAvailable = () => followedEditor() !== null && languageFor(ws.activeTab().doc.path()).kind === 'markdown'
+
+  /**
    * 阅读模式（`previewMode` 的 `only` 档）**此刻真的把编辑区藏起来了吗**。
    *
-   * 🔴 三个条件缺一不可，后两个是「不许出现死胡同」：`.ts` 文件与只读大文件分片都没有预览
-   * 可看，那种时候藏掉编辑器，等于把整块屏幕让给一句「TypeScript 还没有预览」——
-   * 用户既看不到正文也看不到编辑区，而他想不明白是怎么走到这一步的。所以 `only` 档在这两种
-   * 文档上**降级成并排**：那一档说的其实是「让预览独占」，而没有预览可独占时这句话不成立。
-   *
-   * ⚠️ 判据是 `followedEditor() !== null` 而不是「路径以 .md 结尾」：前者正是预览自己
-   * 决定「有没有正文可渲染」用的那一个（`MarkdownPreview` 的 `src === null` 那一支），
-   * 两边同源才不会说出两种答案。语言那一半同样取自 `languageFor`，与 `md/preview.ts`
-   * 判 `unsupported` 用的是同一个函数
+   * 🔴 后半个条件是「不许出现死胡同」：没有预览可看的文档（`.ts`、只读大文件分片）上藏掉
+   * 编辑器，等于把整块屏幕让给一句「TypeScript 还没有预览」——用户既看不到正文也看不到
+   * 编辑区，而他想不明白是怎么走到这一步的。所以 `only` 档在这两种文档上**降级成并排**：
+   * 那一档说的其实是「让预览独占」，而没有预览可独占时这句话不成立
    */
-  const editorHidden = () =>
-    previewMode() === 'only' && followedEditor() !== null && languageFor(ws.activeTab().doc.path()).kind === 'markdown'
+  const editorHidden = () => previewMode() === 'only' && previewAvailable()
+
+  /**
+   * 编辑区与预览是不是**真的**并排站着。
+   *
+   * 判据不是 `previewMode() === 'side'`：`only` 在没有预览可看的文档上会降级成并排
+   * （见 `editorHidden`），那一档里那条分隔线照样该能拖。
+   */
+  const previewSideBySide = () => previewMode() !== 'off' && !editorHidden()
 
   /**
    * 全局替换落盘之后的一句回话（M2-D）：几个开着的标签被从磁盘重读了一遍。
@@ -1091,69 +1156,119 @@ export default function App() {
   }
 
   /**
+   * 导出与打印共用的前半截：渲染出「此刻该被导出／打印的那一份正文」。
+   *
+   * 🔴 四种拒绝**全都要说出口**，一种都不能沉默：按了快捷键之后什么都没发生，用户得到的
+   * 信息是零，而他下一个动作是再按一次。`target` 只影响其中一句的措辞。
+   *
+   * 回 `null` 就代表「已经说过为什么不能做」，调用方直接收手——⛔ 不要改成回一份空字符串
+   * 让调用方自己判，那会让两个出口各写一遍同样的四种判断，迟早漏掉一种。
+   */
+  async function renderExportTarget(
+    target: 'HTML' | 'PDF',
+  ): Promise<{ name: string; path: string | null; html: string } | null> {
+    const controller = ws.focusedEditor()
+    if (controller === null) {
+      setEditorNotice({ level: 'plain', text: '这块分屏里没有可导出的正文' })
+      return null
+    }
+    const doc = ws.activeTab().doc
+    /**
+     * 动态 `import()`（M3-C-1）：`md/preview` 身后是 `md/render`，
+     * 那个 18.1KB 的渲染器不该跟着首屏进来。HTML 与打印快照共用这一份。
+     *
+     * ⚠️ 放在弹对话框／叫打印面板**之前**：那一次 import 在 Tauri 里是读本地文件，
+     * 毫秒以下，但放在用户已经选完路径之后，就变成「路径出来了，界面才卡一下」
+     */
+    const { previewHtml } = await import('./md/preview')
+    const result = previewHtml(controller.view.state, doc.path())
+    if (result.kind === 'unsupported') {
+      setEditorNotice({ level: 'plain', text: `${result.label} 不能导出 ${target}，只有 Markdown 有预览` })
+      return null
+    }
+    // 🔴 `partial` 一律拒绝，⛔ 不「先导出前半截」。那个标志的意思是 `ensureSyntaxTree`
+    // 在 200ms 内没解析完，渲染出来的是**半截树**（见 `md/preview.ts` 的文件头）。
+    // 预览里出半截是可以的——旁边就是源文件，用户看得见少了什么；而导出件是要发出去的，
+    // 收到它的人手上没有源文件，他看到的是一个「结尾莫名其妙没了」的网页/PDF，
+    // 并且会认为这就是这份文档的全部
+    if (result.partial) {
+      setEditorNotice({ level: 'plain', text: '这份文档太大，解析没能在限定时间内跑完——导出会缺后半截，所以先不导' })
+      return null
+    }
+    if (result.html === '') {
+      setEditorNotice({ level: 'plain', text: '这份文档还是空的，没有什么可导出的' })
+      return null
+    }
+    return { name: doc.name(), path: doc.path(), html: result.html }
+  }
+
+  /**
    * 把聚焦那份 Markdown 导出成单文件 HTML（M3-A-6，`Mod+Shift+E`）。
    *
    * 刻意叫 `exportDocument` 而不是 `exportHtml`：后者是从 `./md/export` 引进来的那个纯函数，
    * 同名会让「拼字符串的那一半」与「弹对话框、写盘、说回话的那一半」在读起来变成一个东西，
    * 而它们的可测性差着一整个数量级——前者在 node 环境里能穷举，后者只能靠接线用例
-   *
-   * 🔴 四种拒绝**全都要说出口**，一种都不能沉默：按了 `Mod+Shift+E` 之后什么都没发生，
-   * 用户得到的信息是零，而他下一个动作是再按一次
    */
   async function exportDocument() {
-    const controller = ws.focusedEditor()
-    if (controller === null) {
-      setEditorNotice({ level: 'plain', text: '这块分屏里没有可导出的正文' })
-      return
-    }
-    const doc = ws.activeTab().doc
-    /**
-     * 🔴 两个 `import()` 都是**动态**的（M3-C-1）：`md/preview` 身后是 `md/render`，
-     * `md/export` 身后同样是 `md/render`（它 import 那个 `escapeHtml`），
-     * 于是这两个模块一起把那个 18.1KB 的渲染器挡在首屏外面。
-     *
-     * ⚠️ 放在弹对话框**之前**：那一次 import 在 Tauri 里是读本地文件，毫秒以下，
-     * 但把它放在 `pickToSave` 之后就变成「用户选完了路径，界面才卡一下」——
-     * 同一毫秒，位置不同，读起来完全不同
-     *
-     * ⚠️ `Promise.all` 而不是两次 `await`：两个 chunk 没有先后关系，
-     * 串起来是把一次并行的读盘变成两次
-     */
-    const [{ previewHtml }, exported] = await Promise.all([import('./md/preview'), import('./md/export')])
-    const result = previewHtml(controller.view.state, doc.path())
-    if (result.kind === 'unsupported') {
-      setEditorNotice({ level: 'plain', text: `${result.label} 不能导出 HTML，只有 Markdown 有预览` })
-      return
-    }
-    // 🔴 `partial` 一律拒绝，⛔ 不「先导出前半截」。那个标志的意思是 `ensureSyntaxTree`
-    // 在 200ms 内没解析完，渲染出来的是**半截树**（见 `md/preview.ts` 的文件头）。
-    // 预览里出半截是可以的——旁边就是源文件，用户看得见少了什么；而导出件是要发出去的，
-    // 收到它的人手上没有源文件，他看到的是一个「结尾莫名其妙没了」的网页，
-    // 并且会认为这就是这份文档的全部
-    if (result.partial) {
-      setEditorNotice({ level: 'plain', text: '这份文档太大，解析没能在限定时间内跑完——导出会缺后半截，所以先不导' })
-      return
-    }
-    if (result.html === '') {
-      setEditorNotice({ level: 'plain', text: '这份文档还是空的，没有什么可导出的' })
-      return
-    }
+    const target = await renderExportTarget('HTML')
+    if (target === null) return
+    // `md/export` 与上半截的 `md/preview` 没有先后关系，但只在这一支里用得上，
+    // 所以等过了四种拒绝才加载——「不是 Markdown」时连导出模块都不必读
+    const exported = await import('./md/export')
     // `defaultPath` 只带文件名，不带目录：交给系统对话框去决定落在哪儿。
     // ⚠️ 拼一个「源文件旁边的 t.html」听起来更贴心，但那等于替用户猜了一个目录，
     // 而猜错时他会把导出件写进一个他没打算写的地方
     const picked = await pickToSave({
-      defaultPath: exported.exportFileName(doc.path(), doc.name()),
+      defaultPath: exported.exportFileName(target.path, target.name),
       filters: [{ name: 'HTML', extensions: ['html', 'htm'] }],
     })
     if (typeof picked !== 'string') return
     try {
-      await saveFile(picked, exported.exportHtml(doc.name(), result.html), exported.EXPORT_FILE_FORMAT)
+      await saveFile(picked, exported.exportHtml(target.name, target.html), exported.EXPORT_FILE_FORMAT)
       // `ok`：这一次**真的写了一个文件**，与上面那几句「没什么可做」不是一类事
       setEditorNotice({ level: 'ok', text: `已导出到 ${picked}` })
     } catch (err) {
       // 复用 `describeFsError`：写盘失败的原因（没有目录部分、权限、磁盘满）与保存失败
       // 是同一批，那边已经把它们说成人话了，这里再写一份只会写出不一样的一句
       setEditorNotice({ level: 'error', text: `导出失败：${describeFsError(err)}` })
+    }
+  }
+
+  /**
+   * 把聚焦那份 Markdown 交给系统打印面板（M7-15，`Mod+Alt+E`）。
+   *
+   * 「导出 PDF」在 macOS 上只有这一个可靠出口：Rust 侧调的 `WebviewWindow::print()`
+   * 打开的就是系统打印面板，而面板左下角「PDF ▾」里可以直接「存储为 PDF」。
+   * ⛔ 页面里的 `window.print()` 在 WKWebView 里是**静默的空操作**，理由与整条链路的
+   * 分工写在 `src/md/print.ts` 与 `src-tauri/src/print.rs` 的文件头。
+   *
+   * 🔴 快照必须在 `print()` **之前**挂进 DOM，并且**之后不能摘**：面板弹出后还在照着
+   * 活文档排版，而 `print()` 返回的只是「面板弹出来了」——它没有「打印完了」的回调。
+   *
+   * 打印任务名取自页面标题，所以调用前把 `document.title` 换成源文件名、调用后换回来。
+   * 换回来是安全的：任务名在 Rust 侧创建打印操作那一刻就定下了。
+   */
+  async function exportPdf() {
+    const target = await renderExportTarget('PDF')
+    if (target === null) return
+    try {
+      // 两个都是动态的：`md/print` 身后是 `md/export` → `md/render`，与导出 HTML 同一个
+      // 18.1KB 的渲染器；`ipc/print` 虽然薄，但没有理由为一条低频命令把它提进首屏
+      const [{ mountPrintSnapshot }, { printWindow }] = await Promise.all([import('./md/print'), import('./ipc/print')])
+      mountPrintSnapshot(target.html)
+      const previousTitle = document.title
+      document.title = target.name
+      try {
+        await printWindow()
+      } finally {
+        document.title = previousTitle
+      }
+      // `plain` 而不是 `ok`：这一下只是把面板叫出来了。用户可能存 PDF、可能打印、也可能
+      // 直接取消——说成「已导出」会在最后一种情形里变成一句假话
+      setEditorNotice({ level: 'plain', text: '已打开系统打印窗口——在左下角「PDF ▾」里选「存储为 PDF」' })
+    } catch (err) {
+      // 这里的拒绝值来自 Rust 的 `Err(String)`，不是 fs 错误，不走 `describeFsError`
+      setEditorNotice({ level: 'error', text: `打印窗口没能打开：${err instanceof Error ? err.message : String(err)}` })
     }
   }
 
@@ -1206,9 +1321,12 @@ export default function App() {
    * 正文右键菜单那一份现场。存**这块分屏**，⛔ 不存它的 controller：
    * 菜单弹着的时候用户可能 ⌘W 把这一块关掉（`detach` 会把 `controller` 置 null
    * 并 destroy 那个 view），而 pane 这个对象本身还活着——于是「哪一块」由它答，
-   * 「还在不在」由 `controller === null` 答，两件事分开
+   * 「还在不在」由 `controller === null` 答，两件事分开。
+   *
+   * `pos` 是**右键那一刻**的文档位置：表格那四项要按点中的是哪一行哪一格来决定
+   * 插/删的落点，而菜单开着的时候光标已经不在那儿了
    */
-  const [editorMenu, setEditorMenu] = createSignal<{ x: number; y: number; pane: Pane } | null>(null)
+  const [editorMenu, setEditorMenu] = createSignal<{ x: number; y: number; pane: Pane; pos: number } | null>(null)
 
   /**
    * 右键编辑器正文。
@@ -1225,7 +1343,11 @@ export default function App() {
   function onEditorContextMenu(e: MouseEvent, pane: Pane) {
     if (shardOf(pane) !== null) return
     e.preventDefault()
-    setEditorMenu({ x: e.clientX, y: e.clientY, pane })
+    const view = pane.controller?.view
+    // `posAtCoords` 是 view 的方法（要量排版），落在行号槽、滚动条、字缝里会回 null。
+    // 那一刻退回光标位：菜单宁可开在「光标所在的表格」上，也比表格项凭空消失好
+    const pos = view?.posAtCoords({ x: e.clientX, y: e.clientY }) ?? view?.state.selection.main.head ?? 0
+    setEditorMenu({ x: e.clientX, y: e.clientY, pane, pos })
   }
 
   /**
@@ -1243,17 +1365,30 @@ export default function App() {
    * 「一份没有任何块的 JSON 上这两项是亮的、点了什么也没发生」，比每弹一次菜单扫一遍
    * 全文便宜得多
    */
-  function editorMenuItems(pane: Pane): ContextMenuItem<EditorMenuAction>[] {
+  function editorMenuItems(pane: Pane, pos: number): ContextMenuItem<EditorMenuAction>[] {
     const view = pane.controller?.view
     const hasSelection = view !== undefined && view.state.selection.ranges.some((range) => !range.empty)
     const foldable = view !== undefined && view.state.facet(language) !== null
-    return [
+    const items: ContextMenuItem<EditorMenuAction>[] = [
       { action: 'cut', label: '剪切', disabled: !hasSelection },
       { action: 'copy', label: '复制', disabled: !hasSelection },
       { action: 'paste', label: '粘贴' },
       { action: 'selectAll', label: '全选' },
       { action: 'foldAll', label: '折叠全部', separator: true, disabled: !foldable },
       { action: 'unfoldAll', label: '展开全部', disabled: !foldable },
+    ]
+
+    // 表格那四项只在点中表格时出现。⚠️ 「删除行」对表头/分隔行灰掉、「删除列」对单列表灰掉：
+    // 删了表就不成立，而灰掉比点下去什么都不发生更容易读懂（理由同上面剪切的 disabled）
+    const layout = view === undefined ? null : tableLayoutAt(view.state, pos)
+    if (layout === null) return items
+    const clickedRow = layout.rows[tableCellAt(layout, pos).row]!
+    return [
+      ...items,
+      { action: 'tableRowBelow', label: '在下方插入行', separator: true },
+      { action: 'tableRowDelete', label: '删除行', disabled: clickedRow.kind !== 'data' },
+      { action: 'tableColumnRight', label: '在右侧插入列' },
+      { action: 'tableColumnDelete', label: '删除列', disabled: layout.columns <= 1 },
     ]
   }
 
@@ -1271,11 +1406,15 @@ export default function App() {
    * 点下去什么也没发生（类型只在 `action` 上帮忙，不会替你写分支）
    * ——与 `doc/TabStrip.tsx` 的 `onPick` 同一条纪律
    */
-  function onEditorMenuPick(pane: Pane, action: EditorMenuAction) {
+  function onEditorMenuPick(pane: Pane, action: EditorMenuAction, pos: number) {
     const controller = pane.controller
     // 菜单弹着的时候这块分屏被关掉了：view 已经 destroy，往上 dispatch 是未定义行为
     if (controller === null) return
     const view = controller.view
+    // 表格四项共用的落点：`md/tableEdit.ts` 算出「改哪几个字」，拒绝时（比如表头删行）什么都不做
+    const dispatchTable = (spec: ReturnType<typeof tableInsertRowBelow>) => {
+      if (spec !== null) view.dispatch(spec)
+    }
     switch (action) {
       case 'cut':
         void cutSelection(view).then((ok) => {
@@ -1302,6 +1441,18 @@ export default function App() {
         return
       case 'unfoldAll':
         void registry.execute('editor.unfoldAll', { editor: controller })
+        return
+      case 'tableRowBelow':
+        dispatchTable(tableInsertRowBelow(view.state, pos))
+        return
+      case 'tableRowDelete':
+        dispatchTable(tableDeleteRow(view.state, pos))
+        return
+      case 'tableColumnRight':
+        dispatchTable(tableInsertColumnRight(view.state, pos))
+        return
+      case 'tableColumnDelete':
+        dispatchTable(tableDeleteColumn(view.state, pos))
         return
     }
   }
@@ -1438,6 +1589,7 @@ export default function App() {
       alignTable,
       wordCount,
       exportHtml: exportDocument,
+      exportPdf,
       findInFiles: () => search.show(),
       replaceInFiles: () => search.showReplace(),
       searchWordInFiles,
@@ -1504,6 +1656,9 @@ export default function App() {
             // unhandled rejection——表现是「按 ⌘S 什么都没发生，脏标记一直在」
             save: (c) => void registry.execute('file.save', c),
             saveAs: (c) => void registry.execute('file.saveAs', c),
+            // 与快捷键是同一条命令，不是第二份实现；`ctx` 由上面这一层现取，
+            // 与 `save` / `saveAs` 同一种形状
+            exportPdf: () => void registry.execute('file.exportPdf', ctx),
             // 菜单这一条走的是注册表里那条 `editor.find`（`cmCommand` 包的 `openSearchPanel`），
             // 不是第二份实现：与 ⌘F 快捷键共用同一份 when 判断与同一个面板
             findInEditor: (c) => void registry.execute('editor.find', c),
@@ -1527,7 +1682,7 @@ export default function App() {
             toggleMinimap: () => ws.setMinimap(!ws.minimap()),
             openCommandPalette: () => palette.show(),
             showSettings: () => setSettingsDialogVisible(true),
-            toggleMdToolbar: () => setMdToolbarVisible((v) => !v),
+            toggleMdToolbar: () => settings.setMdToolbarVisible(!settings.mdToolbarVisible()),
             // 与命令面板的 `editor.splitRight` / `editor.splitDown` 共用同一个搬法
             // （把活动标签搬进新分屏），理由写在那一份接线上
             splitRight: () => ws.split('row', ws.activeTab().id),
@@ -1625,9 +1780,17 @@ export default function App() {
           grid 的行数必须固定，所以**不删这一行**，只是没有 item 落在上面（`auto` 塌成 0）。
           理由见 styles.css 里 `.app` 那条注释 */}
 
-      {/* Markdown 工具栏（M4-F）*/}
-      <Show when={mdToolbarVisible()}>
-        <MarkdownToolbar editor={() => ws.focusedEditor()} onToggle={() => setMdToolbarVisible(false)} />
+      {/* Markdown 工具栏（M4-F）。可见性是**落盘偏好**（`~/.vela/settings.json` 的
+          `markdownToolbar`）：点 × 或 View › Markdown 工具栏之后重启仍按上次的选择。
+          与预览面板独立：工具栏答「编辑时有没有快捷按钮」，预览答「渲染出来是什么样」 */}
+      <Show when={settings.mdToolbarVisible()}>
+        <MarkdownToolbar
+          editor={() => ws.focusedEditor()}
+          onToggle={() => settings.setMdToolbarVisible(false)}
+          previewMode={previewMode}
+          previewAvailable={previewAvailable}
+          onPreviewMode={setPreviewMode}
+        />
       </Show>
 
       {/* 常驻容器：.app 是 grid，行数必须固定。两条提示各自当 grid item 的话，
@@ -1715,7 +1878,19 @@ export default function App() {
           两层收起时都是 `<Show>` 直接不渲染，不留任何占位——没开过搜索的用户看到的
           布局与加这两层之前逐像素相同。 */}
       <div class="main">
-        <div class="body-row">
+        {/* 拖过分隔线之后（`previewWidth` 有值）预览栏改吃固定宽度，`--preview-width` 就是
+            用户选的那一份；`preview-resized` 同时挂上两侧的 min-width，窗口缩小时由 CSS
+            先把预览压回下限、再守编辑区（理由见 styles.css 那一段）。
+            ⚠️ 只在本轮真的并排时挂：`only` 档里预览是 `flex: 1 1 0%` 吃满整行，
+            带着固定宽度会让右边空出一条「分隔线底色」 */}
+        <div
+          class="body-row"
+          ref={bodyRowEl}
+          classList={{ 'preview-resized': previewSideBySide() && previewWidth() !== null }}
+          style={
+            previewSideBySide() && previewWidth() !== null ? { '--preview-width': `${previewWidth()}px` } : undefined
+          }
+        >
           {/* 大纲那一栏（M3-A-4）。放在 `.body` **之前**：
               `.body-row` 是横向 flex，顺序就是屏幕顺序，而左边是这份文档的结构（大纲），
               中间是「写」，右边（预览）是「结果」。
@@ -1779,6 +1954,13 @@ export default function App() {
               )}
             </For>
           </div>
+
+          {/* 编辑区与预览之间的分隔线，同时是拖拽把手（`md/PreviewResize.tsx`）。
+              ⚠️ 只在**真并排**时出现：`only` 档里 `.body` 是 `display: none`，没有可拖的两侧；
+              而文档没有预览可看时 `only` 会降级成并排，那一档仍然可拖 */}
+          <Show when={previewSideBySide()}>
+            <PreviewResize width={previewWidth} total={previewSplitTotal} onWidth={setPreviewWidth} />
+          </Show>
 
           {/* Markdown 预览那一栏（M3-A-3）。放在 `.body` **之后**：`.body-row` 是横向 flex，
               顺序就是屏幕顺序，而「左边写、右边看」是这类面板的通用约定（VS Code / Obsidian
@@ -1948,8 +2130,8 @@ export default function App() {
           <TreeMenu
             x={m().x}
             y={m().y}
-            items={editorMenuItems(m().pane)}
-            onPick={(action) => onEditorMenuPick(m().pane, action)}
+            items={editorMenuItems(m().pane, m().pos)}
+            onPick={(action) => onEditorMenuPick(m().pane, action, m().pos)}
             onClose={() => setEditorMenu(null)}
             keepFocus
           />

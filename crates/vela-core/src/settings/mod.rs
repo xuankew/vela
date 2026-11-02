@@ -9,9 +9,10 @@
 //!
 //! 合并顺序是「后一层盖前一层」，但 🔴 **不是每一层都能写每一个键**，见下面「可写层」。
 //!
-//! ## 🔴「哪一层能改哪些键」：十个键**全都**只认用户全局
+//! ## 🔴「哪一层能改哪些键」：十一个键**全都**只认用户全局
 //!
-//! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题是**个人偏好**，只认「内置默认 + 用户全局」两层。
+//! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题 / Markdown 工具栏可见性是**个人偏好**，
+//! 只认「内置默认 + 用户全局」两层。
 //! 打开一个带 `.vela/settings.json` 的仓库**不会**突然改掉你的字号——那样太突兀，
 //! 而且一个克隆来的仓库不该有这种权力（它连你的磁盘都能碰到，见 `commands.rs` 的信任面那张表）。
 //!
@@ -115,6 +116,16 @@ pub const DEFAULT_THEME: &str = "dark";
 /// 用户要的是「Vela 传的图都在我自己那一个前缀下」，这只需要改这一格。
 pub const DEFAULT_OSS_PREFIX: &str = "assets";
 
+/// 内置默认的 Markdown 工具栏可见性：**开**。
+///
+/// 与前端 `src/settings/store.ts` 的 `DEFAULT_MARKDOWN_TOOLBAR` 同值，两边各写一份、各钉一条
+/// （同 `DEFAULT_FONT_SIZE` 的做法）。
+///
+/// 默认开而不是关：那排格式按钮是打开一篇 Markdown 之后最常用的入口，默认关等于让用户先
+/// 知道 View 菜单里有这一项才找得到它。关掉之后写进用户全局层，重启仍然关着（这是本键
+/// 落盘的唯一目的）。
+pub const DEFAULT_MARKDOWN_TOOLBAR: bool = true;
+
 /// 合并之后的**最终配置**：每个键都是具体值，没有 `Option`。
 ///
 /// 这是 `load` 交出去、`save` 收进来的形状。前端拿到它直接往信号里灌，
@@ -147,7 +158,7 @@ pub struct Settings {
     /// 🔴 **不是偏好类，但同样只认用户全局**：理由与偏好类相反却更硬——一个克隆来的
     /// 仓库如果能改这一格，它就能把你粘贴的图**改道到别人的 bucket**。签名在 Rust 侧算、
     /// `Authorization` 里带着我们的 AccessKey ID，改道至少泄露一次派生签名。所以这四格
-    /// OSS 键与六个偏好键走同一条「项目层写了也忽略」的门（见 [`resolve`]）。
+    /// OSS 键与七个偏好键走同一条「项目层写了也忽略」的门（见 [`resolve`]）。
     ///
     /// 空 = 没配。`src-tauri/src/commands.rs` 的 `upload_image` 与前端 `src/md/paste.ts` 的
     /// `landPastedImage` 都用「四格齐不齐 + 钥匙串里有没有 secret」判断走不走云端，**没有**一个
@@ -170,6 +181,12 @@ pub struct Settings {
     pub oss_access_key_id: String,
     /// 对象名前缀（`assets` 那一段，不带首尾斜杠）。见 [`DEFAULT_OSS_PREFIX`]。
     pub oss_prefix: String,
+    /// Markdown 工具栏是否可见（M4-F）。**偏好类**，只认内置默认 + 用户全局。
+    ///
+    /// `true` = 打开 Markdown 时那排格式按钮就在，`false` = 用户点 × 把它收了。默认见
+    /// [`DEFAULT_MARKDOWN_TOOLBAR`]。写进这一层是为了「关了之后重启还是关着」——
+    /// 这是 `Settings` 里唯一一个**布尔**键，Rust 只当它是值原样往返，没有需要夹的范围。
+    pub markdown_toolbar: bool,
 }
 
 impl Default for Settings {
@@ -186,6 +203,7 @@ impl Default for Settings {
             oss_region: String::new(),
             oss_access_key_id: String::new(),
             oss_prefix: DEFAULT_OSS_PREFIX.to_owned(),
+            markdown_toolbar: DEFAULT_MARKDOWN_TOOLBAR,
         }
     }
 }
@@ -215,6 +233,9 @@ pub struct SettingsLayer {
     pub oss_region: Option<String>,
     pub oss_access_key_id: Option<String>,
     pub oss_prefix: Option<String>,
+    /// Markdown 工具栏可见性。与上面七个偏好键同一条规则：**只有用户全局层能写**。
+    /// `None` = 这一层没写这一格，留给下一层（最终落到内置默认，见 [`Settings::default`]）。
+    pub markdown_toolbar: Option<bool>,
 }
 
 /// 一层配置文件在读取时的下场。
@@ -239,7 +260,7 @@ pub struct SettingsReport {
     pub project_layer: LayerStatus,
     /// 项目层试图写「仅全局」的键、因而被忽略的键名（wire 名，前端可直接引用）。
     ///
-    /// v1 里十个键全是仅全局类（六个偏好 + 四格 OSS 账号配置），所以项目层写的任何键
+    /// v1 里十一个键全是仅全局类（七个偏好 + 四格 OSS 账号配置），所以项目层写的任何键
     /// 都会落在这里。前端可以据此说一句
     /// 「这个仓库的 `.vela/settings.json` 想改你的 <键>，但 <键> 只认用户全局，已忽略」。
     pub ignored_project_keys: Vec<String>,
@@ -304,7 +325,7 @@ fn read_layer(path: &Path) -> (Option<SettingsLayer>, LayerStatus) {
 
 /// 把两层文件内容合并成最终配置，并记账项目层被忽略的键。
 ///
-/// 🔴 **可写层门在这里**：v1 十个键都只认全局，只有 `user`（用户全局）能盖过内置默认；
+/// 🔴 **可写层门在这里**：v1 十一个键都只认全局，只有 `user`（用户全局）能盖过内置默认；
 /// `project`（项目级）里的同名键一律**丢弃并记账**。将来第一个 project-safe 键进来时，
 /// 就在这个函数里给它加一条「也接受 project」的分支——门已经在这儿了，不用临时搭。
 pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<String>) {
@@ -342,9 +363,12 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     if let Some(v) = user.oss_prefix {
         settings.oss_prefix = v;
     }
+    if let Some(v) = user.markdown_toolbar {
+        settings.markdown_toolbar = v;
+    }
 
-    // 项目层：v1 没有 project-safe 键，十个键写了都忽略，只记账给前端一句话。
-    // 前六个是偏好（「别改我的字号」），后四格是账号配置（「别把我的图改道到别人的 bucket」）
+    // 项目层：v1 没有 project-safe 键，十一个键写了都忽略，只记账给前端一句话。
+    // 前七个是偏好（「别改我的字号」），后四格是账号配置（「别把我的图改道到别人的 bucket」）
     let mut ignored_project_keys = Vec::new();
     if project.font_size.is_some() {
         ignored_project_keys.push("fontSize".to_owned());
@@ -378,6 +402,10 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     }
     if project.oss_prefix.is_some() {
         ignored_project_keys.push("ossPrefix".to_owned());
+    }
+    // Markdown 工具栏可见性也是偏好类（「别让仓库决定我打开文档时看到什么」），同一个门
+    if project.markdown_toolbar.is_some() {
+        ignored_project_keys.push("markdownToolbar".to_owned());
     }
 
     (settings, ignored_project_keys)
@@ -539,7 +567,7 @@ mod tests {
 
     #[test]
     fn 未知键被忽略而不让整层作废() {
-        // forward-compat：将来才有的键不该让只认十个键的这一版读不动。
+        // forward-compat：将来才有的键不该让只认十一个键的这一版读不动。
         // theme 在 M4-C 之后已是**已知**键，正好顺带钉住「用户层写的 theme 生效」
         let home = tempfile::tempdir().unwrap();
         write_user(home.path(), r#"{"fontSize":18,"theme":"light","将来才有的键":123}"#);
@@ -563,6 +591,7 @@ mod tests {
             oss_region: "cn-hangzhou".into(),
             oss_access_key_id: "LTAI5tExampleId".into(),
             oss_prefix: "docs/notes".into(),
+            markdown_toolbar: false,
         };
         let report = save(home.path(), &settings).unwrap();
         assert_eq!(report.bytes_written, fs::read(user_settings_path(home.path())).unwrap().len() as u64);
@@ -627,8 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn 存下来的文件是干净的十个键_json() {
-        // 整份重写：只含这十个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
+    fn 存下来的文件是干净的十一个键_json() {
+        // 整份重写：只含这十一个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
         let home = tempfile::tempdir().unwrap();
         save(home.path(), &Settings::default()).unwrap();
         let text = fs::read_to_string(user_settings_path(home.path())).unwrap();
@@ -643,6 +672,8 @@ mod tests {
         assert!(text.contains("\"ossAccessKeyId\": \"\""), "{text}");
         // 前缀不是空串：空前缀等于把对象堆在 bucket 根上，默认值替用户做了那个选择
         assert!(text.contains("\"ossPrefix\": \"assets\""), "{text}");
+        // 布尔键也写成具体值：`true` 是内置默认，而这一份是「整份重写」写出来的
+        assert!(text.contains("\"markdownToolbar\": true"), "{text}");
         assert!(!text.contains("null"), "不该写 null 键：{text}");
         // 🔴 这一条是「secret 不进配置文件」那条硬约束的可执行版本：整份文件里
         // 不许出现任何长得像 secret 的键。`ossAccessKeyId` 里有 "AccessKey" 但没有 "Secret"，
@@ -666,6 +697,42 @@ mod tests {
         assert_eq!(loaded.settings.oss_prefix, "docs");
         // 没写的偏好键仍留给内置默认：四格 OSS 不该顺手改动别的键
         assert_eq!(loaded.settings.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn markdown_工具栏默认是开的() {
+        // 默认开：那排格式按钮是打开 Markdown 后最常用的入口，默认关等于先把它藏起来
+        let home = tempfile::tempdir().unwrap();
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.markdown_toolbar, DEFAULT_MARKDOWN_TOOLBAR);
+        assert!(loaded.settings.markdown_toolbar, "内置默认必须是开");
+    }
+
+    #[test]
+    fn 用户层关掉_markdown_工具栏能存回来() {
+        // 这是本键落盘的全部目的：点 × 关掉之后重启仍然关着
+        let home = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"markdownToolbar":false}"#);
+        let loaded = load(home.path(), None);
+        assert!(!loaded.settings.markdown_toolbar);
+
+        save(home.path(), &loaded.settings).unwrap();
+        let again = load(home.path(), None);
+        assert!(!again.settings.markdown_toolbar, "往返之后又开回来了");
+        // 没写的键仍留给内置默认：一个布尔键不该顺带改动别的键
+        assert_eq!(again.settings.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn 项目层想关掉_markdown_工具栏也被忽略并记账() {
+        // 偏好类：一个克隆来的仓库不该决定你打开文档时看到什么
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"markdownToolbar":true}"#);
+        write_project(root.path(), r#"{"markdownToolbar":false}"#);
+        let loaded = load(home.path(), Some(root.path()));
+        assert!(loaded.settings.markdown_toolbar, "用户全局的 true 胜出");
+        assert_eq!(loaded.report.ignored_project_keys, vec!["markdownToolbar".to_owned()]);
     }
 
     #[test]

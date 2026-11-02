@@ -157,6 +157,7 @@ beforeEach(async () => {
       ossRegion: 'cn-hangzhou',
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
+      markdownToolbar: true,
     },
     report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   })

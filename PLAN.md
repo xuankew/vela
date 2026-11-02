@@ -167,7 +167,7 @@ interface ToolDefinition {
 | **图片粘贴自动落地** | `Cmd+V` 截图 → 存入 `assets/`（可配置路径与命名规则）→ 插入相对路径。**对写文档的人价值极高** → ✅ **M3-A-7 已交付，但两条都要改口**：① ⛔ **可配置没有交付**——`.vela/settings.json` 项目级配置由用户决定推到 M4（见 §3.4「M2-F 实施修正」1），所以 `assets/` 与命名规则（`pasted-<内容哈希>.<ext>`）**写死在 Rust 侧**，要改只能改代码（⚠️ **M7-5 加的那一格 `ossPrefix` 是云端前缀，⛔ 不是本地目录**，本地这个 `ASSET_DIR` 到 M7 为止仍然写死，见 §3.9「M7 全账」7）；② 🔴 **「落地的图片在 Vela 自己的预览里不显示」这半句自 M7-9（2026-11-01）起作废**——现在显示得出来了，做法**不是**启用 Tauri 的 asset protocol、也**不是**放开 `render.ts` 的 scheme 白名单，而是应用自己注册一个 `vela-img://` 协议、**由 Rust 每次请求重新校验**（目录逃逸 / 魔数 / 32 MiB）后回字节；`<span class="md-img-local">` 那个占位符从「本地图片一律是它」变成「**只有失败才落到它**」。⛔ **导出的 HTML 里仍然不显示**（`vela-img:` 在 Vela 外面是死链），链接在 GitHub / Typora / 任何别的渲染器里也照旧能用——那一串相对路径从来没变。理由与全文见 §3.5「M3-A-7 实施修正」1、3 与 §3.9「M7 全账」1；③ ✅ **M7 又往前推了一大步：粘贴的图可以顺手传到阿里云 OSS**（三格齐了才走云端；**本地那一份永远先落地**，传不上去也不作废这次粘贴，⚠️ **传上去了正文里写的是那个不带签名的云端 URL，而本地镜像留在 `assets/` 里不被引用**——那是 bucket 没了之后唯一的找回途径；密钥只进 macOS 钥匙串且**任何命令都读不回来**；预览里那一张云端图用的是 **15 分钟**的临时签名地址，🔴 **签名只住 DOM**——不进正文、不进剪贴板、不进大图底部那一行）。⛔ **四件刻意没做**：拖拽插图、文件选择器插图、公读域名、上传进度条与取消。详见 §3.9「M7 全账」5～10、16；④ 🔴 **而 M3-A-7 交付的那一半在 2026-11-02 第一次真机验证时没通过**：⌘V 一张截图**完全静默**（没有链接、没有 `assets/`、也没有一句提示），因为 WKWebView 没把这张图交成 `File`，钩子回了 `false`、CM6 的默认粘贴又插不进任何字节——正是「M3-A-7 实施修正」5 事先写下的那种失败方式。已加诊断 + `navigator.clipboard.read()` 兜底（⚠️ **兜底本身仍未在真机上证实**），见 §3.9「M7 全账」18 与「M3-A-7 实施修正」12① |
 | 链接补全 | 输入 `](` 时补全项目内相对路径文件 → ✅ **M3-A-6 已补做（2026-10-20）**，走的是 M2-E 那个文件索引（`query_project`）而不是 `wordSource`——🔴 **零 Rust 改动、零新命令、零新索引**。插进正文的是**按当前文档重算过的相对目标**（`docs/a.md` 链到根上的 `README.md` 得到 `../README.md`），不是索引里的项目根相对路径。⚠️ 三条改口：① 候选是**全项目模糊**匹配（用户在方案 A/B 里选的 A），⛔ 不是「当前目录优先」；② 用户打的 `./` `../` 前缀**不进 needle**（索引里永远不会有 `..`，而 `](../img/` 是最常见起手式）；③ 与 §1.5 的词补全**并存不互斥**，浮层里会同时出现路径与文档词。理由与全文见 §3.5「M3-A-6 补做 实施修正」 |
 | 统计 | 字数、字符数、阅读时长（中文按字符计，英文按词计）→ ✅ **M3-A-6 已交付，但形态是一条命令**（`editor.wordCount`，`Mod+Shift+C`，结果落在提示条上），⛔ **不是状态栏的一格**。理由是成本而不是位置：`syncMetrics` 在每一个事务上跑（包括只动了光标的），而字数是一次全文扫描。取舍全文见 §3.5「M3-A-6 实施修正」1 |
-| 导出 HTML | 内联样式单文件导出 → ✅ **M3-A-6 已交付**（`file.exportHtml`，`Mod+Shift+E`）。**内联的是样式，不是字体**：⛔ 用系统字体栈，**不嵌霞鹜文楷**——OFL 的保留字体名那笔账还没结（§3.3「M1-G 实施修正」留给用户的那条），而一个导出功能不该悄悄替它结账。详见 §3.5「M3-A-6 实施修正」3 |
+| 导出 HTML | 内联样式单文件导出 → ✅ **M3-A-6 已交付**（`file.exportHtml`，`Mod+Shift+E`）。**内联的是样式，不是字体**：⛔ 用系统字体栈，**不嵌霞鹜文楷**——OFL 的保留字体名那笔账还没结（§3.3「M1-G 实施修正」留给用户的那条），而一个导出功能不该悄悄替它结账。✅ **M7-15 起同一份渲染结果还能导出 PDF**（`file.exportPdf`，`Mod+Alt+E`）：走 macOS 系统打印面板，不走 `window.print()`（WKWebView 里是空操作），详见 §3.19 |
 
 代码块内子语言高亮通过 `@codemirror/language-data` 懒加载。
 
@@ -2009,7 +2009,7 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 >    - ⚠️ **用户看得见的文案全部住在 Rust 侧**（错误码 → 中文），前端只负责把那一串显示出来。所以改文案要重编，热重载不管用。
 >    - ⚠️ **`pub mod secrets;` 是刻意的**：改回私有实测过门禁是干净的，但 ubuntu 上 clippy `-D warnings` 会揪出「有一个变体从来没被构造过」。这一条记在 `lib.rs` 的文件头。
 > 7. **M7-5：配置文件那四格——「忽略项目层」在这里是另一条更硬的理由。**
->    - 四个键 `ossBucket` / `ossRegion` / `ossAccessKeyId` / `ossPrefix` 只认**用户全局那一份** `~/.vela/settings.json`（⛔ **不是** `<root>/.vela/settings.json`）。于是配置总键数从六个偏好键变成**十个**，而 v1 的项目层仍然是「**接好线但空转**」——十个键全在仅全局那一类里，它要等第一个 project-safe 键进来才真的有东西可配。
+>    - 四个键 `ossBucket` / `ossRegion` / `ossAccessKeyId` / `ossPrefix` 只认**用户全局那一份** `~/.vela/settings.json`（⛔ **不是** `<root>/.vela/settings.json`）。于是配置总键数从六个偏好键变成**十个**（🔴 **§3.13 之后是十一个**：+`markdownToolbar`），而 v1 的项目层仍然是「**接好线但空转**」——十个键全在仅全局那一类里，它要等第一个 project-safe 键进来才真的有东西可配。
 >    - 🔴 **项目层被忽略，但理由与那六个偏好键不同、而且更硬**。偏好键的理由是「一个克隆来的仓库不该突然改掉你的字号」；这四格的理由是**仓库若能改它们，就能把你粘贴的图改道到别人的 bucket**，而签名在 Rust 侧算、`Authorization` 里带着我们的 AccessKey ID，**改道至少泄露一次派生签名**。⛔ 别把这两条理由合并成一句「项目层不生效」；记账则共用同一个 `SettingsReport::ignored_project_keys`。
 >    - ⚠️ **store 只是过路**：`save_settings` 会重写整个文件，所以这四格必须原样带上，否则一次「改字号」就把 OSS 配置抹掉了。
 >    - ⚠️ **只 `trim()`，不做任何校验**：填错的 bucket 要等到真上传一次才知道，而那一刻服务端会给一句中文文案（第 5 条）。
@@ -2094,7 +2094,231 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 
 **真机未验**：要用户 `sh restart.sh` 之后在**同一个目录**再存一次，看标签上的未保存标记是否灭掉——我看不到屏幕，能给的证据只到「Rust 侧 8.5 ms 返回」这一层。
 
+---
 
+### 3.11 增强 · 2026-11-02：预览分栏可拖 + 工具栏「预览 / 编辑」
+
+**需求**（用户原话）：「当预览文件、分屏时，中间这条线我需要能左右拖动，改变左屏或右屏的空间大小，但是要设置安全距离，不能缩小的太小。」「在 markdown 工具栏上增加一个按钮：预览/编辑，编辑就是可以左边编辑，右边预览，预览就是只展示预览内容。隐藏编辑器内容。」
+
+**现状核对（先查再写）**：第二件事**大半已经存在**——`PreviewMode` 本来就是三档 `off / side / only`，`Cmd+Shift+V` 循环，`only` 靠 `.body.preview-only { display: none }` 藏编辑器（`md/previewMode.ts` 文件头写了为什么是藏不是卸载）。缺的只是**一个看得见的入口**。第一件事（拖拽）完全没有。
+
+**做法**：
+
+1. **`md/PreviewResize.tsx`**（新）——与 `project/SidebarResize.tsx` 同一套手势与生命周期：window 上的 `pointermove/up/cancel`（不用 pointer capture，松手永远收得到）、`::after` 两侧各扩 3px 当命中区、拖到一半组件卸载时 `onCleanup` 摘监听。纯函数 `clampPreviewWidth(desired, total)`：
+   - 下限 `PREVIEW_MIN_WIDTH = 240`（再窄正文不可读：表格/代码块/图片全部横向挤成一条），上限 `total - EDITOR_MIN_WIDTH`（`EDITOR_MIN_WIDTH = 320`，编辑区不会被压到写不了）；
+   - 窗口窄到连两个下限都放不下时 `total < 240 + 320` 直接回**等分**——那种宽度下没有正确答案，平分是唯一说得过去的；
+   - 返回值一律取整，免得每次拖动起点带半个像素的抖动。
+2. **「安全距离」的第二道闸写进 CSS**：拖过之后 `.body-row` 挂 `preview-resized` 与 `--preview-width`，`.md-preview` 改成 `flex: 0 1 var(--preview-width)` + `min-width: min(240px, 40%)`，`.body` 补 `min-width: min(320px, 55%)`。窗口缩小时**浏览器**先把预览压回下限、再守编辑区；`min(…px, …%)` 保证极窄窗口里两栏加起来不超过容器（纯 px 会横向溢出被裁）。⛔ 所以 App **不**像 `sidebarWidth` 那样在 window resize 里重夹——存的始终是「用户选的那一份」。
+3. **起点优先量 DOM**：窗口缩过之后存着的 900px 与画出来的 600px 不是一回事，从旧值起拖会让分隔线在第一次 move 时跳一下。按下那一拍先量 `nextElementSibling` 的 `getBoundingClientRect().width`，量不到（jsdom / 结构变了）才退回信号值或等分。
+4. **`previewWidth: number | null`**（App）：`null` = 从没拖过，两栏等分；双击、`Home`、`Enter` 都回 `null`（拖坏了很难瞄准正中间，给一条一步到位的退路）；`←/→` 每次 24px、`Shift` 4 倍。分隔线是 `role="separator"` + `tabIndex=0`，有 `aria-valuenow/min/max`。
+5. **工具栏**：右端加一个「预览 / 编辑」按钮（文案说**点下去会到哪儿**），`side/off → only`、`only → side`；文档没有预览可看（`.ts`、只读分片）时禁用并写明原因；`only` 里**全部格式按钮禁用**（它们会改一块看不见的 buffer）。不新增命令 id、不动 `menu.rs`——它只是 `view.toggle_preview` 已有形态的第二个入口，所以 `builtins.test.ts` 那份硬编码清单无需同步。
+6. **只在真并排时挂把手**（`previewSideBySide = previewMode() !== 'off' && !editorHidden()`）：`only` 档里 `.body` 是 `display: none`，没有可拖的两侧；而 `only` 在没有预览的文档上会降级成并排，那一档仍然可拖。`only` 档里固定宽度也必须让位，否则预览吃完自己那份、右边空出一条「分隔线底色」。
+
+**刻意没做**：预览宽度不进会话存档（与 `previewMode` 同一条理由：它是给这一次阅读配的尺寸）；不在原生菜单里加第二项（View 菜单已有「切换预览」，三档循环已经够用）；不做拖拽过程中的实时宽度提示气泡。
+
+**数字**：前端 **3359 → 3383**（**104 → 106 files**；新增 `md/PreviewResize.test.tsx` 15 条、`md/MarkdownToolbar.test.tsx` 7 条，`App.test.tsx` **222 → 224** 两条接线用例；既有 `.body-row` 孩子清单断言两处补上了分隔线），Rust **一个文件都没动**（571 passed / 1 ignored **未重跑**）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净。⛔ Tauri 命令、菜单项、快捷键、事件名全部 **+0**。首屏 296.33 → **297.60KB**（entry `index-CMWPKMHQ.js` **188.17** + modulepreload `dist-CvermxKb.js` **101.77** + CSS `index-CgI9tJHL.css` **7.66**），余量 **2.40KB / 0.80%**；⚠️ modulepreload 一个字节没动（没有新的懒加载边界），涨的 1.27KB 全在 entry（+1.13）与 CSS（+0.14）里。
+
+**真机未验（交用户目视）**：拖拽手感、把手悬停变色、240 / 320 这两个数是否合口味、工具栏按钮的配色与位置。jsdom 不算布局，CSS 的三段 flex 规则我只做了单测层面的接线验证（`--preview-width: 612px` 之类的值），**摆出来的实际比例没有一帧证据**。
+
+---
+
+### 3.12 调整 · 2026-11-02：Markdown 工具栏改为默认显示
+
+**需求**（用户原话）：「markdown工具栏我需要默认显示，然后用户可以关闭」
+
+**做法**：`mdToolbarVisible` 初值 `false → true`。关闭仍是那两条既有入口——工具栏自己的 `×` 与「视图 › Markdown 工具栏」，改的是同一个 signal。~~不进会话存档：与 `sidebarVisible` / `previewMode` / `outlineVisible` / `jsonPreviewVisible` 以及 `lineWrap` / `minimap` 一致，重启回到默认开。~~ 🔴 **这条已被 §3.13 推翻**：用户随后要求「把关闭状态落盘持久化」，现在它走 `~/.vela/settings.json` 的 `markdownToolbar`，关掉之后重启仍是关的；其余几个视图开关仍不落盘。
+
+布局上 `.app` 的默认孩子从三格变四格（`md-toolbar` 在最前）。四格本来就都显式钉了行列号，`<Show>` 关掉时只是第一行 `auto` 塌成 0，不会把 `1fr` 挤错——§3.11 之前就是照这条设计的，本轮只是让默认态真的用上它。
+
+**刻意没做**：
+
+- **不按文档语言自动显隐**（`.ts` 里也照常显示这排格式按钮）。`view.toggle_md_toolbar` 是菜单命令，若按语言挂 `when`，非 Markdown 文档上点菜单会「什么也不发生」——与 `togglePreview` 同一条死入口问题（`builtins.ts` 里写着理由）。工具栏右端那个「预览 / 编辑」按钮已经用 `previewAvailable` 禁用并写明原因；格式按钮往非 Markdown 的 buffer 插 Markdown 记号是**本轮之前就有的行为**（手动打开时一样），不是这次引入的。
+- ~~**不持久化「关掉」这一态**：没有独立的视图偏好存档位，只为此加一个配置键与一套跨重启语义，收益不抵成本；真要记住，应该和侧边栏/大纲/预览一起做一轮「视图偏好落盘」，而不是单给工具栏开一个口子。~~ 🔴 **用户点名要这一态落盘，已按用户选择改做**，做法与取舍见 §3.13。
+
+**数字**：前端 **3383 → 3384**（106 files 不变，`App.test.tsx` **224 → 225**：新增「默认就在、× 关掉、菜单能再打开」一条；四条 `.app` 孩子清单补 `md-toolbar`——无侧栏、有侧栏、预览面板、大纲面板，另加命令面板那条；两条原本靠菜单打开工具栏的用例改成直接用默认打开的它）。Rust 零改动、未重跑。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净。首屏 **297.60KB 不变**（entry 只换哈希：`index-CMWPKMHQ.js → index-BtCrFDX2.js`，仍 **188.17** + modulepreload **101.77** + CSS **7.66**），余量 **2.40KB / 0.80%**。
+
+**真机未验（交用户目视）**：工具栏常驻之后编辑区少掉的那一行垂直空间、以及它在空白新文档上的观感（是不是「一打开就一排版按钮」）。
+
+---
+
+### 3.13 调整 · 2026-11-02：Markdown 工具栏的关闭状态落盘
+
+**需求**（用户原话）：「把关闭状态落盘持久化」
+
+**做法**：复用已有的分层配置（M4-A），不新开存档位。`~/.vela/settings.json` 新增第十一个键 `markdownToolbar`（布尔，内置默认 `true`），内置默认 + 用户全局两层生效，**项目层不认**——`<root>/.vela/settings.json` 里写了也只进 `ignoredProjectKeys`（与其余偏好键同一条规则，`resolve()` 里显式记账）。工具栏自己的 `×` 与「视图 › Markdown 工具栏」都改走 `settings.setMdToolbarVisible()`，即 `signal 赋值 + persist()`，与 `theme` / `fontSize` 同一条写穿队列：JSON 指纹相同就跳过写盘，连续点两下同向不会产生两次原子写。
+
+**接线**：`src/App.tsx` 删掉本地 `mdToolbarVisible` signal，改用 `settings.mdToolbarVisible()` / `settings.setMdToolbarVisible()`；`src/settings/store.ts` 加 `DEFAULT_MARKDOWN_TOOLBAR = true`、signal、`currentSettings().markdownToolbar`、`load()` 里的回复（**只赋值、不写盘**，启动不产生多余保存）；`src/ipc/settings.ts` 的 `Settings` 末尾加字段；Rust 侧 `Settings` / `SettingsLayer` / `Default` / `resolve()` 各加一处。字段一律**追加在末尾**，线上 JSON 的键序保持 append-only（前后端各有 goldens 钉着完整字面量）。
+
+**取舍**：
+
+- **为什么不进 `session.json`**：会话存档的语义是「窗口关掉时打开着什么」（标签、分屏、活动文件），清会话就该回到干净状态；而「工具栏关着」是用户对界面的长期偏好，和字号、主题同类。放进 settings 还顺带白拿原子写、写穿队列、指纹跳过、损坏降级这一整套。
+- **启动会有一帧「先开后关」**：初值是内置默认 `true`，读盘回来才知道是 `false`，于是能看到工具栏闪一下再收起。与字号/主题的「默认值→换值」同一类，可接受；不做 loading 遮罩去等配置——首屏多等一次磁盘往返更差。
+- **其余视图开关仍不落盘**：`sidebarVisible` / `previewMode` / `outlineVisible` / `jsonPreviewVisible` / `lineWrap` / `minimap` 维持原样，本轮只按用户点名的那一个键开的口子。
+
+**数字**：前端 **3384 → 3389**（106 files 不变；`App.test.tsx` **225 → 226**：新增「盘上记着关着 → 重启就是关的 → 菜单打开写回 true」一条，另把「默认就在 / × 关掉落盘 / 菜单打开写回」那条改成断言 `settingsCmd.saved` 的 payload；`store.test.ts` 新增 describe 4 条；`settings.test.ts` 与 `SettingsDialog.test.tsx` 的夹具与 golden 补键），Rust **571 → 575 passed / 1 ignored**（settings 模块 +3、wire_contract 的既有断言补 `markdownToolbar` 并新增默认值钉死）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净、clippy `-D warnings` 干净。首屏 gzip **297.60 → 297.67KB**（entry `index-BtCrFDX2.js → index-xdiaeIhl.js` **188.17 → 188.24**；modulepreload `dist-CvermxKb.js` 101.77 与 CSS `index-CgI9tJHL.css` 7.66 逐字未动），记账线 300KB 余量 **2.33KB / 0.78%**。
+
+**真机未验（交用户目视）**：关掉工具栏 → 重启（含 `sh restart.sh` 与装好的 `.app`）之后它确实还是关的；以及启动那一下的一帧闪烁能不能被眼睛抓到。
+
+---
+
+### 3.14 调整 · 2026-11-02：两个代码按钮的图标分开
+
+**需求**（用户原话）：「markdown工具栏中，这两个代码的不太正确……是不是应该有一个是注解？」
+
+**核实结论**：两个按钮本身没有坏——左 `</>` 是**行内代码**（插 `` `代码` ``），右 `{ }` 是**代码块**（插三反引号围栏），这是 Obsidian 等工具的标准一对，不是重复功能。问题出在**图标区分度**：32px 按钮里 `</>` 与 `{ }` 都读成「代码」。而「给文字加标注」这件事工具栏里已经有 `❝` **引用**（`> `）；GitHub 那种 `> [!NOTE]` 提示卡渲染器目前不认（会原样显示 `[!NOTE]` 文本），那是另一个功能，本轮没做。
+
+**做法**（用户选「只改图标区分」，不动渲染）：`code-block` 图标 `{ }` → ` ``` `（Markdown 自己的围栏记号，与 `</>` 的尖括号轮廓明显不同）；两个 tooltip 补上语法示意——「行内代码（\`代码\`）」「代码块（\`\`\` 围栏，可多行）」。动作代码一行没改。
+
+**数字**：前端 **3389 → 3390**（106 files；`MarkdownToolbar.test.tsx` **7 → 8**：新增一条钉住两个按钮的图标与 tooltip，防止再退回「两个都像代码」）。Rust 零改动、未重跑（仍 575 / 1 ignored）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净。首屏 gzip **297.67 → 297.71KB**（entry `index-xdiaeIhl.js → index-Brq60BBj.js`，**188.24 → 188.28**；modulepreload 101.77 与 CSS 7.66 逐字未动），余量 **2.29KB / 0.76%**。
+
+**真机未验（交用户目视）**：三反引号图标在 32px 按钮里的实际观感（会不会太小/太歪），以及 `</>` 与 ` ``` ` 挨着看是否真的一眼可分。
+
+---
+
+### 3.15 修正 · 2026-11-02：编辑时预览一直在闪
+
+**需求**（用户原话）：「在编辑markdown时，开着预览页面，预览一直在闪动，有办法优化吗？」
+
+**根因**：`MarkdownPreview.render()` 每次（防抖 150ms 之后）都把整块 `bodyEl.innerHTML = html` 重写一遍。它不只是「浪费一次 diff」：预览里的**每一个节点**都变成新节点，于是一篇带本地图片的笔记里，每一张 `<img>` 每敲几个字就重新走一遍 `vela-img://` 读取与解码（`loading="lazy"` 的新元素会先空着再出现），整块面板跟着重排；用户在预览里选中的文字也每次被清掉。云端图片有签名缓存护着，但节点照样重建。
+
+**做法**：`render()` 改成调用 `patchBody(html, reuse)`——用 `<template>` 解析出新节点，按**顶层块**做前缀/后缀对齐，只把中间真的变了的那几块换掉，两头的节点原地不动（先插入、后删除，中间不会出现空帧）。配套两处状态：
+
+- `renderedKeys`：上一次每个顶层节点的**源 HTML**（`render.ts` 的输出，而不是被 `rewriteLocalImages` 改过的 DOM）——拿 DOM 去比的话下一次一个键都对不上，等于没做；
+- `renderedPath`：上一次用的文档路径。**换文档时整块重建**，理由见下。
+
+**取舍**：
+
+- **不做 LCS / 全局匹配**：变化来自光标处的一次编辑，前缀/后缀已经能留住绝大部分节点；更复杂的匹配换不到用户看得见的差别。
+- **换文档不许复用**：本地图片的 `src` 里带着文档绝对路径（`vela-img://…?doc=…`），两份内容相同的文档会命中每一块键，复用就会让新文档里显示上一份的图。顺带补上了一个旧洞：原来只看 `html` 是否相同，两份同内容文档互切时连 `rewriteLocalImages` 都不跑。
+- **安全边界一个字没动**：进 DOM 的仍然只有 `./render.ts` 的输出，`patchBody` 只是把「整块替换」换成「分块替换」。
+- `markZoomableImages` 的幂等性因此成了必要前提：被复用的节点源 HTML 一样，`zoomOf` 的答案不会变，所以旧标记留着是对的（注释已同步）。
+
+**数字**：前端 **3390 → 3393**（106 files；`MarkdownPreview.test.tsx` **73 → 76**：新增三条——文末追加时图片节点身份不变、改中间段时两头节点不动、两份同内容文档互切时图片换成本文档地址）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净。首屏 gzip **297.71KB 不变**（Markdown 预览在懒加载块里；entry `index-Brq60BBj.js → index-BCvY2V72.js` 仍 188.28，modulepreload 101.77 与 CSS 7.66 逐字未动），余量 **2.29KB / 0.76%**。
+
+**真机未验（交用户目视）**：真实 WKWebView 里「闪」到底降到什么程度——jsdom 只能钉住节点身份，钉不住排版与解码；以及重画时预览里选中的文字是否真的还在。
+
+---
+
+### 3.16 新增 · 2026-11-02：自动存盘
+
+**需求**（用户原话）：「可以增加自动存盘的功能，得保证我们数据不丢失。不过，我应该会习惯性的手动保存。」
+
+**做法**：
+
+- 新增 `src/doc/autoSave.ts`：订阅 `ws.revision()`，停手 **1500ms** 之后把**该落盘的**文档写回原路径。写盘走一条串行尾巴（任意时刻最多一个自动写盘在飞），`onCleanup` 时取消还没跑的那一次。
+- `document.ts` 新增 `edits` 计数（`Accessor<number>`）：只在 `markChanged()` 里、`replacing` 闸之后 +1。它回答的是「这次脏是不是用户自己弄的」，打开 / 静默重载 / 恢复草稿都不算。
+- `fileWatch` 新增 `hasConflict(tabId)`；App 里 `createAutoSave({ workspace: ws, blocked: (id) => fileWatch.hasConflict(id) })`，与 `fileWatch` 同层、同在组件体内建。
+
+**只自动写五类之外的文档**（其余一律让路）：
+
+| 不写的情况 | 理由 |
+|---|---|
+| 未命名（`path === null`） | `save()` 走另存为，会弹原生对话框——定时器不能弹窗；会话存档照收草稿 |
+| 只读分片 | `save` 本来就拒，正文也不在内存里 |
+| 有损解码（`lossy`） | 原样写回就是拿 U+FFFD 覆盖原文件，那是**数据损坏**；手动 ⌘S 时 Vela 会先说一句 |
+| 冲突队列里还排着（`hasConflict`） | 写下去等于替用户在「覆盖磁盘上那份」上按了确认 |
+| `edits() === 0` | 启动恢复出来的草稿按定义就是脏的，但可能已经比磁盘旧；用户真敲第一个字之后才归自动存盘管 |
+| `busy()`（暂时让路，不是不写） | 手动保存 / 打开 / 重载正在飞；这一轮跳过并**重新排期**，落定之后补存 |
+
+**顺带堵上的一个旧洞**：`writeTo` 原来在 `await saveFile(...)` 之后无条件 `setDirty(false)` + `clearChangeMarks()`。写盘期间用户又敲的字落在磁盘上的是**旧**字节，却被一次成功保存标成「已保存」，自动存盘此后也不会再来碰它——这是引入自动存盘之后最容易丢数据的一条缝。现在拿写盘前的 `edits` 与 `format` 快照对一下，变过就保留脏标记与 gutter。
+
+**取舍**：
+
+- **`edits` 而不是 `dirty` 作为闸门**：见上表；这是「自动存盘会不会拿旧草稿盖掉磁盘」的唯一边界。
+- **残留竞态**：`fileWatch` 的事件有 250ms 防抖，而自动存盘在停手 1.5s 后写。别人恰好在这一轮触发前 250ms 内改文件的话，那一次仍会被覆盖。再往下压就要把两个防抖合成一个状态机，代价与收益不成比例：会话存档里还留着一份。
+- **与 `sessionSync` 互补**：那一条管「进程没了还能捡回来」（5s 草稿），这一条管「文件本身就是最新的」。
+- 冲突里用户选了「保留我的改动」之后，再编辑会重新进入自动存盘范围——与手动 ⌘S 的语义一致。
+
+**数字**：前端 **3393 → 3404**（**106 → 107 files**；新增 `autoSave.test.ts` 7 条，`document.test.ts` +3：edits 口径、写盘期间敲字、写盘期间改格式，`fileWatch.test.ts` +1：`hasConflict` 随答复出队）。typecheck 干净、eslint **0 error + 8 warning 不变**（新文件 0 warning）、prettier 干净。首屏 gzip **297.71 → 297.96KB**（entry `index-BCvY2V72.js → index-BRalYEB8.js` 188.28 → **188.53**，modulepreload 101.77 与 CSS 7.66 未动），余量 **2.04KB / 0.68%**。
+
+**真机未验**：真实 WKWebView 里「停手 1.5s 就写盘」的手感（尤其大文档的原子写耗时）、与文件冲突对话框的现场交错。
+
+---
+
+### 3.17 新增 · 2026-11-02：表格编辑（跳格 / 加行 / 插删行列）
+
+**需求**：用户确认「建议加的功能，我听从你的建议可以添加」中的表格编辑一项。原先把表格当纯文本敲，改一列要逐行对齐竖线。
+
+**做法**：
+
+- 新增 `src/md/tableEdit.ts`：每个动作都是 `(EditorState, pos) => TransactionSpec | null`，只算「改哪几个字」，派发留给键位层与菜单。几何与 `./table` 共用 `rowParts`——竖线在哪儿、哪段算空格子必须同源，否则对齐结果和 Tab 落点会对不上。
+- `setup.ts` 的 markdown 分支挂 `tableEditKeymap`；`App.tsx` 的正文右键菜单在点击处有表时多出四项：在下方插入行 / 删除行 / 在右侧插入列 / 删除列。
+
+**按键语义**：
+
+| 按键 | 行为 |
+|---|---|
+| `Tab` / `Shift-Tab` | 按视觉顺序跳格（表头 → 各行，跳过分隔行）；最后一格往右补一行、第一格往左绕回最后一格。有内容整格选中，空格子落进段内第一个位置 |
+| `Enter` | 当前行下面加一行；表头/分隔行上则落在第一条数据行之前。最后一行整行空着时按 Enter = 清空该行并离开表格 |
+| `Shift-Enter` | 不接管，落回默认行为 |
+
+**取舍**：
+
+- **`Prec.highest`**：`markdown()` 自带的 Enter（继续列表/引用）是 `Prec.high`，同档时先注册者先拿到按键；不高一档就永远轮不到表格。
+- **有选区也接管 Enter**：Tab 跳格后整格是选中的，默认 Enter 只会往单元格里塞换行、把表拆坏，没有一种是用户想要的。
+- **分隔行是叶子节点**：Lezer 顶层 `TableDelimiter` 没有内部子节点，`rowParts` 只能得到一整段，所以分隔行自己按 `|` 切（过滤规则与 `parseAlignments` 逐条对齐）。
+- **列数取自分隔行**：GFM 的列数就是它。插列贴着右侧竖线下刀，行尾没有外侧竖线时新格自带收尾竖线；删列保留后一根竖线当新分隔，行里只剩一格时只清内容（连竖线删会把整行变成空行）。
+- **删行只认数据行**：表头与分隔行删掉表就不成立，菜单里那两项灰掉。
+- **引用/缩进里的表格**：行首 `> ` 不在行节点范围里，插行时从当前行切出前缀拼到新行，否则表在新行处断成两块。
+
+**数字**：前端 **3404 → 3430**（**107 → 108 files**；新增 `tableEdit.test.ts` 23 条，`App.test.tsx` +3：菜单项与灰态、插行、删列）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净。首屏 gzip **297.96 → 299.46KB**（entry `index-BRalYEB8.js → index-D6DAgmIq.js` 188.53 → **190.03**，modulepreload 101.77 与 CSS 7.66 未动）。300KB 记账线余量 **0.54KB / 0.18%**——`tableEdit.ts` 走 `editor/setup.ts` 静态进首屏，这是它第一次吃掉余量；体积门禁仍未建（M4-K 口径）。
+
+**真机未验**：真实 WKWebView 里 Tab 跳格与 Enter 加行的连贯手感、右键菜单在大表格上的定位（jsdom 用 `posAtCoords` 桩钉住点击位置，钉不住真实排版）。
+
+---
+
+### 3.18 新增 · 2026-11-02：脚注 `[^1]`
+
+**需求**：用户确认「建议加的功能，我听从你的建议可以添加」中的脚注一项。
+
+**做法**：
+
+- 定义从**源文本**上扫：`render.ts` 的 `extractFootnotes` 逐行认 `[^标签]: 正文`，续行按缩进 4 格/一个制表符收进正文，空行只有后面还跟着缩进行时才算正文里的空行；同标签第一份生效。
+- 引用：`[^标签]` 在树里是一个**没有目标的 `Link`**，`link()` 在走引用式链接之前先认它，编号按**正文里第一次引用**的顺序发（不是定义顺序）。
+- 文末追加 `<section class="md-footnotes">`：`hr` + `ol`，每条一个 `li#fn-N`，带 `↩` 回跳第一次引用（`#fnref-N`）。
+- 脚注正文用**同一个** `markdownLanguage.parser` 当独立文档再渲染一遍（粗体、链接、列表、代码块都照常），坐标是正文自己那一套；编号与主文档共用一份状态，脚注之间互相引用不会错位。
+- 预览与导出各补一段 `.md-fn-ref` / `.md-footnotes` 样式。
+
+**取舍**：
+
+- **不从语法树上认定义**：Lezer 把 `[^1]: 脚注内容` 当成 `LinkReference`（目标就是「脚注内容」这个词）；定义里一旦有空格（`[^1]: 这是 一段 定义`）连 `LinkReference` 都不是，只是一段普通 `Paragraph`。按树认只能认出最没用的那一种。
+- **定义必须起一个块**：开头、空行之后、或紧跟在上一条定义后面。写在段落中间那一行按 CommonMark 属于段落，不当定义。
+- **围栏代码里的 `[^1]: …` 不认**：行扫描自带围栏状态机，示例代码不会被吞掉。
+- **只列被引用到的脚注**：没引用的定义在预览里一个字都不出现（与 GitHub 一致）。
+- **编号与锚点 id 只用数字**：用户写的标签不进 `id`，不用为转义再开一条路；正文 HTML 仍然逐段过 `escapeHtml`。
+- **嵌套渲染不收集定义、不发新编号、不追加文末节**：脚注正文里再写一条没人引用过的脚注定义，只会按字面量显示，不会把文末那一节越写越长。
+- **没有工具栏按钮**：脚注要同时落「正文引用 + 文末定义」两处，不是一个 `insertAround` 能表达的动作；先按语法支持做，入口等真有批量需求再加。
+
+**数字**：前端 **3430 → 3442**（108 files；`render.test.ts` **137 → 148**：11 条脚注用例 + 1 条敌意输入），typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净。首屏 gzip **299.46 → 299.53KB**（entry 190.03 → **190.05**，modulepreload 101.77 未动，CSS 7.66 → **7.71**）。300KB 记账线余量 **0.47KB / 0.16%**。
+
+**真机未验**：真实 WKWebView 里点脚注编号跳到文末、点 `↩` 跳回正文的滚动行为（预览自己也有滚动同步，两套滚动叠在一起的手感 jsdom 测不到）。
+
+---
+
+### 3.19 新增 · 2026-11-02：导出 PDF（走系统打印面板）
+
+**需求**：用户确认「建议加的功能，我听从你的建议可以添加」中的导出 PDF 一项。
+
+**为什么是打印面板，而不是直接生成 PDF**：macOS 上页面里的 `window.print()` 在 WKWebView 里是**静默空操作**——它不像 Safari 自带浏览器外壳，没有人接这个调用；wry 的 `WebviewWindow::print()` 才是可靠出口（原生 `printOperationWithPrintInfo`），它打开的就是系统打印面板，面板左下角「PDF ▾ → 存储为 PDF」就是 PDF 出口。直接调 `WKWebView.createPDFWithConfiguration` 也能做，但要写一大块 unsafe 原生代码、再开一个隐藏窗口把正文喂给它，且整条路在 jsdom / CI 里没有可测性——收益只是省一次面板点击，代价与风险不成比例，**本轮不做**。
+
+**做法**：
+
+- 新增 `src/md/print.ts`：把 `previewHtml()` 渲染好的正文挂成 `<main class="md-doc" id="vela-print-root" aria-hidden="true">`，并给 `<html>` 打 `data-print-snapshot`；同一份 `EXPORT_STYLE` 塞进 `media="print"` 的 `<style>`。屏幕上 `display: none`，只有打印媒体里可见（规则在 `styles.css` 末尾）。
+- 新增 `src/ipc/print.ts` + `src-tauri/src/print.rs`：命令 `print_window` **不带参数**——正文已经在主窗口 DOM 里，再经 IPC 送一遍只会多出一份要审的载荷。macOS 走 `window.print()`，其余平台回落到 `window.eval("window.print()")`。
+- `App.tsx` 抽出 `renderExportTarget('HTML' | 'PDF')`，HTML 与 PDF 共用那四种拒绝（没有编辑器 / 不是 Markdown / 解析没跑完 / 空文档），只是措辞里点名 PDF。`exportPdf()` 挂快照 → 临时把 `document.title` 换成源文件名 → `printWindow()` → `finally` 里还原标题；成功提示指向面板里的「PDF ▾」。
+- 命令 `file.exportPdf`（`Mod+Alt+E`，E = Export，与 `Mod+Shift+E` 同族不互吃）+ 原生菜单「文件 › 导出 PDF…」（`CmdOrCtrl+Alt+E`，`file.export_pdf` 路由到同一条命令）。
+
+**取舍**：
+
+- 🔴 **快照打印完不摘**：`print()` 返回的是「面板弹出来了」，wry 没有「打印完了」的回调，而面板是照着**活文档**排版的；立刻摘掉会让纸上的内容缺一截且没有任何报错。下一次导出整块替换；它留在屏幕上没有代价（`display: none` + `aria-hidden`）。
+- 🔴 **页边距只能由 CSS 给**：wry 的 `print()` 用默认 `PrintOptions`，四边都是 0，而 macOS 面板里没有直接输边距的框。`EXPORT_STYLE` 的打印段补了 `@page { margin: 18mm 16mm }`。
+- **全局布局要在打印媒体里解锁**：应用给 `html, body, #root` 设了 `height: 100%`、`body` 是 `overflow: hidden`，不覆盖的话原生打印只会出一页。打印媒体里改回 `height: auto` / `overflow: visible`，并把 `body > *:not(#vela-print-root)` 全部藏掉。
+- **安全边界一个字没动**：进 `innerHTML` 的仍然只有 `render.ts` 的输出，这一层不做第二遍白名单（与导出 HTML 同一条边界）；样式也共用同一段常量，纸面与网页不会漂成两套观感。
+- **分页只做最小约束**：标题 `break-after: avoid`、表格行与图片 `break-inside: avoid`；⛔ 不给整段 `pre` / `table` 加 `break-inside: avoid`，长代码或长表排不进一页时那会在前一页留下半页空白。
+
+**数字**：前端 **3442 → 3460**（**108 → 110 files**：新增 `md/print.test.ts` 6 条、`ipc/print.test.ts` 2 条；`commands/builtins.test.ts` +4；`App.test.tsx` +6：快照与命令、第二次替换不叠加、非 Markdown / 空文档拒绝、面板打不开、菜单路由）。Rust **575 passed / 1 ignored 不变**（新命令无单测，靠 `wire_contract` 之外的人工核对——命令名只在前端 mock 与 `lib.rs` 各写一份）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净、clippy `-D warnings` 干净。🔴 **Tauri 命令 31 → 32**（只加 `print_window`），managed state 与事件名不变，新增依赖 **0**。首屏 gzip **299.53 → 299.93KB**（entry `index-D6DAgmIq.js` → `index-aKRB7Aiw.js` **190.05 → 190.38**；modulepreload `dist-CvermxKb.js` **101.77 逐字未动**；CSS `index-*.css` 7.71 → **7.78**，打印快照那几条规则）。300KB 记账线余量 **0.07KB / 0.02%**——`print.ts` / `ipc/print.ts` 都走动态 import，没有进首屏；涨幅全部来自 `App.tsx` / `builtins.ts` 的接线与 `styles.css`。⛔ 体积门禁仍未建（M4-K 口径），且用户已明示暂时不管体积。
+
+**真机未验（交用户目视）**：① 真实 WKWebView 里 `print()` 弹出的面板能否正常预览中文与代码块；② 打印预览里是否只出现正文（应用界面、提示条、状态栏是否都让位）；③ 多页文档的分页是否正常、页边距 18mm / 16mm 的观感；④ 面板里「PDF ▾ → 存储为 PDF」落出来的 PDF 与预览是否一致；⑤ 打印任务名是否显示为源文件名。
 
 ---
 

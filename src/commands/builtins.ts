@@ -172,6 +172,18 @@ export interface BuiltinHooks {
    */
   exportHtml: () => void | Promise<void>
   /**
+   * 把聚焦那份 Markdown 交给系统打印面板（M7-15，`Mod+Alt+E`）。
+   *
+   * 名字是 `exportPdf` 而不是 `printDocument`：用户要的是**一份 PDF**，而系统面板只是
+   * 这条路上唯一可用的出口（macOS 的 WKWebView 里 `window.print()` 是空操作）。
+   * 面板里除了打印还能「存储为 PDF」，所以它同时覆盖了「打一张」与「发一份」两种意图。
+   *
+   * 与 `exportHtml` 共用同一批拒绝（不是 Markdown / 解析没跑完 / 文档是空的 /
+   * 这块分屏没有 CM6 实例），也同一条理由不设 `when`：那些话归宿主说。
+   * ⚠️ 它**不写盘**，所以没有「已导出到 …」那一声；成没成由系统面板自己回答
+   */
+  exportPdf: () => void | Promise<void>
+  /**
    * 展开窗口底部的全局搜索面板，并把焦点放进搜索词输入框（M2-C）。
    *
    * 与项目三条同一条道理：它作用于那个面板而不是 `ctx.editor`，
@@ -376,6 +388,23 @@ export function registerBuiltinCommands(registry: CommandRegistry, hooks: Builti
       keybinding: 'Mod+Shift+E',
       run: async () => {
         await hooks.exportHtml()
+      },
+    }),
+    // 导出 PDF（M7-15）。绑 Mod+Alt+E：E = Export，与上面那条同族。
+    //
+    // ⛔ 不用 `Mod+Shift+E` 的任何变体：`Mod+Shift+*` 那一排已经挤到 `Mod+Shift+R` 之外
+    // 不留空位了（见 `builtins.test.ts` 里那条「Mod+Shift+R 仍然空着」），而新增命令
+    // 优先 `Mod+Alt` 是本项目定下的规矩。⚠️ `Mod+Alt+E` 此前是空的。
+    //
+    // 实际动作是叫出系统打印面板（面板里可以「存储为 PDF」），理由与「为什么不是
+    // 页面里的 window.print()」写在 `src/md/print.ts` 与 `src-tauri/src/print.rs` 的文件头
+    registry.register({
+      id: 'file.exportPdf',
+      title: '导出 PDF…',
+      category: '文件',
+      keybinding: 'Mod+Alt+E',
+      run: async () => {
+        await hooks.exportPdf()
       },
     }),
 

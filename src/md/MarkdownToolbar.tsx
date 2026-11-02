@@ -3,15 +3,28 @@
  *
  * 提供常用的 Markdown 格式化操作，挂在编辑器上方。
  * 支持显示/隐藏，按钮根据当前选区智能启用/禁用。
+ *
+ * 右端另有一个「预览 / 编辑」开关：并排（左写右看）与只预览（藏掉编辑区）之间来回。
+ * 它就是 `Cmd+Shift+V` 那条三档循环的**前两档**，不新增命令、也不新增形态——
+ * 只是把「用户得先知道快捷键存在」的那个入口摆到看得见的地方。
+ * ⚠️ 阅读模式下格式按钮全部禁用：它们会改一块用户看不见的 buffer，
+ * 改了没反应（或者更糟，改错了地方）比按不动更难查。
  */
 
 import type { EditorController } from '../editor/controller'
+import type { PreviewMode } from './previewMode'
 
 export interface MarkdownToolbarProps {
   /** 当前编辑器实例 */
   editor: () => EditorController | null
   /** 点击关闭按钮时隐藏工具栏 */
   onToggle: () => void
+  /** 预览那一栏此刻的形态（`md/previewMode.ts` 的三档） */
+  previewMode: () => PreviewMode
+  /** 这份文档此刻有没有预览可看：`.ts`、只读大文件分片都没有 */
+  previewAvailable: () => boolean
+  /** 「预览 / 编辑」按钮的落点：并排 ↔ 只预览 */
+  onPreviewMode: (mode: PreviewMode) => void
 }
 
 /** 工具栏按钮定义 */
@@ -134,14 +147,14 @@ const BUTTONS: ToolbarButton[] = [
   },
   {
     id: 'code-inline',
-    title: '行内代码',
+    title: '行内代码（`代码`）',
     icon: '</>',
     action: (ed) => insertAround(ed, '`', '`', '代码'),
   },
   {
     id: 'code-block',
-    title: '代码块',
-    icon: '{ }',
+    title: '代码块（``` 围栏，可多行）',
+    icon: '```',
     action: (ed) => {
       const view = ed.view
       if (!view) return
@@ -221,6 +234,14 @@ const BUTTONS: ToolbarButton[] = [
 ]
 
 export function MarkdownToolbar(props: MarkdownToolbarProps) {
+  /** 此刻真的在「只预览」里：文档没有预览可看时那一档会降级成并排，不算 */
+  const previewOnly = () => props.previewMode() === 'only' && props.previewAvailable()
+
+  const modeTitle = () => {
+    if (!props.previewAvailable()) return '这个文件没有 Markdown 预览'
+    return previewOnly() ? '回到左编辑、右预览' : '只看预览（隐藏编辑区）'
+  }
+
   return (
     <div class="md-toolbar" role="toolbar" aria-label="Markdown 工具栏">
       <div class="md-toolbar-toggle">
@@ -232,8 +253,9 @@ export function MarkdownToolbar(props: MarkdownToolbarProps) {
         {BUTTONS.map((btn) => (
           <button
             class="md-toolbar-btn"
-            title={btn.title}
+            title={previewOnly() ? '预览模式下不能编辑，先切回「编辑」' : btn.title}
             aria-label={btn.title}
+            disabled={previewOnly()}
             onClick={() => {
               const ed = props.editor()
               if (ed) btn.action(ed)
@@ -243,6 +265,18 @@ export function MarkdownToolbar(props: MarkdownToolbarProps) {
           </button>
         ))}
       </div>
+      {/* 放在最右：它是「换整个视图形态」，和左边那一排「往正文里插东西」不是一类动作，
+          离得远一点不容易误点。文案说的是**点下去会到哪儿**（与菜单项的时态一致） */}
+      <button
+        class="md-toolbar-btn md-toolbar-mode"
+        title={modeTitle()}
+        aria-label={previewOnly() ? '编辑' : '预览'}
+        aria-pressed={previewOnly()}
+        disabled={!props.previewAvailable()}
+        onClick={() => props.onPreviewMode(previewOnly() ? 'side' : 'only')}
+      >
+        {previewOnly() ? '编辑' : '预览'}
+      </button>
     </div>
   )
 }

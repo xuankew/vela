@@ -59,6 +59,14 @@ export interface DocumentModel {
   readonly name: Accessor<string>
   readonly format: Accessor<FileFormat>
   readonly dirty: Accessor<boolean>
+  /**
+   * 用户真敲进正文的次数。单调递增，只涨不落；打开 / 静默重载 / 恢复草稿都不算。
+   *
+   * 自动存盘要回答的不是「脏不脏」，而是「这次脏是不是用户自己弄的」：启动时恢复出来的
+   * 草稿按定义就是脏的，照着 `dirty` 行事的话，自动存盘会拿一份可能已经过时的草稿
+   * 把磁盘上真正的版本盖掉。`edits` 是那个问题的答案，`dirty` 不是
+   */
+  readonly edits: Accessor<number>
   readonly busy: Accessor<boolean>
   /**
    * 解码时有字节无法映射，正文里已含替换字符 U+FFFD。
@@ -183,6 +191,7 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
   const [path, setPath] = createSignal<string | null>(null)
   const [format, setFormat] = createSignal<FileFormat>(DEFAULT_FORMAT)
   const [dirty, setDirty] = createSignal(false)
+  const [edits, setEdits] = createSignal(0)
   const [busy, setBusy] = createSignal(false)
   const [lossy, setLossy] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice | null>(null)
@@ -208,6 +217,9 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
 
   function markChanged() {
     if (replacing) return
+    // 自动存盘的判据（见接口上的 `edits`）。放在 `replacing` 那道闸之后：从后端灌进来的
+    // 正文不是用户敲的，恢复草稿尤其不能被记成一次编辑
+    setEdits((n) => n + 1)
     // 脏标记只增不减：撤销回到已保存状态时它仍然是脏的。
     // 这是有意的取舍——反向的错误（明明有改动却显示干净）会让人丢数据，
     // 而这一侧的错误只是多一次无意义的保存。要精确就得每次按键比对全文，不值当。
@@ -425,15 +437,22 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
   async function writeTo(target: string) {
     setBusy(true)
     try {
-      const report = await saveFile(target, host.getText(), format())
+      const editsBefore = edits()
+      const formatBefore = format()
+      const report = await saveFile(target, host.getText(), formatBefore)
       setPath(target)
       // 另存为会把无名文档（默认当 Markdown）换成别的扩展名，语言得跟着走。
       // 保存不重建 state，所以这里只能靠槽位 reconfigure
       host.pathChanged()
-      setDirty(false)
-      // 正文这一刻与磁盘一致了：清掉 gutter 累积的「未保存改动」标记。
-      // 只有存盘走这里——其余「变干净」的路都重建了 state（见 DocumentHost.clearChangeMarks）
-      host.clearChangeMarks()
+      // 🔴 写盘是异步的，用户完全可能在这几毫秒里又敲了字、或者换了保存格式。
+      // 那一刻磁盘上落的是**旧**字节，脏标记就必须留着——清掉的话，那几笔改动会被
+      // 一次成功的保存标成「已保存」，而自动存盘此后也不会再来碰它
+      if (edits() === editsBefore && format() === formatBefore) {
+        setDirty(false)
+        // 正文这一刻与磁盘一致了：清掉 gutter 累积的「未保存改动」标记。
+        // 只有存盘走这里——其余「变干净」的路都重建了 state（见 DocumentHost.clearChangeMarks）
+        host.clearChangeMarks()
+      }
       setNotice(
         report.unmappable
           ? {
@@ -493,6 +512,7 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     },
     format,
     dirty,
+    edits,
     busy,
     lossy,
     notice,

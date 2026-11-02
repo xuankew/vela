@@ -15,7 +15,7 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
 
 import { DEFAULT_CODE_FONT, DEFAULT_VARIANT } from '../fonts/loader'
-import { DEFAULT_OSS_PREFIX } from '../settings/store'
+import { DEFAULT_MARKDOWN_TOOLBAR, DEFAULT_OSS_PREFIX } from '../settings/store'
 import {
   describeSettingsError,
   loadSettings,
@@ -37,11 +37,11 @@ import {
  * 于是 Rust 的黄金字面量写 `letterSpacing:0.0`，这里写 `letterSpacing:0`，各钉各那一侧的输出。
  */
 const GOLDEN_SETTINGS =
-  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets"}'
+  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true}'
 
 /** 非默认值的一份配置，用来钉「任何一档都走同一条反序列化路径」（字段是具体值不是 Option） */
 const GOLDEN_SETTINGS_CUSTOM =
-  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs"}'
+  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":false}'
 
 /**
  * Rust 侧 `loaded_settings_的线上形状` 断言的就是这个字面量。
@@ -50,11 +50,11 @@ const GOLDEN_SETTINGS_CUSTOM =
  * 两件事一次钉住。
  */
 const GOLDEN_LOADED =
-  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
+  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":true},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
 
 /** Rust 侧 `空现场下_load_的线上形状`：两层都 absent、配置是内置默认、没有键被忽略 */
 const GOLDEN_LOADED_EMPTY =
-  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets"},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
+  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
 
 /** Rust 侧 `save_report_的线上形状` */
 const GOLDEN_SAVE_REPORT = '{"bytesWritten":42}'
@@ -71,6 +71,7 @@ function sampleSettings(): Settings {
     ossRegion: '',
     ossAccessKeyId: '',
     ossPrefix: 'assets',
+    markdownToolbar: true,
   }
 }
 
@@ -94,6 +95,7 @@ describe('Rust → 前端 的字段名', () => {
       'ossRegion',
       'ossAccessKeyId',
       'ossPrefix',
+      'markdownToolbar',
     ])
   })
 
@@ -115,6 +117,7 @@ describe('Rust → 前端 的字段名', () => {
       ossRegion: 'cn-hangzhou',
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
+      markdownToolbar: false,
     })
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SETTINGS_CUSTOM)
   })
@@ -174,10 +177,11 @@ describe('Rust → 前端 的字段名', () => {
 })
 
 describe('内置默认值两边各钉一条', () => {
-  it('黄金字面量里的十个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
+  it('黄金字面量里的十一个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
     // Rust 侧 `内置默认配置被钉住` 断言 DEFAULT_FONT_SIZE==14 / DEFAULT_FONT_VARIANT=="screen-gb"
     // / DEFAULT_CODE_FONT=="maple-cn" / DEFAULT_LINE_HEIGHT==1.75 / DEFAULT_LETTER_SPACING==0.0
-    // / DEFAULT_THEME=="dark" / DEFAULT_OSS_PREFIX=="assets"，并断言另外三格 OSS 默认是空串。
+    // / DEFAULT_THEME=="dark" / DEFAULT_OSS_PREFIX=="assets" / DEFAULT_MARKDOWN_TOOLBAR==true，
+    // 并断言另外三格 OSS 默认是空串。
     // 这里钉的是**同一个字面量**的前端那一半：改了任一边而没改另一边，两条测试会一起红。
     const parsed = JSON.parse(GOLDEN_SETTINGS) as Settings
     expect(parsed.fontSize).toBe(14)
@@ -187,6 +191,8 @@ describe('内置默认值两边各钉一条', () => {
     expect(parsed.letterSpacing).toBe(0)
     expect(parsed.theme).toBe('dark')
     expect(parsed.ossPrefix).toBe(DEFAULT_OSS_PREFIX)
+    expect(parsed.markdownToolbar).toBe(DEFAULT_MARKDOWN_TOOLBAR)
+    expect(parsed.markdownToolbar).toBe(true)
     // 🔴 三格空串是「没配阿里云」那个态的形状。默认值只要有一格非空，
     // 「没配」就再也判不出来，粘贴会去尝试一条注定失败的上传
     expect(parsed.ossBucket).toBe('')
@@ -232,7 +238,7 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     expect(invoke).toHaveBeenCalledWith('save_settings', { settings })
   })
 
-  it('发出去的 settings payload 永远带齐十个键', async () => {
+  it('发出去的 settings payload 永远带齐十一个键', async () => {
     invoke.mockResolvedValue(JSON.parse(GOLDEN_SAVE_REPORT))
     await saveSettings(sampleSettings())
     const sent = invoke.mock.calls[0]![1] as { settings: Settings }
@@ -247,8 +253,9 @@ describe('前端 → Rust 的 command 名与参数名', () => {
       'ossRegion',
       'ossAccessKeyId',
       'ossPrefix',
+      'markdownToolbar',
     ])
-    // 十个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
+    // 十一个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
     // 落到 Rust 侧就成了「缺键」，而 Settings 没有 #[serde(default)]，缺键直接拒）。
     // 🔴 这一条因此也是「M7-5 加的四格必须进 store 的 currentSettings()」的守卫：
     // 少带一格，用户改一次字号就会把那一格从盘上抹掉

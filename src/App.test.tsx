@@ -36,6 +36,7 @@ const {
   ossCmd,
   settingsCmd,
   gitCmd,
+  printCmd,
 } = vi.hoisted(() => {
   /**
    * 会话存档这一头（M1-F）。App 一挂载就会 `load_session`，关窗放行后会 `save_session`，
@@ -193,6 +194,7 @@ const {
         ossRegion: '',
         ossAccessKeyId: '',
         ossPrefix: 'assets',
+        markdownToolbar: true,
       },
       report: {
         userLayer: { status: 'absent' },
@@ -219,6 +221,14 @@ const {
     calls: [],
     heads: null,
   }
+  /**
+   * 系统打印面板那一头（M7-15）。`print_window` 也走 `tauriCore.invoke`。
+   *
+   * `calls` 只数次数：这条命令刻意**不带参数**（正文在主窗口 DOM 里，不另开一条载荷），
+   * 要钉的就是「叫了一次、没递任何东西」。`error` 用来演「面板打不开」那一支——
+   * 失败的症状是一条**红色**提示，而不是按了没反应。
+   */
+  const printCmd: { calls: number; error: unknown } = { calls: 0, error: null }
   return {
     ipc: {
       openFile: vi.fn<typeof import('./ipc/fs').openFile>(),
@@ -241,6 +251,7 @@ const {
     ossCmd,
     settingsCmd,
     gitCmd,
+    printCmd,
   }
 })
 
@@ -286,6 +297,9 @@ await Promise.all([
   import('./md/MarkdownPreview'),
   import('./md/preview'),
   import('./md/export'),
+  // M7-15 的打印快照与那条 IPC 也是动态 import 的，同一条理由
+  import('./md/print'),
+  import('./ipc/print'),
   import('./tools/ToolBox'),
   import('./commands/CommandPalette'),
   // M4-I 起这三块面板/浮层的**组件**也走 `lazy()`（store 仍常驻，见 App.tsx 那条注释）
@@ -417,11 +431,14 @@ beforeEach(async () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: 'assets',
+      markdownToolbar: true,
     },
     report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   }
   settingsCmd.loadError = null
   settingsCmd.saved = []
+  printCmd.calls = 0
+  printCmd.error = null
   disk = {}
   projectCmd.fs = {
     '': [dirEntry('src', 'src', true), dirEntry('README.md', 'README.md', false), dirEntry('docs', 'docs', true)],
@@ -576,6 +593,13 @@ beforeEach(async () => {
       if (ossCmd.hang) return new Promise<string>(() => {})
       return ossCmd.url
     }
+    if (cmd === 'print_window') {
+      // 正文不走这条 IPC：参数清单必须为空（见 `src/md/print.ts` 与 `src-tauri/src/print.rs`）
+      printCmd.calls += 1
+      // eslint-disable-next-line @typescript-eslint/only-throw-error
+      if (printCmd.error !== null) throw printCmd.error
+      return undefined
+    }
     return undefined
   })
   tauriEvent.listen.mockImplementation(async (name: string, handler: (payload: unknown) => void) => {
@@ -615,6 +639,12 @@ afterEach(() => {
   dispose()
   container.remove()
   document.documentElement.removeAttribute('style')
+  // M7-15 的打印快照挂在 body 上、**刻意不随打印结束删除**（见 `md/print.ts` 文件头），
+  // 所以用例之间必须自己收：它带着 `data-print-snapshot`，漏掉会把下一组的 body 也换掉
+  document.getElementById('vela-print-root')?.remove()
+  document.getElementById('vela-print-style')?.remove()
+  document.documentElement.removeAttribute('data-print-snapshot')
+  document.title = ''
 })
 
 /** 打开/保存是异步的：命令 execute → hook → invoke 有好几层微任务，一个宏任务就能冲干净 */
@@ -1808,10 +1838,11 @@ describe('侧边栏接线（M2-B）', () => {
     // styles.css 里那条注释警告的正是这件事：`.app` 是行数固定的 grid，
     // 多出来的东西一旦成了 grid item，`1fr` 就会落到错误的行上，正文区被挤掉。
     // 所以面板必须住在 `.main` 里面，而不是直接当 `.app` 的孩子。
-    // 工具栏移入桌面菜单后，默认（侧栏收起、Markdown 工具栏关着）只剩这三格。
+    // 工具栏移入桌面菜单后，`.app` 的常驻格只剩三格；M4-F 的 Markdown 工具栏默认开，
+    // 于是默认四格——四格都显式钉了行列号，不靠自动放置，关掉工具栏只是第一行塌成 0
     // ⚠️ 标签条不在其中：M4-R 起它每屏一条、住在 `.editor-host` 里面（上一条钉了它的位置）
     const app = container.querySelector('.app')!
-    expect([...app.children].map((el) => el.className)).toEqual(['notices', 'main', 'statusbar'])
+    expect([...app.children].map((el) => el.className)).toEqual(['md-toolbar', 'notices', 'main', 'statusbar'])
     // 默认没搜过，面板整个不渲染：没开过搜索的用户看到的布局与加这两层之前逐像素相同
     expect(container.querySelector('.find-panel')).toBeNull()
   })
@@ -2622,6 +2653,7 @@ describe('跳转浮层接线（M2-E）', () => {
     // 于是它不再是 `.app` 的 grid item（侧边栏接线那一组钉了它的新位置）
     expect([...app.children].map((el) => el.className)).toEqual([
       'sidebar-col',
+      'md-toolbar',
       'notices',
       'main',
       'statusbar',
@@ -3469,14 +3501,18 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     toggle()
     await settle()
 
-    // `.body-row` 是横向 flex，孩子的顺序就是屏幕上的顺序：放在 `.body` 之后 = 在右边
+    // `.body-row` 是横向 flex，孩子的顺序就是屏幕上的顺序：放在 `.body` 之后 = 在右边。
+    // 中间那条 `md-preview-resize` 是分隔线兼拖拽把手（`md/PreviewResize.tsx`），
+    // 平时就是 1px 的那条线
     expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual([
       'body',
+      'md-preview-resize',
       'md-preview',
     ])
     // ⚠️ 它必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定，
     // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那一组用例钉过同一件事）
     expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
+      'md-toolbar',
       'notices',
       'main',
       'statusbar',
@@ -3491,6 +3527,94 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     await settle()
 
     expect(preview()).toBeNull()
+  })
+
+  it('并排时中间那条线能拖：拖过之后预览拿固定宽度，只预览时把宽度让出去', async () => {
+    toggle()
+    await settle()
+
+    const handle = container.querySelector<HTMLElement>('.md-preview-resize')
+    expect(handle).not.toBeNull()
+
+    // jsdom 不算布局：clientWidth 全是 0，App 的总宽退回 window.innerWidth（1024），
+    // 于是起点是等分 512。按住往左拖 100px → 预览变宽到 612
+    handle!.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientX: 500 }))
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 400 }))
+    window.dispatchEvent(new MouseEvent('pointerup'))
+    await settle()
+
+    const row = container.querySelector<HTMLElement>('.body-row')!
+    expect(row.classList.contains('preview-resized')).toBe(true)
+    expect(row.style.getPropertyValue('--preview-width')).toBe('612px')
+
+    // 往右猛拖也不许把预览压没：停在下限 240（`PREVIEW_MIN_WIDTH`）
+    handle!.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, clientX: 300 }))
+    window.dispatchEvent(new MouseEvent('pointermove', { clientX: 3000 }))
+    window.dispatchEvent(new MouseEvent('pointerup'))
+    await settle()
+    expect(row.style.getPropertyValue('--preview-width')).toBe('240px')
+
+    // 只预览：`.body` 不参与布局，预览靠 `flex: 1 1 0%` 吃满整行。
+    // 固定宽度这时必须让位，否则右侧会空出一条「分隔线底色」的竖带
+    toggle()
+    await settle()
+    expect(container.querySelector('.body')!.classList.contains('preview-only')).toBe(true)
+    expect(row.classList.contains('preview-resized')).toBe(false)
+    expect(row.style.getPropertyValue('--preview-width')).toBe('')
+  })
+
+  it('Markdown 工具栏默认就在；点 × 关掉落盘，菜单能再打开并落回 true', async () => {
+    const toolbar = () => container.querySelector('.md-toolbar')
+    expect(toolbar()).not.toBeNull()
+
+    container.querySelector<HTMLButtonElement>('.md-toolbar-toggle-btn')!.click()
+    await settle()
+    expect(toolbar()).toBeNull()
+    // 🔴 关掉是**偏好**：写穿到用户全局层，重启仍按上次选择
+    expect(settingsCmd.saved.at(-1)).toMatchObject({ markdownToolbar: false })
+
+    // 菜单那一项与 × 改的是同一个值（`view.toggle_md_toolbar`）
+    await menu('view.toggle_md_toolbar')
+    await settle()
+    expect(toolbar()).not.toBeNull()
+    expect(settingsCmd.saved.at(-1)).toMatchObject({ markdownToolbar: true })
+  })
+
+  it('工具栏的「预览 / 编辑」：只预览时藏起编辑区并禁用格式按钮，再点回并排', async () => {
+    // 工具栏默认就开着（上一条钉了），这里直接用它
+    const modeBtn = () => {
+      const el = container.querySelector<HTMLButtonElement>('.md-toolbar-mode')
+      if (!el) throw new Error('工具栏上没有「预览 / 编辑」按钮')
+      return el
+    }
+    const formatBtns = () => [...container.querySelectorAll<HTMLButtonElement>('.md-toolbar-btn:not(.md-toolbar-mode)')]
+
+    expect(modeBtn().textContent).toBe('预览')
+    expect(modeBtn().disabled).toBe(false)
+    expect(formatBtns().length).toBeGreaterThan(0)
+    expect(formatBtns().every((b) => !b.disabled)).toBe(true)
+
+    modeBtn().click()
+    await settle()
+
+    // 🔴 是藏不是卸载：预览读的是这块编辑器自己的 CM6 view，卸了预览就空了
+    expect(container.querySelector('.body')!.classList.contains('preview-only')).toBe(true)
+    expect(hosts()).toHaveLength(1)
+    expect(container.querySelectorAll('.cm-editor')).toHaveLength(1)
+    expect(modeBtn().textContent).toBe('编辑')
+    expect(modeBtn().getAttribute('aria-pressed')).toBe('true')
+    // 格式按钮会改一块看不见的 buffer，一律按不动
+    expect(formatBtns().every((b) => b.disabled)).toBe(true)
+    // 编辑区藏起来之后没有可拖的两侧，把手跟着退场
+    expect(container.querySelector('.md-preview-resize')).toBeNull()
+
+    modeBtn().click()
+    await settle()
+
+    expect(container.querySelector('.body')!.classList.contains('preview-only')).toBe(false)
+    expect(modeBtn().textContent).toBe('预览')
+    expect(formatBtns().every((b) => !b.disabled)).toBe(true)
+    expect(container.querySelector('.md-preview-resize')).not.toBeNull()
   })
 
   it('未命名文档按 Markdown 处理：空的说一句空状态，写了内容就渲染出带 data-line 的 HTML', async () => {
@@ -3527,6 +3651,14 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     expect(preview()).not.toBeNull()
     expect(previewNote()).toBe('TypeScript 还没有预览')
     expect(previewBody()).toBe('')
+
+    // 工具栏上那个「预览 / 编辑」开关也得认这一条：没有预览可切时就该按不动，
+    // 否则点下去只会把编辑区藏掉、留一块「TypeScript 还没有预览」的死胡同。
+    // 工具栏默认就开着，不必先切出来
+    const modeBtn = container.querySelector<HTMLButtonElement>('.md-toolbar-mode')
+    expect(modeBtn).not.toBeNull()
+    expect(modeBtn!.disabled).toBe(true)
+    expect(modeBtn!.title).toBe('这个文件没有 Markdown 预览')
   })
 
   it('换标签立刻重渲染：正文换了，而那块 CM6 实例是同一个', async () => {
@@ -3691,12 +3823,14 @@ describe('大纲接线（M3-A-4）', () => {
     expect([...container.querySelector('.body-row')!.children].map((el) => el.className)).toEqual([
       'outline',
       'body',
+      'md-preview-resize',
       'md-preview',
     ])
     // ⚠️ 大纲必须住在 `.body-row` **里面**，而不是直接当 `.app` 的孩子：`.app` 的行数固定，
     // 多出来的东西一旦成了 grid item，那份 `1fr` 就会落到错误的行上（侧边栏那组用例钉过同一件事）
     expect([...container.querySelector('.app')!.children].map((el) => el.className)).toEqual([
       'sidebar-col',
+      'md-toolbar',
       'notices',
       'main',
       'statusbar',
@@ -4255,6 +4389,118 @@ describe('字数统计与导出 HTML 接线（M3-A-6）', () => {
   // 自己的用例钉住（那边能造出超时），这里不假装覆盖了
 })
 
+describe('导出 PDF 接线（M7-15）', () => {
+  const doPdf = () => press('e', { ...modInit(), altKey: true })
+  const noticeEl = () => container.querySelector('.notices .notice')
+  const noticeText = () => noticeEl()?.textContent ?? ''
+  const printRoot = () => document.getElementById('vela-print-root')
+  const printStyle = () => document.getElementById('vela-print-style')
+
+  async function openFrom(text: string, path: string): Promise<void> {
+    dialog.open.mockResolvedValue(path)
+    ipc.openFile.mockResolvedValue(textFile({ text }))
+    press('o', modInit())
+    await flush()
+  }
+
+  it('Mod+Alt+E 把正文挂成打印快照，再叫出系统面板', async () => {
+    await openFrom('# 标题\n\n正文一句话。\n', '/notes/t.md')
+    document.title = 'Vela'
+
+    doPdf()
+    await flush()
+    await flush()
+
+    // 正文不走 IPC：`print_window` 收到的就是这个命令名，没有第二个参数
+    expect(printCmd.calls).toBe(1)
+    expect(tauriCore.invoke).toHaveBeenCalledWith('print_window')
+
+    const root = printRoot()
+    expect(root).not.toBeNull()
+    // 外壳必须与 `exportHtml` 的 `<main class="md-doc">` 一致：排版规则都挂在 `.md-doc` 下
+    expect(root!.tagName).toBe('MAIN')
+    expect(root!.className).toBe('md-doc')
+    expect(root!.getAttribute('aria-hidden')).toBe('true')
+    expect(root!.innerHTML).toContain('<h1')
+    expect(root!.innerHTML).toContain('正文一句话。')
+    expect(document.documentElement.hasAttribute('data-print-snapshot')).toBe(true)
+
+    // 排版与导出 HTML 共用同一段常量，但只在打印媒体里生效
+    const style = printStyle()
+    expect(style?.getAttribute('media')).toBe('print')
+
+    // 打印任务名取自 document.title，所以调用期间换成源文件名、调用后还原
+    expect(document.title).toBe('Vela')
+    // 无色而不是 ok：这一步只是**打开面板**，一个字节都还没落盘
+    expect(noticeEl()!.className).toBe('notice')
+    expect(noticeText()).toContain('存储为 PDF')
+  })
+
+  it('第二次导出整块换掉快照，不叠加两份正文', async () => {
+    await openFrom('# 第一份\n', '/notes/a.md')
+    doPdf()
+    await flush()
+    await flush()
+
+    await openFrom('# 第二份\n', '/notes/b.md')
+    doPdf()
+    await flush()
+    await flush()
+
+    expect(printCmd.calls).toBe(2)
+    // ⛔ 叠加的失败方式是「第二次打印出来是第一份」，屏幕上永远看不见
+    expect(document.querySelectorAll('#vela-print-root')).toHaveLength(1)
+    expect(printRoot()!.innerHTML).toContain('第二份')
+    expect(printRoot()!.innerHTML).not.toContain('第一份')
+  })
+
+  it('不是 Markdown 时拒绝，措辞点名 PDF', async () => {
+    await openFrom('第一行\n', '/notes/a.txt')
+
+    doPdf()
+    await flush()
+
+    expect(noticeText()).toContain('不能导出 PDF，只有 Markdown 有预览')
+    expect(printCmd.calls).toBe(0)
+    expect(printRoot()).toBeNull()
+  })
+
+  it('空文档时拒绝，不叫出一个没有内容的打印面板', async () => {
+    doPdf()
+    await flush()
+
+    expect(noticeText()).toContain('这份文档还是空的，没有什么可导出的')
+    expect(printCmd.calls).toBe(0)
+    expect(printRoot()).toBeNull()
+  })
+
+  it('面板打不开时是 error 级，并把原因说出来', async () => {
+    await openFrom('# 标题\n', '/notes/t.md')
+    printCmd.error = '打印面板打不开'
+
+    doPdf()
+    await flush()
+    await flush()
+
+    expect(noticeEl()!.className).toBe('notice error')
+    expect(noticeText()).toContain('打印窗口没能打开')
+    expect(noticeText()).toContain('打印面板打不开')
+  })
+
+  it('「文件 › 导出 PDF…」菜单走同一条命令', async () => {
+    // 原生菜单里这一项带 accelerator（⌘⌥E），真机上按键先被 NSMenu 吃掉，
+    // 落到这里的是 `menu-event`。与 `file.save` 那条同一种失败方式：
+    // 菜单 id 与注册表里的命令 id 写岔了，`execute` 抛的错会被 `void` 吞掉
+    await openFrom('# 标题\n', '/notes/t.md')
+
+    await menu('file.export_pdf')
+    await flush()
+    await flush()
+
+    expect(printCmd.calls).toBe(1)
+  })
+})
+
 /**
  * M3-A-6 链接补全的接线。这一组钉的只有一件事：**`App.tsx` 有没有把 `linkFiles` 递进
  * `createWorkspace`**——那个选项是可选的，漏递 TypeScript 一声不响，症状是「Markdown 里
@@ -4555,6 +4801,7 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
           ossRegion: 'cn-hangzhou',
           ossAccessKeyId: 'LTAI-x',
           ossPrefix: 'assets',
+          markdownToolbar: true,
           ...oss,
         },
         report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
@@ -5209,6 +5456,7 @@ describe('分层配置接线（M4-A）', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: 'assets',
+      markdownToolbar: true,
     })
   })
 
@@ -5227,6 +5475,7 @@ describe('分层配置接线（M4-A）', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: 'assets',
+      markdownToolbar: true,
     })
   })
 
@@ -5244,6 +5493,7 @@ describe('分层配置接线（M4-A）', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: 'assets',
+      markdownToolbar: true,
     })
   })
 
@@ -5261,6 +5511,7 @@ describe('分层配置接线（M4-A）', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: 'assets',
+      markdownToolbar: true,
     })
   })
 
@@ -5309,6 +5560,7 @@ describe('分层配置接线（M4-A）', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: 'assets',
+      markdownToolbar: true,
     })
   })
 
@@ -5325,6 +5577,7 @@ describe('分层配置接线（M4-A）', () => {
         ossRegion: 'cn-hangzhou',
         ossAccessKeyId: 'LTAI5tExampleId',
         ossPrefix: 'docs',
+        markdownToolbar: true,
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -5351,7 +5604,35 @@ describe('分层配置接线（M4-A）', () => {
       ossRegion: 'cn-hangzhou',
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
+      markdownToolbar: true,
     })
+  })
+
+  it('盘上记着 Markdown 工具栏关着：重启后它就是关的，菜单能再打开并写回 true', async () => {
+    await restartWithSettings({
+      settings: {
+        fontSize: 14,
+        fontVariant: 'screen-gb',
+        codeFont: 'maple-cn',
+        lineHeight: 1.75,
+        letterSpacing: 0,
+        theme: 'dark',
+        ossBucket: '',
+        ossRegion: '',
+        ossAccessKeyId: '',
+        ossPrefix: 'assets',
+        markdownToolbar: false,
+      },
+      report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
+    })
+    // 装回来就是关的：这正是「关闭状态落盘」要的那个效果
+    expect(container.querySelector('.md-toolbar')).toBeNull()
+    expect(settingsCmd.saved).toEqual([])
+
+    await menu('view.toggle_md_toolbar')
+    await flush()
+    expect(container.querySelector('.md-toolbar')).not.toBeNull()
+    expect(settingsCmd.saved.at(-1)).toMatchObject({ markdownToolbar: true })
   })
 
   it('盘上的字体 ID 不认识时退回注册表默认，档外字号退回默认档', async () => {
@@ -5367,6 +5648,7 @@ describe('分层配置接线（M4-A）', () => {
         ossRegion: '',
         ossAccessKeyId: '',
         ossPrefix: 'assets',
+        markdownToolbar: true,
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -5390,6 +5672,7 @@ describe('分层配置接线（M4-A）', () => {
           ossRegion: '',
           ossAccessKeyId: '',
           ossPrefix: 'assets',
+          markdownToolbar: true,
         },
         report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
       },
@@ -5440,6 +5723,21 @@ describe('正文的右键菜单', () => {
     if (!host) throw new Error(`没有第 ${index} 块分屏`)
     const target = host.querySelector('.cm-content') ?? host
     target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 40, clientY: 60 }))
+  }
+
+  /**
+   * 右键在正文的**某个文档位置**上。
+   *
+   * ⚠️ jsdom 没有排版：`posAtCoords` 量不出「点在第几个字符」，这里把它钉死。
+   * 真机上那一下由浏览器按坐标算，这里测的是「拿到位置之后表格项怎么长、点了做什么」。
+   */
+  function rightClickAt(pos: number): void {
+    const spy = vi.spyOn(EditorView.prototype, 'posAtCoords').mockReturnValue(pos)
+    try {
+      rightClick()
+    } finally {
+      spy.mockRestore()
+    }
   }
 
   function menu(): HTMLElement | null {
@@ -5519,6 +5817,42 @@ describe('正文的右键菜单', () => {
     expect(menu()).not.toBeNull()
     expect(menuItems().map((b) => b.textContent)).toEqual(['剪切', '复制', '粘贴', '全选', '折叠全部', '展开全部'])
     expect(container.querySelectorAll('.tree-menu-sep')).toHaveLength(1)
+  })
+
+  it('右键落在表格里时多出四项；表头上「删除行」灰掉，分隔线也多一条', () => {
+    typeText('| a | b |\n| --- | --- |\n| 1 | 2 |')
+    // 点在表头第一格里（'a' 的下标是 2）
+    rightClickAt(2)
+
+    expect(menuItems().map((b) => b.textContent)).toEqual([
+      '剪切',
+      '复制',
+      '粘贴',
+      '全选',
+      '折叠全部',
+      '展开全部',
+      '在下方插入行',
+      '删除行',
+      '在右侧插入列',
+      '删除列',
+    ])
+    // 表头与分隔行删不得：删了整张表就不成立
+    expect(greyed()).toEqual(['剪切', '复制', '删除行'])
+    expect(container.querySelectorAll('.tree-menu-sep')).toHaveLength(2)
+  })
+
+  it('「在下方插入行」点在表头上时加在分隔行下面，也就是第一条数据行', () => {
+    typeText('| a | b |\n| --- | --- |\n| 1 | 2 |')
+    rightClickAt(2)
+    item('在下方插入行').click()
+    expect(view().state.doc.toString()).toBe('| a | b |\n| --- | --- |\n|  |  |\n| 1 | 2 |')
+  })
+
+  it('「删除列」真的删掉右键点中的那一列', () => {
+    typeText('| a | b |\n| --- | --- |\n| 1 | 2 |')
+    rightClickAt(2)
+    item('删除列').click()
+    expect(view().state.doc.toString()).toBe('| b |\n| --- |\n| 2 |')
   })
 
   it('没有选区时剪切与复制灰掉，粘贴与全选恒亮', () => {

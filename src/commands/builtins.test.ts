@@ -48,6 +48,7 @@ function makeHooks(): BuiltinHooks {
     alignTable: vi.fn(),
     wordCount: vi.fn(),
     exportHtml: vi.fn(),
+    exportPdf: vi.fn(),
     findInFiles: vi.fn(),
     replaceInFiles: vi.fn(),
     searchWordInFiles: vi.fn(),
@@ -187,7 +188,7 @@ async function pressKey(doc: string, selection: number | [number, number], key: 
 }
 
 describe('内置命令', () => {
-  it('六十五条命令全部注册成功，且互不抢占快捷键', () => {
+  it('六十六条命令全部注册成功，且互不抢占快捷键', () => {
     const { registry } = makeRegistry(null)
     // ⚠️ list() 先按 category 码点排、再按 id 排，所以这个数组**不是**按 id 前缀分组的：
     // 「工具」(U+5DE5) < 「搜索」(U+641C) < 「文件」(U+6587) < 「编辑器」(U+7F16)
@@ -203,6 +204,7 @@ describe('内置命令', () => {
       'search.replaceInFiles',
       'search.wordInFiles',
       'file.exportHtml',
+      'file.exportPdf',
       'file.new',
       'file.open',
       'file.save',
@@ -329,6 +331,8 @@ describe('内置命令', () => {
     // `file.saveAs` 不一致——它要说的四种拒绝里有一种是「这不是 Markdown」，
     // 而那与有没有编辑器无关，`ctx.editor !== null` 表达不了
     expect(enabled.get('file.exportHtml')).toBe(true)
+    // 导出 PDF 同理：拒绝全归宿主说（没有编辑器 / 不是 Markdown / 空文档 / 解析没跑完）
+    expect(enabled.get('file.exportPdf')).toBe(true)
   })
 
   it('编辑器挂上之后保存类立即可用', () => {
@@ -1209,6 +1213,8 @@ describe('M3-A-6：字数统计与导出 HTML 的接线', () => {
     const { registry } = makeRegistry(fakeController(false))
     expect(registry.findForKey(event('C', { metaKey: true, shiftKey: true }))?.id).toBe('editor.wordCount')
     expect(registry.findForKey(event('E', { metaKey: true, shiftKey: true }))?.id).toBe('file.exportHtml')
+    // 导出 PDF 走 Mod+Alt+E（M7-15）：与上面那条同族但不同前缀，两条互不吃
+    expect(registry.findForKey(event('E', { metaKey: true, altKey: true }))?.id).toBe('file.exportPdf')
     // ⛔ Mod+Shift+W 刻意不占：macOS 上它是系统的「关闭所有窗口」，事件到不了 webview，
     // 与上面 `Mod+W`（合并分屏）不绑是同一条理由
     expect(registry.findForKey(event('W', { metaKey: true, shiftKey: true }))).toBeNull()
@@ -1263,6 +1269,41 @@ describe('M3-A-6：字数统计与导出 HTML 的接线', () => {
     // 同一种标记。没有省略号的话用户在命令面板里看不出它要打断自己
     expect(registry.get('file.exportHtml')?.title).toBe('导出 HTML…')
     expect(registry.get('file.exportHtml')?.category).toBe('文件')
+  })
+})
+
+describe('M7-15：导出 PDF 的接线', () => {
+  it('分派到 exportPdf，不与导出 HTML 混用同一个 hook', async () => {
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    expect(await registry.execute('file.exportPdf')).toBe(true)
+    expect(hooks.exportPdf).toHaveBeenCalledOnce()
+    expect(hooks.exportHtml).not.toHaveBeenCalled()
+  })
+
+  it('没有编辑器时照样执行成功——四种拒绝全归宿主说', async () => {
+    const { registry, hooks } = makeRegistry(null)
+    expect(await registry.execute('file.exportPdf')).toBe(true)
+    expect(hooks.exportPdf).toHaveBeenCalledOnce()
+  })
+
+  it('🔴 Promise 会等到打印面板弹出来才 resolve', async () => {
+    // 成功提示「在左下角 PDF ▾ 里选存储为 PDF」写在 await 之后：提前 resolve 的话
+    // 用户按提示去找那个面板，而它还没出来
+    const { registry, hooks } = makeRegistry(fakeController(false))
+    let settled = false
+    hooks.exportPdf = vi.fn(async () => {
+      await Promise.resolve()
+      settled = true
+    })
+    await registry.execute('file.exportPdf')
+    expect(settled).toBe(true)
+  })
+
+  it('标题与分类', () => {
+    const { registry } = makeRegistry(fakeController(false))
+    // 省略号同 `file.exportHtml`：它会叫出系统面板，是一条会打断用户的命令
+    expect(registry.get('file.exportPdf')?.title).toBe('导出 PDF…')
+    expect(registry.get('file.exportPdf')?.category).toBe('文件')
   })
 })
 

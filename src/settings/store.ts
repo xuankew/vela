@@ -9,7 +9,7 @@
  *
  * ## 这一层管什么、不管什么
  *
- * 管：六个偏好值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
+ * 管：七个偏好值的**当前状态**、把它们应用到 DOM（CSS 变量 + 注入 webfont）、以及写穿到
  * 用户全局层。还管「从 Rust 读回来的值不一定合法」这件事——配置文件可能被手改成任何
  * 字符串，`fontSize` 可能是 17 这种档外值，`fontVariant` 可能是一个不存在的 ID，
  * `lineHeight` 可能是一个区间外的数或 NaN。**sanitize 归这一层**：读到不认识的字体 ID
@@ -37,7 +37,7 @@
  *
  * ## 🔴 项目层在 v1 是「接好线但空转」的
  *
- * 十个键（六个偏好 + 四格 OSS 账号配置）全只认「内置默认 + 用户全局」。打开一个带
+ * 十一个键（七个偏好 + 四格 OSS 账号配置）全只认「内置默认 + 用户全局」。打开一个带
  * `.vela/settings.json` 的仓库**不会**改掉你的字号，**也不会**把你粘贴的图改道到别人的
  * bucket——Rust 的 `resolve` 已经把项目层写的键丢进
  * `report.ignoredProjectKeys` 了。这一层把那份 `report` 原样暴露出去（[`SettingsStore.report`]），
@@ -191,6 +191,16 @@ function sanitizeLetterSpacing(n: number): number {
 export const DEFAULT_OSS_PREFIX = 'assets'
 
 /**
+ * Markdown 工具栏的默认可见性：**开**。与 Rust `settings::DEFAULT_MARKDOWN_TOOLBAR` 同值——
+ * 两边各写一份、由 `wire_contract.rs` 的 `内置默认配置被钉住` 与 `src/ipc/settings.test.ts`
+ * 各钉一条（同 `DEFAULT_FONT_SIZE` 的做法）。
+ *
+ * 默认开：那排格式按钮是打开 Markdown 后最常用的入口，默认关等于先把它藏起来。
+ * 用户点 × 关掉之后写进用户全局层，重启仍然关着。
+ */
+export const DEFAULT_MARKDOWN_TOOLBAR = true
+
+/**
  * 那四格 OSS 配置在**前端**的形状（M7-5）。
  *
  * ⚠️ 字段名与 `Settings` 上的 wire 名差一个 `oss` 前缀：`ossBucket` → `bucket`。这个类型
@@ -284,9 +294,17 @@ export interface SettingsStore {
    */
   readonly oss: Accessor<OssConfig>
   /**
+   * Markdown 工具栏是否可见（M4-F）。默认见 [`DEFAULT_MARKDOWN_TOOLBAR`]。
+   *
+   * 这个值**不进 DOM**：`App.tsx` 用它决定要不要渲染工具栏。写穿到用户全局层，
+   * 于是「关了之后重启还是关着」——与其它视图开关（侧栏 / 预览 / 大纲）只活在会话里不同，
+   * 这是用户明确要求落盘的偏好。
+   */
+  readonly mdToolbarVisible: Accessor<boolean>
+  /**
    * 最近一次 [`SettingsStore.load`] 的账单；`null` = 还没 load 过。
    * `report().ignoredProjectKeys` 非空表示当前仓库的 `.vela/settings.json` 试图改偏好键、
-   * 已被忽略（v1 里十个键全只认用户全局，所以它写的任何键都会落在这儿）。
+   * 已被忽略（v1 里十一个键全只认用户全局，所以它写的任何键都会落在这儿）。
    */
   readonly report: Accessor<SettingsReport | null>
 
@@ -325,6 +343,13 @@ export interface SettingsStore {
    * 把「填一只 bucket」变成几十次盘上重写。
    */
   setOss: (patch: Partial<OssConfig>) => void
+  /**
+   * 显示 / 收起 Markdown 工具栏（M4-F）：更新信号 + 写穿，不碰 DOM。
+   *
+   * 与 [`SettingsStore.setOss`] 同一条写穿路径：`currentSettings()` 少带这一格，
+   * 下次改字号就会把「关着」这个状态从盘上抹掉。
+   */
+  setMdToolbarVisible: (visible: boolean) => void
 
   /**
    * 从 Rust 读回合并好的配置，sanitize 后灌进信号并应用。**不写穿**。
@@ -365,6 +390,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     accessKeyId: '',
     prefix: DEFAULT_OSS_PREFIX,
   })
+  /** Markdown 工具栏可见性（M4-F）。与 OSS 四格一样不进 DOM，只被 `App.tsx` 读 */
+  const [mdToolbarVisible, setMdToolbarVisibleSignal] = createSignal(DEFAULT_MARKDOWN_TOOLBAR)
   const [report, setReport] = createSignal<SettingsReport | null>(null)
 
   /** 写队列的尾巴。所有写挂在它后面，于是任意时刻最多一个写在飞（见文件头） */
@@ -453,6 +480,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
       ossRegion: c.region,
       ossAccessKeyId: c.accessKeyId,
       ossPrefix: c.prefix,
+      // 工具栏可见性与四格同一个理由：整份重写，少带一格就抹掉用户「关着」的选择
+      markdownToolbar: mdToolbarVisible(),
     }
   }
 
@@ -511,6 +540,8 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setThemeSignal(sanitizeThemeId(s.theme))
     // 四格 OSS 配置只装进信号，不应用、不写穿（这一层不解释它们，见文件头）
     setOssSignal(ossFromSettings(s))
+    // 工具栏可见性同理：只装信号，`applyNow` 不碰它（渲染由 App 决定），load 不写穿
+    setMdToolbarVisibleSignal(s.markdownToolbar)
     setReport(loaded.report)
     applyNow()
   }
@@ -596,7 +627,13 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     if (patch.accessKeyId !== undefined) next.accessKeyId = patch.accessKeyId.trim()
     if (patch.prefix !== undefined) next.prefix = patch.prefix.trim()
     setOssSignal(next)
-    // 与六个偏好键同一条写穿路径：这里不 apply，四格不进 DOM（见文件头）
+    // 与七个偏好键同一条写穿路径：这里不 apply，四格不进 DOM（见文件头）
+    persist()
+  }
+
+  /** 显示 / 收起 Markdown 工具栏（M4-F）：更新信号 + 写穿，不碰 DOM */
+  function setMdToolbarVisible(visible: boolean): void {
+    setMdToolbarVisibleSignal(visible)
     persist()
   }
 
@@ -623,6 +660,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     letterSpacing,
     theme,
     oss,
+    mdToolbarVisible,
     report,
     setFontVariant,
     setCodeFont,
@@ -637,6 +675,7 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     resetLetterSpacing,
     setTheme,
     setOss,
+    setMdToolbarVisible,
     load,
     applyNow,
   }

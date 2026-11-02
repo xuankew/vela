@@ -78,6 +78,13 @@ export interface FileWatch {
   readonly current: Accessor<FileConflict | null>
   /** 队列里还等着几个（不含 `current` 那一个）。给对话框上那句「还有 N 个」用 */
   readonly pending: Accessor<number>
+  /**
+   * 这个标签身上是否还排着一条没答复的冲突。
+   *
+   * 自动存盘用它来让路：冲突还没问完就自动写盘，等于替用户在「覆盖磁盘上那份」上
+   * 按了确认，而那个决定恰恰是这一层存在的理由
+   */
+  hasConflict: (tabId: number) => boolean
   /** 答复当前这一个。队列为空时什么都不做——于是「连点两下」不会误伤下一个 */
   resolve: (choice: ConflictChoice) => Promise<void>
   /**
@@ -319,6 +326,7 @@ export function createFileWatch(options: FileWatchOptions): FileWatch {
   return {
     current: () => live()[0] ?? null,
     pending: () => Math.max(0, live().length - 1),
+    hasConflict: (tabId) => live().some((c) => c.tabId === tabId),
     resolve,
     async start() {
       try {

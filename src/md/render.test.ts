@@ -762,6 +762,7 @@ const CORPUS: readonly string[] = [
   '| 甲 | 乙 |\n|:--|--:|\n| 1 | 2 |',
   '```js\nconst x = 1\n```\n\n    缩进代码',
   '[链接](https://e.com "标题") ![图](https://e.com/a.png) <https://auto> [ref]\n\n[ref]: https://r.example',
+  '脚注[^注] 与重复[^注]\n\n[^注]: 脚注 **正文**',
   '---\n\n硬折  \n下一行\n\n<a>内联HTML</a>',
 ]
 
@@ -811,6 +812,7 @@ const HOSTILE: readonly string[] = [
   '\\<script\\>alert(1)\\</script\\>',
   '<SCRIPT>alert(1)</SCRIPT>',
   '<scr<script>ipt>alert(1)</scr</script>ipt>',
+  '脚注[^<script>]\n\n[^<script>]: <script>alert(1)</script>',
 ]
 
 /**
@@ -927,5 +929,97 @@ describe('整体输出', () => {
     expect(names.has('Task'), 'GFM 任务列表没在解析器里').toBe(true)
     expect(names.has('Table'), 'GFM 表格没在解析器里').toBe(true)
     expect(names.has('Strikethrough'), 'GFM 删除线没在解析器里').toBe(true)
+  })
+})
+
+/**
+ * 脚注（`[^标签]` / `[^标签]: 正文`）。
+ *
+ * 定义是从**源文本**上扫的，不是从树上认的——理由写在 `render.ts` 的 `FOOTNOTE_DEF`
+ * 那一段（有空格的定义在树里只是普通段落）。这一组用例同时钉住两件事：
+ * 引用怎么编号，以及「定义不是内容」这条在列表、代码块里也成立。
+ */
+describe('脚注', () => {
+  it('引用变成上标编号，定义在文末成节，正文里不出现定义那一行', () => {
+    const output = html('正文[^注] 后面\n\n[^注]: 这是脚注')
+    expect(output).toContain('<sup class="md-fn-ref"><a id="fnref-1" href="#fn-1">1</a></sup>')
+    expect(output).not.toContain('[^注]:')
+    // 定义正文只在文末出现一次
+    expect(output.match(/这是脚注/g)).toHaveLength(1)
+    expect(output.indexOf('<section class="md-footnotes">')).toBeGreaterThan(output.indexOf('</p>'))
+    expect(output).toContain('<li id="fn-1">')
+  })
+
+  it('编号按正文里第一次引用的顺序，不按定义的顺序', () => {
+    const output = html('乙[^b] 甲[^a]\n\n[^a]: 甲注\n\n[^b]: 乙注')
+    expect(output).toContain('href="#fn-1"')
+    expect(output).toContain('href="#fn-2"')
+    // 文末按编号排：1 是「乙注」，2 是「甲注」
+    expect(output).toMatch(/<li id="fn-1"><p[^>]*>乙注/)
+    expect(output).toMatch(/<li id="fn-2"><p[^>]*>甲注/)
+  })
+
+  it('同一个脚注引用多次：同一个编号、各自有锚点，文末只有一条', () => {
+    const output = html('一[^1] 二[^1]\n\n[^1]: 同一条')
+    expect(output).toContain('id="fnref-1"')
+    expect(output).toContain('id="fnref-1-2"')
+    expect(output.match(/<li id="fn-1">/g)).toHaveLength(1)
+    // 回跳只回第一处
+    expect(output).toContain('href="#fnref-1" title="返回正文"')
+  })
+
+  it('没有对应定义的 `[^x]` 原样显示，不凭空造一节', () => {
+    const output = html('孤立[^x]')
+    expect(output).toContain('[^x]')
+    expect(output).not.toContain('md-footnotes')
+  })
+
+  it('带目标的 `[^1](url)` 是普通链接，不被脚注抢走', () => {
+    const output = html('[^1](https://e.com)')
+    expect(output).toContain('href="https://e.com"')
+    expect(output).not.toContain('md-fn-ref')
+  })
+
+  it('多行定义：续行与空行后的缩进段落都属于正文，正文里的格式照常渲染', () => {
+    const output = html('正文[^1]\n\n[^1]: 第一段 **粗**\n    继续第二行\n\n    第二段')
+    expect(output).toContain('<strong>粗</strong>')
+    expect(output).toContain('继续第二行')
+    expect(output).toContain('第二段')
+    // 续行没有被当成缩进代码块
+    expect(output).not.toContain('<pre')
+  })
+
+  it('代码块里写的 `[^1]: …` 是示例，不当定义', () => {
+    const output = html('```md\n[^1]: 示例\n```\n\n正文[^1]')
+    expect(output).toContain('[^1]: 示例')
+    expect(output).toContain('[^1]')
+    expect(output).not.toContain('md-footnotes')
+  })
+
+  it('只给被引用到的脚注成节：没引用的定义不出现在文末', () => {
+    const output = html('正文[^1]\n\n[^1]: 一\n\n[^2]: 二')
+    expect(output).toMatch(/<li id="fn-1"><p[^>]*>一/)
+    expect(output).not.toContain('二')
+  })
+
+  it('标签按大小写无关、空白折叠来匹配', () => {
+    const output = html('文[^A  B]\n\n[^a b]: 内容')
+    expect(output).toContain('md-fn-ref')
+    expect(output).toContain('内容')
+    expect(output).not.toContain('[^A  B]')
+  })
+
+  it('列表项里的定义同样不显示，引用照常拿到编号', () => {
+    const output = html('- 项[^1]\n\n  [^1]: 定义')
+    expect(output).toContain('项<sup class="md-fn-ref">')
+    expect(output).not.toContain('[^1]:')
+    expect(output.match(/定义/g)).toHaveLength(1)
+  })
+
+  it('脚注正文里的 HTML 一样只当文字', () => {
+    const output = html('脚注[^<script>]\n\n[^<script>]: <script>alert(1)</script>')
+    expect(output).not.toContain('<script')
+    expect(output).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(output).toContain('md-fn-ref')
   })
 })

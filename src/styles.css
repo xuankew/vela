@@ -3121,6 +3121,56 @@ body.tab-dragging {
   background: var(--vela-bg);
 }
 
+/* 编辑区与预览之间那条分隔线，同时是拖拽把手（组件见 `md/PreviewResize.tsx`）。
+   与 `.sidebar-resize` 同一套：自己画 1px、`::after` 向两边各扩 3px 当命中区。
+   ⚠️ 那对 -1px 外边距不是修饰：`.body-row` 的 gap 是 1px，不抵消的话这条线会变成
+   3px 宽，一眼就能看出它比别的分隔线粗 */
+.md-preview-resize {
+  flex: 0 0 1px;
+  margin: 0 -1px;
+  position: relative;
+  background: var(--vela-border);
+  cursor: col-resize;
+  user-select: none;
+}
+
+.md-preview-resize::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+
+/* 悬停 / 键盘聚焦时把那条线染成 accent：1px 的反馈是弱，但把手加宽就会破坏
+   「所有分隔线同宽」这条肉眼在校的约定 */
+.md-preview-resize:hover,
+.md-preview-resize:focus-visible {
+  background: var(--vela-accent);
+}
+
+.md-preview-resize:focus-visible {
+  outline: none;
+}
+
+/* 拖过分隔线之后：预览栏吃用户选定的那份宽度，编辑区吃剩下的。
+   - flex-shrink 留在 1：窗口缩小时先把预览压回去，而不是让它顶住、把编辑区挤没；
+   - 两侧的 min-width 是「安全距离」的第二道闸（第一道是拖动/按键时的夹取，见
+     `clampPreviewWidth`）。用 min(…px, …%) 而不是纯 px：窗口窄到连两个下限都放不下时，
+     百分比那一档保证两栏加起来不超过容器，不会横向溢出被裁掉。
+   ⚠️ 只在这两栏真并排时生效；`only` 档里预览是 `flex: 1 1 0%`，不吃这个变量 */
+.body-row.preview-resized > .md-preview {
+  flex-grow: 0;
+  flex-shrink: 1;
+  flex-basis: var(--preview-width);
+  min-width: min(240px, 40%);
+}
+
+.body-row.preview-resized > .body {
+  min-width: min(320px, 55%);
+}
+
 /* 头部形状照抄 `.shard-head`：它说的也是「这一栏是什么 + 一句限定」，
    两处不一致的话用户会以为它们是两种东西 */
 .md-preview-head {
@@ -3382,6 +3432,31 @@ body.tab-dragging {
   text-decoration: underline;
 }
 
+/* 脚注：正文里的上标编号 + 文末那一节 */
+.md-preview-body .md-fn-ref {
+  font-size: 0.75em;
+  line-height: 0;
+}
+
+.md-preview-body .md-fn-ref a {
+  padding: 0 1px;
+}
+
+.md-preview-body .md-footnotes {
+  margin-top: 1.6em;
+  font-size: 0.9em;
+  color: var(--vela-fg-dim);
+}
+
+.md-preview-body .md-footnotes li {
+  margin: 0.3em 0;
+}
+
+.md-preview-body .md-fn-back {
+  margin-left: 0.35em;
+  text-decoration: none;
+}
+
 /* Markdown 工具栏（M4-F）*/
 .md-toolbar {
   display: flex;
@@ -3451,6 +3526,36 @@ body.tab-dragging {
 
 .md-toolbar-btn:active {
   transform: translateY(1px);
+}
+
+/* 阅读模式下格式按钮禁用：它们会改一块看不见的 buffer。
+   压暗到 0.35 而不是用 disabled 的默认灰度——这里没有表单语义，
+   只想要「看得见但按不动」。hover 规则一并收掉，否则鼠标划过仍像可点 */
+.md-toolbar-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.md-toolbar-btn:disabled:hover {
+  background: var(--vela-bg);
+  border-color: var(--vela-border);
+  color: var(--vela-fg);
+}
+
+/* 「预览 / 编辑」开关。与格式化按钮同一形状，但它是「换整个视图形态」，
+   文字比图标更说得清，所以固定一个能放下两个汉字的宽度 */
+.md-toolbar-mode {
+  flex: 0 0 auto;
+  min-width: 52px;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+
+/* 只在「只预览」里点亮：那时按钮上写的是「编辑」，强调色表示
+   「你此刻在预览形态，这里可以回去」 */
+.md-toolbar-mode[aria-pressed='true'] {
+  border-color: var(--vela-accent);
+  color: var(--vela-accent);
 }
 
 /* 编辑器区域包含工具栏时的布局 */
@@ -3837,4 +3942,33 @@ body.tab-dragging {
 
 .cm-changeGutter .vela-change-deleted::before {
   background: var(--vela-bad);
+}
+
+/* ---------- 打印快照（M7-15） ---------- */
+
+/* 屏幕上一个像素都不占：快照只活在打印媒体里（见 `src/md/print.ts` 的文件头）。
+   排版整段来自 `md/export.ts` 的 EXPORT_STYLE——它由 `md/print.ts` 塞进一个
+   media="print" 的 <style> 里，所以这里只管「打印时谁可见」 */
+#vela-print-root {
+  display: none;
+}
+
+@media print {
+  /* body 的两条全局规则（height: 100% + overflow: hidden）会把打印裁成一页 */
+  html[data-print-snapshot],
+  html[data-print-snapshot] body {
+    height: auto;
+    overflow: visible;
+    background: #fff;
+  }
+
+  /* 应用界面整个让位。用 `:not(#vela-print-root)` 而不是逐个点名字：
+     以后往 body 下加任何东西（提示条、浮层、挂件）都自动被藏掉 */
+  html[data-print-snapshot] body > *:not(#vela-print-root) {
+    display: none;
+  }
+
+  html[data-print-snapshot] #vela-print-root {
+    display: block;
+  }
 }

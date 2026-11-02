@@ -5,20 +5,20 @@
  * （Rust 在 `crates/vela-core/tests/wire_contract.rs`，前端在 `./settings.test.ts`），
  * 改一边必须改另一边。
  *
- * 配置比会话简单（十个具体键，没有嵌套元组），但失败方式一样安静：字段名写错的后果是
+ * 配置比会话简单（十一个具体键，没有嵌套元组），但失败方式一样安静：字段名写错的后果是
  * **「重启后字号/字体回到默认」**——不崩、不报错，用户只会觉得「我设的没记住」。
  *
- * ## 🔴 十个键**全都**只认用户全局，项目层写了也忽略
+ * ## 🔴 十一个键**全都**只认用户全局，项目层写了也忽略
  *
- * 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题是**个人偏好**，只认「内置默认 + 用户全局」两层。
- * 打开一个带 `.vela/settings.json` 的仓库**不会**改掉你的字号。M7-5 加的四格 OSS 配置
+ * 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题 / Markdown 工具栏可见性是**个人偏好**，
+ * 只认「内置默认 + 用户全局」两层。打开一个带 `.vela/settings.json` 的仓库**不会**改掉你的字号。M7-5 加的四格 OSS 配置
  * （`ossBucket` / `ossRegion` / `ossAccessKeyId` / `ossPrefix`）不是偏好，却落在同一扇门后面，
  * 动机更硬：仓库若能改这四格，它就能把你粘贴的图**改道到别人的 bucket**。于是项目层被读、被解析、
  * 但**不生效**：它试图写的键落进 `SettingsReport.ignoredProjectKeys`，前端据此说一句
  * 「这个仓库想改你的 <键>，但 <键> 只认用户全局，已忽略」。完整推理见 Rust 侧模块文档
  * 与 PLAN §3.6「M4-A 实施修正」。
  *
- * ## 🔴 这十个键里没有 AccessKeySecret
+ * ## 🔴 这十一个键里没有 AccessKeySecret
  *
  * `ossAccessKeyId` 在（它不是凭证，只指明用哪对密钥签名），`ossAccessKeySecret` **不在**，
  * 也永远不该出现在这份文件里：它只住 macOS 钥匙串（见 `src-tauri/src/secrets.rs`），
@@ -100,6 +100,13 @@ export interface Settings {
   ossAccessKeyId: string
   /** 对象名前缀（`assets` 那一段，不带首尾斜杠）。见 `DEFAULT_OSS_PREFIX` */
   ossPrefix: string
+  /**
+   * Markdown 工具栏是否可见（M4-F）。偏好类，只认内置默认 + 用户全局。
+   *
+   * `true` = 打开 Markdown 时那排格式按钮就在，`false` = 用户点 × 收了它。写进配置文件是为了
+   * 「关了之后重启还是关着」。线上就是布尔值，Rust 原样往返、不校验。
+   */
+  markdownToolbar: boolean
 }
 
 /**
@@ -121,7 +128,7 @@ export interface SettingsReport {
   projectLayer: LayerStatus
   /**
    * 项目层试图写「仅全局」的偏好键、因而被忽略的键名（wire 名，可直接引用）。
-   * v1 里十个键全是「仅用户全局」类（六个偏好 + 四格 OSS 账号配置），所以项目层写的任何键都会落在这里。
+   * v1 里十一个键全是「仅用户全局」类（七个偏好 + 四格 OSS 账号配置），所以项目层写的任何键都会落在这里。
    */
   ignoredProjectKeys: string[]
 }
@@ -184,7 +191,7 @@ export function loadSettings(roots: string[]): Promise<LoadedSettings> {
 /**
  * 把配置写进**用户全局层**（`~/.vela/settings.json`），原子。
  *
- * 🔴 v1 只写用户全局层：十个键都只认全局（六个偏好 + 四格 OSS 账号配置），没有需要落到项目层的键。
+ * 🔴 v1 只写用户全局层：十一个键都只认全局（七个偏好 + 四格 OSS 账号配置），没有需要落到项目层的键。
  *
  * ⚠️ 参数名 `settings` 在契约里：Tauri 按名字去 payload 里取值，拼错的后果是 Rust 报
  * 「invalid args」——这一条**会**报错，不像字段名写错那样静默。

@@ -247,6 +247,22 @@ body {
   text-decoration: underline;
 }
 
+.md-doc .md-fn-ref {
+  font-size: 0.75em;
+  line-height: 0;
+}
+
+.md-doc .md-footnotes {
+  margin-top: 1.6em;
+  font-size: 0.9em;
+  color: #59636e;
+}
+
+.md-doc .md-fn-back {
+  margin-left: 0.35em;
+  text-decoration: none;
+}
+
 .md-doc .md-unsafe-link {
   color: #cf222e;
   cursor: not-allowed;
@@ -292,6 +308,14 @@ body {
 }
 
 @media print {
+  /* 🔴 页边距只能由 CSS 给：wry 的打印走的是 PrintOptions 默认值，
+     四个方向都是 0，而 macOS 打印面板里没有直接的边距输入框。少了这一条，
+     正文会从纸张最边缘开始排（M7-15 打印快照用的是同一段样式，见 ./print.ts）。
+     18mm / 16mm 与打印面板的默认观感接近，也比浏览器各自的默认值更不受影响 */
+  @page {
+    margin: 18mm 16mm;
+  }
+
   .md-doc {
     max-width: none;
     padding: 0;
@@ -300,6 +324,23 @@ body {
   .md-doc a {
     color: inherit;
     text-decoration: underline;
+  }
+
+  /* 分页处不要出现「标题孤零零留在页底」或「表格行被劈成两半」。
+     ⚠️ 不给 pre / table 整块加 break-inside: avoid：一段长代码或一张长表
+     排不进一页时，硬避免分页会在前一页留下半页空白 */
+  .md-doc h1,
+  .md-doc h2,
+  .md-doc h3,
+  .md-doc h4,
+  .md-doc h5,
+  .md-doc h6 {
+    break-after: avoid;
+  }
+
+  .md-doc tr,
+  .md-doc img {
+    break-inside: avoid;
   }
 }
 `.trim()

@@ -525,6 +525,26 @@ describe('事件分流：干净的静默重载，其余排队问', () => {
     expect(ipc.openFile).toHaveBeenCalledTimes(1)
   })
 
+  // 自动存盘靠这一问让路：冲突没答复就写盘，等于替用户在「覆盖磁盘上那份」上按了确认
+  it('hasConflict 只认还排着队的那个标签，答复之后立刻不再挡路', async () => {
+    const h = harness()
+    await h.ws.openAt('/repo/a.txt')
+    await h.fw.start()
+    await flush()
+    const tab = h.ws.activeTab()
+    tab.doc.markChanged()
+
+    fire('/repo/a.txt')
+    await flush()
+    expect(h.fw.hasConflict(tab.id)).toBe(true)
+    expect(h.fw.hasConflict(tab.id + 1)).toBe(false)
+
+    // 「保留我的改动」= 什么都不做，但那条冲突出队了
+    await h.fw.resolve('keep')
+    await flush()
+    expect(h.fw.hasConflict(tab.id)).toBe(false)
+  })
+
   it('同一个标签的同一种冲突排两次只留一条：用户没答复的那几分钟里文件可能被改很多次', async () => {
     const h = harness()
     await h.ws.openAt('/repo/a.txt')

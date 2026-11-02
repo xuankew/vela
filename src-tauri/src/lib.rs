@@ -5,6 +5,8 @@ mod menu;
 // M7-3 把 [`commands::upload_image`] 接上之后不需要了：改回私有实测过门禁是干净的，
 // 而少一个公开模块就少一个「以后有人往里加只给测试用的 pub 项」的借口
 mod oss;
+// M7-15：系统打印面板。前端把正文挂成打印快照，这里只叫出面板
+mod print;
 // ⚠️ 同样要 `pub`，但理由不是「还没人调」：`SecretError::Keychain` 只由 macOS 那一份
 // 后端构造，而门禁的 rust job 在 ubuntu 上跑 `clippy --all-targets -D warnings`。
 // 私有模块里的 `pub` 枚举按 crate 内可见性算，那一边就会报「variant is never constructed」。
@@ -111,6 +113,8 @@ pub fn run() {
             commands::reveal_entry,
             commands::copy_entry_path,
             commands::close_window,
+            // M7-15 的「导出 PDF」出口：正文在主窗口 DOM 里，这里只把系统打印面板叫出来
+            print::print_window,
             commands::load_session,
             commands::save_session,
             commands::load_settings,

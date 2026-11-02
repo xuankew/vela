@@ -42,6 +42,7 @@ import { indentGuides } from './indentGuides'
 import { jsonLint } from './jsonLint'
 import { isJsonLanguage, type LanguageChoice } from './language'
 import { linkCompletions, type LinkCompletionHook } from './linkSource'
+import { tableEditKeymap } from '../md/tableEdit'
 import { mouseGestures } from './multiCursor'
 import { imagePaste, type PasteImageHook } from './paste'
 import { coveredRange, escapesCoverage } from './viewport'
@@ -391,8 +392,15 @@ export function languageExtensions(choice: LanguageChoice, support: LanguageSupp
   switch (choice.kind) {
     case 'markdown':
       // markdown 是静态依赖，不走 language-data 的懒加载。codeLanguages 让围栏里的
-      // ts/rust/json 按需解析；正文用文楷，代码块与表格行由装饰换成等宽字体
-      return [markdown({ base: markdownLanguage, codeLanguages: languages }), fontTheme, codeFontBySyntax]
+      // ts/rust/json 按需解析；正文用文楷，代码块与表格行由装饰换成等宽字体。
+      // 最后那条是表格里的 Tab / Enter（`md/tableEdit.ts`）：只挂在 Markdown 上，
+      // 别的语言里按 Tab 仍然只是缩进
+      return [
+        markdown({ base: markdownLanguage, codeLanguages: languages }),
+        fontTheme,
+        codeFontBySyntax,
+        tableEditKeymap,
+      ]
     case 'code':
       // support 为 null 时连校验一起不装，理由见本函数的文档注释
       if (support === null) return [codeDocFontTheme]

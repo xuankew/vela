@@ -39,6 +39,7 @@ import {
   DEFAULT_FONT_SIZE,
   DEFAULT_LETTER_SPACING,
   DEFAULT_LINE_HEIGHT,
+  DEFAULT_MARKDOWN_TOOLBAR,
   DEFAULT_OSS_PREFIX,
   FONT_SIZES,
   fontSizeChoices,
@@ -68,6 +69,7 @@ function loaded(settings: Partial<Settings> = {}, report: Partial<SettingsReport
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
+      markdownToolbar: true,
       ...settings,
     },
     report: {
@@ -151,13 +153,15 @@ beforeEach(() => {
 })
 
 describe('初始状态', () => {
-  it('六个偏好信号停在内置默认，OSS 四格停在内置默认，report 是 null', () => {
+  it('七个偏好信号停在内置默认，OSS 四格停在内置默认，report 是 null', () => {
     expect(store.fontKey()).toBe(DEFAULT_VARIANT)
     expect(store.codeFontKey()).toBe(DEFAULT_CODE_FONT)
     expect(store.fontSize()).toBe(DEFAULT_FONT_SIZE)
     expect(store.lineHeight()).toBe(DEFAULT_LINE_HEIGHT)
     expect(store.letterSpacing()).toBe(DEFAULT_LETTER_SPACING)
     expect(store.theme()).toBe(DEFAULT_THEME)
+    // 工具栏默认开：首屏还没 load 过时它就是 Rust `Settings::default()` 的那个 true
+    expect(store.mdToolbarVisible()).toBe(DEFAULT_MARKDOWN_TOOLBAR)
     // 首屏（还没 load 过）时 OSS 三格是空的、只有前缀有默认值：与 Rust `Settings::default()` 同形
     expect(store.oss()).toEqual({ bucket: '', region: '', accessKeyId: '', prefix: DEFAULT_OSS_PREFIX })
     expect(store.report()).toBeNull()
@@ -310,6 +314,7 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
+      markdownToolbar: true,
     })
   })
 
@@ -329,6 +334,7 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
+      markdownToolbar: true,
     })
   })
 
@@ -348,6 +354,7 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       ossRegion: '',
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
+      markdownToolbar: true,
     })
   })
 
@@ -695,6 +702,7 @@ describe('OSS 四格（M7-5 读回 / M7-6 面板可写）：这一层不解释�
       ossRegion: 'cn-hangzhou',
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
+      markdownToolbar: true,
     })
   })
 
@@ -762,5 +770,43 @@ describe('OSS 四格（M7-5 读回 / M7-6 面板可写）：这一层不解释�
     expect(darkCalls).toEqual([false])
     expect(fontLoader.applyFontVariant).not.toHaveBeenCalled()
     expect(fontLoader.applyCodeFont).not.toHaveBeenCalled()
+  })
+})
+
+describe('Markdown 工具栏可见性（M4-F）：落盘的偏好', () => {
+  it('默认开，首屏不写盘', async () => {
+    expect(store.mdToolbarVisible()).toBe(true)
+    store.applyNow()
+    await flush()
+    // 与其它偏好同一条口径：首屏应用是纯 DOM 副作用，不该凭「默认值」写一次盘
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('setMdToolbarVisible 改信号并写穿，不碰 DOM', async () => {
+    const before = document.documentElement.style.cssText
+    store.setMdToolbarVisible(false)
+    expect(store.mdToolbarVisible()).toBe(false)
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({ markdownToolbar: false })
+    // 它不进 DOM（渲染由 App 决定），所以没有任何 CSS 伴生物
+    expect(document.documentElement.style.cssText).toBe(before)
+  })
+
+  it('盘上记着关着：load 装回来是关的，而且不写穿', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ markdownToolbar: false }))
+    await store.load([])
+    expect(store.mdToolbarVisible()).toBe(false)
+    // 装回来只是把盘上的值灌进信号，不是用户改动
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('再关一次同一个值不重复写（指纹跳过）', async () => {
+    store.setMdToolbarVisible(false)
+    await flush()
+    expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
+    store.setMdToolbarVisible(false)
+    await flush()
+    expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
   })
 })

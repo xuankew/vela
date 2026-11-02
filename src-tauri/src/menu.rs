@@ -21,6 +21,10 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "file.save", "保存", true, Some("CmdOrCtrl+S"))?,
             &MenuItem::with_id(app, "file.save_as", "另存为...", true, Some("CmdOrCtrl+Shift+S"))?,
+            // M7-15：macOS 上打开系统打印面板，里面选「存储为 PDF」。键与注册表里
+            // `file.exportPdf` 的 `Mod+Alt+E` 是同一个——原生 accelerator 会先吃掉按键，
+            // 只改一边的话菜单点了没反应，或者同一个键触发两次
+            &MenuItem::with_id(app, "file.export_pdf", "导出 PDF...", true, Some("CmdOrCtrl+Alt+E"))?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "file.close_folder", "关闭文件夹", true, Option::<&str>::None)?,
             &PredefinedMenuItem::separator(app)?,
