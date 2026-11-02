@@ -2060,6 +2060,10 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 >     - 🔴 **主路径一次剪贴板都不多读**：`App.test.tsx` 里专门有一条断言 `readCalls === 0`。兜底不能变成「每次粘贴都读一遍剪贴板」，那会让 WebKit 的授权提示反复弹，而**反复弹系统提示在本项目口径里就是缺陷**。
 >     - ⚠️ **仍有一个静默口子，本轮刻意没堵**：判据靠 `data.types`，所以**万一 WKWebView 连 `types` 都不给**（既没有 `File` 也没有 `types`），这一支照样回 `false`、照样一个字都不说。堵法是「粘贴什么都没交出来时也无脑调一次 `read()`」，⛔ 但那会让**一次空剪贴板上的误触 ⌘V** 也弹出一句 `error`（外加可能一次系统授权提示）——用一个常见误触的假报警去换一个不太可能的静默，不划算（`osascript` 那九种图片风味说明 pasteboard 侧数据是在的，`types` 通常是最可靠的那一个成员）。⚠️ 所以真机上若**仍然完全静默**，那本身就是证据：说明 `types` 也没给，下一步该**换判据**而不是再兜一层。
 >     - **数字**：前端 3336 → **3357**（`editor/paste.test.ts` 18 → **34**、`App.test.tsx` 215 → **220**，文件数仍 **104**），Rust **一个文件都没动**（571 passed / 1 ignored 不变，⚠️ 本轮**没重跑**），typecheck 干净，eslint **0 error + 8 warning 不变**，prettier 干净。⛔ **Tauri 命令、快捷键、事件名、managed state 全部 +0**（粘贴是一个 DOM 处理器，不是一条命令）。首屏 295.88 → **296.32KB**（entry `index-BxRi0R9G.js` **187.03** + modulepreload `dist-CvermxKb.js` **101.77** + CSS `index-CBS_KNNh.css` **7.52**），余量 **3.68KB / 1.23%**；⚠️ **modulepreload 与 CSS 的哈希和字节一个没动**（→ 仍然没有新的懒加载边界），涨的那 0.44KB 全在 entry 里。
+> 19. **2026-11-02 晚间那一轮（补记，见 §3.20）：M7-8 与「预览增量渲染」并到一起之后接线仍在，而真机第一轮过的是读侧。**
+>     - ⚠️ 远端并行落地的 `3e4f97f`（§3.15「编辑时预览一直在闪」：只换真的变了的那几块）与 M7-8 改的是**同一层**。合并后逐处核对过：`rewriteCloudImages` 仍挂在 `src/md/MarkdownPreview.tsx:318`，`resignAfterError` 仍挂在 `:461` 那条捕获 `error` 监听上，`src/md/ossImage.test.ts` 那 18 条与 `MarkdownPreview.test.tsx` 里「云端图片换临时签名 src」那一组全绿。🔴 **这一句只是接线检查**，它成立的原因是两半各守一半：增量渲染钉的是「图片**节点身份不变**」（§3.15 那三条新用例），而签名换址只动属性、不造节点——所以一张图换过一次签名之后，重画不会把 `data-oss-src` 擦掉。⛔ 别把它读成「增量 × 换签的时序被专门验过」，没有那样的用例。
+>     - 🔴 **真机第一轮（装好的 `/Applications/Vela.app`，就是 §3.20 那个包）过了两件事**：① **私有桶的图在预览里显示出来了**——`presign_oss_images` → `<img src>` → 阿里云验签这一整条**第一次真的打到服务端**。第 15 条①那句「没有一次请求真的打到过阿里云」从此**只对写侧（PUT）成立**，读侧不再是盲区。② **ad-hoc 重签没有影响钥匙串**——本轮 `pnpm tauri build` 重签换了 cdhash，**实测没弹系统授权、也没有一句「没有拿到 AccessKey Secret」**，用户一次密钥都没重填。⚠️ **PLAN 此前没记过「重签与钥匙串项」的关系**（第 6 条只记了钥匙串那一层是写 / 删 / 状态三种操作），所以这条是**新增观察**而不是「一直如此」：它既不能推广成「钥匙串与代码签名无关」——只说明**这台机器上这一次**那一项仍可读（同一 `app.vela.m1`、同一用户、访问控制没动）——也不能反过来当成「以后重装都会自动接上」。
+>     - ⚠️ **第 15 条那份清单里仍然欠着的**：④ **15 分钟到期后靠 `error` 重签那一条**（要等一张图真的挂过 15 分钟，本轮没等）、③ `vela-img://` 的六个状态码在真 WKWebView 里的表现、⑦ M7-13 那句兜底提示，以及**写侧的一次真 PUT**。
 
 
 ---
@@ -2319,6 +2323,27 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 **数字**：前端 **3442 → 3460**（**108 → 110 files**：新增 `md/print.test.ts` 6 条、`ipc/print.test.ts` 2 条；`commands/builtins.test.ts` +4；`App.test.tsx` +6：快照与命令、第二次替换不叠加、非 Markdown / 空文档拒绝、面板打不开、菜单路由）。Rust **575 passed / 1 ignored 不变**（新命令无单测，靠 `wire_contract` 之外的人工核对——命令名只在前端 mock 与 `lib.rs` 各写一份）。typecheck 干净、eslint **0 error + 8 warning 不变**、prettier 干净、clippy `-D warnings` 干净。🔴 **Tauri 命令 31 → 32**（只加 `print_window`），managed state 与事件名不变，新增依赖 **0**。首屏 gzip **299.53 → 299.93KB**（entry `index-D6DAgmIq.js` → `index-aKRB7Aiw.js` **190.05 → 190.38**；modulepreload `dist-CvermxKb.js` **101.77 逐字未动**；CSS `index-*.css` 7.71 → **7.78**，打印快照那几条规则）。300KB 记账线余量 **0.07KB / 0.02%**——`print.ts` / `ipc/print.ts` 都走动态 import，没有进首屏；涨幅全部来自 `App.tsx` / `builtins.ts` 的接线与 `styles.css`。⛔ 体积门禁仍未建（M4-K 口径），且用户已明示暂时不管体积。
 
 **真机未验（交用户目视）**：① 真实 WKWebView 里 `print()` 弹出的面板能否正常预览中文与代码块；② 打印预览里是否只出现正文（应用界面、提示条、状态栏是否都让位）；③ 多页文档的分页是否正常、页边距 18mm / 16mm 的观感；④ 面板里「PDF ▾ → 存储为 PDF」落出来的 PDF 与预览是否一致；⑤ 打印任务名是否显示为源文件名。
+
+---
+
+### 3.20 修正 + 重打包 · 2026-11-02：折叠全部把「一轮没推进」当成卡死，以及那之后的第一个生产包
+
+📌 这一节补的是**同一晚的两笔**：`53c7be9`（CI 上偶发的那个折叠用例）与它之后的一次生产包构建 + 重装。两笔都只有提交信息、没有实施修正块，本轮补齐；M7-8 与这次真机第一轮记在 §3.9「M7 全账」19。
+
+**① 折叠全部（`src/editor/fold.ts`）：把「一轮没折叠」直接当成卡死，负载一高就只折前半截。**
+
+- 现场：`src/editor/fold.test.ts` 里那条整篇折叠的用例在 CI 上偶发红（run 30 / run 32 是同一条）。
+- 病因：那个循环原来的早退条件是「**这一轮 `syntaxTree` 的长度没往前走就 break**」，而 `forceParsing` 给出去的时间片偶尔整个花在一小段上、树一格都不动，下一轮却照样推（提交信息里那组 1ms 时间片的实测是 `3003 → 3003 → 12682`）。负载高的机器上这就足够让它提前收手，**只折了文档前半截**。
+- 修法：**连续 3 轮零推进才认输**（`STALLED_ROUNDS_LIMIT = 3`，有推进就把计数清回 0），总预算 `PARSE_BUDGET_MS = 2000` 一个字没改。⚠️ 这不是「把超时调大」：调的是「一次空转不算证据」这个判据。
+- 回归用例：`中途有一两轮空转，仍然折满整篇`——⚠️ 「负载高」在 jsdom 里造不出来，只能**注入**：`vi.mock('@codemirror/language')` 包一层 `forceParsing`，由一个 `vi.hoisted` 的 `remaining` 开关让前两轮直接空转（`afterEach` 复位）。旧行为在这条下必红，钉的是「第三轮才认输」那个形状，顺带钉住「先确认整篇确实得靠循环推完」（用例开头那句 `syntaxTreeAvailable(..., doc.length)` 为 `false`）。
+
+**② 生产包（`53c7be9`，arm64）**：`pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'`（本机 `~/.tauri` 没有 minisign 私钥，开着 updater 产物必失败），release 编译 2m39s。
+
+- 产物：`target/release/bundle/macos/Vela.app` **27 MB**、`Vela_1.0.0_aarch64.dmg` **24 MB**（`.app` 那一半与 dmg 都成功，⛔ 没撞上 §3.8「M6-C 实施修正」12 那次 `bundle_dmg.sh` 半路失败）。⛔ **没有 `--target x86_64`**：Intel 那一半仍然欠着，账在 §3.8「M6-A 实施修正」1 与 17⑦，分发仍走 `.github/workflows/release-build.yml`。
+- 签名：`Signature=adhoc`、`TeamIdentifier=not set`、跳过 notarization（没有 `APPLE_ID*` 那组环境变量）。🔴 这次 `codesign --verify --deep --strict` 直接 **valid on disk + satisfies its Designated Requirement**——⚠️ **「本地构建的 `.app` 要不要手工重签一遍」这件事 PLAN 里从来没记过**（§3.8「M6-A 实施修正」2 只定了另一件事：机器上那张 `Apple Development` 证书**不能**用于分发，所以 `signingIdentity: "-"` 是对的、别去改它）。本轮把这条钉下来：`pnpm tauri build` 自己那一道签名就是完整的，**不需要手工补签**。`spctl -a` 仍 rejected——那是无证书包的必然结果，本机可开，分发要右键「打开」或 `xattr -cr`。
+- 安装：走 `scripts/build-installer.sh` 那套口径（退出正在跑的 Vela → `ditto` 覆盖 `/Applications/Vela.app` → 删掉 `target` 下那份副本，磁盘只留一个图标）。⚠️ **只替换 `.app` 本体**，`~/Library/Application Support/app.vela.m1/` 时间戳逐字未动（会话存档与未保存草稿都在那里）。
+
+**数字**（⚠️ 全部是本轮在 `53c7be9` 上**重跑**的，不是抄 §3.19 的）：typecheck 干净，前端 **3460 → 3461 passed / 110 files**（多的那一条就是上面的折叠回归用例），Rust **575 passed / 1 ignored 不变**（本轮重跑过，与 §3.19 那个数对得上；`cargo fmt --all --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 都干净），eslint **0 error + 8 warning 不变**，prettier 干净。首屏 gzip **299.93 → 299.94KB**（entry `index-aKRB7Aiw.js` → `index-BcmpooUu.js` **190.38 → 190.39**；modulepreload `dist-CvermxKb.js` **101.77 哈希与字节逐字未动** → ⛔ 没加新的懒加载边界；CSS `index-B06moflj.css` **7.78 未变**）。🔴 **300KB 记账线的余量只剩 0.06KB / 0.02%**——下一轮只要动前端就会越线。⛔ 越线不算缺陷、**不建体积门禁**（M4-K 那条判决不变，用户也已明示暂时不管体积），但 §3.9 第 13 条那句「**第一个该看的地方是 `src/settings/SettingsDialog.tsx` 在 `App.tsx` 里是静态 import**」到现在还没做，那是这一层唯一一处成块的余量。
 
 ---
 
