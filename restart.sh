@@ -18,6 +18,14 @@
 #
 # 命中之后还要过两道闸：命令行撞上 DENY_RE（编辑器、容器、虚拟机、各家 AI 运行时）
 # 的一律放过；自己和自己的祖先链一律放过——脚本就是从用户那个 shell 里跑起来的。
+
+# ⚠️ 本脚本用了 bash 的进程替换（`done < <(ps …)`）与数组。`sh restart.sh` 会在那一行炸成
+# `syntax error near unexpected token '<'`——macOS 的 `/bin/sh` **就是 bash 3.2**，只是跑在
+# POSIX 模式下，而 POSIX 模式把进程替换关掉了（⛔ 所以「判断 `$BASH_VERSION` 是否为空」这个
+# 常见写法在这儿根本不触发：它在 `sh` 下同样有值，2026-11-02 实测踩过）。
+# 一律无条件交给 PATH 上的 `bash` 重跑一次，用环境变量挡住第二次，避免自我循环。
+if [ -z "${VELA_RESTART_REEXEC:-}" ]; then exec env VELA_RESTART_REEXEC=1 bash "$0" "$@"; fi
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
