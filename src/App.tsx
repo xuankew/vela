@@ -1456,8 +1456,11 @@ export default function App() {
             openFolder: () => void openFolder(),
             openRecentProject: () => void goto.show('', 'project'),
             closeFolder: () => tree.close(),
-            save: (c) => void registry.execute('editor.save', c),
-            saveAs: (c) => void registry.execute('editor.saveAs', c),
+            // ⚠️ 这里的 id 必须是 `builtins.ts` 里**真注册过**的那一个：`registry.execute`
+            // 对没注册的 id 是 `throw`，而外面这个 `void` 会把它变成一次看不见的
+            // unhandled rejection——表现是「按 ⌘S 什么都没发生，脏标记一直在」
+            save: (c) => void registry.execute('file.save', c),
+            saveAs: (c) => void registry.execute('file.saveAs', c),
             // 菜单这一条走的是注册表里那条 `editor.find`（`cmCommand` 包的 `openSearchPanel`），
             // 不是第二份实现：与 ⌘F 快捷键共用同一份 when 判断与同一个面板
             findInEditor: (c) => void registry.execute('editor.find', c),

@@ -1117,6 +1117,45 @@ describe('文件生命周期接线', () => {
     expect(statusName()).toBe('空文档')
   })
 
+  // 🔴 上面三条走的都是 `press()`：jsdom 里没有原生菜单，keydown 直接落到注册表的
+  // `findForKey`。真机上 ⌘S 被 NSMenu 的 key equivalent **吃掉**，走的是
+  // `menu-event` → `routeMenuEvent` → `registry.execute(id)` 这一条。
+  // 那条路上写错过一次 id（`editor.save`，从来没注册过），`execute` 抛的
+  // 「未注册的命令」被外面的 `void` 变成一次看不见的 rejection——本地测试全绿，
+  // 真机按 ⌘S 一个字都没写、脏标记一直亮着。⛔ 别把这两条删掉或改回 `press()`
+  it('「文件 › 保存」菜单真把内容写下去，脏标记跟着灭', async () => {
+    dialog.open.mockResolvedValue('/a.txt')
+    ipc.openFile.mockResolvedValue(textFile({ text: '原文' }))
+    press('o', modInit())
+    await flush()
+
+    typeText('改')
+    expect(statusName()).toBe('● a.txt')
+
+    await menu('file.save')
+    await flush()
+
+    expect(ipc.saveFile).toHaveBeenCalledWith('/a.txt', '原文改', { encoding: 'utf8', bom: false, eol: 'lf' })
+    expect(statusName()).toBe('a.txt')
+  })
+
+  it('「文件 › 另存为…」菜单对无名文档弹对话框，拿到路径才写', async () => {
+    dialog.save.mockResolvedValue('/chosen/new.txt')
+    typeText('新内容')
+    expect(statusName()).toBe('● 空文档')
+
+    await menu('file.save_as')
+    await flush()
+
+    expect(dialog.save).toHaveBeenCalledOnce()
+    expect(ipc.saveFile).toHaveBeenCalledWith('/chosen/new.txt', '新内容', {
+      encoding: 'utf8',
+      bom: false,
+      eol: 'lf',
+    })
+    expect(statusName()).toBe('new.txt')
+  })
+
   it('打开失败时报出错误，并且另开一个干净标签来承载——草稿一动不动', async () => {
     typeText('手稿')
     dialog.open.mockResolvedValue('/gone.txt')

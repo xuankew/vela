@@ -13,7 +13,7 @@
  * ```json
  * {
  *   "view.togglePreview": "Mod+Shift+P",
- *   "editor.save": ["Mod+S", "F2"]
+ *   "file.save": ["Mod+S", "F2"]
  * }
  * ```
  *
