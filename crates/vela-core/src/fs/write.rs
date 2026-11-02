@@ -8,7 +8,9 @@
 //! 1. 临时文件必须与目标**同目录**——`rename` 跨文件系统会直接失败（EXDEV）；
 //! 2. rename 之前必须 `sync_all()`，否则元数据落盘了、数据还在页缓存里，
 //!    断电后可能得到一个长度为 0 的文件；
-//! 3. rename 之后要 fsync 父目录，rename 这个目录项本身才算持久。
+//! 3. rename 之后要 fsync 父目录，rename 这个目录项本身才算持久。⚠️ 这一步**在后台做、
+//!    不等结果**：目录无响应时 `open` 会无限阻塞，同步等它会把「保存」变成永久挂起
+//!    （理由与现场见 `write_and_rename`）。前两步仍然是同步的。
 
 use std::fs;
 use std::io::Write;
@@ -118,13 +120,48 @@ fn write_and_rename(tmp: &Path, parent: &Path, dest: &Path, bytes: &[u8]) -> Res
 
     fs::rename(tmp, dest).map_err(WriteError::io)?;
 
+    // 🔴 父目录 fsync 绝不能挡在返回路径上。
+    //
+    // `fs::File::open(parent)` 在目录**无响应**时是**无限阻塞**，不是报错——网络卷掉线、
+    // 外置盘被拔、卡住的本地目录都会这样。而这一步发生在 `rename` 之后：文件内容其实
+    // 已经完整落盘了。同步等它的代价是「文件写好了，但 `save_file` 永不应答」——前端
+    // `await` 不落地，`setDirty(false)` 一行都不执行，用户看到的是「保存成功却永远显示
+    // 未保存」。2026-11-02 的真实现场：`~/Downloads` 卡死，采样的 1486 个 tick 全停在这一句。
+    //
+    // 放到后台线程里做，语义变成「最终持久」：数据本身在 rename 之前已经 `sync_all`
+    // 过，这里只差目录项。宁可让它晚一点落盘，也不能让保存失败、更不能让它挂起。
+    //
+    // ⚠️ 目录真的卡死时，每次保存会漏一个阻塞在 `open` 上的线程（无栈增长压力，
+    // 但会累积）。这是刻意的取舍：泄漏一个线程远好过让用户的数据「看起来没保存」。
     #[cfg(unix)]
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    spawn_dir_sync(parent.to_path_buf());
 
     Ok(())
 }
+
+/// 尽力而为地 fsync 父目录，**不等结果**。
+///
+/// 线程起不来也只是少一次目录 fsync，与「只差目录项」这个定位一致——不该让一次保存
+/// 因为线程资源紧张而失败。
+#[cfg(unix)]
+fn spawn_dir_sync(parent: PathBuf) {
+    let _ = std::thread::Builder::new().name("vela-dir-sync".into()).spawn(move || {
+        // 测试专用：把「目录卡死」变成可确定性复现的「后台线程永不返回」。
+        // `cfg(test)` 装不进发布包，产品路径上这个分支根本不存在
+        #[cfg(test)]
+        if DIR_SYNC_NEVER_RETURNS.load(std::sync::atomic::Ordering::SeqCst) {
+            loop {
+                std::thread::park();
+            }
+        }
+        if let Ok(dir) = fs::File::open(&parent) {
+            let _ = dir.sync_all();
+        }
+    });
+}
+
+#[cfg(all(unix, test))]
+static DIR_SYNC_NEVER_RETURNS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 临时文件名带上 pid 与纳秒时间戳：同一个进程里连续保存两次、或者用户开了两个
 /// Vela 实例保存同名文件，都不该互相踩。
@@ -241,6 +278,27 @@ mod tests {
         assert_ne!(a, b, "同一个目标文件生成了相同的临时名");
         assert!(a.starts_with(dir.path()));
         assert!(a.file_name().unwrap().to_string_lossy().contains(".vela-tmp-"));
+    }
+
+    /// 父目录卡死时，写盘必须照样立刻返回。
+    ///
+    /// 2026-11-02 的现场：`~/Downloads` 的 `open` 无限阻塞，`save_file` 的线程以 100%
+    /// 的采样停在那句 `File::open(parent)` 上，前端 `await` 永不落地——文件写成功了，
+    /// 编辑器却永远显示未保存。这条测试把那个卡死点换成「后台线程 park 住」：
+    /// 修复前它是同步执行的，测试会当场挂死；修复后它只活在后台线程里。
+    #[test]
+    #[cfg(unix)]
+    fn 父目录卡死也不会拖住写盘() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hang.txt");
+
+        DIR_SYNC_NEVER_RETURNS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = write_text_atomic(&path, "内容", fmt(Encoding::Utf8, LineEnding::Lf));
+        DIR_SYNC_NEVER_RETURNS.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let report = result.expect("目录卡死不该让写盘失败");
+        assert_eq!(report.bytes_written, 6);
+        assert_eq!(fs::read(&path).unwrap(), "内容".as_bytes());
     }
 
     /// `write_bytes_atomic` 存在的全部理由：一个字节都不许动。
