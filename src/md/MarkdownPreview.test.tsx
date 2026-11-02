@@ -151,14 +151,14 @@ function mount(doc: string, path: string | null, alone = false) {
     /**
      * 预览里的勾选框，按出现顺序。
      *
-     * ⚠️ 每次回写都会重写 `innerHTML`，于是上一批节点全部游离——所以调用点必须**现查**，
+     * ⚠️ 回写之后勾选框所在的那一块会被换掉，上一批节点游离——所以调用点必须**现查**，
      * 不能把元素存下来跨一次点击再用。存下来的那个点得动（事件照样派发），
      * 但它已经不在文档里，于是「点完焦点还在不在」这类断言会拿到一个假答案
      */
     tasks: () => [...body.querySelectorAll<HTMLElement>('.md-task')],
     /**
      * 预览里真的渲染出来的 `<img>`（外链的与本地换成功的都算），按出现顺序。
-     * 同样必须**现查**，理由与 `tasks()` 一样：每次重画 `innerHTML` 都换掉了整批节点
+     * 同样必须**现查**：改动所在的那一块每次都会换新节点
      */
     imgs: () => [...body.querySelectorAll('img')],
     /** 还没换成 `<img>` 的本地图片占位（M7-9）。它们都是有原因的：见 `./localImage.ts` 文件头 */
@@ -304,6 +304,54 @@ describe('MarkdownPreview：什么时候重渲染', () => {
     p.setSource({ view: md, path: '/r/a.md' })
     expect(p.note()).toBeNull()
     expect(p.bodyHtml()).toContain('甲')
+  })
+})
+
+/**
+ * 用户报的那个「开着预览编辑时一直在闪」：早期每敲几个字就把整块 `innerHTML` 换掉，
+ * 每一张本地图片都成了全新的 `<img>`，`vela-img` 的读取与解码跟着重走。
+ *
+ * 现在按顶层块做前缀/后缀对齐，只换真的变了的那几块。这一组钉的就是「节点身份」——
+ * 那是 jsdom 里唯一能看见的那一半；真实窗口里「看着还闪不闪」只有眼睛能判
+ */
+describe('MarkdownPreview：最小改动重画（预览不闪）', () => {
+  const PIC = '# 甲\n\n![截图](assets/a.png)\n\n乙。\n'
+
+  it('🔴 在文末追加一段：没变的图片还是同一个节点，不会重新读一遍本地文件', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const img = p.imgs()[0]!
+    const heading = container.querySelector<HTMLElement>('.md-preview-body h1')!
+    p.retype('# 甲\n\n![截图](assets/a.png)\n\n乙。\n\n丙。\n')
+    p.bump()
+    p.settle()
+    expect(p.bodyHtml()).toContain('丙')
+    expect(p.imgs()[0], '没变的图被重建了：每次编辑都会重新走一遍 vela-img 读取').toBe(img)
+    expect(container.querySelector('.md-preview-body h1')).toBe(heading)
+  })
+
+  it('改中间一段：两头的块原地不动，只有那一段换了新节点', () => {
+    const p = mount('# 甲\n\n乙。\n\n丙。\n', '/r/a.md')
+    const heading = container.querySelector<HTMLElement>('.md-preview-body h1')!
+    const before = container.querySelectorAll<HTMLElement>('.md-preview-body p')
+    const changed = before[0]!
+    const tail = before[1]!
+    p.retype('# 甲\n\n乙改。\n\n丙。\n')
+    p.bump()
+    p.settle()
+    const after = container.querySelectorAll<HTMLElement>('.md-preview-body p')
+    expect(container.querySelector('.md-preview-body h1'), '上面那一段没变，却被重建了').toBe(heading)
+    expect(after[0], '变了的那一段应该是新节点').not.toBe(changed)
+    expect(after[0]!.textContent).toBe('乙改。')
+    expect(after[1], '下面那一段没变，却被重建了').toBe(tail)
+  })
+
+  it('🔴 两份内容相同的文档之间切换：不复用上一份的节点，图片换成新文档的地址', () => {
+    const p = mount(PIC, '/notes/a.md')
+    const img = p.imgs()[0]!
+    p.setSource({ view: makeView(PIC), path: '/notes/b.md' })
+    const next = p.imgs()[0]!
+    expect(next, '复用了上一份文档的节点：图会一直指着上一份文档').not.toBe(img)
+    expect(next.getAttribute('src')).toContain('doc=%2Fnotes%2Fb.md')
   })
 })
 
@@ -471,7 +519,7 @@ describe('MarkdownPreview：点勾选框回写源文档（M3-A-5）', () => {
     expect(document.activeElement).toBe(box)
     box.click()
     const after = p.tasks()[1]!
-    // `innerHTML` 整个换过，所以它必然是另一个节点——「还是同一个」在这里是失败而不是成功
+    // 勾选框所在的那一块整个换过，所以它必然是另一个节点——「还是同一个」在这里是失败而不是成功
     expect(after).not.toBe(box)
     expect(document.activeElement, '键盘用户点完就被丢回 body 了').toBe(after)
   })
@@ -728,11 +776,13 @@ describe('MarkdownPreview：键盘也能开大图（M7-11 欠账一）', () => {
     expect(document.activeElement, '丢回 body 就得从文档开头重新 Tab 一遍').toBe(img)
   })
 
-  it('重画之后仍然标着：那一批节点是整块换过的', () => {
+  it('在别处追加一段之后仍然标着：没变的那一块被原地留下', () => {
     const p = mount(PIC, '/notes/a.md')
+    const img = p.imgs()[0]!
     p.retype('# 甲\n\n![截图](assets/a.png)\n\n补了一句。\n')
     p.bump()
     p.settle()
+    expect(p.imgs()[0], '这一块没变，却被重建了').toBe(img)
     expect(p.imgs()[0]!.getAttribute('tabindex')).toBe('0')
   })
 })

@@ -21,6 +21,17 @@
  * 第二个：这是一整块**外来的** HTML，让响应式系统去 diff 它没有任何好处。
  * 第三个：`EditorPane.tsx` 里那条「⛔ Solid 的响应式不许碰 CM6 的 DOM」是同一种纪律。
  *
+ * ## ⚠️ 但**不**整块换：记得住的块原地不动（预览闪动的根）
+ *
+ * 早期这一层是 `bodyEl.innerHTML = html` 一把梭。它每敲几个字就把预览里每一个节点重建一遍，
+ * 于是每一张本地图片都是一个全新的 `<img>`：`vela-img` 那一次读取与解码跟着重走，
+ * 一篇文章里有几张图就是一路闪；用户在预览里选中的文字、浏览器记着的解码结果也一并丢掉。
+ * 现在只换**真的变了的那几块**（`patchBody`），两头原地不动。安全边界一个字没动：
+ * 进 DOM 的仍然只有 `render.ts` 的输出。
+ *
+ * 🔴 换文档时**一个节点都不许复用**：本地图片的 `src` 里带着文档路径，两份内容相同的
+ * 文档会命中同一批键（见 `renderedPath`）。
+ *
  * ## 🔴 安全
  *
  * 这里写进 `innerHTML` 的每一个字节都出自 `./render.ts`，而那个模块的白名单与转义
@@ -125,6 +136,17 @@ export interface MarkdownPreviewProps extends PanelRefreshSource {
  */
 const TASK_MARKER = /^\[[ xX]\]$/
 
+/**
+ * 一个顶层节点在新旧两次渲染之间认不认作「同一块」。
+ *
+ * 元素用 `outerHTML`（`render.ts` 对同一份正文给同一串输出，`data-line` 也在里面，
+ * 所以上面加了一行文字导致行号整体漂移时，那一块会如实判成「变了」），
+ * 文本节点用它的内容。前缀把两种键分开，免得一段恰好长得像标签的正文与真正的元素撞键。
+ */
+function blockKey(node: Node): string {
+  return node instanceof Element ? `e${node.outerHTML}` : `t${node.nodeValue ?? ''}`
+}
+
 export function MarkdownPreview(props: MarkdownPreviewProps) {
   /** 面板顶上那句话。null = 没什么要说的 */
   const [note, setNote] = createSignal<string | null>(null)
@@ -181,6 +203,22 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   let anchors: LineAnchor[] = []
   /** 上一次真的写进 DOM 的那份 HTML。null = 还没写过 */
   let rendered: string | null = null
+  /**
+   * 上一次渲染结果里每个顶层节点的**源 HTML**，与 `bodyEl.childNodes` 一一对应。
+   *
+   * ⚠️ 存的是 `render.ts` 那一份（占位 `span`），不是 DOM 里此刻的样子：本地图片已经被
+   * `rewriteLocalImages` 换成了 `<img>`，拿 DOM 去比的话下一次一个键都对不上，等于没做
+   */
+  let renderedKeys: string[] | null = null
+  /**
+   * 上一次渲染用的文档路径。
+   *
+   * 🔴 换文档时**一个节点都不许复用**：本地图片的 `<img src>` 里带着这份路径
+   * （`vela-img://…?doc=…`），而复用的判据是「源 HTML 一样」。两份内容相同的文档会命中
+   * 每一条键，于是新文档里显示的还是上一份的图。路径变了就整块重建，让
+   * `rewriteLocalImages` 拿到新的 `docPath`
+   */
+  let renderedPath: string | null = null
   /**
    * 第几次重画。云端图片那一次签名是**异步**回来的，而防抖窗口里可能已经又画了一次
    *
@@ -239,8 +277,8 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
 
     // M7-11：不是同一份文档了就把大图关掉。⚠️ `untrack` 不是防循环，是防「点开大图」
     // 这一次 `setZoom` 反过来把整个重画流程再触发一遍（见 `./panel.ts` 那份调度）
-    // M7-12 同一句管着右键菜单：它指着的是**上一份文档里的一张图**，那份 DOM 已经被
-    // `innerHTML` 整块换掉了。⚠️ 不能只靠 `TreeMenu` 自己那条「宿主滚动就关」——
+    // M7-12 同一句管着右键菜单：它指着的是**上一份文档里的一张图**，而换文档时那一批
+    // DOM 是整块重建的。⚠️ 不能只靠 `TreeMenu` 自己那条「宿主滚动就关」——
     // 真实窗口里 `follow()` 会滚，但没到文末的那次换文档可能一像素都不动
     const open = untrack(zoom)
     if (open !== null && open.path !== pathOf(src)) setZoom(null)
@@ -248,9 +286,14 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     if (menu !== null && menu.path !== pathOf(src)) setImgMenu(null)
 
     setNote(text)
-    if (html !== rendered) {
+    // 🔴 路径也要比：两份内容相同的文档切来切去时 `html` 一个字都不差，但本地图片的
+    // `src` 里带着文档路径——只看 `html` 的话，图会一直指着上一份文档
+    const docPath = pathOf(src)
+    const pathChanged = docPath !== renderedPath
+    if (html !== rendered || pathChanged) {
       rendered = html
-      bodyEl.innerHTML = html
+      renderedPath = docPath
+      patchBody(html, !pathChanged)
       // M7-9：`render.ts` 给本地图片出的是占位 `span`，这里换成走 `vela-img` 协议的 `<img>`。
       // ⚠️ 必须在 `measure()` **之前**换：那一张表量的是每个 `data-line` 元素离内容顶部多远，
       // 换在之后就会量出一份没有算进图片那部分高度的表
@@ -277,6 +320,53 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
       if (seq === paintSeq) setCloudNote(cloud)
     })
     if (src !== null) follow(src)
+  }
+
+  /**
+   * 用**最小改动**把 `bodyEl` 换到 `html`（预览闪动就是从这里治的）。
+   *
+   * 做法是拿新旧两份结果的**顶层块**做前缀/后缀对齐：两头一样的节点原地不动，
+   * 只把中间那一段换掉。一次编辑的改动几乎总是局部的（在文末追加、改中间一段），
+   * 所以这一对循环就能把绝大部分节点留下。留下的节点意味着本地图片不会被重新读一遍、
+   * 解码结果不丢、用户选中的文字还在。
+   *
+   * 🟡 不按内容做全局匹配（LCS 之类）：那是给「整篇重排」准备的，而这里的变化来自
+   * 光标处的一次编辑。多出来的复杂度换不到用户看得见的差别。
+   *
+   * ⚠️ 先插入再删除：反过来的话中间会有一帧是空的（脚本是同步的，理论上没有那一帧，
+   * 但插入在前还顺带让前缀/后缀节点的下标一直有效）
+   *
+   * 🔴 `reuse` 为 false 时整块重建（首屏、换文档）。换文档不能复用，理由见 `renderedPath`
+   */
+  function patchBody(html: string, reuse: boolean) {
+    if (bodyEl === undefined) return
+    // ⚠️ 用 `<template>` 而不是 `bodyEl.innerHTML`：这一个是「解析成节点」，
+    // 不碰文档本身。进来的字符串只有一个来源（`./render.ts`），边界没有放宽
+    const template = document.createElement('template')
+    template.innerHTML = html
+    const fresh = Array.from(template.content.childNodes)
+    const freshKeys = fresh.map(blockKey)
+    const oldKeys = reuse ? renderedKeys : null
+
+    if (oldKeys === null || oldKeys.length !== bodyEl.childNodes.length) {
+      bodyEl.replaceChildren(template.content)
+      renderedKeys = freshKeys
+      return
+    }
+
+    const old = Array.from(bodyEl.childNodes)
+    const max = Math.min(oldKeys.length, freshKeys.length)
+    let head = 0
+    while (head < max && oldKeys[head] === freshKeys[head]) head++
+    let tail = 0
+    while (tail < max - head && oldKeys[oldKeys.length - 1 - tail] === freshKeys[freshKeys.length - 1 - tail]) tail++
+
+    const insert = document.createDocumentFragment()
+    for (let i = head; i < fresh.length - tail; i++) insert.appendChild(fresh[i]!)
+    const tailNode = old[oldKeys.length - tail] ?? null
+    for (let i = head; i < oldKeys.length - tail; i++) old[i]!.remove()
+    bodyEl.insertBefore(insert, tailNode)
+    renderedKeys = freshKeys
   }
 
   /**
@@ -349,7 +439,7 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
    *
    * ⚠️ 监听挂在容器上、走**捕获相**：`load` 与 `error` 都不冒泡，但都会经过捕获路径，
    * 于是容器上一个监听就够。不给每张 `<img>` 各挂一个的理由与勾选框那条一样——
-   * 那些元素每次重画都会被整体换掉，挂上去的没人负责重挂
+   * 变了的那几块会换成新节点（`patchBody`），挂上去的没人负责重挂
    */
   function relayout() {
     measure()
@@ -431,9 +521,9 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     // ⚠️ 立刻重画，而不是等那 150ms：等的话勾选框在点下去之后**看着没变**，用户会再点一次，
     // 而那一下是真的（它读的是已经改过的文档），于是一来一回等于没点
     render()
-    // `render()` 换掉了整块 `innerHTML`，被点的那个元素已经不在文档里了。键盘用户
-    // （`role="checkbox"` + `tabindex="0"`，见 `render.ts` 的 `taskMarker`）会把焦点掉到 body 上，
-    // 于是「空格连打三个待办」变成「空格打一个，然后什么都没有了」
+    // `render()` 换掉了勾选框所在的那一块（`[ ]` → `[x]` 改了源 HTML），被点的那个元素
+    // 已经不在文档里了。键盘用户（`role="checkbox"` + `tabindex="0"`，见 `render.ts` 的 `taskMarker`）
+    // 会把焦点掉到 body 上，于是「空格连打三个待办」变成「空格打一个，然后什么都没有了」
     if (hadFocus) bodyEl?.querySelector<HTMLElement>(`.md-task[data-pos="${pos}"]`)?.focus()
   }
 
