@@ -167,6 +167,21 @@ export interface DocumentModel {
    * 那份正文不在内存里，没法逐字比对，而能走到这一步说明磁盘上刚刚发生过一次写
    */
   reload: () => Promise<boolean>
+  /**
+   * 磁盘上现在这份字节，是不是**上一次成功写盘时落下的那一份**。
+   *
+   * 存在的理由只有一个：让 `fileWatch` 认出「Vela 自己写的那一次事件」。原子写盘
+   * （临时文件 + rename）必然让监听器报一条 `changed`，而 250ms 的防抖把它送到时，
+   * 用户可能已经又敲了几个字、或者自动存盘已经开始了下一轮——那一刻文档是脏的，
+   * 不认就会弹一个毫无根据的「在 Vela 之外被改过了」。
+   *
+   * 判据刻意是**内容**而不是时间窗：一张「哪个文件、多久之内」的抑制表漏一条的失败
+   * 方式是那个文件从此再也不提醒，而逐字节比对只有两个答案，也不会随时间漂移。
+   *
+   * 未命名、分片、从未在这一次打开里写过盘、以及**读失败**一律 false——
+   * 调用方把 false 当「不认识，按冲突处理」：不知道盘上发生了什么时，问一句比悄悄盖掉安全。
+   */
+  diskMatchesLastWrite: () => Promise<boolean>
 }
 
 function baseName(path: string): string {
@@ -205,6 +220,18 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
    * 取决于 CM6 的回调是同步还是异步，不该赌。
    */
   let replacing = false
+
+  /**
+   * 最近一次**成功**写进磁盘的正文与格式。给 `diskMatchesLastWrite` 用。
+   *
+   * 存 `format` 是因为读回来时要按**写下去时**的那一种编码解码：用户完全可能在写完之后
+   * 又改了保存格式（`changeFormat` 只动内存），而磁盘上那份字节还是旧格式的
+   *
+   * ⚠️ 只在 `saveFile` 成功之后赋值，打开/恢复文档时清空：换了文件之后，上一份文件的
+   * 写盘记录与这一份毫无关系，留着的话一次巧合（比如两个文件都恰好是空文件）
+   * 就能把一次真的外部改动认领成自己的回声
+   */
+  let lastWritten: { text: string; format: FileFormat } | null = null
 
   function replaceText(text: string) {
     replacing = true
@@ -251,6 +278,8 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     // 判错一次的后果是漏一个 fd（见 `ipc/shard.ts` 的 `closeLarge`）
     releaseShard()
     replaceText(file.text)
+    // 正文来自磁盘，不是这一次 Vela 写的：上一份文件留下的写盘记录必须作废
+    lastWritten = null
     setPath(target)
     // 必须在 replaceText 之后：重建 state 会把语言槽位清空，这里再把新语言装进去。
     // 反过来的话语言会装到一个马上被丢弃的 state 上，且静默无报错
@@ -276,6 +305,7 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     // 正文清空。分片的行在 Rust 那边按页取，CM6 这份 buffer 只是个占位；
     // 🔴 留着上一个文件的正文的话，`host.getText()` 会把它当成这个文件的内容
     replaceText('')
+    lastWritten = null
     setPath(target)
     host.pathChanged()
     const { encoding, bom, eol } = opened.header
@@ -310,6 +340,8 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     // replaceText 而不是 setText：整篇替换会触发 docChanged，不挡住的话恢复出来的
     // 草稿会被再标一次脏——dirty 该由存档说了算，不该由「装进去」这个动作决定
     replaceText(init.text)
+    // 草稿是存档里的，不是这一次 Vela 写的
+    lastWritten = null
     setPath(init.path)
     // 必须在 replaceText 之后：重建 state 把语言槽位清空了
     host.pathChanged()
@@ -439,7 +471,12 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     try {
       const editsBefore = edits()
       const formatBefore = format()
-      const report = await saveFile(target, host.getText(), formatBefore)
+      // 只取一次：落盘的、事后用来认领回声的，必须是**同一份**正文
+      const text = host.getText()
+      const report = await saveFile(target, text, formatBefore)
+      // 这一份就是磁盘上现在的字节（原子写，要么是它要么是旧的）。记下来，
+      // 监听器 250ms 后报回「文件改了」时用它认亲（见 `diskMatchesLastWrite`）
+      lastWritten = { text, format: formatBefore }
       setPath(target)
       // 另存为会把无名文档（默认当 Markdown）换成别的扩展名，语言得跟着走。
       // 保存不重建 state，所以这里只能靠槽位 reconfigure
@@ -466,6 +503,26 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
       setNotice({ level: 'error', text: `保存失败：${describeFsError(err)}` })
     } finally {
       setBusy(false)
+    }
+  }
+
+  /**
+   * 读一遍磁盘，看它是不是还停在上一次成功写盘的那一份上。理由见接口上那段。
+   *
+   * 用**写下去时**的编码读回来：正文在 `TextFile` 里是按 LF 归一化的，BOM 也由解码层
+   * 剥掉，所以行尾与 BOM 都不会让这次比对误判成「不一样」
+   */
+  async function diskMatchesLastWrite(): Promise<boolean> {
+    const written = lastWritten
+    const target = path()
+    // 分片没有内存正文，写也写不进去，`lastWritten` 本来就是 null
+    if (written === null || target === null || shard() !== null) return false
+    try {
+      const file = await openFile(target, written.format.encoding)
+      return file.text === written.text
+    } catch {
+      // 读失败说不清盘上是什么。false 让调用方照旧弹窗，比悄悄盖掉安全
+      return false
     }
   }
 
@@ -528,5 +585,6 @@ export function createDocumentModel(host: DocumentHost): DocumentModel {
     changeFormat,
     reopenWith,
     reload,
+    diskMatchesLastWrite,
   }
 }

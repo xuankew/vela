@@ -494,7 +494,7 @@ describe('事件分流：干净的静默重载，其余排队问', () => {
 
     expect(h.fw.current()).toEqual({ tabId: tab.id, kind: 'changed', name: 'a.txt', path: '/repo/a.txt' })
     expect(tabText(tab)).toBe('旧正文')
-    // 没排到队里去读盘：那份未保存的改动是磁盘上没有的唯一副本
+    // 这一次打开之后还没写过盘（`lastWritten` 为空），没有可认领的东西，于是不读盘
     expect(ipc.openFile).toHaveBeenCalledTimes(1)
   })
 
@@ -605,6 +605,67 @@ describe('事件分流：干净的静默重载，其余排队问', () => {
     expect(ipc.openFile).toHaveBeenCalledTimes(2)
     expect(h.fw.current()).toBeNull()
     expect(tab.snapshot.state).toBe(before)
+  })
+
+  it('保存之后文档又变脏：那条回声认得出来，不弹窗（用户实际遇到的那个假冲突）', async () => {
+    const h = harness()
+    await h.ws.openAt('/repo/a.txt')
+    await h.fw.start()
+    await flush()
+    const tab = h.ws.activeTab()
+    tab.doc.markChanged()
+    await h.ws.save()
+    // 保存成功的那一刻是干净的，但原子写盘的事件要 250ms 后才到；这中间用户继续敲字
+    // （或者自动存盘跑完之后用户接着打），文档重新变脏。不认亲的话弹窗就出现在这里
+    tab.doc.markChanged()
+    expect(tab.doc.dirty()).toBe(true)
+
+    fire('/repo/a.txt')
+    await flush()
+
+    expect(h.fw.current()).toBeNull()
+    expect(h.fw.pending()).toBe(0)
+    // 认亲读了盘，用的是**写下去时**的编码
+    expect(ipc.openFile).toHaveBeenLastCalledWith('/repo/a.txt', 'utf8')
+    expect(tabText(tab)).toBe('旧正文')
+    expect(tab.doc.dirty()).toBe(true)
+  })
+
+  it('磁盘上确实是别人写的：照样弹窗', async () => {
+    const h = harness()
+    await h.ws.openAt('/repo/a.txt')
+    await h.fw.start()
+    await flush()
+    const tab = h.ws.activeTab()
+    tab.doc.markChanged()
+    await h.ws.save()
+    tab.doc.markChanged()
+    ipc.openFile.mockResolvedValueOnce(textFile({ text: '别人写的' }))
+
+    fire('/repo/a.txt')
+    await flush()
+
+    expect(h.fw.current()).toEqual({ tabId: tab.id, kind: 'changed', name: 'a.txt', path: '/repo/a.txt' })
+    // 冲突没答复之前正文一个字节都不动
+    expect(tabText(tab)).toBe('旧正文')
+  })
+
+  it('认亲时读不出来就按冲突处理：不知道盘上是什么，问一句比悄悄盖掉安全', async () => {
+    const h = harness()
+    await h.ws.openAt('/repo/a.txt')
+    await h.fw.start()
+    await flush()
+    const tab = h.ws.activeTab()
+    tab.doc.markChanged()
+    await h.ws.save()
+    tab.doc.markChanged()
+    ipc.openFile.mockRejectedValueOnce({ kind: 'io', message: '读不了' })
+
+    fire('/repo/a.txt')
+    await flush()
+
+    expect(h.fw.current()).toMatchObject({ kind: 'changed', path: '/repo/a.txt' })
+    expect(tab.doc.dirty()).toBe(true)
   })
 
   it('保存失败时脏标记还在，那一次弹窗是该弹的：盘上真的变了', async () => {

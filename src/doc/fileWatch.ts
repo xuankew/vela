@@ -22,15 +22,18 @@ import type { Workspace } from './workspace'
  * 3. **冲突队列**：脏标签被外部改了、或者文件被外部删了 → 排队问一次，一次只弹一个。
  *    这两种的共同点是「Vela 手里有磁盘上没有的东西」，自动决定就等于替用户扔数据。
  *
- * ⛔ **刻意没有「Vela 自己写的就不算」那张表。** 原子写盘（临时文件 + rename）确实会
- * 让 FSEvents 报一条，于是 ⌘S 之后会收到自己那一次改动的事件。不挡它的理由是三条：
+ * ⛔ **没有「Vela 自己写的不算」那张表，但有一句逐字节的认领。** 原子写盘
+ * （临时文件 + rename）必然让 FSEvents 报一条；250ms 的防抖把它送到时，用户可能已经
+ * 又敲了几个字，自动存盘也可能已经开始了下一轮——那一刻文档是脏的，于是会弹一个
+ * 「在 Vela 之外被改过了」，而这条事件里没有任何第三方参与。
  *
- * - 保存成功的那一刻文档已经干净了，走的是第 2 条路：`reload()` 把同样的字节读回来，
- *   而 `reload` 里那句 `if (changed) replaceText(...)` 让它连撤销栈都不碰——**零可见后果**
- * - 保存失败时脏标记还在（`writeTo` 刻意不清），那时弹一次窗恰恰是对的：盘上真变了
- * - 一张抑制表要记「哪个文件、多久之内、算不算过期」，而它一旦漏掉一条，失败方式是
- *   **那个文件从此再也不提醒**，并且没有任何东西会说出来。用一次多余的空转
- *   换掉一个会静默失效的状态机，这笔账很清楚
+ * 认领的判据是 `doc.diskMatchesLastWrite()`：磁盘上现在的字节，是不是正好等于上一次
+ * 成功写盘落下的那一份。刻意不用时间窗——一张「哪个文件、多久之内、算不算过期」的
+ * 抑制表漏掉一条的失败方式是**那个文件从此再也不提醒**，而内容比对只有两个答案，
+ * 也不会随时间漂移。
+ *
+ * 读失败一律按「不认识」处理，照旧弹窗：不知道盘上发生了什么时，问一句比悄悄盖掉安全。
+ * 保存失败那一侧不受影响——`writeTo` 刻意留着脏标记，而那时盘上可能真的变了。
  *
  * ⚠️ 这一层只管**打开着的标签**。侧边栏那棵树不跟着刷新（M2-G 的范围之外）：
  * 树说的是「目录里有什么」，刷新它要重列目录，而绝大多数事件与树里看得见的那几行无关。
@@ -267,14 +270,41 @@ export function createFileWatch(options: FileWatchOptions): FileWatch {
         continue
       }
       // 脏标签被改、或者文件被删（脏不脏都一样）：Vela 手里有磁盘上没有的东西，
-      // 自动决定就等于替用户扔数据
-      const kind = change.kind
-      setQueue((q) =>
-        // 同一个标签的同一种冲突只排一次：debouncer 已经把 250ms 内的抖动合掉了，
-        // 而用户不答复的那几分钟里同一个文件可能被改很多次，排一队同样的对话框毫无意义
-        q.some((c) => c.tabId === tab.id && c.kind === kind) ? q : [...q, { tabId: tab.id, kind }],
-      )
+      // 自动决定就等于替用户扔数据。
+      // 「改了」要先认一次亲——这一次很可能是 Vela 自己刚那笔写盘的回声
+      if (change.kind === 'changed') void queueChangedConflict(tab.id, change.path)
+      else enqueueConflict(tab.id, 'removed')
     }
+  }
+
+  /** 同一个标签的同一种冲突只排一次：debouncer 已经把 250ms 内的抖动合掉了，
+   * 而用户不答复的那几分钟里同一个文件可能被改很多次，排一队同样的对话框毫无意义 */
+  function enqueueConflict(tabId: number, kind: FileChangeKind) {
+    setQueue((q) => (q.some((c) => c.tabId === tabId && c.kind === kind) ? q : [...q, { tabId, kind }]))
+  }
+
+  /**
+   * 脏标签收到「改了」：先读一遍盘，确认这不是 Vela 自己那笔写盘的回声。
+   *
+   * 不认的后果就是用户现在遇到的那个：正常编辑、自动存盘/⌘S 之后，250ms 前那次写盘
+   * 的事件到了，而文档此刻又是脏的，于是弹一个「在 Vela 之外被改过了」——
+   * 全程只有 Vela 一个写入方。判据的理由见 `document.ts` 的 `diskMatchesLastWrite`
+   *
+   * ⚠️ 读盘是异步的，回来之后必须重新核对现场：标签可能已经关掉、另存为换了路径、
+   * 或者刚好存成功（那就不脏了，该走静默重载而不是冲突）
+   */
+  async function queueChangedConflict(tabId: number, eventPath: string): Promise<void> {
+    const tab = ws.tabs().find((t) => t.id === tabId)
+    if (tab === undefined) return
+    if (await tab.doc.diskMatchesLastWrite()) return
+    const after = ws.tabs().find((t) => t.id === tabId)
+    if (after === undefined || after.doc.path() !== eventPath) return
+    if (!after.doc.dirty()) {
+      // 读盘期间存成功了。干净标签的规矩与上面那条同步分支一致：直接对齐磁盘
+      void after.doc.reload()
+      return
+    }
+    enqueueConflict(tabId, 'changed')
   }
 
   async function resolve(choice: ConflictChoice): Promise<void> {
