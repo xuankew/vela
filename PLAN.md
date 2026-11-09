@@ -2043,7 +2043,7 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 >     - ⚠️ **那段断档是真实的记账缺口，⛔ 不要用「M4-R 到 M7-6 之间一共长了 2.55KB、平摊到中间那几轮」这种算法补**：M4-S（标签拖拽改走鼠标手势）与 M6-B（原生菜单补 `⌘F`）都是**动前端**的轮次，各改了多少一个数都没有。所以 **M7 全线的净增量只能给出「≤ 2.58KB」这个上界**，而不是一个准数——本轮记的 295.88 是量的，295.60 / 295.81 / 295.83 是抄提交信息的，再往前就断了。
 >     - ⚠️ **§2.9 那条箭头链仍然停在 M5-R 的 292.04**，按「M4-P 实施修正」9 的口径**不逐轮更新**——本节这条链是 M7 的账，⛔ 别把两处当成一份。
 >     - 🔴 **余量只剩 1.37%**，而 300KB 自 M4-K 起已经**降级为记账线**（超线不算缺陷、⛔ 不建 CI 体积门禁）。⚠️ **本地那一半（M7-9 / 11 / 12）几乎没长——协议与大图都不需要新的前端依赖**，长的是云端那一半（`ipc/oss` + `ipc/secrets` + `md/ossImage` + 设置面板）。
->     - 📌 **顺手发现的一处首屏常驻，本轮没动**：`src/settings/SettingsDialog.tsx` 在 `App.tsx` 里是**静态 import**（`:64`），而同一层的其余七个浮层（`MarkdownPreview` / `JsonPreview` / `CommandPalette` / `ToolBox` / `OutlinePanel` / `FindInFiles` / `QuickOpen`）**全是 `lazy()`**。⛔ 本轮范围是「记账 + 两笔 a11y 欠账」，所以没改；⚠️ 真要再挤出余量，这是**第一个**该看的地方——设置面板是一个只在 `⌘,` 之后才需要的浮层，与那七个同一性质。
+>     - 📌 **顺手发现的一处首屏常驻，本轮没动**：`src/settings/SettingsDialog.tsx` 在 `App.tsx` 里是**静态 import**（`:64`），而同一层的其余七个浮层（`MarkdownPreview` / `JsonPreview` / `CommandPalette` / `ToolBox` / `OutlinePanel` / `FindInFiles` / `QuickOpen`）**全是 `lazy()`**。⛔ 本轮范围是「记账 + 两笔 a11y 欠账」，所以没改；⚠️ 真要再挤出余量，这是**第一个**该看的地方——设置面板是一个只在 `⌘,` 之后才需要的浮层，与那七个同一性质。**（→ 2026-11-08 做掉了，见 §3.21。⚠️ 那句里的行号 `:64` 早已漂移，本轮动手前那份静态 import 写在 `App.tsx:75`——PLAN 里这类点名的行号，动之前都要重新 grep 一遍。）**
 > 14. **本轮（2026-11-02）的门禁数**：前端 **3336 passed / 104 files**（比 M7 全账落地前的 3320 **+16**，新增的全是 M7-11 那两笔欠账的用例），Rust **571 passed / 1 ignored 不变**，typecheck 干净，eslint **0 error + 8 warning 不变**（那 8 条 reactivity warning 是刻意留的），prettier 干净，`cargo fmt` 干净，clippy 干净。**Tauri 命令净 +5**（`upload_image` / `presign_oss_images` / `set_oss_secret` / `delete_oss_secret` / `oss_secret_status`），⛔ **一个读密钥的命令都没加**。
 > 15. ⛔ **真机未验的清单**（本轮之前 M7 全线都没在装好的 `.app` 上走过一遍，本轮只构建、不重测）：① 🔴 **真上传**——六条黄金向量对的是签名字节，**没有一次 PUT 真的打到过阿里云**（第 5 条那个网络盲区）；② 🔴 **钥匙串**——写 / 删 / 状态在 jsdom 里全是桩，真机上第一次调用会弹系统授权；③ 🔴 **`vela-img://` 在真 WKWebView 里的行为**（三种 URI 形状、六个状态码、没有 ACAO 头时 `fetch()` 到底拿不拿得到字节）；④ ⚠️ **15 分钟签名过期之后重签一次**那一条路径；⑤ ⚠️ **大图的焦点陷阱与 `:focus-visible` 描边**要眼睛看（jsdom 没有布局，`outline` 一个像素都画不出来）；⑥ ⚠️ **`⌘,` 设置面板改过之后热重载不管用**（文案在 Rust 侧），要重启 dev。
 > 16. ⛔ **M7 刻意没做的四件**（都不是「忘了」）：**拖拽插图**、**文件选择器插图**、**公读域名**、**上传进度条与取消**。前两件的理由与「粘贴」同一条链路但各要一份新的落地判据；后两件见第 8、9 条。
@@ -2346,6 +2346,27 @@ Windows / Linux 留到 v1.x（届时需处理 WebView2 内存差异与 WebkitGTK
 **数字**（⚠️ 全部是本轮在 `53c7be9` 上**重跑**的，不是抄 §3.19 的）：typecheck 干净，前端 **3460 → 3461 passed / 110 files**（多的那一条就是上面的折叠回归用例），Rust **575 passed / 1 ignored 不变**（本轮重跑过，与 §3.19 那个数对得上；`cargo fmt --all --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 都干净），eslint **0 error + 8 warning 不变**，prettier 干净。首屏 gzip **299.93 → 299.94KB**（entry `index-aKRB7Aiw.js` → `index-BcmpooUu.js` **190.38 → 190.39**；modulepreload `dist-CvermxKb.js` **101.77 哈希与字节逐字未动** → ⛔ 没加新的懒加载边界；CSS `index-B06moflj.css` **7.78 未变**）。🔴 **300KB 记账线的余量只剩 0.06KB / 0.02%**——下一轮只要动前端就会越线。⛔ 越线不算缺陷、**不建体积门禁**（M4-K 那条判决不变，用户也已明示暂时不管体积），但 §3.9 第 13 条那句「**第一个该看的地方是 `src/settings/SettingsDialog.tsx` 在 `App.tsx` 里是静态 import**」到现在还没做，那是这一层唯一一处成块的余量。
 
 ---
+
+### 3.21 修正 · 2026-11-08：把「设置」对话框挪出首屏，那条 0.06KB 的余量还回来了
+
+📌 这一节做掉的就是 §3.20 结尾欠下的那一件事，也正是 §3.9 第 13 条那条 📌 点名「第一个该看的地方」却始终没动的这一处（2026-11-08 这轮用户批准动它）。
+
+**① 切法**：`src/App.tsx` 里 `SettingsDialog` 从静态 `import` 换成 `lazy(() => import(...).then(m => ({ default: m.SettingsDialog })))`，渲染点那层 `<Show when={settingsDialogVisible()}>` 内再加一个 `<Suspense>`。⚠️ 外面那层 `Show` **本来就在**，所以不必像 `ToolBox` / `CommandPalette` 那样补一层外框（那两位是组件内部自带 `Show`，理由逐字写在 `src/App.tsx` 那段 M3-C-2 的注释里），而 `Suspense` 不产生 DOM 节点，这个根层浮层的层叠顺序一个字没变。
+
+**② 🔴 真正挪走的只有两样，⛔ 别把整条依赖链都算进这笔账**：`settings/SettingsDialog.tsx`（源文件 16.6KB）本体 + **只有它在 import 的** `ipc/secrets.ts`（4.7KB，那三条钥匙串命令的封装）。它另外三个依赖都还被别的模块拉着，一个字节都省不掉——`fonts/loader` 与 `settings/theme` 走 `settings/store.ts`（`createSettingsStore` 在 `App.tsx` 是静态的，boot 时就得接上字体/主题/键位/OSS 四格），`ipc/oss` 走 `md/paste.ts`（那条在 entry）。⚠️ 这里有一个数错了会被 `dist/assets` 打脸的地方：`md/ossImage.ts` **不在 entry**，它跟着 `MarkdownPreview` 住在懒加载那块（探针：`ossRetried` 只命中 `MarkdownPreview-CcfDxXLs.js`），所以把 `ipc/oss` 钉在首屏的是粘贴那一条，不是预览签名那一条。硬证据（`dist/assets` 里数命中，不是「看 chunk 名单」）：`set_oss_secret` 在 entry `index-BAEaqYB2.js` **命中 0**、在新 chunk `SettingsDialog-C4P_ehzq.js` **命中 1**；`.settings-dialog` 同样 **0 / 1**；反过来 `upload_image` 与 `presign_oss_images` 两个命令名**仍在 entry 里出现**——那正是「`ipc/oss` 一个字节都没被挪走」的凭据。⚠️ 口径说清楚：`grep -c` 数的是**行数**，而产物是单行压缩的，所以上面那些 `1` 只证明「这个符号在这个文件里出现过」、`0` 才是要看的结论（它**不在这个文件里**）；⛔ 别把 `1` 读成「只有一个字节」或「只出现一次」。
+
+**③ 切分开销要如实记**：entry 降 **2.86KB** gz（190.39 → 187.53），而切出来的那块是 **3.30KB** gz（8.31KB raw）。⚠️ 于是**整包 gzip 总和反而多了 0.44KB**——这一刀买的是首屏，不是总量。⛔ 别在别处写成「设置面板那 3.3KB 省掉了」。
+
+**④ 测试侧只动了预热清单，没加用例**：`src/App.test.tsx` 顶部那条 `await Promise.all([...])` 加一行 `import('./settings/SettingsDialog')`。口径与 M3-C 那几条逐字相同——预热焐热的是**模块图**，之后 `lazy` 内部那次 `import()` 只剩微任务，而 `openSettings()` 走的是 `menu()` → `fireEvent()` → **一个 `flush()`（`setTimeout(0)`）**，够了。⛔ 不要改成多等几个 tick 蒙过去（§3.5「M3-C 实施修正」5 写的正是「顶层预热焐热的是模块、⛔ 不是那份 memo」，而 `App.test.tsx` 那段注释钉的是「多加 flush 只能把偶发挪个位置」）。`fontSizeSelect()` / 那三条取设置面板控件的用例一个字没改就跑绿。
+
+**数字**：typecheck 干净，前端 **3461 passed / 110 files 不变**（`App.test.tsx` 235 条单跑也全绿；本轮**没有新增用例**——切 `lazy` 是接线，行为面一条没变，面板自己的 23 条在 `SettingsDialog.test.tsx` 里静态 import，不受影响），Rust **575 passed / 1 ignored 不变**（本轮未改 Rust 一个字，`cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo test --workspace` 仍全部重跑过），eslint **0 error + 8 warning 不变**（那 8 条 reactivity warning 里有 3 条就住在 `SettingsDialog.tsx`，§3.7「M5-R 实施修正」8 那条判决不变：单独开一轮才动），prettier 干净。**首屏 gzip 299.94 → 297.08KB**（entry `index-BcmpooUu.js` → `index-BAEaqYB2.js` **190.39 → 187.53**；modulepreload `dist-CvermxKb.js` **101.77 哈希与字节逐字未动**；CSS `index-B06moflj.css` **7.78 未变**）。🔴 **300KB 记账线的余量 0.06KB / 0.02% → 2.92KB / 0.97%**。⛔ 依旧不建体积门禁（M4-K 判决不变）。
+
+**真机未验（交用户目视）**：⚠️ 第一次按 `⌘,` 时浏览器要多读一个 3.3KB 的本地文件。在 Tauri 里那是读一个本地文件、量级毫秒以下（口径见 `src/App.tsx` 里 M3-C-1 那段注释），但**面板是否有一帧空白**要眼睛看——jsdom 里那个 `flush()` 测不出观感。第二次打开应当没有（`lazy` 那份 memo 会兜住）。
+
+**同层剩下的候选（本轮没做，理由记在这儿）**：`settings/KeybindingsDialog.tsx`（源文件 7.2KB）仍是静态 import，而且**同样**包在 `<Show when={keybindingsDialogVisible()}>` 里，看着是同一刀就能切。⚠️ 它唯一的入口是「设置」面板里那个按钮（`App.tsx` 里 `setKeybindingsDialogVisible(true)` 只有一处命中），切它等于把「读盘那一跳」套在「已经读过一次盘」之后，收益比第一条小、而那条回调链（`onOpenKeybindings` 关面板再开面板）要一起想清楚，所以这轮没顺手做。⛔ 下一条动前端的轮次若要再挤余量，先量它，别凭源文件大小猜。
+
+---
+
 
 ## 4. 风险登记册
 

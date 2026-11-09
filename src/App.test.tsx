@@ -306,6 +306,9 @@ await Promise.all([
   import('./md/OutlinePanel'),
   import('./search/FindInFiles'),
   import('./goto/QuickOpen'),
+  // 「设置」对话框的组件也走 `lazy()`：上面 `openSettings()` 走的是 `menu()` → 一个 `flush()`，
+  // 冷缓存时那一次 import 横跨好几个宏任务，`fontSizeSelect()` 会取不到 select
+  import('./settings/SettingsDialog'),
   // M4-I 起六个工具的**实现**也从 `tools/builtin.ts` 里按需 import（描述符仍常驻）。
   // 同一条理由：下面「在工具箱里跑一次 Base64」那几条用例等的是 `setTimeout(0)` 量级的 tick，
   // 冷缓存时那一次 import 横跨好几个宏任务，会让它偶发红

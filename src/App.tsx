@@ -72,7 +72,6 @@ import { revealTarget } from './search/reveal'
 import type { HitRow } from './search/rows'
 import { createSearchPanel } from './search/store'
 // import { AppearancePopover } from './settings/AppearancePopover' // 工具栏隐藏后暂时不用，保留导入以备将来恢复
-import { SettingsDialog } from './settings/SettingsDialog'
 import { KeybindingsDialog } from './settings/KeybindingsDialog'
 import { createKeybindingStore } from './settings/keybindings'
 import { createSettingsStore } from './settings/store'
@@ -145,6 +144,23 @@ const ToolBox = lazy(() => import('./tools/ToolBox').then((m) => ({ default: m.T
 const OutlinePanel = lazy(() => import('./md/OutlinePanel').then((m) => ({ default: m.OutlinePanel })))
 const FindInFiles = lazy(() => import('./search/FindInFiles').then((m) => ({ default: m.FindInFiles })))
 const QuickOpen = lazy(() => import('./goto/QuickOpen').then((m) => ({ default: m.QuickOpen })))
+
+/**
+ * 「设置」对话框的 UI 也改成按需加载。与上面几块同一条理由、同一套切法：它只有一个入口
+ * （「视图 › 设置…」/ `Cmd+,`），而启动那一刻需要的是它身后的 `settings/store.ts`——那一份
+ * **留在首屏**（字体、主题、键位、OSS 四格的读写全在 boot 时就要接上）。
+ *
+ * 🔴 于是这一刀真正挪走的是两样：`SettingsDialog.tsx` 本体，与**只有它 import 的**
+ * `ipc/secrets.ts`（那三条钥匙串命令的封装）。它另外的依赖——`fonts/loader`、`settings/theme`、
+ * `ipc/oss`——都还被首屏里别的模块拉着，一个字节都省不掉，⛔ 别把它们算进这笔账。
+ *
+ * ⚠️ 渲染点**本来就已经**包在 `<Show when={settingsDialogVisible()}>` 里，所以不必像
+ * ToolBox / CommandPalette 那样再补一层外框（那两位是因为组件内部自带 `Show`，见上面 M3-C-2
+ * 那条注释）；而组件每次打开都是一个新实例，这一点在 `SettingsDialog.tsx` 的草稿注释里早已钉死。
+ * `KeybindingsDialog`（7.2KB 源文件）看着同类，但它唯一的入口是这份对话框里的一个按钮，
+ * 挪走它得连 `onOpenKeybindings` 那条回调一起改，这轮没做。
+ */
+const SettingsDialog = lazy(() => import('./settings/SettingsDialog').then((m) => ({ default: m.SettingsDialog })))
 
 /**
  * 编辑器那一层要说的话（见下面 `editorNotice` 那条注释）。
@@ -2079,17 +2095,21 @@ export default function App() {
         </Suspense>
       </Show>
 
-      {/* 设置对话框（菜单触发，View → 设置... / Cmd+,）*/}
+      {/* 设置对话框（菜单触发，View → 设置... / Cmd+,）。
+          🔴 组件走 `lazy()`，外面那层 `<Show>` 是它不提前进首屏的唯一凭据，理由见上面
+          那个 `lazy()` 的注释；`<Suspense>` 不产生 DOM 节点，所以这里的层叠顺序照旧 */}
       <Show when={settingsDialogVisible()}>
-        <SettingsDialog
-          settings={settings}
-          visible={settingsDialogVisible()}
-          onClose={() => setSettingsDialogVisible(false)}
-          onOpenKeybindings={() => {
-            setSettingsDialogVisible(false)
-            setKeybindingsDialogVisible(true)
-          }}
-        />
+        <Suspense>
+          <SettingsDialog
+            settings={settings}
+            visible={settingsDialogVisible()}
+            onClose={() => setSettingsDialogVisible(false)}
+            onOpenKeybindings={() => {
+              setSettingsDialogVisible(false)
+              setKeybindingsDialogVisible(true)
+            }}
+          />
+        </Suspense>
       </Show>
 
       {/* 快捷键配置对话框（M4-E）*/}
