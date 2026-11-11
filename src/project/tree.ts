@@ -31,6 +31,7 @@
  */
 
 import type { DirEntry } from '../ipc/project'
+import { MARKDOWN_EXT } from '../editor/language'
 
 /** 树里的一行。扁平化之后只有「第几行、缩进多深」，没有父子指针 */
 export interface TreeRow {
@@ -192,6 +193,19 @@ function appendDir(
 }
 
 /**
+ * 剥掉**所有**末尾斜杠，不是只剥一个：`/a/b///` 的最后一段是空字符串。
+ * 停在 1 是为了让 '/' 保住自己那一个斜杠。
+ *
+ * 这是 `displayName` 与 `sameDir` 共用的那一半：两处各写一个循环的话，
+ * 「尾斜杠算不算同一个目录」就会在名字显示与图标显示之间悄悄分岔
+ */
+function trimTailSlash(path: string): string {
+  let end = path.length
+  while (end > 1 && path.charAt(end - 1) === '/') end--
+  return path.slice(0, end)
+}
+
+/**
  * 从绝对路径里抠出给人看的名字。
  *
  * ⚠️ **这是全前端唯一一处「拆」绝对路径的地方**，与 `childRel` 的「拼」正好是一对，
@@ -203,14 +217,30 @@ function appendDir(
  * JSON 要同步改），换来的只是省掉一个 `lastIndexOf('/')`。不划算。
  */
 export function displayName(rootPath: string): string {
-  // 剥掉**所有**末尾斜杠，不是只剥一个：`/a/b///` 的最后一段是空字符串。
-  // 停在 1 是为了让 '/' 保住自己那一个斜杠——根目录没有名字可抠，只能拿路径当名字
-  let end = rootPath.length
-  while (end > 1 && rootPath.charAt(end - 1) === '/') end--
-  const trimmed = rootPath.slice(0, end)
+  const trimmed = trimTailSlash(rootPath)
   const at = trimmed.lastIndexOf('/')
   const name = at < 0 ? trimmed : trimmed.slice(at + 1)
   return name.length > 0 ? name : trimmed
+}
+
+/**
+ * 两条绝对路径是不是**同一个目录**（M8-6a：目录级同步图标与右键项的唯一判据）。
+ *
+ * 判的是**相等**，⛔ 不是 `startsWith`：打开的是同步目录的子目录时不算——
+ * 用户说的是「打开同步的目录时」，同步状态也只在根行上显示。
+ *
+ * ⚠️ **这一层只去尾斜杠，不解软链**。前端没有 fs API（项目没引 `@tauri-apps/plugin-fs`），
+ * 而为了一个图标去加一条 Rust 命令不划算。落到实处的两个后果：
+ * - 根与配置都来自原生目录对话框，正常都已经是解开的真实路径，碰不上的场合极少；
+ * - 万一真的「配置的是软链、打开的是真实路径」，图标**不出现**（false negative，安静）；
+ *   反过来一旦图标出现了而 Rust 侧 canonicalize 后对不上，`weread_sync_dir` 的预检会用
+ *   一句「配置与打开的目录不一致」当场拒绝——⛔ 不会往错的地方写。
+ *
+ * `undefined`（位次越界，不该发生）与空串（没配）一律不相等，⛔ 不让 `''` 与 `''` 配上。
+ */
+export function sameDir(a: string | undefined, b: string): boolean {
+  if (a === undefined || b === '') return false
+  return trimTailSlash(a) === trimTailSlash(b)
 }
 
 /**
@@ -256,8 +286,9 @@ export function isMutedRow(row: TreeRow): boolean {
   return row.isDir && row.rel !== '' && (row.name.startsWith('.') || MUTED_DIR_NAMES.has(row.name))
 }
 
-/** 右键菜单里的一项动作。七个都是 store 上已有的方法，一一对应 */
-export type TreeMenuAction = 'newFile' | 'newFolder' | 'rename' | 'trash' | 'reveal' | 'copyPath' | 'removeRoot'
+/** 右键菜单里的一项动作。七个都是 store 上已有的方法，一一对应；`syncWeread` 走同步 store */
+export type TreeMenuAction =
+  'newFile' | 'newFolder' | 'rename' | 'trash' | 'reveal' | 'copyPath' | 'removeRoot' | 'syncWeread'
 
 export interface TreeMenuItem {
   action: TreeMenuAction
@@ -301,8 +332,9 @@ export function containerRel(row: TreeRow): string {
  *   一个根时说「关闭文件夹」（与头部那个 × 的 title 同一句话），多个根时说
  *   「从工作区移除」。两句话背后是同一个动作，而说反了会让用户以为要丢东西——
  *   只有一个根的时候「工作区」这个词在界面上压根没出现过
+ * @param sync 目录级同步的条件（M8-6a）。不传 = 这一轮没有同步入口，菜单与原样一致
  */
-export function menuFor(row: TreeRow, rootCount: number): TreeMenuItem[] {
+export function menuFor(row: TreeRow, rootCount: number, sync?: MenuSyncOptions): TreeMenuItem[] {
   const isRoot = row.rel === ''
   const items: TreeMenuItem[] = [
     { action: 'newFile', label: '新建文件' },
@@ -321,7 +353,36 @@ export function menuFor(row: TreeRow, rootCount: number): TreeMenuItem[] {
   if (isRoot) {
     items.push({ action: 'removeRoot', label: rootCount > 1 ? '从工作区移除' : '关闭文件夹', separator: true })
   }
+  if (sync !== undefined && canSyncWeread(row, sync)) {
+    // 自己一组、排在最后：它会联网、会往磁盘上写几十个文件，与「复制路径」之间
+    // 必须隔着一次误点的距离。⛔ 目录行、别的根的行、非 md 文件都不出这一项——
+    // 判据全在 `canSyncWeread` 里，渲染那一层不重复
+    items.push({ action: 'syncWeread', label: '同步微信读书笔记', separator: true })
+  }
   return items
+}
+
+/** 目录级同步在菜单里的条件（M8-6a）。与图标用的是同一条 `sameDir` 判据 */
+export interface MenuSyncOptions {
+  /** 这一行所属根的绝对路径。`undefined` = 位次越界（不该发生），一律不出这一项 */
+  readonly rootPath: string | undefined
+  /** 配置里的微信读书目录。空串 = 没配 */
+  readonly wereadDir: string
+}
+
+/**
+ * 这一行该不该给「同步微信读书笔记」。
+ *
+ * 四条**同时**成立：不是目录、扩展名是 Markdown、所属根就是配置的那个目录
+ * （`sameDir`，算的是**相等**不是前缀）、配置非空。
+ *
+ * ⚠️ 只认 `.md` 那一串扩展名（`MARKDOWN_EXT`），⛔ 不另写一张表：与高亮、导出名、
+ * 工具栏共用同一份判断——这里多认一个 `.mdx` 而那里不认，症状是「右键有同步、
+ * 点开却不是 Markdown」。⚠️ 判的是 `row.name` 而不是 `row.path`：两个都行，
+ * 但名字更短，而这条判据只看最后一段
+ */
+function canSyncWeread(row: TreeRow, sync: MenuSyncOptions): boolean {
+  return !row.isDir && sameDir(sync.rootPath, sync.wereadDir) && MARKDOWN_EXT.test(row.name)
 }
 
 /**

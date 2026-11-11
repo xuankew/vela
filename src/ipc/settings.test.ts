@@ -37,11 +37,11 @@ import {
  * 于是 Rust 的黄金字面量写 `letterSpacing:0.0`，这里写 `letterSpacing:0`，各钉各那一侧的输出。
  */
 const GOLDEN_SETTINGS =
-  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true}'
+  '{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true,"wereadLocalDir":"","syncLocalDir":"","githubRepo":""}'
 
 /** 非默认值的一份配置，用来钉「任何一档都走同一条反序列化路径」（字段是具体值不是 Option） */
 const GOLDEN_SETTINGS_CUSTOM =
-  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":false}'
+  '{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":false,"wereadLocalDir":"/Users/me/notes/微信读书","syncLocalDir":"/Users/me/notes","githubRepo":"xuanke/notes"}'
 
 /**
  * Rust 侧 `loaded_settings_的线上形状` 断言的就是这个字面量。
@@ -50,11 +50,11 @@ const GOLDEN_SETTINGS_CUSTOM =
  * 两件事一次钉住。
  */
 const GOLDEN_LOADED =
-  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":true},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
+  '{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":true,"wereadLocalDir":"/Users/me/notes/微信读书","syncLocalDir":"/Users/me/notes","githubRepo":"xuanke/notes"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}'
 
 /** Rust 侧 `空现场下_load_的线上形状`：两层都 absent、配置是内置默认、没有键被忽略 */
 const GOLDEN_LOADED_EMPTY =
-  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
+  '{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true,"wereadLocalDir":"","syncLocalDir":"","githubRepo":""},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}'
 
 /** Rust 侧 `save_report_的线上形状` */
 const GOLDEN_SAVE_REPORT = '{"bytesWritten":42}'
@@ -72,6 +72,9 @@ function sampleSettings(): Settings {
     ossAccessKeyId: '',
     ossPrefix: 'assets',
     markdownToolbar: true,
+    wereadLocalDir: '',
+    syncLocalDir: '',
+    githubRepo: '',
   }
 }
 
@@ -96,6 +99,9 @@ describe('Rust → 前端 的字段名', () => {
       'ossAccessKeyId',
       'ossPrefix',
       'markdownToolbar',
+      'wereadLocalDir',
+      'syncLocalDir',
+      'githubRepo',
     ])
   })
 
@@ -118,19 +124,26 @@ describe('Rust → 前端 的字段名', () => {
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
       markdownToolbar: false,
+      wereadLocalDir: '/Users/me/notes/微信读书',
+      syncLocalDir: '/Users/me/notes',
+      githubRepo: 'xuanke/notes',
     })
     expect(JSON.stringify(parsed)).toBe(GOLDEN_SETTINGS_CUSTOM)
   })
 
-  it('🔴 契约里没有 secret 那一格', () => {
-    // AccessKeySecret **只住钥匙串**（`src-tauri/src/secrets.rs`），永远不进 `~/.vela/settings.json`。
-    // 这一条钉的是「字段清单」而不是某个值：将来谁给 `Settings` 加一个 `ossAccessKeySecret`，
-    // 上面那两条 stringify 相等的断言只会红在「多了个键」，看不出为什么不该多——
-    // 这一条直接把理由写在名字里，并且把两边唯一的 secret 相关暴露面锁成一个布尔值
+  it('🔴 契约里没有 secret / token 那一格', () => {
+    // AccessKeySecret **只住钥匙串**（`src-tauri/src/secrets.rs`），GitHub token 同理
+    // （`src-tauri/src/github.rs`），永远不进 `~/.vela/settings.json`。
+    // 这一条钉的是「字段清单」而不是某个值：将来谁给 `Settings` 加一个 `ossAccessKeySecret`
+    // 或 `githubToken`，上面那两条 stringify 相等的断言只会红在「多了个键」，看不出为什么不该多——
+    // 这一条直接把理由写在名字里，并且把两边唯一的凭证暴露面锁成一个布尔值
     const keys = Object.keys(JSON.parse(GOLDEN_SETTINGS_CUSTOM) as Settings)
     expect(keys.filter((k) => k.toLowerCase().includes('secret'))).toEqual([])
-    // `ossAccessKeyId` 里含 "AccessKey" 但不含 "secret"，所以它不会被上面的过滤误伤
+    expect(keys.filter((k) => k.toLowerCase().includes('token'))).toEqual([])
+    // `ossAccessKeyId` 里含 "AccessKey" 但不含 "secret"，所以它不会被上面的过滤误伤；
+    // `githubRepo` 同理只含 "repo"，它是地址不是凭证
     expect(keys).toContain('ossAccessKeyId')
+    expect(keys).toContain('githubRepo')
   })
 
   it('Rust 发的 0.0 与 JS 发的 0 读回来是同一个数', () => {
@@ -177,7 +190,7 @@ describe('Rust → 前端 的字段名', () => {
 })
 
 describe('内置默认值两边各钉一条', () => {
-  it('黄金字面量里的十一个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
+  it('黄金字面量里的十四个默认值与 Rust 侧 DEFAULT_* 常量同值', () => {
     // Rust 侧 `内置默认配置被钉住` 断言 DEFAULT_FONT_SIZE==14 / DEFAULT_FONT_VARIANT=="screen-gb"
     // / DEFAULT_CODE_FONT=="maple-cn" / DEFAULT_LINE_HEIGHT==1.75 / DEFAULT_LETTER_SPACING==0.0
     // / DEFAULT_THEME=="dark" / DEFAULT_OSS_PREFIX=="assets" / DEFAULT_MARKDOWN_TOOLBAR==true，
@@ -198,6 +211,12 @@ describe('内置默认值两边各钉一条', () => {
     expect(parsed.ossBucket).toBe('')
     expect(parsed.ossRegion).toBe('')
     expect(parsed.ossAccessKeyId).toBe('')
+    // 微信读书同步目录（M8-3）默认空串 = 没配
+    expect(parsed.wereadLocalDir).toBe('')
+    // 文件同步的两格（M8-5）同理：默认空串 = 没配。
+    // 🔴 「没配 GitHub」必须判得出来，否则同步按钮会去尝试一条注定失败的推送
+    expect(parsed.syncLocalDir).toBe('')
+    expect(parsed.githubRepo).toBe('')
   })
 
   it('字体注册表的默认 ID 就是契约里的默认值', () => {
@@ -238,7 +257,7 @@ describe('前端 → Rust 的 command 名与参数名', () => {
     expect(invoke).toHaveBeenCalledWith('save_settings', { settings })
   })
 
-  it('发出去的 settings payload 永远带齐十一个键', async () => {
+  it('发出去的 settings payload 永远带齐十四个键', async () => {
     invoke.mockResolvedValue(JSON.parse(GOLDEN_SAVE_REPORT))
     await saveSettings(sampleSettings())
     const sent = invoke.mock.calls[0]![1] as { settings: Settings }
@@ -254,8 +273,11 @@ describe('前端 → Rust 的 command 名与参数名', () => {
       'ossAccessKeyId',
       'ossPrefix',
       'markdownToolbar',
+      'wereadLocalDir',
+      'syncLocalDir',
+      'githubRepo',
     ])
-    // 十一个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
+    // 十四个键都是具体值，没有 undefined（undefined 会被 JSON.stringify 整个删掉，
     // 落到 Rust 侧就成了「缺键」，而 Settings 没有 #[serde(default)]，缺键直接拒）。
     // 🔴 这一条因此也是「M7-5 加的四格必须进 store 的 currentSettings()」的守卫：
     // 少带一格，用户改一次字号就会把那一格从盘上抹掉

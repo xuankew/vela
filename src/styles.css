@@ -1625,6 +1625,17 @@ body.tab-dragging {
 .tree-glyph.t-font {
   --h: 240;
 }
+/* 微信读书同步入口（M8-6a）。青绿偏冷：与 markdown 的蓝、code 的绿都隔得开，
+   而它只出现在根行尾巴上，一屏里最多一个，不会和旁边那些类别撞成一片 */
+.tree-glyph.t-weread {
+  --h: 152;
+}
+
+/* GitHub 同步入口（M8-6b）。天蓝：与 markdown 的 210 同色系但只在这两枚入口
+   之间出现，最近邻是 weread 的 152——两者永远并排，色相差 48° 足够一眼分开 */
+.tree-glyph.t-cloud {
+  --h: 200;
+}
 
 /* 「读取中…」与错误文本都占同一行的剩余空间，绝不另起一行——
    多一行就不再是 ROW_HEIGHT，窗口算术立刻失准 */
@@ -1640,6 +1651,87 @@ body.tab-dragging {
 
 .tree-note.bad {
   color: var(--vela-bad);
+}
+
+/* ---------- 目录级同步入口（M8-6a / M8-6b）---------- */
+
+/* 行尾那一格：两个入口（微信读书 / GitHub）共用，所以 `margin-left: auto` 只挂在
+   这一层。挂在按钮上的话两个 auto 会把剩余空间对半分，图标被顶到行中间 */
+.tree-sync-actions {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+/* 根行尾部那一小格。16px、无底色无边框：它是「这一行能做的一件事」，
+   权重必须低于文件名，也不该长成一枚行内按钮 */
+.tree-sync {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+/* 悬停时整枚图形亮起来。必须打到图形上：`.tree-glyph.t-*` 自己给了 color，
+   光换按钮的 color 是看不见的 */
+.tree-sync:hover .tree-glyph {
+  color: var(--vela-fg);
+}
+
+/* 键盘焦点要看得见：这是根行里唯一一个不靠「点一整行」触发的动作 */
+.tree-sync:focus-visible {
+  outline: 1px solid var(--vela-accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+/* 跑起来的那一句「同步中… N/M」与取消。与 `.tree-note` 同一个字号与灰度，
+   且同样绝不另起一行：行高变了窗口算术立刻失准 */
+.tree-sync-running {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+}
+
+.tree-sync-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-sync-cancel {
+  flex: 0 0 auto;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--vela-fg-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tree-sync-cancel:hover {
+  color: var(--vela-fg);
+  text-decoration: underline;
+}
+
+.tree-sync-cancel:focus-visible {
+  outline: 1px solid var(--vela-accent);
+  outline-offset: 1px;
+  border-radius: 2px;
 }
 
 /* ---------- 文件树右键菜单（M2-B-5）---------- */

@@ -70,6 +70,9 @@ function loaded(settings: Partial<Settings> = {}, report: Partial<SettingsReport
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
       ...settings,
     },
     report: {
@@ -164,6 +167,9 @@ describe('初始状态', () => {
     expect(store.mdToolbarVisible()).toBe(DEFAULT_MARKDOWN_TOOLBAR)
     // 首屏（还没 load 过）时 OSS 三格是空的、只有前缀有默认值：与 Rust `Settings::default()` 同形
     expect(store.oss()).toEqual({ bucket: '', region: '', accessKeyId: '', prefix: DEFAULT_OSS_PREFIX })
+    // 文件同步的两格（M8-5）默认空串 = 没配
+    expect(store.syncLocalDir()).toBe('')
+    expect(store.githubRepo()).toBe('')
     expect(store.report()).toBeNull()
   })
 
@@ -315,6 +321,9 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -335,6 +344,9 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -355,6 +367,9 @@ describe('用户改动：更新 + 应用 + 写穿', () => {
       ossAccessKeyId: '',
       ossPrefix: DEFAULT_OSS_PREFIX,
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -703,6 +718,9 @@ describe('OSS 四格（M7-5 读回 / M7-6 面板可写）：这一层不解释�
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -808,5 +826,88 @@ describe('Markdown 工具栏可见性（M4-F）：落盘的偏好', () => {
     store.setMdToolbarVisible(false)
     await flush()
     expect(settingsIpc.saveSettings).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('微信读书同步目录（M8-3）：只 trim、只往返', () => {
+  it('默认空串，首屏不写盘', async () => {
+    expect(store.wereadLocalDir()).toBe('')
+    store.applyNow()
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('setWereadLocalDir 只 trim，然后写穿；不碰 DOM', async () => {
+    const before = document.documentElement.style.cssText
+    store.setWereadLocalDir('  /Users/me/notes/微信读书/  ')
+    expect(store.wereadLocalDir()).toBe('/Users/me/notes/微信读书/')
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      wereadLocalDir: '/Users/me/notes/微信读书/',
+    })
+    // 这一层不解释它：没有 CSS 伴生物，也不注入字体
+    expect(document.documentElement.style.cssText).toBe(before)
+    expect(fontLoader.applyFontVariant).not.toHaveBeenCalled()
+    expect(fontLoader.applyCodeFont).not.toHaveBeenCalled()
+  })
+
+  it('盘上记着目录：load 装回来（trim 过）且不写穿', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ wereadLocalDir: '/Users/me/notes/book' }))
+    await store.load([])
+    expect(store.wereadLocalDir()).toBe('/Users/me/notes/book')
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('改了别的键时目录原样带回：整份重写不能把它抹掉', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ wereadLocalDir: '/Users/me/notes/book' }))
+    await store.load([])
+    store.setFontSize(16)
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      fontSize: 16,
+      wereadLocalDir: '/Users/me/notes/book',
+    })
+  })
+})
+
+describe('文件同步的两格（M8-5）：只 trim、只往返', () => {
+  it('setSyncLocalDir / setGithubRepo 只 trim，然后写穿；不碰 DOM', async () => {
+    const before = document.documentElement.style.cssText
+    store.setSyncLocalDir('  /Users/me/notes  ')
+    store.setGithubRepo('  xuanke/notes  ')
+    expect(store.syncLocalDir()).toBe('/Users/me/notes')
+    expect(store.githubRepo()).toBe('xuanke/notes')
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      syncLocalDir: '/Users/me/notes',
+      githubRepo: 'xuanke/notes',
+    })
+    expect(document.documentElement.style.cssText).toBe(before)
+    expect(fontLoader.applyFontVariant).not.toHaveBeenCalled()
+    expect(fontLoader.applyCodeFont).not.toHaveBeenCalled()
+  })
+
+  it('盘上记着两格：load 装回来（trim 过）且不写穿', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(
+      loaded({ syncLocalDir: ' /Users/me/notes ', githubRepo: ' xuanke/notes ' }),
+    )
+    await store.load([])
+    expect(store.syncLocalDir()).toBe('/Users/me/notes')
+    expect(store.githubRepo()).toBe('xuanke/notes')
+    await flush()
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('🔴 改了别的键时两格原样带回：整份重写不能把它们抹掉', async () => {
+    settingsIpc.loadSettings.mockResolvedValue(loaded({ syncLocalDir: '/Users/me/notes', githubRepo: 'xuanke/notes' }))
+    await store.load([])
+    store.setFontSize(16)
+    await flush()
+    expect(settingsIpc.saveSettings.mock.calls[0]![0]).toMatchObject({
+      fontSize: 16,
+      syncLocalDir: '/Users/me/notes',
+      githubRepo: 'xuanke/notes',
+    })
   })
 })

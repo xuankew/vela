@@ -37,10 +37,12 @@
  *
  * ## 🔴 项目层在 v1 是「接好线但空转」的
  *
- * 十一个键（七个偏好 + 四格 OSS 账号配置）全只认「内置默认 + 用户全局」。打开一个带
- * `.vela/settings.json` 的仓库**不会**改掉你的字号，**也不会**把你粘贴的图改道到别人的
- * bucket——Rust 的 `resolve` 已经把项目层写的键丢进
- * `report.ignoredProjectKeys` 了。这一层把那份 `report` 原样暴露出去（[`SettingsStore.report`]），
+ * 十四个键（七个偏好 + 四格 OSS 账号配置 + 微信读书同步目录 + 文件同步的两格）全只认
+ * 「内置默认 + 用户全局」。
+ * 打开一个带 `.vela/settings.json` 的仓库**不会**改掉你的字号，**也不会**把你粘贴的图改道到
+ * 别人的 bucket，更**不会**决定 Vela 往你机器上哪个目录写微信读书笔记、把哪个目录推到哪个仓库
+ * ——Rust 的 `resolve` 已经把
+ * 项目层写的键丢进 `report.ignoredProjectKeys` 了。这一层把那份 `report` 原样暴露出去（[`SettingsStore.report`]），
  * 由 `App.tsx` 决定要不要据此说一句「这个仓库想改你的字号，但字号只认全局」。
  * ⚠️ 于是 `load` 在 roots 变化时**仍然要重跑**：v1 里合并出的配置不随 roots 变（项目层
  * 不生效），但那份**账单**会变——换一个仓库，它想覆盖的键可能不一样。
@@ -302,9 +304,32 @@ export interface SettingsStore {
    */
   readonly mdToolbarVisible: Accessor<boolean>
   /**
+   * 微信读书笔记要同步进去的本地目录（M8-3）。空串 = 没配。
+   *
+   * 🔴 与四格 OSS 同一条理由（整份重写，少带一格就抹掉），但**更不解释自己**：这一层只
+   * `trim()`，不校验目录是否存在、不解析软链、不归一尾斜杠。解软链与「是否等于当前打开的
+   * 目录」的判定在 `src-tauri/src/weread.rs` 的前置闸里，那里失败会指名问题。
+   *
+   * ⚠️ 它也不进 DOM：写它的是设置面板（M8-5），读它的是 Rust 的同步命令。
+   */
+  readonly wereadLocalDir: Accessor<string>
+  /**
+   * 「文件同步」要推上去的本地目录（M8-5，PLAN.md §3.22 ⑨）。空串 = 没配。
+   *
+   * 🔴 与 `wereadLocalDir` 逐字同一条：整份重写少带一格就抹掉；这一层只 `trim()`，
+   * 不校验存在性、不归一。与「当前打开的目录」比相等归 `src-tauri` 的落地层。
+   */
+  readonly syncLocalDir: Accessor<string>
+  /**
+   * GitHub 仓库地址（M8-5）。空串 = 没配。`owner/repo` 或整条 URL 都收，这一层不解析。
+   *
+   * 🔴 这里**只有地址没有 token**：token 只住 macOS 钥匙串（`src/ipc/github.ts`）。
+   */
+  readonly githubRepo: Accessor<string>
+  /**
    * 最近一次 [`SettingsStore.load`] 的账单；`null` = 还没 load 过。
    * `report().ignoredProjectKeys` 非空表示当前仓库的 `.vela/settings.json` 试图改偏好键、
-   * 已被忽略（v1 里十一个键全只认用户全局，所以它写的任何键都会落在这儿）。
+   * 已被忽略（v1 里十四个键全只认用户全局，所以它写的任何键都会落在这儿）。
    */
   readonly report: Accessor<SettingsReport | null>
 
@@ -350,6 +375,25 @@ export interface SettingsStore {
    * 下次改字号就会把「关着」这个状态从盘上抹掉。
    */
   setMdToolbarVisible: (visible: boolean) => void
+  /**
+   * 用户改了微信读书同步目录（M8-5）：`trim()` + 更新信号 + 写穿，不校验、不碰 DOM。
+   *
+   * 与 [`SettingsStore.setOss`] 同一条写穿路径；`trim()` 的理由也相同——路径首尾多一个
+   * 空白几乎总是手滑，留着只会让 Rust 侧的相等判定静默失败。存在性/软链归落地层。
+   */
+  setWereadLocalDir: (dir: string) => void
+  /**
+   * 用户改了「文件同步」的本地目录（M8-5）：`trim()` + 更新信号 + 写穿，不校验、不碰 DOM。
+   * 与 [`SettingsStore.setWereadLocalDir`] 同一条路径、同一条理由。
+   */
+  setSyncLocalDir: (dir: string) => void
+  /**
+   * 用户改了 GitHub 仓库地址（M8-5）：`trim()` + 更新信号 + 写穿。
+   *
+   * ⚠️ 这一层**不解析、不校验** `owner/repo` 的形状：手改出来的任何串都原样存回去，
+   * 解析归 `src-tauri` 里真要用它的那一步。
+   */
+  setGithubRepo: (repo: string) => void
 
   /**
    * 从 Rust 读回合并好的配置，sanitize 后灌进信号并应用。**不写穿**。
@@ -392,6 +436,17 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
   })
   /** Markdown 工具栏可见性（M4-F）。与 OSS 四格一样不进 DOM，只被 `App.tsx` 读 */
   const [mdToolbarVisible, setMdToolbarVisibleSignal] = createSignal(DEFAULT_MARKDOWN_TOOLBAR)
+  /**
+   * 微信读书同步目录（M8-3）。与 OSS 四格同一条存在理由：`save_settings` 整份重写，
+   * 不带回去就会在下次改字号时把盘上的目录抹掉。这一层不解释它，也不碰 DOM。
+   */
+  const [wereadLocalDir, setWereadLocalDirSignal] = createSignal('')
+  /**
+   * 「文件同步」的两格（M8-5）。与 `wereadLocalDir` 同一类：整份重写要带回去，
+   * 这一层不解释它们，也不碰 DOM。token 不在这里——它只住钥匙串。
+   */
+  const [syncLocalDir, setSyncLocalDirSignal] = createSignal('')
+  const [githubRepo, setGithubRepoSignal] = createSignal('')
   const [report, setReport] = createSignal<SettingsReport | null>(null)
 
   /** 写队列的尾巴。所有写挂在它后面，于是任意时刻最多一个写在飞（见文件头） */
@@ -482,6 +537,11 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
       ossPrefix: c.prefix,
       // 工具栏可见性与四格同一个理由：整份重写，少带一格就抹掉用户「关着」的选择
       markdownToolbar: mdToolbarVisible(),
+      // 微信读书同步目录同理：整份重写，少带一格就抹掉用户配好的目录
+      wereadLocalDir: wereadLocalDir(),
+      // 文件同步的两格（M8-5）同理：整份重写，少带一格就抹掉配好的目录/仓库
+      syncLocalDir: syncLocalDir(),
+      githubRepo: githubRepo(),
     }
   }
 
@@ -542,6 +602,11 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setOssSignal(ossFromSettings(s))
     // 工具栏可见性同理：只装信号，`applyNow` 不碰它（渲染由 App 决定），load 不写穿
     setMdToolbarVisibleSignal(s.markdownToolbar)
+    // 微信读书同步目录同理：只装信号。`trim()` 与 mutator 一致，否则首次写穿会多一次
+    setWereadLocalDirSignal(s.wereadLocalDir.trim())
+    // 文件同步的两格同理：只装信号。`trim()` 与 mutator 一致，否则首次写穿会多一次
+    setSyncLocalDirSignal(s.syncLocalDir.trim())
+    setGithubRepoSignal(s.githubRepo.trim())
     setReport(loaded.report)
     applyNow()
   }
@@ -637,6 +702,24 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     persist()
   }
 
+  /** 微信读书同步目录（M8-3）：只 `trim()` + 更新信号 + 写穿。存在性/软链归 Rust 落地层 */
+  function setWereadLocalDir(dir: string): void {
+    setWereadLocalDirSignal(dir.trim())
+    persist()
+  }
+
+  /** 「文件同步」的本地目录（M8-5）：只 `trim()` + 更新信号 + 写穿 */
+  function setSyncLocalDir(dir: string): void {
+    setSyncLocalDirSignal(dir.trim())
+    persist()
+  }
+
+  /** GitHub 仓库地址（M8-5）：只 `trim()` + 更新信号 + 写穿。形状校验归落地层 */
+  function setGithubRepo(repo: string): void {
+    setGithubRepoSignal(repo.trim())
+    persist()
+  }
+
   /** `Cmd/Ctrl + =/-`：无级缩放，步进 +/- 1px，不写盘，只改 CSS 变量 */
   function stepZoomedFontSize(delta: number): void {
     const base = zoomedFontSize() ?? fontSize()
@@ -661,6 +744,9 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     theme,
     oss,
     mdToolbarVisible,
+    wereadLocalDir,
+    syncLocalDir,
+    githubRepo,
     report,
     setFontVariant,
     setCodeFont,
@@ -676,6 +762,9 @@ export function createSettingsStore(options: SettingsStoreOptions = {}): Setting
     setTheme,
     setOss,
     setMdToolbarVisible,
+    setWereadLocalDir,
+    setSyncLocalDir,
+    setGithubRepo,
     load,
     applyNow,
   }

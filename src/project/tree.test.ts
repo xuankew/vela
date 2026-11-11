@@ -20,6 +20,7 @@ import {
   menuFor,
   parentRel,
   rowKey,
+  sameDir,
   sameRow,
   type RowKey,
   type TreeMenuAction,
@@ -202,6 +203,29 @@ describe('displayName：从绝对路径抠出标签', () => {
   })
 })
 
+describe('sameDir：两条绝对路径是不是同一个目录（M8-6a）', () => {
+  it('逐字相等才算，尾斜杠有一边没有也算', () => {
+    expect(sameDir('/repo/notes', '/repo/notes')).toBe(true)
+    expect(sameDir('/repo/notes/', '/repo/notes')).toBe(true)
+    expect(sameDir('/repo/notes//', '/repo/notes')).toBe(true)
+  })
+
+  it('⚠️ 子目录不算匹配——判的是相等，不是前缀', () => {
+    // 打开的是同步目录的子目录时，根行上不该出现同步入口：同步状态属于那个目录本身。
+    // 写成 `startsWith` 的话 `/repo/notes-旧` 也会被当成 `/repo/notes`
+    expect(sameDir('/repo/notes/sub', '/repo/notes')).toBe(false)
+    expect(sameDir('/repo/notes', '/repo/notes/sub')).toBe(false)
+    expect(sameDir('/repo/notes-旧', '/repo/notes')).toBe(false)
+  })
+
+  it('空串与位次越界一律不相等——不许两个「没配」互相配上', () => {
+    expect(sameDir('', '')).toBe(false)
+    expect(sameDir(undefined, '')).toBe(false)
+    expect(sameDir('/repo', '')).toBe(false)
+    expect(sameDir(undefined, '/repo')).toBe(false)
+  })
+})
+
 describe('childRel / parentRel：rel 的拼与拆', () => {
   it('⚠️ 根层新建得到的是名字本身，不是以斜杠开头的 rel', () => {
     // 这一条是整个函数的存在理由。`'' + '/' + name` 会得到 `"/foo.txt"`，
@@ -347,6 +371,33 @@ describe('containerRel / menuFor：右键一行该给出什么', () => {
     // 「在 Finder 中显示」与「复制路径」都是当场做完的，也都不带
     expect(items.find((i) => i.action === 'reveal')!.label).toBe('在 Finder 中显示')
     expect(items.find((i) => i.action === 'copyPath')!.label).toBe('复制路径')
+  })
+
+  it('只有 md 文件才给「同步微信读书笔记」，且自成一组建在最后', () => {
+    const items = menuFor(rowOf('README.md'), 1, { rootPath: '/repo', wereadDir: '/repo' })
+    const item = items.find((i) => i.action === 'syncWeread')!
+    expect(item.label).toBe('同步微信读书笔记')
+    expect(item.separator).toBe(true)
+    // 排在最后：它会联网、会往磁盘上写几十个文件，必须与每天点几十次的
+    // 「复制路径」之间隔着一次误点的距离
+    expect(items[items.length - 1]!.action).toBe('syncWeread')
+  })
+
+  it('目录、非 md 文件、根行都不给这一项', () => {
+    const sync = { rootPath: '/repo', wereadDir: '/repo' }
+    expect(menuFor(rowOf('src'), 1, sync).map((i) => i.action)).not.toContain('syncWeread')
+    expect(menuFor(rowOf('src/main.rs'), 1, sync).map((i) => i.action)).not.toContain('syncWeread')
+    expect(menuFor(rowOf(''), 1, sync).map((i) => i.action)).not.toContain('syncWeread')
+  })
+
+  it('根不是配置的那个目录、或压根没配时都不给（与图标同一条 sameDir）', () => {
+    const file = rowOf('README.md')
+    expect(menuFor(file, 1, { rootPath: '/notes', wereadDir: '/repo' }).map((i) => i.action)).not.toContain(
+      'syncWeread',
+    )
+    expect(menuFor(file, 1, { rootPath: '/repo', wereadDir: '' }).map((i) => i.action)).not.toContain('syncWeread')
+    // 不传第三个参数 = 这一轮没有同步入口：菜单与原样逐字一致
+    expect(menuFor(file, 1).map((i) => i.action)).not.toContain('syncWeread')
   })
 
   it('containerRel：目录行是它自己，文件行是它的父层', () => {

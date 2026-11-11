@@ -1,4 +1,5 @@
 import { Show, onCleanup, onMount, createSignal } from 'solid-js'
+import { open as pickDirectory } from '@tauri-apps/plugin-dialog'
 import {
   CODE_FONTS,
   DEFAULT_CODE_FONT,
@@ -8,6 +9,8 @@ import {
   type FontVariantId,
 } from '../fonts/loader'
 import { describeSecretError, deleteOssSecret, ossSecretStatus, setOssSecret } from '../ipc/secrets'
+import { deleteGithubToken, githubTokenStatus, setGithubToken } from '../ipc/github'
+import { deleteWereadKey, setWereadKey, wereadKeyStatus } from '../ipc/weread'
 import { describeUploadError, TEST_UPLOAD_PNG, uploadImage } from '../ipc/oss'
 import {
   DEFAULT_FONT_SIZE,
@@ -40,6 +43,77 @@ const OSS_FIELDS: Array<{ key: keyof OssConfig; label: string; placeholder: stri
   { key: 'accessKeyId', label: 'AccessKey ID', placeholder: 'LTAI5t…' },
   { key: 'prefix', label: '对象前缀', placeholder: 'assets', hint: 'bucket 里的那一层目录；留空就放在根上。' },
 ]
+
+/**
+ * 钥匙串那一行（写 / 清除 / 「已配置」）。三把凭证长得一模一样，只差标题与文案。
+ *
+ * 🔴 这里**没有任何输入**能拿到现值：`draft` 只从用户键入流向 `onSave`，成功之后父组件
+ * 立刻把它清空；`configured` 是异步查回来的一个布尔。拼成组件不是为了省行数，是为了
+ * 「三条命令的写法只有一份」——三份手抄最容易漂的正是「失败时咽成未配置」那一条。
+ */
+interface SecretRowProps {
+  label: string
+  placeholder: string
+  saveLabel: string
+  configured: boolean
+  busy: boolean
+  draft: string
+  msg: string | null
+  failed: boolean
+  onDraft: (value: string) => void
+  onSave: () => void
+  onClear: () => void
+}
+
+function SecretRow(props: SecretRowProps) {
+  return (
+    <>
+      <label class="settings-row">
+        <span class="settings-label">
+          {props.label}
+          <Show when={props.configured}>
+            <span class="settings-badge">已配置</span>
+          </Show>
+        </span>
+        <input
+          class="settings-input"
+          type="password"
+          spellcheck={false}
+          autocomplete="off"
+          placeholder={props.placeholder}
+          value={props.draft}
+          onInput={(e) => props.onDraft(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              if (!props.busy) props.onSave()
+            }
+          }}
+        />
+      </label>
+      <div class="settings-inline">
+        <button
+          class="settings-action"
+          onClick={() => props.onSave()}
+          disabled={props.busy || props.draft.trim() === ''}
+        >
+          {props.busy ? '保存中…' : props.saveLabel}
+        </button>
+        <Show when={props.configured}>
+          {/* 清除是反向操作，权重要低于保存：同 styles.css 的 .settings-action-quiet */}
+          <button class="settings-action settings-action-quiet" onClick={() => props.onClear()}>
+            清除
+          </button>
+        </Show>
+      </div>
+      <Show when={props.msg !== null}>
+        <p class={props.failed ? 'settings-result settings-result-bad' : 'settings-result'} role="status">
+          {props.msg}
+        </p>
+      </Show>
+    </>
+  )
+}
 
 /**
  * 「设置」对话框（M4-B 的外观 + M7-6 的阿里云 OSS）。
@@ -79,6 +153,26 @@ export function SettingsDialog(props: SettingsDialogProps) {
   const [uploading, setUploading] = createSignal(false)
   const [uploadMsg, setUploadMsg] = createSignal<string | null>(null)
   const [uploadFailed, setUploadFailed] = createSignal(false)
+
+  /**
+   * 微信读书那一组（M8-5）。目录是地址、走 settings；key 是凭证、只走钥匙串——
+   * 与上面 OSS 那四格 + secret 同一条分法。
+   */
+  const [wereadDirDraft, setWereadDirDraft] = createSignal(settings.wereadLocalDir())
+  const [wereadKeyDraft, setWereadKeyDraft] = createSignal('')
+  const [wereadKeyBusy, setWereadKeyBusy] = createSignal(false)
+  const [wereadKeyConfigured, setWereadKeyConfigured] = createSignal(false)
+  const [wereadKeyMsg, setWereadKeyMsg] = createSignal<string | null>(null)
+  const [wereadKeyFailed, setWereadKeyFailed] = createSignal(false)
+
+  /** 文件同步那一组（M8-5）：目录 + 仓库地址走 settings，token 只走钥匙串 */
+  const [syncDirDraft, setSyncDirDraft] = createSignal(settings.syncLocalDir())
+  const [githubRepoDraft, setGithubRepoDraft] = createSignal(settings.githubRepo())
+  const [githubTokenDraft, setGithubTokenDraft] = createSignal('')
+  const [githubTokenBusy, setGithubTokenBusy] = createSignal(false)
+  const [githubTokenConfigured, setGithubTokenConfigured] = createSignal(false)
+  const [githubTokenMsg, setGithubTokenMsg] = createSignal<string | null>(null)
+  const [githubTokenFailed, setGithubTokenFailed] = createSignal(false)
 
   function close(): void {
     props.onClose()
@@ -135,6 +229,118 @@ export function SettingsDialog(props: SettingsDialogProps) {
     const trimmed = raw.trim()
     setDraft((d) => ({ ...d, [key]: trimmed }))
     if (trimmed !== settings.oss()[key]) settings.setOss({ [key]: trimmed })
+  }
+
+  /**
+   * 挑一个目录填进草稿并立刻提交。
+   *
+   * 原生面板回 `null` 是「用户取消」，不是失败，所以不写任何一句话。系统层面的异常
+   * 同样不在这里铺开：这条路径唯一的后果是「没选到」，用户再点一次就行。
+   */
+  async function chooseDir(setDraftValue: (v: string) => void, commit: (v: string) => void): Promise<void> {
+    const picked = await pickDirectory({ multiple: false, directory: true })
+    if (typeof picked !== 'string') return
+    setDraftValue(picked)
+    commit(picked)
+  }
+
+  function commitWereadDir(raw: string): void {
+    const trimmed = raw.trim()
+    setWereadDirDraft(trimmed)
+    if (trimmed !== settings.wereadLocalDir()) settings.setWereadLocalDir(trimmed)
+  }
+
+  function commitSyncDir(raw: string): void {
+    const trimmed = raw.trim()
+    setSyncDirDraft(trimmed)
+    if (trimmed !== settings.syncLocalDir()) settings.setSyncLocalDir(trimmed)
+  }
+
+  function commitGithubRepo(raw: string): void {
+    const trimmed = raw.trim()
+    setGithubRepoDraft(trimmed)
+    if (trimmed !== settings.githubRepo()) settings.setGithubRepo(trimmed)
+  }
+
+  async function refreshWereadKey(): Promise<void> {
+    try {
+      setWereadKeyConfigured((await wereadKeyStatus()).configured)
+    } catch (err) {
+      // 与 OSS 那把同一条：不咽成「未配置」
+      setWereadKeyFailed(true)
+      setWereadKeyMsg(describeSecretError(err))
+    }
+  }
+
+  async function saveWereadKey(): Promise<void> {
+    const value = wereadKeyDraft()
+    setWereadKeyBusy(true)
+    try {
+      await setWereadKey(value)
+      // 先清输入框再改状态：这一串只在这里存在过
+      setWereadKeyDraft('')
+      setWereadKeyConfigured(true)
+      setWereadKeyFailed(false)
+      setWereadKeyMsg('key 已存进 macOS 钥匙串。')
+    } catch (err) {
+      // 失败时不清输入框：用户要能看见刚打了什么再改
+      setWereadKeyFailed(true)
+      setWereadKeyMsg(describeSecretError(err))
+    } finally {
+      setWereadKeyBusy(false)
+    }
+  }
+
+  async function clearWereadKey(): Promise<void> {
+    try {
+      await deleteWereadKey()
+      setWereadKeyConfigured(false)
+      setWereadKeyDraft('')
+      setWereadKeyFailed(false)
+      setWereadKeyMsg('已从钥匙串清除。')
+    } catch (err) {
+      setWereadKeyFailed(true)
+      setWereadKeyMsg(describeSecretError(err))
+    }
+  }
+
+  async function refreshGithubToken(): Promise<void> {
+    try {
+      setGithubTokenConfigured((await githubTokenStatus()).configured)
+    } catch (err) {
+      setGithubTokenFailed(true)
+      setGithubTokenMsg(describeSecretError(err))
+    }
+  }
+
+  async function saveGithubToken(): Promise<void> {
+    const value = githubTokenDraft()
+    setGithubTokenBusy(true)
+    try {
+      await setGithubToken(value)
+      setGithubTokenDraft('')
+      setGithubTokenConfigured(true)
+      setGithubTokenFailed(false)
+      setGithubTokenMsg('token 已存进 macOS 钥匙串。')
+    } catch (err) {
+      setGithubTokenFailed(true)
+      setGithubTokenMsg(describeSecretError(err))
+    } finally {
+      setGithubTokenBusy(false)
+    }
+  }
+
+  async function clearGithubToken(): Promise<void> {
+    try {
+      await deleteGithubToken()
+      setGithubTokenConfigured(false)
+      setGithubTokenDraft('')
+      setGithubTokenFailed(false)
+      setGithubTokenMsg('已从钥匙串清除。')
+    } catch (err) {
+      setGithubTokenFailed(true)
+      setGithubTokenMsg(describeSecretError(err))
+    }
   }
 
   async function refreshSecret(): Promise<void> {
@@ -206,6 +412,8 @@ export function SettingsDialog(props: SettingsDialogProps) {
 
   onMount(() => {
     void refreshSecret()
+    void refreshWereadKey()
+    void refreshGithubToken()
   })
 
   return (
@@ -344,49 +552,19 @@ export function SettingsDialog(props: SettingsDialogProps) {
             ))}
 
             <div class="settings-field">
-              <label class="settings-row">
-                <span class="settings-label">
-                  AccessKey Secret
-                  <Show when={secretConfigured()}>
-                    <span class="settings-badge">已配置</span>
-                  </Show>
-                </span>
-                <input
-                  class="settings-input"
-                  type="password"
-                  spellcheck={false}
-                  autocomplete="off"
-                  placeholder="填完按回车，或点旁边的「保存密钥」"
-                  value={secretDraft()}
-                  onInput={(e) => setSecretDraft(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      if (!secretBusy()) void saveSecret()
-                    }
-                  }}
-                />
-              </label>
-              <div class="settings-inline">
-                <button
-                  class="settings-action"
-                  onClick={() => void saveSecret()}
-                  disabled={secretBusy() || secretDraft().trim() === ''}
-                >
-                  {secretBusy() ? '保存中…' : '保存密钥'}
-                </button>
-                <Show when={secretConfigured()}>
-                  {/* 清除是反向操作，权重要低于「保存密钥」：同 styles.css 的 .settings-action-quiet */}
-                  <button class="settings-action settings-action-quiet" onClick={() => void clearSecret()}>
-                    清除
-                  </button>
-                </Show>
-              </div>
-              <Show when={secretMsg() !== null}>
-                <p class={secretFailed() ? 'settings-result settings-result-bad' : 'settings-result'} role="status">
-                  {secretMsg()}
-                </p>
-              </Show>
+              <SecretRow
+                label="AccessKey Secret"
+                placeholder="填完按回车，或点旁边的「保存密钥」"
+                saveLabel="保存密钥"
+                configured={secretConfigured()}
+                busy={secretBusy()}
+                draft={secretDraft()}
+                msg={secretMsg()}
+                failed={secretFailed()}
+                onDraft={setSecretDraft}
+                onSave={() => void saveSecret()}
+                onClear={() => void clearSecret()}
+              />
             </div>
 
             <div class="settings-field">
@@ -398,6 +576,133 @@ export function SettingsDialog(props: SettingsDialogProps) {
                   {uploadMsg()}
                 </p>
               </Show>
+            </div>
+          </section>
+
+          <section class="settings-group">
+            <h3 class="settings-group-title">微信读书</h3>
+            <p class="settings-group-hint">
+              同步这个账号下的全部划线与想法。每本书落两份：`…·划线素材.md` 每次同步整份重写， 同名的 `.md`
+              只在你还没改过时写一份种子。
+            </p>
+
+            <div class="settings-field">
+              <label class="settings-row">
+                <span class="settings-label">本地目录</span>
+                <input
+                  class="settings-input"
+                  type="text"
+                  spellcheck={false}
+                  placeholder="选一个目录，笔记就落在那里"
+                  value={wereadDirDraft()}
+                  onInput={(e) => setWereadDirDraft(e.currentTarget.value)}
+                  onBlur={(e) => commitWereadDir(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      commitWereadDir(e.currentTarget.value)
+                    }
+                  }}
+                />
+              </label>
+              <div class="settings-inline">
+                <button
+                  class="settings-action"
+                  onClick={() => void chooseDir(setWereadDirDraft, commitWereadDir)}
+                  title="选择同步目录"
+                >
+                  选择…
+                </button>
+              </div>
+            </div>
+
+            <div class="settings-field">
+              <SecretRow
+                label="API key"
+                placeholder="填完按回车，或点旁边的「保存密钥」"
+                saveLabel="保存密钥"
+                configured={wereadKeyConfigured()}
+                busy={wereadKeyBusy()}
+                draft={wereadKeyDraft()}
+                msg={wereadKeyMsg()}
+                failed={wereadKeyFailed()}
+                onDraft={setWereadKeyDraft}
+                onSave={() => void saveWereadKey()}
+                onClear={() => void clearWereadKey()}
+              />
+            </div>
+          </section>
+
+          <section class="settings-group">
+            <h3 class="settings-group-title">文件同步</h3>
+            <p class="settings-group-hint">
+              只往上面这个仓库里写，不会建仓库、不推分支、也不删远端文件。token 建议用只授权这一个仓库的 fine-grained
+              PAT。`…·划线素材.md` 是机器生成的，不进仓库。
+            </p>
+
+            <div class="settings-field">
+              <label class="settings-row">
+                <span class="settings-label">本地目录</span>
+                <input
+                  class="settings-input"
+                  type="text"
+                  spellcheck={false}
+                  placeholder="要同步进仓库的那个目录"
+                  value={syncDirDraft()}
+                  onInput={(e) => setSyncDirDraft(e.currentTarget.value)}
+                  onBlur={(e) => commitSyncDir(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      commitSyncDir(e.currentTarget.value)
+                    }
+                  }}
+                />
+              </label>
+              <div class="settings-inline">
+                <button
+                  class="settings-action"
+                  onClick={() => void chooseDir(setSyncDirDraft, commitSyncDir)}
+                  title="选择同步目录"
+                >
+                  选择…
+                </button>
+              </div>
+            </div>
+
+            <label class="settings-row">
+              <span class="settings-label">仓库地址</span>
+              <input
+                class="settings-input"
+                type="text"
+                spellcheck={false}
+                placeholder="owner/repo 或 https://github.com/owner/repo"
+                value={githubRepoDraft()}
+                onInput={(e) => setGithubRepoDraft(e.currentTarget.value)}
+                onBlur={(e) => commitGithubRepo(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    commitGithubRepo(e.currentTarget.value)
+                  }
+                }}
+              />
+            </label>
+
+            <div class="settings-field">
+              <SecretRow
+                label="GitHub token"
+                placeholder="填完按回车，或点旁边的「保存 token」"
+                saveLabel="保存 token"
+                configured={githubTokenConfigured()}
+                busy={githubTokenBusy()}
+                draft={githubTokenDraft()}
+                msg={githubTokenMsg()}
+                failed={githubTokenFailed()}
+                onDraft={setGithubTokenDraft}
+                onSave={() => void saveGithubToken()}
+                onClear={() => void clearGithubToken()}
+              />
             </div>
           </section>
         </div>

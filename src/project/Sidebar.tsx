@@ -1,6 +1,8 @@
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { iconForPath } from '../editor/language'
+import type { GithubSync } from '../github/store'
 import { visibleWindow } from '../ui/virtual'
+import type { WereadSync } from '../weread/store'
 import { TreeGlyphIcon } from './icons'
 import type { ProjectTree } from './store'
 import { NameDialog, type NameDialogProps } from './NameDialog'
@@ -15,6 +17,7 @@ import {
   menuFor,
   ROW_HEIGHT,
   rowKey,
+  sameDir,
   sameRow,
   type RowKey,
   type TreeMenuAction,
@@ -42,6 +45,30 @@ export interface SidebarProps {
    * 窗口 resize 时还要把它重新夹进上下限（见 `project/SidebarResize.tsx`）
    */
   width: number
+  /**
+   * 微信读书全量同步的状态机（M8-6a）。不传 = 这一轮没有同步入口：
+   * 根行尾部不长图标，右键菜单也不出那一项。测试里四十多个挂载点都是这样，
+   * 所以它必须是可选的——不给它也能编译，而且渲染结果与 M8-5 时逐字一致。
+   */
+  sync?: WereadSync
+  /**
+   * 「同步目录」配置（`settings.json` 的 `wereadLocalDir`）。空串 = 没配。
+   * 与 `sync` 同时给、且某个根恰好就是这个目录时，那一行才长出图标。
+   *
+   * ⚠️ 单独成一个 prop 而不是塞进 `sync`：配置的真相在 settings store 里，
+   * 同步的状态机不该再存一份副本——两份的话开关设置之后图标会晚一拍才消失
+   */
+  wereadDir?: string
+  /**
+   * GitHub 目录同步的状态机（M8-6b）。不传 = 这一轮没有云图标：
+   * 根行尾部少一枚，渲染结果与 M8-6a 逐字一致。
+   */
+  githubSync?: GithubSync
+  /**
+   * 「文件同步」配置（`settings.json` 的 `syncLocalDir`）。空串 = 没配。
+   * 判据与 `wereadDir` 同一条 `sameDir`，只判相等不判前缀。
+   */
+  githubDir?: string
 }
 
 /**
@@ -229,6 +256,47 @@ export function Sidebar(props: SidebarProps) {
     return rel === '' ? tree.rootName(rootIndex) : displayName(rel)
   }
 
+  /** 第几个根的绝对路径。位次越界只可能是树在这一瞬间被重读了，调用方一律当作「没有」 */
+  function rootPathOf(rootIndex: number): string | undefined {
+    return tree.roots()[rootIndex]
+  }
+
+  /**
+   * 这一行该不该出现微信读书入口（M8-6a）：**根行**，且这个根就是配置的那个目录。
+   *
+   * 判的是相等不是前缀（`sameDir`）：打开的是同步目录的子目录时不算——
+   * 同步状态属于那个目录本身，而图标与右键项都只挂在根行上。
+   * 也没配（空串）时 `sameDir` 直接为假，所以不配就一个都不出现。
+   */
+  function isWereadRoot(row: TreeRow): boolean {
+    return row.rel === '' && sameDir(rootPathOf(row.rootIndex), props.wereadDir ?? '')
+  }
+
+  /** 云图标（M8-6b）：同一条判据，条件换成「文件同步」的目录 */
+  function isGithubRoot(row: TreeRow): boolean {
+    return row.rel === '' && sameDir(rootPathOf(row.rootIndex), props.githubDir ?? '')
+  }
+
+  /**
+   * 这一行有没有任何一个同步入口。
+   *
+   * ⚠️ 用它来决定要不要落那个包装 `<span>`：包装带 `margin-left: auto`，无条件渲染的话
+   * 每一行都会多出一个吃掉剩余空间的空元素（视觉上看不出来，但下一枚想贴着行尾的东西
+   * 会被顶到中间去）。条件与下面两个 `<Show>` 的判据逐字一致。
+   */
+  function hasSyncEntry(row: TreeRow): boolean {
+    return (props.sync !== undefined && isWereadRoot(row)) || (props.githubSync !== undefined && isGithubRoot(row))
+  }
+
+  /**
+   * 两把同步同时跑是界面层要避免的事：一个根只有一行，塞不下两句「同步中…」，
+   * 而且它们会各自往同一个目录写盘。所以**一边在跑时，另一枚图标先收起来**——
+   * 不是变灰（灰的会被读成「这里本来有东西，只是暂时点不了」）。
+   * store 那一层的单飞只看自己，跨 store 的这道闸在这里。
+   */
+  const wereadRunning = () => props.sync?.running() ?? false
+  const githubRunning = () => props.githubSync?.running() ?? false
+
   /**
    * 菜单里选了一项。
    *
@@ -283,6 +351,16 @@ export function Sidebar(props: SidebarProps) {
         tree.removeRoot(row.rootIndex)
         say('ok', `已把「${row.name}」移出工作区，磁盘上的文件一个都没动`)
         return
+      case 'syncWeread': {
+        // 不 `await`、也不在这里等结果：进度与失败都走同步 store 的事件与 `onError`，
+        // 这一层只负责把那一下点下去（与图标那一条是同一个入口、同一句话）。
+        // 位次越界/同步没接上时安静地不动——菜单项本来就不会出现在那种场合
+        const sync = props.sync
+        const rootPath = rootPathOf(row.rootIndex)
+        if (sync === undefined || rootPath === undefined) return
+        void sync.start(rootPath)
+        return
+      }
     }
   }
 
@@ -370,6 +448,103 @@ export function Sidebar(props: SidebarProps) {
                       <span class="tree-note">读取中…</span>
                     </Show>
                     <Show when={row.error}>{(text) => <span class="tree-note bad">{text()}</span>}</Show>
+                    {/* 同步入口（M8-6a / M8-6b）。条件成立才渲染：接了那个同步状态机，
+                        且这一行就是配置的那个目录。⛔ 不满足时连一个 `<Show>` 都不落 DOM，
+                        不是画成灰色不可点——灰图标会被读成「这里本来有东西，只是暂时点不了」。
+                        点与取消都 `stopPropagation`：根行自己的 `onClick` 会收起这棵树，
+                        而用户此刻要的只是同步。
+                        ⚠️ 两枚图标共用行尾那一格（`.tree-sync-actions`，只有一个 `auto` 外边距），
+                        否则两个 `margin-left: auto` 会把剩余空间对半分、图标被顶到行中间 */}
+                    <Show when={hasSyncEntry(row)}>
+                      <span class="tree-sync-actions">
+                        <Show when={props.sync}>
+                          {(sync) => (
+                            <Show when={isWereadRoot(row)}>
+                              <Show
+                                when={sync().running()}
+                                fallback={
+                                  <Show when={!githubRunning()}>
+                                    <button
+                                      class="tree-sync"
+                                      title="同步微信读书笔记到这里"
+                                      aria-label="同步微信读书笔记"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        void sync().start(row.path)
+                                      }}
+                                    >
+                                      <TreeGlyphIcon glyph="weread" />
+                                    </button>
+                                  </Show>
+                                }
+                              >
+                                <span class="tree-sync-running">
+                                  <span class="tree-sync-label">
+                                    {sync().progress() === null
+                                      ? '同步中…'
+                                      : `同步中… ${sync().progress()!.booksDone}/${sync().progress()!.booksTotal}`}
+                                  </span>
+                                  <button
+                                    class="tree-sync-cancel"
+                                    title="取消这次同步（已经写完的不会回滚）"
+                                    aria-label="取消微信读书同步"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      void sync().cancel()
+                                    }}
+                                  >
+                                    取消
+                                  </button>
+                                </span>
+                              </Show>
+                            </Show>
+                          )}
+                        </Show>
+                        <Show when={props.githubSync}>
+                          {(sync) => (
+                            <Show when={isGithubRoot(row)}>
+                              <Show
+                                when={sync().running()}
+                                fallback={
+                                  <Show when={!wereadRunning()}>
+                                    <button
+                                      class="tree-sync"
+                                      title="把笔记同步到这个 GitHub 仓库"
+                                      aria-label="同步到 GitHub"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        void sync().start(row.path)
+                                      }}
+                                    >
+                                      <TreeGlyphIcon glyph="cloud" />
+                                    </button>
+                                  </Show>
+                                }
+                              >
+                                <span class="tree-sync-running">
+                                  <span class="tree-sync-label">
+                                    {sync().progress() === null
+                                      ? '同步中…'
+                                      : `同步中… ${sync().progress()!.filesDone}/${sync().progress()!.filesTotal}`}
+                                  </span>
+                                  <button
+                                    class="tree-sync-cancel"
+                                    title="取消这次同步（已经拉下来/推上去的不会回滚）"
+                                    aria-label="取消 GitHub 同步"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      void sync().cancel()
+                                    }}
+                                  >
+                                    取消
+                                  </button>
+                                </span>
+                              </Show>
+                            </Show>
+                          )}
+                        </Show>
+                      </span>
+                    </Show>
                   </div>
                 )
               }}
@@ -386,7 +561,13 @@ export function Sidebar(props: SidebarProps) {
           <TreeMenu
             x={m().x}
             y={m().y}
-            items={menuFor(m().row, tree.roots().length)}
+            items={menuFor(
+              m().row,
+              tree.roots().length,
+              // 同步没接上就传 undefined：于是 `menuFor` 的行为与 M8-5 逐字一致，
+              // 四十多个没接同步的挂载点（含全部旧测试）都不必改
+              props.sync ? { rootPath: rootPathOf(m().row.rootIndex), wereadDir: props.wereadDir ?? '' } : undefined,
+            )}
             onPick={(action) => pick(action, m().row)}
             onClose={() => setMenu(null)}
           />

@@ -195,6 +195,9 @@ const {
         ossAccessKeyId: '',
         ossPrefix: 'assets',
         markdownToolbar: true,
+        wereadLocalDir: '',
+        syncLocalDir: '',
+        githubRepo: '',
       },
       report: {
         userLayer: { status: 'absent' },
@@ -435,6 +438,9 @@ beforeEach(async () => {
       ossAccessKeyId: '',
       ossPrefix: 'assets',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     },
     report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   }
@@ -4805,6 +4811,9 @@ describe('图片粘贴落地接线（M3-A-7）', () => {
           ossAccessKeyId: 'LTAI-x',
           ossPrefix: 'assets',
           markdownToolbar: true,
+          wereadLocalDir: '',
+          syncLocalDir: '',
+          githubRepo: '',
           ...oss,
         },
         report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
@@ -5460,6 +5469,9 @@ describe('分层配置接线（M4-A）', () => {
       ossAccessKeyId: '',
       ossPrefix: 'assets',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -5479,6 +5491,9 @@ describe('分层配置接线（M4-A）', () => {
       ossAccessKeyId: '',
       ossPrefix: 'assets',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -5497,6 +5512,9 @@ describe('分层配置接线（M4-A）', () => {
       ossAccessKeyId: '',
       ossPrefix: 'assets',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -5515,6 +5533,9 @@ describe('分层配置接线（M4-A）', () => {
       ossAccessKeyId: '',
       ossPrefix: 'assets',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -5564,6 +5585,9 @@ describe('分层配置接线（M4-A）', () => {
       ossAccessKeyId: '',
       ossPrefix: 'assets',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -5581,6 +5605,9 @@ describe('分层配置接线（M4-A）', () => {
         ossAccessKeyId: 'LTAI5tExampleId',
         ossPrefix: 'docs',
         markdownToolbar: true,
+        wereadLocalDir: '',
+        syncLocalDir: '',
+        githubRepo: '',
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -5608,6 +5635,9 @@ describe('分层配置接线（M4-A）', () => {
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
       markdownToolbar: true,
+      wereadLocalDir: '',
+      syncLocalDir: '',
+      githubRepo: '',
     })
   })
 
@@ -5625,6 +5655,9 @@ describe('分层配置接线（M4-A）', () => {
         ossAccessKeyId: '',
         ossPrefix: 'assets',
         markdownToolbar: false,
+        wereadLocalDir: '',
+        syncLocalDir: '',
+        githubRepo: '',
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -5652,6 +5685,9 @@ describe('分层配置接线（M4-A）', () => {
         ossAccessKeyId: '',
         ossPrefix: 'assets',
         markdownToolbar: true,
+        wereadLocalDir: '',
+        syncLocalDir: '',
+        githubRepo: '',
       },
       report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
     })
@@ -5676,6 +5712,9 @@ describe('分层配置接线（M4-A）', () => {
           ossAccessKeyId: '',
           ossPrefix: 'assets',
           markdownToolbar: true,
+          wereadLocalDir: '',
+          syncLocalDir: '',
+          githubRepo: '',
         },
         report: { userLayer: { status: 'absent' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
       },

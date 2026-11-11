@@ -5,10 +5,10 @@
  * （Rust 在 `crates/vela-core/tests/wire_contract.rs`，前端在 `./settings.test.ts`），
  * 改一边必须改另一边。
  *
- * 配置比会话简单（十一个具体键，没有嵌套元组），但失败方式一样安静：字段名写错的后果是
+ * 配置比会话简单（十四个具体键，没有嵌套元组），但失败方式一样安静：字段名写错的后果是
  * **「重启后字号/字体回到默认」**——不崩、不报错，用户只会觉得「我设的没记住」。
  *
- * ## 🔴 十一个键**全都**只认用户全局，项目层写了也忽略
+ * ## 🔴 十四个键**全都**只认用户全局，项目层写了也忽略
  *
  * 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题 / Markdown 工具栏可见性是**个人偏好**，
  * 只认「内置默认 + 用户全局」两层。打开一个带 `.vela/settings.json` 的仓库**不会**改掉你的字号。M7-5 加的四格 OSS 配置
@@ -18,11 +18,12 @@
  * 「这个仓库想改你的 <键>，但 <键> 只认用户全局，已忽略」。完整推理见 Rust 侧模块文档
  * 与 PLAN §3.6「M4-A 实施修正」。
  *
- * ## 🔴 这十一个键里没有 AccessKeySecret
+ * ## 🔴 这十四个键里没有 AccessKeySecret / GitHub token
  *
  * `ossAccessKeyId` 在（它不是凭证，只指明用哪对密钥签名），`ossAccessKeySecret` **不在**，
- * 也永远不该出现在这份文件里：它只住 macOS 钥匙串（见 `src-tauri/src/secrets.rs`），
- * 前端**没有任何一条路**能读到它的值——只有一个「有没有配过」的布尔值（`ossSecretConfigured`）。
+ * `githubRepo` 在（它只是地址）而 GitHub token **不在**：两把凭证都只住 macOS 钥匙串
+ * （见 `src-tauri/src/secrets.rs` 与 `src-tauri/src/github.rs`），前端**没有任何一条路**
+ * 能读到它们的值——只有「有没有配过」的布尔值。
  * `settings.test.ts` 与 Rust 侧 `wire_contract.rs` 各钉一条「字段清单里没有 secret」。
  *
  * ## ⚠️ 路径不是这两个 command 的参数
@@ -107,6 +108,34 @@ export interface Settings {
    * 「关了之后重启还是关着」。线上就是布尔值，Rust 原样往返、不校验。
    */
   markdownToolbar: boolean
+  /**
+   * 微信读书笔记要同步进去的本地目录（M8-3，PLAN.md §3.22 ⑦）。
+   *
+   * 空串 = 没配。🔴 只认用户全局，理由比四格 OSS 更硬：仓库若能改这一格，打开一次就等于
+   * 「让别人的仓库决定 Vela 往你机器上写几十个 `.md`」。
+   *
+   * ⚠️ 这一层（与 Rust 的 `Settings`）都**不校验、不归一**：它可能是手改出来的任何字符串。
+   * 解软链、去尾斜杠、与「当前打开的目录」比相等，全部发生在真要用它的那一步
+   * （`src-tauri/src/weread.rs` 的前置闸），那里失败会指名是哪一格。
+   */
+  wereadLocalDir: string
+  /**
+   * 「文件同步」把哪些笔记同步进 GitHub 时的本地目录（M8-5，PLAN.md §3.22 ⑨）。
+   *
+   * 空串 = 没配。🔴 只认用户全局，理由与 `wereadLocalDir` 逐字相同：仓库若能改这一格，
+   * 打开一次就等于「让别人的仓库决定 Vela 把哪个目录推到 GitHub」。
+   *
+   * ⚠️ 不校验、不归一：与「当前打开的目录」比相等发生在 `src-tauri` 的落地层。
+   */
+  syncLocalDir: string
+  /**
+   * GitHub 仓库地址（M8-5）：`owner/repo` 或整条 `https://github.com/owner/repo` 都收。
+   *
+   * 空串 = 没配。只认用户全局（理由同上）。🔴 这里**只有地址没有 token**——token 只住
+   * macOS 钥匙串，前端能拿到的只有「有没有配过」的布尔值（见 `./github.ts`）。
+   * 解析 `owner/repo` 归落地层，这一层原样往返。
+   */
+  githubRepo: string
 }
 
 /**
@@ -128,7 +157,8 @@ export interface SettingsReport {
   projectLayer: LayerStatus
   /**
    * 项目层试图写「仅全局」的偏好键、因而被忽略的键名（wire 名，可直接引用）。
-   * v1 里十一个键全是「仅用户全局」类（七个偏好 + 四格 OSS 账号配置），所以项目层写的任何键都会落在这里。
+   * v1 里十四个键全是「仅用户全局」类（七个偏好 + 四格 OSS 账号配置 + 微信读书同步目录
+   * + 文件同步的两格），所以项目层写的任何键都会落在这里。
    */
   ignoredProjectKeys: string[]
 }
@@ -191,7 +221,8 @@ export function loadSettings(roots: string[]): Promise<LoadedSettings> {
 /**
  * 把配置写进**用户全局层**（`~/.vela/settings.json`），原子。
  *
- * 🔴 v1 只写用户全局层：十一个键都只认全局（七个偏好 + 四格 OSS 账号配置），没有需要落到项目层的键。
+ * 🔴 v1 只写用户全局层：十四个键都只认全局（七个偏好 + 四格 OSS 账号配置 + 微信读书同步目录
+ * + 文件同步的两格），没有需要落到项目层的键。
  *
  * ⚠️ 参数名 `settings` 在契约里：Tauri 按名字去 payload 里取值，拼错的后果是 Rust 报
  * 「invalid args」——这一条**会**报错，不像字段名写错那样静默。

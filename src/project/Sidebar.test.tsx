@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
-import { createRoot } from 'solid-js'
+import { createRoot, createSignal } from 'solid-js'
 import { render } from 'solid-js/web'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { GithubProgress } from '../github/ipc'
+import type { GithubSync } from '../github/store'
+import type { WereadProgress } from '../weread/ipc'
+import type { WereadSync } from '../weread/store'
 
 /**
  * 侧边栏的测试：DOM 与 `createProjectTree` 之间的接线。
@@ -199,7 +203,15 @@ let notices: TreeNotice[]
 let disposeTree: (() => void) | undefined
 let disposeRender: (() => void) | undefined
 
-function mount(fs: Record<string, DirEntry[]> = FS): ProjectTree {
+/** 挂载时可以额外塞进来的东西。不传 = 与 M8-5 的渲染结果逐字一致 */
+interface MountExtras {
+  sync?: WereadSync
+  wereadDir?: string
+  githubSync?: GithubSync
+  githubDir?: string
+}
+
+function mount(fs: Record<string, DirEntry[]> = FS, extra: MountExtras = {}): ProjectTree {
   installFs(fs)
   opened = []
   notices = []
@@ -207,7 +219,20 @@ function mount(fs: Record<string, DirEntry[]> = FS): ProjectTree {
     tree = createProjectTree({ openFile: async (path) => void opened.push(path) })
     return teardown
   })
-  disposeRender = render(() => <Sidebar tree={tree} onNotice={(n) => notices.push(n)} width={220} />, container)
+  disposeRender = render(
+    () => (
+      <Sidebar
+        tree={tree}
+        onNotice={(n) => notices.push(n)}
+        width={220}
+        sync={extra.sync}
+        wereadDir={extra.wereadDir}
+        githubSync={extra.githubSync}
+        githubDir={extra.githubDir}
+      />
+    ),
+    container,
+  )
   return tree
 }
 
@@ -1615,5 +1640,398 @@ describe('名称对话框', () => {
     expect(modalError()).toContain('already_exists')
     expect(names()).toContain('a.ts')
     expect(notices).toHaveLength(0)
+  })
+})
+
+/**
+ * 目录级同步入口（M8-6a）。
+ *
+ * 这里钉四件事：**什么时候出现**（配置 + 根匹配，四条组合）、
+ * **长什么样**（16px、无底色、a11y 名字）、**点了调谁**（start / cancel，且不顺手收起根行）、
+ * 以及**右键项与图标同一条判据**。
+ *
+ * ⚠️ 真机上才看得见的那一半（图标像不像一本书、进度那句折行没有、悬停亮度）这里钉不住：
+ * jsdom 没有布局，宽度与颜色都是空值。
+ */
+describe('目录级同步入口（M8-6a）', () => {
+  /** 一个只记调用、不带认账逻辑的同步状态机。认账那一半在 `weread/store.test.ts` 里钉过 */
+  function fakeSync() {
+    const [running, setRunning] = createSignal(false)
+    const [progress, setProgress] = createSignal<WereadProgress | null>(null)
+    const start = vi.fn(async (_dir: string) => {})
+    const cancel = vi.fn(async () => {})
+    const sync: WereadSync = {
+      running,
+      progress,
+      start,
+      cancel,
+      handlers: { onProgress: vi.fn(), onDone: vi.fn(), onFailed: vi.fn() },
+    }
+    return { sync, setRunning, setProgress, start, cancel }
+  }
+
+  function syncIcons(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('.tree-sync')]
+  }
+
+  it('没配置时一个入口都不渲染——哪怕同步状态机已经接上了', async () => {
+    const { sync } = fakeSync()
+    mount(FS, { sync, wereadDir: '' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(0)
+    expect(container.querySelector('.tree-sync-running')).toBeNull()
+  })
+
+  it('配置了、但打开的根是它的子目录：不算匹配，图标不出现', async () => {
+    const { sync } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await tree.openAt('/repo/docs')
+    await flush()
+
+    // 根行确实在（根是 /repo/docs），所以空数组不是因为树没渲染
+    expect(rowByRel('', '/repo/docs')).toBeDefined()
+    expect(syncIcons()).toHaveLength(0)
+  })
+
+  it('根就是配置的那个目录时，只有根行尾部长出图标（尾斜杠不影响判定）', async () => {
+    const { sync } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo/' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(1)
+    // 其余行一个都没有：图标说的是「这个根能往哪儿同步」，不挂在文件行上
+    expect(rowByRel('src')!.querySelector('.tree-sync')).toBeNull()
+    expect(rowByRel('README.md')!.querySelector('.tree-sync')).toBeNull()
+  })
+
+  it('图标是行尾的 16px 按钮，名字给读屏软件，图形自己隐身', async () => {
+    const { sync } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+
+    const button = rowByRel('')!.querySelector<HTMLElement>('.tree-sync')!
+    expect(button.tagName.toLowerCase()).toBe('button')
+    expect(button.getAttribute('aria-label')).toBe('同步微信读书笔记')
+    expect(button.getAttribute('title')).toBe('同步微信读书笔记到这里')
+    const svg = button.querySelector('.tree-glyph')!
+    expect(svg.getAttribute('aria-hidden')).toBe('true')
+    expect(svg.classList.contains('t-weread')).toBe(true)
+  })
+
+  it('点图标调 start(根路径)，而且不顺手把根行收起来', async () => {
+    const { sync, start } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+
+    rowByRel('')!.querySelector<HTMLElement>('.tree-sync')!.click()
+    await flush()
+
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(start).toHaveBeenCalledWith('/repo')
+    // 根行自己的 onClick 是「收起这一层」；少了 stopPropagation 这会变成
+    // 「点了同步，树塌了」，而所有断言都还绿着
+    expect(names()).toContain('README.md')
+  })
+
+  it('跑起来时图标换成「同步中… N/M」与取消，结束后图标回来', async () => {
+    const { sync, setRunning, setProgress } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+
+    setRunning(true)
+    await flush()
+    expect(syncIcons()).toHaveLength(0)
+    // 第一份进度到达之前只写「同步中…」：写 0/N 会像是「一本都没动」
+    expect(container.querySelector('.tree-sync-label')?.textContent).toBe('同步中…')
+
+    setProgress({ booksDone: 2, booksTotal: 7 })
+    await flush()
+    expect(container.querySelector('.tree-sync-label')?.textContent).toBe('同步中… 2/7')
+
+    setRunning(false)
+    await flush()
+    expect(container.querySelector('.tree-sync-running')).toBeNull()
+    expect(syncIcons()).toHaveLength(1)
+  })
+
+  it('点取消调 cancel，同样不动根行', async () => {
+    const { sync, setRunning, cancel } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+    setRunning(true)
+    await flush()
+
+    const cancelButton = container.querySelector<HTMLElement>('.tree-sync-cancel')!
+    expect(cancelButton.getAttribute('aria-label')).toBe('取消微信读书同步')
+    cancelButton.click()
+    await flush()
+
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(names()).toContain('README.md')
+  })
+
+  it('右键 md 文件有那一项，点了与图标是同一个入口', async () => {
+    const { sync, start } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+
+    await openMenu('README.md')
+    expect(menuLabels()).toContain('同步微信读书笔记')
+    await pickItem('同步微信读书笔记')
+
+    expect(start).toHaveBeenCalledWith('/repo')
+  })
+
+  it('非 md 文件、目录、根行都不给这一项', async () => {
+    const { sync } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+    await tree.toggle(k('src'))
+    await flush()
+
+    await openMenu('src/a.ts')
+    expect(menuLabels()).not.toContain('同步微信读书笔记')
+
+    await openMenu('docs')
+    expect(menuLabels()).not.toContain('同步微信读书笔记')
+
+    await openMenu('')
+    expect(menuLabels()).not.toContain('同步微信读书笔记')
+  })
+
+  it('根不匹配时，连 md 文件的右键项也不出（图标与菜单同一条判据）', async () => {
+    const { sync } = fakeSync()
+    mount(FS, { sync, wereadDir: '/notes' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(0)
+    await openMenu('README.md')
+    expect(menuLabels()).not.toContain('同步微信读书笔记')
+  })
+
+  it('没接同步状态机时整块都不存在（四十多个旧挂载点的渲染不变）', async () => {
+    mount(FS, { wereadDir: '/repo' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(0)
+    await openMenu('README.md')
+    expect(menuLabels()).not.toContain('同步微信读书笔记')
+  })
+})
+
+/**
+ * 云图标（M8-6b）：与 6a 同一条 `sameDir` 判据，条件换成 `syncLocalDir`。
+ *
+ * 这里另外钉住两件 6a 没有的事：**两枚图标共用行尾那一格**（各带一个 `auto` 外边距
+ * 会被顶到行中间去，jsdom 量不出来，只能钉结构），以及**跨 store 的互斥**——
+ * 一边在跑时另一枚图标整个不渲染，不是变灰。
+ */
+describe('目录级同步入口（M8-6b）', () => {
+  /** 与 `fakeSync` 同一副骨架，载荷换成一本书一个文件的进度 */
+  function fakeGithubSync() {
+    const [running, setRunning] = createSignal(false)
+    const [progress, setProgress] = createSignal<GithubProgress | null>(null)
+    const start = vi.fn(async (_dir: string) => {})
+    const cancel = vi.fn(async () => {})
+    const sync: GithubSync = {
+      running,
+      progress,
+      start,
+      cancel,
+      handlers: { onProgress: vi.fn(), onDone: vi.fn(), onFailed: vi.fn() },
+    }
+    return { sync, setRunning, setProgress, start, cancel }
+  }
+
+  function fakeWereadSync() {
+    const [running, setRunning] = createSignal(false)
+    const [progress, setProgress] = createSignal<WereadProgress | null>(null)
+    const sync: WereadSync = {
+      running,
+      progress,
+      start: vi.fn(async (_dir: string) => {}),
+      cancel: vi.fn(async () => {}),
+      handlers: { onProgress: vi.fn(), onDone: vi.fn(), onFailed: vi.fn() },
+    }
+    return { sync, setRunning, setProgress }
+  }
+
+  function syncIcons(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('.tree-sync')]
+  }
+
+  function cloudIcon(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('[aria-label="同步到 GitHub"]')
+  }
+
+  function bookIcon(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('[aria-label="同步微信读书笔记"]')
+  }
+
+  it('没配置时不渲染云图标——哪怕同步状态机已经接上了', async () => {
+    const { sync } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(0)
+    expect(container.querySelector('.tree-sync-running')).toBeNull()
+  })
+
+  it('配置了、但打开的根是它的子目录：不算匹配，云图标不出现', async () => {
+    const { sync } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '/repo' })
+    await tree.openAt('/repo/docs')
+    await flush()
+
+    expect(rowByRel('', '/repo/docs')).toBeDefined()
+    expect(cloudIcon()).toBeNull()
+  })
+
+  it('根就是配置的那个目录时，只有根行尾部有一枚（尾斜杠不影响判定）', async () => {
+    const { sync } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '/repo/' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(1)
+    expect(rowByRel('src')!.querySelector('.tree-sync')).toBeNull()
+    expect(rowByRel('README.md')!.querySelector('.tree-sync')).toBeNull()
+  })
+
+  it('图标是行尾的 16px 按钮，名字给读屏软件，图形自己隐身，色相与书不同', async () => {
+    const { sync } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '/repo' })
+    await openRepo()
+
+    const button = rowByRel('')!.querySelector<HTMLElement>('.tree-sync')!
+    expect(button.tagName.toLowerCase()).toBe('button')
+    expect(button.getAttribute('aria-label')).toBe('同步到 GitHub')
+    expect(button.getAttribute('title')).toBe('把笔记同步到这个 GitHub 仓库')
+    const svg = button.querySelector('.tree-glyph')!
+    expect(svg.getAttribute('aria-hidden')).toBe('true')
+    expect(svg.classList.contains('t-cloud')).toBe(true)
+    expect(svg.classList.contains('t-weread')).toBe(false)
+  })
+
+  it('点云图标调 start(根路径)，而且不顺手把根行收起来', async () => {
+    const { sync, start } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '/repo' })
+    await openRepo()
+
+    cloudIcon()!.click()
+    await flush()
+
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(start).toHaveBeenCalledWith('/repo')
+    expect(names()).toContain('README.md')
+  })
+
+  it('跑起来时换成「同步中… N/M」与取消，结束后图标回来', async () => {
+    const { sync, setRunning, setProgress } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '/repo' })
+    await openRepo()
+
+    setRunning(true)
+    await flush()
+    expect(syncIcons()).toHaveLength(0)
+    // 第一份进度到达之前只有「同步中…」：单位是文件，不是书
+    expect(container.querySelector('.tree-sync-label')?.textContent).toBe('同步中…')
+
+    setProgress({ filesDone: 2, filesTotal: 7 })
+    await flush()
+    expect(container.querySelector('.tree-sync-label')?.textContent).toBe('同步中… 2/7')
+
+    setRunning(false)
+    await flush()
+    expect(container.querySelector('.tree-sync-running')).toBeNull()
+    expect(cloudIcon()).not.toBeNull()
+  })
+
+  it('点取消调 cancel，标题里说清「已经动过的不会回滚」', async () => {
+    const { sync, setRunning, cancel } = fakeGithubSync()
+    mount(FS, { githubSync: sync, githubDir: '/repo' })
+    await openRepo()
+    setRunning(true)
+    await flush()
+
+    const cancelButton = container.querySelector<HTMLElement>('.tree-sync-cancel')!
+    expect(cancelButton.getAttribute('aria-label')).toBe('取消 GitHub 同步')
+    // 取消是协作式的：点了之后已经拉下来/推上去的照样留着，不说清会像是「撤销」
+    expect(cancelButton.getAttribute('title')).toBe('取消这次同步（已经拉下来/推上去的不会回滚）')
+    cancelButton.click()
+    await flush()
+
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(names()).toContain('README.md')
+  })
+
+  it('⚠️ 书在跑时云图标整个不渲染（互斥，不是变灰）', async () => {
+    const weread = fakeWereadSync()
+    const github = fakeGithubSync()
+    mount(FS, {
+      sync: weread.sync,
+      wereadDir: '/repo',
+      githubSync: github.sync,
+      githubDir: '/repo',
+    })
+    await openRepo()
+
+    // 都空闲时两枚都在、都在同一格
+    expect(syncIcons()).toHaveLength(2)
+    expect(container.querySelectorAll('.tree-sync-actions')).toHaveLength(1)
+
+    weread.setRunning(true)
+    await flush()
+    // 一行放不下两条进度、而且两边会往同一个目录写盘，所以云先收起来。
+    // 收起来 = 不在 DOM 里；`disabled` 的灰按钮会被读成「这里本来有东西，只是点不了」
+    expect(cloudIcon()).toBeNull()
+    expect(bookIcon()).toBeNull()
+    expect(container.querySelectorAll('.tree-sync-running')).toHaveLength(1)
+  })
+
+  it('反过来：GitHub 在跑时书图标让位', async () => {
+    const weread = fakeWereadSync()
+    const github = fakeGithubSync()
+    mount(FS, {
+      sync: weread.sync,
+      wereadDir: '/repo',
+      githubSync: github.sync,
+      githubDir: '/repo',
+    })
+    await openRepo()
+
+    github.setRunning(true)
+    await flush()
+
+    expect(bookIcon()).toBeNull()
+    const label = container.querySelector('.tree-sync-label')?.textContent
+    expect(label).toBe('同步中…')
+    expect(container.querySelector('.tree-sync-cancel')?.getAttribute('aria-label')).toBe('取消 GitHub 同步')
+  })
+
+  it('只接了书那边时，云一格都不多出来（旧挂载点的渲染不变）', async () => {
+    const { sync } = fakeWereadSync()
+    mount(FS, { sync, wereadDir: '/repo' })
+    await openRepo()
+
+    expect(syncIcons()).toHaveLength(1)
+    expect(cloudIcon()).toBeNull()
+    expect(rowByRel('')!.querySelector('.tree-sync-actions')).not.toBeNull()
+  })
+
+  it('两格配置指向不同的目录时，各自只在匹配的那个根上出现', async () => {
+    const weread = fakeWereadSync()
+    const github = fakeGithubSync()
+    mount(FS, {
+      sync: weread.sync,
+      wereadDir: '/repo',
+      githubSync: github.sync,
+      githubDir: '/notes',
+    })
+    await openRepo()
+
+    // 同一个根只满足书那一条：云图标说的仓库不在这里
+    expect(syncIcons()).toHaveLength(1)
+    expect(cloudIcon()).toBeNull()
   })
 })

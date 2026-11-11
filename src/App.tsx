@@ -77,6 +77,10 @@ import { createKeybindingStore } from './settings/keybindings'
 import { createSettingsStore } from './settings/store'
 import { BUILTIN_TOOLS } from './tools/builtin'
 import { createToolBox } from './tools/store'
+import { attachGithubListeners } from './github/ipc'
+import { createGithubSync } from './github/store'
+import { attachWereadListeners } from './weread/ipc'
+import { createWereadSync } from './weread/store'
 
 /**
  * Markdown 预览那一栏改成**按需加载**（M3-C-1）。
@@ -297,6 +301,8 @@ export default function App() {
   let detachFileWatch: (() => void) | undefined
   let detachDrop: (() => void) | undefined
   let detachMenu: (() => void) | undefined
+  let detachWeread: (() => void) | undefined
+  let detachGithub: (() => void) | undefined
   /** 卸载比 `listen` 的 promise 先落地时，拿到的注销函数要立刻用掉，见 onMount */
   let tornDown = false
   let sync: SessionSync | undefined
@@ -378,6 +384,29 @@ export default function App() {
    * 也和 workspace 的 `promptDiscard` 同一条道理——store 不该知道宿主长什么样。
    */
   const tree = createProjectTree({ openFile: (path) => ws.openAt(path) })
+
+  /**
+   * 微信读书全量同步（M8-6a）：在不在跑、跑到第几本、怎么取消。
+   *
+   * 失败那句话落到**文件树同一个提示条**（`treeNotice`）上，而不是另开一条：
+   * 它是由侧边栏根行上那个图标触发的，用户此刻的注意力就在树那边；再说，
+   * 侧边栏里塞不下带路径的中文（见 `TreeNotice` 的注释）。
+   * 同步本身的结果不弹提示——成没成看磁盘上那两份文件，见 `weread/store.ts`。
+   */
+  const wereadSync = createWereadSync({
+    onError: (text) => setTreeNotice({ level: 'error', text }),
+  })
+
+  /**
+   * GitHub 目录同步（M8-6b）：同一个根行尾部的另一枚图标。
+   *
+   * 提示落点与微信读书那一份**逐字相同**（文件树的提示条）：两枚图标挨在一起，
+   * 失败的话如果出现在两个不同的地方，用户会以为是两个功能的两种故障。
+   * ⚠️ 两把同步的互斥只在侧栏那一层（一边在跑时另一枚先收起），store 各自单飞。
+   */
+  const githubSync = createGithubSync({
+    onError: (text) => setTreeNotice({ level: 'error', text }),
+  })
 
   /**
    * 工作区的根一变就重读分层配置（M4-A）。
@@ -1733,6 +1762,22 @@ export default function App() {
       if (tornDown) unlisten()
       else detachReplace = unlisten
     })
+    // 微信读书同步的三个事件（M8-6a）与上面两组同一条规矩：启动时挂一次、挂着不放。
+    // 这一组漏掉的后果比搜索那组更重：`weread-done` 是唯一能让根行从「同步中…」
+    // 回到图标的东西，漏接之后用户面对的是一个永远停在进度上的入口。
+    // ⚠️ 事件里认的是 `taskId`（认领逻辑在 `weread/store.ts`），所以这组监听可以
+    // 与别的任务监听同时挂着，不会互相顶掉
+    void attachWereadListeners(wereadSync.handlers).then((unlisten) => {
+      if (tornDown) unlisten()
+      else detachWeread = unlisten
+    })
+    // GitHub 同步的三个事件（M8-6b）与上面同一条规矩、同一个理由：`github-done`
+    // 是唯一能让根行从「同步中…」回到云图标的东西。两组事件名不同、taskId 由同一个
+    // 计数器发号且永不重复，所以同时挂着不会互相顶掉
+    void attachGithubListeners(githubSync.handlers).then((unlisten) => {
+      if (tornDown) unlisten()
+      else detachGithub = unlisten
+    })
     // 文件监听同样是**启动时挂一次、挂着不放**，而且比上面两组更要紧：那两组漏了
     // 顶多是界面转圈不停，这一组漏了用户会在不知情的情况下用 ⌘S 把别人的改动盖掉。
     // `start()` 内部先挂 `listen` 再送第一份清单，顺序的理由写在 `doc/fileWatch.ts`。
@@ -1764,6 +1809,8 @@ export default function App() {
     detachMenu?.()
     detachSearch?.()
     detachReplace?.()
+    detachWeread?.()
+    detachGithub?.()
     detachFileWatch?.()
     detachDrop?.()
     detachKeys?.()
@@ -1784,7 +1831,15 @@ export default function App() {
           把手是 `.sidebar-col` 的 flex 子项，必须紧跟侧边栏：它画的就是左列与右列之间那条线 */}
       <Show when={sidebarVisible()}>
         <div class="sidebar-col">
-          <Sidebar tree={tree} onNotice={setTreeNotice} width={sidebarWidth()} />
+          <Sidebar
+            tree={tree}
+            onNotice={setTreeNotice}
+            width={sidebarWidth()}
+            sync={wereadSync}
+            wereadDir={settings.wereadLocalDir()}
+            githubSync={githubSync}
+            githubDir={settings.syncLocalDir()}
+          />
           <SidebarResize width={sidebarWidth} onWidth={setSidebarWidth} />
         </div>
       </Show>

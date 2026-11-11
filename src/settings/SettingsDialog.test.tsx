@@ -20,13 +20,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
  * 只有 `dataBase64`、`{ secret }`）就是安全边界本身。用假模块就等于把要验的东西 mock 掉了。
  */
 
-const { invoke, settingsIpc, fontLoader } = vi.hoisted(() => ({
+const { invoke, settingsIpc, fontLoader, dialogModule } = vi.hoisted(() => ({
   invoke: vi.fn(),
   settingsIpc: { loadSettings: vi.fn(), saveSettings: vi.fn() },
   fontLoader: { applyFontVariant: vi.fn(), applyCodeFont: vi.fn() },
+  dialogModule: { open: vi.fn() },
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke }))
+vi.mock('@tauri-apps/plugin-dialog', () => dialogModule)
 
 vi.mock('../ipc/settings', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../ipc/settings')>()),
@@ -72,7 +74,8 @@ const closeCalls: number[] = []
  */
 function wireInvoke(options: { configured?: boolean; upload?: string; secret?: SecretError } = {}): void {
   invoke.mockImplementation((command: string) => {
-    if (command === 'oss_secret_status') return Promise.resolve({ configured: options.configured ?? false })
+    if (command === 'oss_secret_status' || command === 'weread_key_status' || command === 'github_token_status')
+      return Promise.resolve({ configured: options.configured ?? false })
     if (command === 'upload_image') return Promise.resolve(options.upload ?? 'https://b.oss.aliyuncs.com/p.png')
     if (command === 'set_oss_secret' && options.secret) return rejectWith(options.secret)
     return Promise.resolve(undefined)
@@ -98,11 +101,14 @@ const group = (title: string): HTMLElement =>
   [...container.querySelectorAll<HTMLElement>('.settings-group')].find((g) =>
     g.querySelector('.settings-group-title')?.textContent?.includes(title),
   )!
-/** 按标签找那一行的 input/值：`AccessKey Secret` 那一个标签后面还会挂 badge，所以用前缀匹配 */
-function fieldInput(label: string): HTMLInputElement {
-  const rows = [...group('阿里云 OSS').querySelectorAll<HTMLElement>('.settings-row')]
+/** 按标签找某一组里那一行的 input：`AccessKey Secret` 那一个标签后面还会挂 badge，所以用前缀匹配 */
+function inputIn(title: string, label: string): HTMLInputElement {
+  const rows = [...group(title).querySelectorAll<HTMLElement>('.settings-row')]
   const row = rows.find((r) => r.querySelector('.settings-label')?.textContent?.startsWith(label))
   return row!.querySelector<HTMLInputElement>('input')!
+}
+function fieldInput(label: string): HTMLInputElement {
+  return inputIn('阿里云 OSS', label)
 }
 const resultText = (label: string): string | null => {
   const el = fieldInput(label).closest('.settings-field')?.querySelector('.settings-result')
@@ -143,6 +149,8 @@ beforeEach(async () => {
   fontLoader.applyCodeFont.mockReset()
   fontLoader.applyFontVariant.mockResolvedValue({})
   fontLoader.applyCodeFont.mockResolvedValue({})
+  dialogModule.open.mockReset()
+  dialogModule.open.mockResolvedValue(null)
   closeCalls.length = 0
   wireInvoke()
   settingsIpc.loadSettings.mockResolvedValue({
@@ -158,6 +166,9 @@ beforeEach(async () => {
       ossAccessKeyId: 'LTAI5tExampleId',
       ossPrefix: 'docs',
       markdownToolbar: true,
+      wereadLocalDir: '/Users/me/notes/微信读书',
+      syncLocalDir: '/Users/me/notes',
+      githubRepo: 'xuanke/notes',
     },
     report: { userLayer: { status: 'present' }, projectLayer: { status: 'absent' }, ignoredProjectKeys: [] },
   })
@@ -177,8 +188,8 @@ describe('标题与分组（M7-6 的改名）', () => {
     expect(dialog().getAttribute('aria-label')).toBe('设置')
   })
 
-  it('两组小标题：外观在前、阿里云 OSS 在后', () => {
-    expect(groupTitles()).toEqual(['外观', '阿里云 OSS'])
+  it('四组小标题：外观、阿里云 OSS、微信读书、文件同步', () => {
+    expect(groupTitles()).toEqual(['外观', '阿里云 OSS', '微信读书', '文件同步'])
   })
 
   it('外观那六项还在「外观」组里，OSS 的四格在另一组', () => {
@@ -319,7 +330,9 @@ describe('密钥那一行：只写不进读', () => {
     invoke.mockImplementation((command: string) =>
       command === 'oss_secret_status'
         ? rejectWith({ kind: 'unsupported', message: 'PROBE-NO-KEYCHAIN' } satisfies SecretError)
-        : Promise.resolve(undefined),
+        : command === 'weread_key_status' || command === 'github_token_status'
+          ? Promise.resolve({ configured: false })
+          : Promise.resolve(undefined),
     )
     await reopen()
     expect(resultText('AccessKey Secret')).toContain('PROBE-NO-KEYCHAIN')
@@ -366,6 +379,8 @@ describe('测试上传', () => {
     invoke.mockImplementation((command: string) => {
       if (command === 'upload_image') return rejectWith(rejected)
       if (command === 'oss_secret_status') return Promise.resolve({ configured: true })
+      if (command === 'weread_key_status' || command === 'github_token_status')
+        return Promise.resolve({ configured: false })
       return Promise.resolve(undefined)
     })
     await reopen()
@@ -382,7 +397,9 @@ describe('测试上传', () => {
         ? new Promise<string>((res) => void (resolveUpload = res))
         : command === 'oss_secret_status'
           ? Promise.resolve({ configured: true })
-          : Promise.resolve(undefined),
+          : command === 'weread_key_status' || command === 'github_token_status'
+            ? Promise.resolve({ configured: false })
+            : Promise.resolve(undefined),
     )
     await reopen()
     const button = uploadButton()
@@ -399,7 +416,11 @@ describe('测试上传', () => {
     invoke.mockImplementation((command: string) =>
       command === 'upload_image'
         ? rejectWith({ kind: 'not_configured', reason: 'PROBE-NOT-CONFIG' } satisfies UploadError)
-        : Promise.resolve({ configured: true }),
+        : command === 'oss_secret_status'
+          ? Promise.resolve({ configured: true })
+          : command === 'weread_key_status' || command === 'github_token_status'
+            ? Promise.resolve({ configured: false })
+            : Promise.resolve(undefined),
     )
     await reopen()
     click(uploadButton())
@@ -407,6 +428,110 @@ describe('测试上传', () => {
     expect(group('阿里云 OSS').textContent).toContain('PROBE-NOT-CONFIG')
     type(fieldInput('Bucket'), 'another')
     expect(group('阿里云 OSS').textContent).not.toContain('PROBE-NOT-CONFIG')
+  })
+})
+
+describe('微信读书 / 文件同步两组（M8-5）', () => {
+  it('目录与仓库地址的初值就是盘上那几格', () => {
+    expect(inputIn('微信读书', '本地目录').value).toBe('/Users/me/notes/微信读书')
+    expect(inputIn('文件同步', '本地目录').value).toBe('/Users/me/notes')
+    expect(inputIn('文件同步', '仓库地址').value).toBe('xuanke/notes')
+  })
+
+  it('目录失焦提交：trim 后写穿，其余格原样带着', async () => {
+    const dir = inputIn('微信读书', '本地目录')
+    type(dir, '  /Users/me/notes/book  ')
+    await flush()
+    // 打字不写盘（与 OSS 四格同一条：一次原子写带一次 fsync）
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+    blur(dir)
+    await flush()
+    expect(dir.value).toBe('/Users/me/notes/book')
+    expect(savedPayload(0)).toMatchObject({
+      wereadLocalDir: '/Users/me/notes/book',
+      syncLocalDir: '/Users/me/notes',
+      githubRepo: 'xuanke/notes',
+    })
+  })
+
+  it('仓库地址回车提交', async () => {
+    const repo = inputIn('文件同步', '仓库地址')
+    type(repo, 'xuanke/other')
+    press(repo, 'Enter')
+    await flush()
+    expect(savedPayload(0)).toMatchObject({ githubRepo: 'xuanke/other' })
+  })
+
+  it('「选择…」把原生面板选中的目录填进去并立刻写穿', async () => {
+    dialogModule.open.mockResolvedValue('/Users/me/picked')
+    click(
+      [...group('微信读书').querySelectorAll<HTMLButtonElement>('button')].find((b) =>
+        b.textContent?.includes('选择'),
+      )!,
+    )
+    await flush()
+    expect(dialogModule.open).toHaveBeenCalledWith({ multiple: false, directory: true })
+    expect(inputIn('微信读书', '本地目录').value).toBe('/Users/me/picked')
+    expect(savedPayload(0)).toMatchObject({ wereadLocalDir: '/Users/me/picked' })
+  })
+
+  it('取消选择（原生面板回 null）什么都不动', async () => {
+    click(
+      [...group('文件同步').querySelectorAll<HTMLButtonElement>('button')].find((b) =>
+        b.textContent?.includes('选择'),
+      )!,
+    )
+    await flush()
+    expect(inputIn('文件同步', '本地目录').value).toBe('/Users/me/notes')
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('🔴 微信读书 key：原样（不 trim）交给 `set_weread_key`，成功后清空输入框', async () => {
+    const key = inputIn('微信读书', 'API key')
+    type(key, '  wrk-abc  ')
+    click(
+      [...group('微信读书').querySelectorAll<HTMLButtonElement>('.settings-action')].find((b) =>
+        b.textContent?.startsWith('保存密钥'),
+      )!,
+    )
+    await flush()
+    expect(invoke).toHaveBeenCalledWith('set_weread_key', { key: '  wrk-abc  ' })
+    expect(key.value).toBe('')
+    expect(group('微信读书').textContent).toContain('已配置')
+  })
+
+  it('🔴 GitHub token：原样交给 `set_github_token`，不碰 settings 的写穿', async () => {
+    const token = inputIn('文件同步', 'GitHub token')
+    type(token, 'ghp-abc')
+    click(
+      [...group('文件同步').querySelectorAll<HTMLButtonElement>('.settings-action')].find((b) =>
+        b.textContent?.startsWith('保存 token'),
+      )!,
+    )
+    await flush()
+    expect(invoke).toHaveBeenCalledWith('set_github_token', { token: 'ghp-abc' })
+    expect(token.value).toBe('')
+    // 🔴 token 不进 `~/.vela/settings.json`：这一串只走了钥匙串
+    expect(settingsIpc.saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('保存失败时把 Rust 那句原文显示出来，输入框不清空', async () => {
+    invoke.mockImplementation((command: string) =>
+      command === 'set_github_token'
+        ? rejectWith({ kind: 'keychain', code: -25293, message: 'PROBE-GH-KEYCHAIN' } satisfies SecretError)
+        : Promise.resolve(command.endsWith('_status') ? { configured: false } : undefined),
+    )
+    await reopen()
+    const token = inputIn('文件同步', 'GitHub token')
+    type(token, 'ghp-abc')
+    click(
+      [...group('文件同步').querySelectorAll<HTMLButtonElement>('.settings-action')].find((b) =>
+        b.textContent?.startsWith('保存 token'),
+      )!,
+    )
+    await flush()
+    expect(group('文件同步').textContent).toContain('PROBE-GH-KEYCHAIN')
+    expect(token.value).toBe('ghp-abc')
   })
 })
 
