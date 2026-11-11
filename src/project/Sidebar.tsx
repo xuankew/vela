@@ -12,7 +12,6 @@ import {
   containerRel,
   displayName,
   isMutedRow,
-  isSameOrUnder,
   isTreeKey,
   keyOf,
   menuFor,
@@ -54,7 +53,7 @@ export interface SidebarProps {
   sync?: WereadSync
   /**
    * 「同步目录」配置（`settings.json` 的 `wereadLocalDir`）。空串 = 没配。
-   * 与 `sync` 同时给、且某个根就是这个目录**或它的祖先**时，那一行才长出图标。
+   * 与 `sync` 同时给、且这个目录**本身在树里看得见**时，那一行才长出图标。
    *
    * ⚠️ 单独成一个 prop 而不是塞进 `sync`：配置的真相在 settings store 里，
    * 同步的状态机不该再存一份副本——两份的话开关设置之后图标会晚一拍才消失
@@ -264,18 +263,18 @@ export function Sidebar(props: SidebarProps) {
   }
 
   /**
-   * 这一行该不该出现微信读书入口（M8-6a / M8-6c）：**根行**，且这个根就是配置的那个
-   * 目录**或它的祖先**。
+   * 这一行该不该出现微信读书入口（M8-6a / M8-6d）：**配置的那个目录自己那一行**。
    *
-   * 放宽到「包含」是因为主用法就是两个目录套在一起：微信读书目录放在 GitHub 同步目录
-   * 里面（素材靠根上的 `.gitignore` 排除、种子随 GitHub 同步走）。打开外层目录时，
-   * 书图标与云图标并排挂在同一行，点下去仍然只写配置的那个子目录。
+   * M8-6c 一度放宽成「根是它的祖先就挂在根上」，主用法（笔记目录嵌在 GitHub 同步目录里）
+   * 是能点到了，但图标落在了外层目录上，看的人以为同步的是整个仓库。M8-6d 把它挪回
+   * 笔记目录那一条：外层仍可有云图标，两枚各管各的目录。
    *
-   * ⚠️ 判的是带分隔符的包含（`isSameOrUnder`）：打开的是配置目录的**子目录**时不算——
-   * 那个根里没有笔记目录本身。也没配（空串）时直接为假，所以不配就一个都不出现。
+   * ⚠️ 判的是**路径相等**（`sameDir`），不是包含：祖先行、子目录行都不挂。
+   * 配置目录被折叠或根本不在当前树里时，这一轮就没有图标——⛔ 不回退到根上，
+   * 那正是要修的表现。也没配（空串）时直接为假。
    */
-  function isWereadRoot(row: TreeRow): boolean {
-    return row.rel === '' && isSameOrUnder(rootPathOf(row.rootIndex), props.wereadDir ?? '')
+  function isWereadDirRow(row: TreeRow): boolean {
+    return sameDir(row.path, props.wereadDir ?? '')
   }
 
   /**
@@ -304,12 +303,12 @@ export function Sidebar(props: SidebarProps) {
    * 会被顶到中间去）。条件与下面两个 `<Show>` 的判据逐字一致。
    */
   function hasSyncEntry(row: TreeRow): boolean {
-    return (props.sync !== undefined && isWereadRoot(row)) || (props.githubSync !== undefined && isGithubRoot(row))
+    return (props.sync !== undefined && isWereadDirRow(row)) || (props.githubSync !== undefined && isGithubRoot(row))
   }
 
   /**
-   * 两把同步同时跑是界面层要避免的事：一个根只有一行，塞不下两句「同步中…」，
-   * 而且它们会各自往同一个目录写盘。所以**一边在跑时，另一枚图标先收起来**——
+   * 两把同步同时跑是界面层要避免的事：它们会各自往同一棵目录里写盘（笔记目录通常就在
+   * GitHub 同步目录里面）。所以**一边在跑时，另一枚图标先收起来**——
    * 不是变灰（灰的会被读成「这里本来有东西，只是暂时点不了」）。
    * store 那一层的单飞只看自己，跨 store 的这道闸在这里。
    */
@@ -467,7 +466,7 @@ export function Sidebar(props: SidebarProps) {
                     {/* 同步入口（M8-6a / M8-6b）。条件成立才渲染：接了那个同步状态机，
                         且这一行就是配置的那个目录。⛔ 不满足时连一个 `<Show>` 都不落 DOM，
                         不是画成灰色不可点——灰图标会被读成「这里本来有东西，只是暂时点不了」。
-                        点与取消都 `stopPropagation`：根行自己的 `onClick` 会收起这棵树，
+                        点与取消都 `stopPropagation`：这一行自己的 `onClick` 会把目录收起来，
                         而用户此刻要的只是同步。
                         ⚠️ 两枚图标共用行尾那一格（`.tree-sync-actions`，只有一个 `auto` 外边距），
                         否则两个 `margin-left: auto` 会把剩余空间对半分、图标被顶到行中间 */}
@@ -475,7 +474,7 @@ export function Sidebar(props: SidebarProps) {
                       <span class="tree-sync-actions">
                         <Show when={props.sync}>
                           {(sync) => (
-                            <Show when={isWereadRoot(row)}>
+                            <Show when={isWereadDirRow(row)}>
                               <Show
                                 when={sync().running()}
                                 fallback={

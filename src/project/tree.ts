@@ -254,6 +254,9 @@ export function sameDir(a: string | undefined, b: string): boolean {
  * 「本该没有的同步入口出现了」。
  *
  * 与 `sameDir` 同一条口径：只去尾斜杠、不解软链（前端没有 fs API），空串一律不匹配。
+ *
+ * ⚠️ M8-6d 之后**只有右键项**用这两条包含判断（`canSyncWeread`）。图标已挪到配置目录
+ * 自己那一行，走 `sameDir(row.path, wereadDir)`，不再经过这里。
  */
 export function isSameOrUnder(parent: string | undefined, child: string): boolean {
   if (parent === undefined || parent === '' || child === '') return false
@@ -381,7 +384,7 @@ export function menuFor(row: TreeRow, rootCount: number, sync?: MenuSyncOptions)
   return items
 }
 
-/** 目录级同步在菜单里的条件（M8-6a / M8-6c）。与图标共用 `isSameOrUnder` 那一条口径 */
+/** 目录级同步在菜单里的条件（M8-6a / M8-6c）。图标另有一条（M8-6d），见 `Sidebar.tsx` 的 `isWereadDirRow` */
 export interface MenuSyncOptions {
   /** 这一行所属根的绝对路径。`undefined` = 位次越界（不该发生），一律不出这一项 */
   readonly rootPath: string | undefined

@@ -1646,9 +1646,9 @@ describe('名称对话框', () => {
 /**
  * 目录级同步入口（M8-6a）。
  *
- * 这里钉四件事：**什么时候出现**（配置 + 根匹配，四条组合）、
- * **长什么样**（16px、无底色、a11y 名字）、**点了调谁**（start / cancel，且不顺手收起根行）、
- * 以及**右键项与图标同一条判据**。
+ * 这里钉四件事：**什么时候出现**（配置 + 哪一行是配置目录，四条组合）、
+ * **长什么样**（16px、无底色、a11y 名字）、**点了调谁**（start / cancel，且不顺手把那一行收起/摊开）、
+ * 以及**右键项与图标各管各的判据**（M8-6d：图标按行路径相等，右键按文件在目录内）。
  *
  * ⚠️ 真机上才看得见的那一半（图标像不像一本书、进度那句折行没有、悬停亮度）这里钉不住：
  * jsdom 没有布局，宽度与颜色都是空值。
@@ -1705,12 +1705,17 @@ describe('目录级同步入口（M8-6a）', () => {
     expect(rowByRel('README.md')!.querySelector('.tree-sync')).toBeNull()
   })
 
-  it('配置目录在打开的根里面时，图标也挂在根行上，点下去 start(配置目录)（M8-6c）', async () => {
+  it('配置目录嵌在打开的根里时，图标挂在那个目录自己那一行上，点下去 start(配置目录)（M8-6d）', async () => {
     const { sync, start } = fakeSync()
     mount(FS, { sync, wereadDir: '/repo/docs' })
     await openRepo()
 
-    const button = rowByRel('')!.querySelector<HTMLElement>('.tree-sync')!
+    // 外层根上什么都没有：图标说的是「同步这个目录」，挂在根上会被读成整个仓库
+    expect(rowByRel('')!.querySelector('.tree-sync')).toBeNull()
+    expect(rowByRel('README.md')!.querySelector('.tree-sync')).toBeNull()
+
+    // 目录行自己不用展开就在树里，图标跟着它
+    const button = rowByRel('docs')!.querySelector<HTMLElement>('.tree-sync')!
     expect(button).not.toBeNull()
     expect(button.getAttribute('title')).toBe('同步微信读书笔记到 /repo/docs')
     button.click()
@@ -1718,7 +1723,8 @@ describe('目录级同步入口（M8-6a）', () => {
 
     // 递的不是根（/repo）：Rust 预检要求参数与配置目录相等
     expect(start).toHaveBeenCalledWith('/repo/docs')
-    expect(names()).toContain('README.md')
+    // 图标自己的点击不该顺带把 docs 展开（stopPropagation）
+    expect(names()).not.toContain('intro.md')
   })
 
   it('图标是行尾的 16px 按钮，名字给读屏软件，图形自己隐身', async () => {

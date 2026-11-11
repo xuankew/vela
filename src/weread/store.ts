@@ -32,7 +32,7 @@ import {
 } from './ipc'
 
 export interface WereadSync {
-  /** 有没有一次同步在飞。图标用它禁用自己、根行用它换掉那一格 */
+  /** 有没有一次同步在飞。侧栏用它把书图标那一格换成「同步中…」 */
   readonly running: Accessor<boolean>
   /** 最近一份进度。`null` = 还没收到第一份（刚起飞的极短窗口） */
   readonly progress: Accessor<WereadProgress | null>
