@@ -12,6 +12,7 @@ import {
   containerRel,
   displayName,
   isMutedRow,
+  isSameOrUnder,
   isTreeKey,
   keyOf,
   menuFor,
@@ -53,7 +54,7 @@ export interface SidebarProps {
   sync?: WereadSync
   /**
    * 「同步目录」配置（`settings.json` 的 `wereadLocalDir`）。空串 = 没配。
-   * 与 `sync` 同时给、且某个根恰好就是这个目录时，那一行才长出图标。
+   * 与 `sync` 同时给、且某个根就是这个目录**或它的祖先**时，那一行才长出图标。
    *
    * ⚠️ 单独成一个 prop 而不是塞进 `sync`：配置的真相在 settings store 里，
    * 同步的状态机不该再存一份副本——两份的话开关设置之后图标会晚一拍才消失
@@ -66,7 +67,8 @@ export interface SidebarProps {
   githubSync?: GithubSync
   /**
    * 「文件同步」配置（`settings.json` 的 `syncLocalDir`）。空串 = 没配。
-   * 判据与 `wereadDir` 同一条 `sameDir`，只判相等不判前缀。
+   * ⚠️ 判据与 `wereadDir` **不同**：这一格仍要求**相等**（`sameDir`）——GitHub 同步
+   * 只写这个根本身，不像微信读书那样允许配在子目录里。
    */
   githubDir?: string
 }
@@ -262,14 +264,31 @@ export function Sidebar(props: SidebarProps) {
   }
 
   /**
-   * 这一行该不该出现微信读书入口（M8-6a）：**根行**，且这个根就是配置的那个目录。
+   * 这一行该不该出现微信读书入口（M8-6a / M8-6c）：**根行**，且这个根就是配置的那个
+   * 目录**或它的祖先**。
    *
-   * 判的是相等不是前缀（`sameDir`）：打开的是同步目录的子目录时不算——
-   * 同步状态属于那个目录本身，而图标与右键项都只挂在根行上。
-   * 也没配（空串）时 `sameDir` 直接为假，所以不配就一个都不出现。
+   * 放宽到「包含」是因为主用法就是两个目录套在一起：微信读书目录放在 GitHub 同步目录
+   * 里面（素材靠根上的 `.gitignore` 排除、种子随 GitHub 同步走）。打开外层目录时，
+   * 书图标与云图标并排挂在同一行，点下去仍然只写配置的那个子目录。
+   *
+   * ⚠️ 判的是带分隔符的包含（`isSameOrUnder`）：打开的是配置目录的**子目录**时不算——
+   * 那个根里没有笔记目录本身。也没配（空串）时直接为假，所以不配就一个都不出现。
    */
   function isWereadRoot(row: TreeRow): boolean {
-    return row.rel === '' && sameDir(rootPathOf(row.rootIndex), props.wereadDir ?? '')
+    return row.rel === '' && isSameOrUnder(rootPathOf(row.rootIndex), props.wereadDir ?? '')
+  }
+
+  /**
+   * 微信读书同步唯一的目标目录。
+   *
+   * ⚠️ 图标与右键项都走这一个函数，而且递的是**配置目录**不是行所属的根：
+   * 根可能是配置目录的祖先（M8-6c），而 Rust 预检要求「参数 == 配置」。
+   * 空串 / 没接同步时安静地不做——入口本来就不会出现在那种场合。
+   */
+  function startWereadSync(): void {
+    const dir = props.wereadDir
+    if (props.sync === undefined || dir === undefined || dir === '') return
+    void props.sync.start(dir)
   }
 
   /** 云图标（M8-6b）：同一条判据，条件换成「文件同步」的目录 */
@@ -354,11 +373,8 @@ export function Sidebar(props: SidebarProps) {
       case 'syncWeread': {
         // 不 `await`、也不在这里等结果：进度与失败都走同步 store 的事件与 `onError`，
         // 这一层只负责把那一下点下去（与图标那一条是同一个入口、同一句话）。
-        // 位次越界/同步没接上时安静地不动——菜单项本来就不会出现在那种场合
-        const sync = props.sync
-        const rootPath = rootPathOf(row.rootIndex)
-        if (sync === undefined || rootPath === undefined) return
-        void sync.start(rootPath)
+        // 递的是配置目录而不是行所属的根：根可能是配置目录的祖先（M8-6c）
+        startWereadSync()
         return
       }
     }
@@ -466,11 +482,11 @@ export function Sidebar(props: SidebarProps) {
                                   <Show when={!githubRunning()}>
                                     <button
                                       class="tree-sync"
-                                      title="同步微信读书笔记到这里"
+                                      title={`同步微信读书笔记到 ${props.wereadDir ?? ''}`}
                                       aria-label="同步微信读书笔记"
                                       onClick={(e) => {
                                         e.stopPropagation()
-                                        void sync().start(row.path)
+                                        startWereadSync()
                                       }}
                                     >
                                       <TreeGlyphIcon glyph="weread" />

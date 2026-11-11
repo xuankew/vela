@@ -1705,6 +1705,22 @@ describe('目录级同步入口（M8-6a）', () => {
     expect(rowByRel('README.md')!.querySelector('.tree-sync')).toBeNull()
   })
 
+  it('配置目录在打开的根里面时，图标也挂在根行上，点下去 start(配置目录)（M8-6c）', async () => {
+    const { sync, start } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo/docs' })
+    await openRepo()
+
+    const button = rowByRel('')!.querySelector<HTMLElement>('.tree-sync')!
+    expect(button).not.toBeNull()
+    expect(button.getAttribute('title')).toBe('同步微信读书笔记到 /repo/docs')
+    button.click()
+    await flush()
+
+    // 递的不是根（/repo）：Rust 预检要求参数与配置目录相等
+    expect(start).toHaveBeenCalledWith('/repo/docs')
+    expect(names()).toContain('README.md')
+  })
+
   it('图标是行尾的 16px 按钮，名字给读屏软件，图形自己隐身', async () => {
     const { sync } = fakeSync()
     mount(FS, { sync, wereadDir: '/repo' })
@@ -1713,7 +1729,7 @@ describe('目录级同步入口（M8-6a）', () => {
     const button = rowByRel('')!.querySelector<HTMLElement>('.tree-sync')!
     expect(button.tagName.toLowerCase()).toBe('button')
     expect(button.getAttribute('aria-label')).toBe('同步微信读书笔记')
-    expect(button.getAttribute('title')).toBe('同步微信读书笔记到这里')
+    expect(button.getAttribute('title')).toBe('同步微信读书笔记到 /repo')
     const svg = button.querySelector('.tree-glyph')!
     expect(svg.getAttribute('aria-hidden')).toBe('true')
     expect(svg.classList.contains('t-weread')).toBe(true)
@@ -1781,6 +1797,24 @@ describe('目录级同步入口（M8-6a）', () => {
     await pickItem('同步微信读书笔记')
 
     expect(start).toHaveBeenCalledWith('/repo')
+  })
+
+  it('配置目录在根里面时，只给配置目录内的 md 那一项（M8-6c）', async () => {
+    const { sync, start } = fakeSync()
+    mount(FS, { sync, wereadDir: '/repo/docs' })
+    await openRepo()
+    await tree.toggle(k('docs'))
+    await flush()
+
+    // 祖先根里与笔记无关的 md 不出这一项
+    await openMenu('README.md')
+    expect(menuLabels()).not.toContain('同步微信读书笔记')
+
+    await openMenu('docs/intro.md')
+    expect(menuLabels()).toContain('同步微信读书笔记')
+    await pickItem('同步微信读书笔记')
+
+    expect(start).toHaveBeenCalledWith('/repo/docs')
   })
 
   it('非 md 文件、目录、根行都不给这一项', async () => {

@@ -244,6 +244,25 @@ export function sameDir(a: string | undefined, b: string): boolean {
 }
 
 /**
+ * `child` 是不是 `parent` 本身，或者 `parent` 里面的东西（M8-6c）。
+ *
+ * 微信读书目录常被放在 GitHub 同步目录**内部**（素材靠根上的 `.gitignore` 排除、种子随
+ * GitHub 同步走），所以「打开的根是配置目录的祖先」也是一个合法现场。
+ *
+ * ⚠️ 前缀判断**必须带分隔符**：`/repo` 包含 `/repo/notes`，但不包含 `/repo2/notes`。
+ * 这也是为什么这里不用裸 `startsWith`——它会把兄弟目录读成子目录，而症状是
+ * 「本该没有的同步入口出现了」。
+ *
+ * 与 `sameDir` 同一条口径：只去尾斜杠、不解软链（前端没有 fs API），空串一律不匹配。
+ */
+export function isSameOrUnder(parent: string | undefined, child: string): boolean {
+  if (parent === undefined || parent === '' || child === '') return false
+  const p = trimTailSlash(parent)
+  const c = trimTailSlash(child)
+  return c === p || c.startsWith(p === '/' ? '/' : `${p}/`)
+}
+
+/**
  * 把父层的 `rel` 与一个名字拼成子项的 `rel`。根层（`''`）直接就是名字本身。
  *
  * ⚠️ **这是前端唯一一处「拼」路径的地方**，与 `displayName` 的「拆」正好是一对。
@@ -362,7 +381,7 @@ export function menuFor(row: TreeRow, rootCount: number, sync?: MenuSyncOptions)
   return items
 }
 
-/** 目录级同步在菜单里的条件（M8-6a）。与图标用的是同一条 `sameDir` 判据 */
+/** 目录级同步在菜单里的条件（M8-6a / M8-6c）。与图标共用 `isSameOrUnder` 那一条口径 */
 export interface MenuSyncOptions {
   /** 这一行所属根的绝对路径。`undefined` = 位次越界（不该发生），一律不出这一项 */
   readonly rootPath: string | undefined
@@ -373,16 +392,25 @@ export interface MenuSyncOptions {
 /**
  * 这一行该不该给「同步微信读书笔记」。
  *
- * 四条**同时**成立：不是目录、扩展名是 Markdown、所属根就是配置的那个目录
- * （`sameDir`，算的是**相等**不是前缀）、配置非空。
+ * 五条**同时**成立：不是目录、扩展名是 Markdown、配置非空、**所属根等于或包含配置目录**
+ * （图标那一条）、**这一行的绝对路径在配置目录里**（菜单这一条）。
+ *
+ * ⚠️ 后两条缺一不可：只有第一条的话，祖先根里每一个 `.md`——包括与笔记无关的
+ * README——都会长出一项「同步微信读书笔记」；只有第二条的话，打开的是笔记目录的
+ * **子目录**时也会出现，而那一行没有图标，两个入口就分岔了。
  *
  * ⚠️ 只认 `.md` 那一串扩展名（`MARKDOWN_EXT`），⛔ 不另写一张表：与高亮、导出名、
  * 工具栏共用同一份判断——这里多认一个 `.mdx` 而那里不认，症状是「右键有同步、
- * 点开却不是 Markdown」。⚠️ 判的是 `row.name` 而不是 `row.path`：两个都行，
- * 但名字更短，而这条判据只看最后一段
+ * 点开却不是 Markdown」。⚠️ 文件判断用 `row.path`（绝对路径）而不是 `row.rel`：
+ * `rel` 是相对根的，祖先根与配置目录之间那一段只有绝对路径里才有
  */
 function canSyncWeread(row: TreeRow, sync: MenuSyncOptions): boolean {
-  return !row.isDir && sameDir(sync.rootPath, sync.wereadDir) && MARKDOWN_EXT.test(row.name)
+  return (
+    !row.isDir &&
+    MARKDOWN_EXT.test(row.name) &&
+    isSameOrUnder(sync.rootPath, sync.wereadDir) &&
+    isSameOrUnder(sync.wereadDir, row.path)
+  )
 }
 
 /**

@@ -16,6 +16,7 @@ import {
   displayName,
   flattenRows,
   isMutedRow,
+  isSameOrUnder,
   keyOf,
   menuFor,
   parentRel,
@@ -226,6 +227,31 @@ describe('sameDir：两条绝对路径是不是同一个目录（M8-6a）', () =
   })
 })
 
+describe('isSameOrUnder：包含匹配（M8-6c）', () => {
+  it('自己、直接子项、多层子项都算；尾斜杠不影响', () => {
+    expect(isSameOrUnder('/repo', '/repo')).toBe(true)
+    expect(isSameOrUnder('/repo/', '/repo/notes')).toBe(true)
+    expect(isSameOrUnder('/repo', '/repo/notes/a.md')).toBe(true)
+    // 根目录 '/' 是所有绝对路径的祖先
+    expect(isSameOrUnder('/', '/repo/notes')).toBe(true)
+  })
+
+  it('⚠️ 带分隔符判前缀：兄弟目录与同名前缀都不算', () => {
+    // 裸 `startsWith` 会把这两个读成子目录——症状是「本该没有的同步入口出现了」
+    expect(isSameOrUnder('/repo', '/repo2')).toBe(false)
+    expect(isSameOrUnder('/repo', '/repo-旧/a.md')).toBe(false)
+    // 方向反了也不算：父目录不是子目录的子孙
+    expect(isSameOrUnder('/repo/notes', '/repo')).toBe(false)
+    expect(isSameOrUnder('/repo/notes', '/repo/notes-旧/a.md')).toBe(false)
+  })
+
+  it('空串与 undefined 一律不匹配', () => {
+    expect(isSameOrUnder('', '')).toBe(false)
+    expect(isSameOrUnder(undefined, '/repo/a.md')).toBe(false)
+    expect(isSameOrUnder('/repo', '')).toBe(false)
+  })
+})
+
 describe('childRel / parentRel：rel 的拼与拆', () => {
   it('⚠️ 根层新建得到的是名字本身，不是以斜杠开头的 rel', () => {
     // 这一条是整个函数的存在理由。`'' + '/' + name` 会得到 `"/foo.txt"`，
@@ -390,7 +416,7 @@ describe('containerRel / menuFor：右键一行该给出什么', () => {
     expect(menuFor(rowOf(''), 1, sync).map((i) => i.action)).not.toContain('syncWeread')
   })
 
-  it('根不是配置的那个目录、或压根没配时都不给（与图标同一条 sameDir）', () => {
+  it('根不是配置的那个目录、或压根没配时都不给（与图标同一条包含判据）', () => {
     const file = rowOf('README.md')
     expect(menuFor(file, 1, { rootPath: '/notes', wereadDir: '/repo' }).map((i) => i.action)).not.toContain(
       'syncWeread',
@@ -398,6 +424,23 @@ describe('containerRel / menuFor：右键一行该给出什么', () => {
     expect(menuFor(file, 1, { rootPath: '/repo', wereadDir: '' }).map((i) => i.action)).not.toContain('syncWeread')
     // 不传第三个参数 = 这一轮没有同步入口：菜单与原样逐字一致
     expect(menuFor(file, 1).map((i) => i.action)).not.toContain('syncWeread')
+  })
+
+  it('M8-6c：配置目录在根里面时，只给配置目录内的 md', () => {
+    const sync = { rootPath: '/repo', wereadDir: '/repo/notes' }
+    const inside: TreeRow = { ...rowOf('README.md'), rel: 'notes/a.md', name: 'a.md', path: '/repo/notes/a.md' }
+    const outside: TreeRow = { ...rowOf('README.md'), rel: 'docs/b.md', name: 'b.md', path: '/repo/docs/b.md' }
+
+    expect(menuFor(inside, 1, sync).map((i) => i.action)).toContain('syncWeread')
+    // 祖先根里与笔记无关的 md 不该长出一项「同步微信读书笔记」
+    expect(menuFor(outside, 1, sync).map((i) => i.action)).not.toContain('syncWeread')
+  })
+
+  it('M8-6c：打开的根是配置目录的子目录时，右键项也不出（与图标同一条）', () => {
+    const file: TreeRow = { ...rowOf('README.md'), rel: 'a.md', name: 'a.md', path: '/repo/notes/a.md' }
+    expect(
+      menuFor(file, 1, { rootPath: '/repo/notes/sub', wereadDir: '/repo/notes' }).map((i) => i.action),
+    ).not.toContain('syncWeread')
   })
 
   it('containerRel：目录行是它自己，文件行是它的父层', () => {
