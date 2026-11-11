@@ -1446,9 +1446,9 @@ fn 分片接不住的编码在契约上有其名() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 分层配置（M4-A，M7-5 加了四格 OSS，M4-F 加了工具栏可见性）。与 session 同一套钉法：合并后的
-// 最终配置是**具体的十一键对象**（没有 Option），账单（report）里的两层状态用 snake_case 的
-// `status` 打标签。前端 `src/ipc/settings.ts` 的镜像类型与 `src/ipc/settings.test.ts` 的黄金 JSON 是另一半。
+// 分层配置（M4-A，M7-5 加了四格 OSS，M4-F 加了工具栏可见性，M8-3 加了微信读书同步目录）。
+// 与 session 同一套钉法：合并后的最终配置是**具体的十四键对象**（没有 Option），账单（report）
+// 里的两层状态用 snake_case 的 `status` 打标签。前端 `src/ipc/settings.ts` 的镜像类型与 `src/ipc/settings.test.ts` 的黄金 JSON 是另一半。
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `Settings`（合并后的最终配置）的线上形状：紧凑、camelCase、字段顺序 = 声明顺序。
@@ -1456,8 +1456,8 @@ fn 分片接不住的编码在契约上有其名() {
 /// 这个类型同时是 `save` 命令的**入参**（前端把信号拼成它发回来），所以它必须能
 /// 反序列化——下面紧跟一条 `from_str` 钉住这一点。
 ///
-/// 🔴 十一个键里**没有** `ossAccessKeySecret`：它只住钥匙串，永远不进这份文件，也因此
-/// 不进这条黄金 JSON。前端 `src/ipc/settings.test.ts` 有同一条断言的另一半。
+/// 🔴 十四个键里**没有** `ossAccessKeySecret` / `githubToken`：凭证只住钥匙串，永远不进这份文件，
+/// 也因此不进这条黄金 JSON。前端 `src/ipc/settings.test.ts` 有同一条断言的另一半。
 ///
 /// ⚠️ `letterSpacing` 的默认值在线上是 `0.0` 而不是 `0`：serde_json 对 `f64` 永远带小数点，
 /// 而 JS 那边 `JSON.stringify(0)` 写的是 `0`。两者是**同一个 JSON number**，
@@ -1470,7 +1470,7 @@ fn settings_的线上形状() {
     let json = serde_json::to_string(&Settings::default()).unwrap();
     assert_eq!(
         json,
-        r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true}"#
+        r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true,"wereadLocalDir":"","syncLocalDir":"","githubRepo":""}"#
     );
 
     // save 命令收的就是这个形状，必须能原样读回来（含 JS 那侧会发的整数字面量 `0`）
@@ -1478,7 +1478,7 @@ fn settings_的线上形状() {
     assert_eq!(parsed, Settings::default());
     assert_eq!(
         serde_json::from_str::<Settings>(
-            r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true}"#
+            r#"{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true,"wereadLocalDir":"","syncLocalDir":"","githubRepo":""}"#
         )
         .unwrap(),
         Settings::default(),
@@ -1486,7 +1486,7 @@ fn settings_的线上形状() {
     );
 
     // 非默认值也一样：字段是具体值不是 Option，任何一档都走同一条反序列化路径
-    let custom = r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":false}"#;
+    let custom = r#"{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":false,"wereadLocalDir":"/Users/me/notes/微信读书","syncLocalDir":"/Users/me/notes","githubRepo":"xuanke/notes"}"#;
     let parsed: Settings = serde_json::from_str(custom).unwrap();
     assert_eq!(
         (parsed.font_size, parsed.font_variant.as_str(), parsed.code_font.as_str()),
@@ -1508,6 +1508,12 @@ fn settings_的线上形状() {
     // 唯一一个布尔键：wire 名是 camelCase 的 `markdownToolbar`。非默认值 `false` 从这里能读进来，
     // 才说明「关掉之后重启还是关着」这条路在契约上是通的
     assert!(!parsed.markdown_toolbar);
+    // M8-3 的同步目录：wire 名是 camelCase 的 `wereadLocalDir`（不是 `weread_local_dir`，
+    // 也不是 `localDir`——那一格单看名字看不出它属于谁）
+    assert_eq!(parsed.weread_local_dir, "/Users/me/notes/微信读书");
+    // M8-5 文件同步的两格：wire 名是 camelCase 的 `syncLocalDir` / `githubRepo`
+    assert_eq!(parsed.sync_local_dir, "/Users/me/notes");
+    assert_eq!(parsed.github_repo, "xuanke/notes");
 }
 
 /// 内置默认值两边各钉一条：这八个常量前端也各写一份（`App.tsx` 的 `DEFAULT_FONT_SIZE`、
@@ -1531,6 +1537,11 @@ fn 内置默认配置被钉住() {
     assert_eq!(Settings::default().letter_spacing, DEFAULT_LETTER_SPACING);
     assert_eq!(Settings::default().theme, DEFAULT_THEME);
     assert_eq!(Settings::default().oss_prefix, DEFAULT_OSS_PREFIX);
+    // 微信读书同步目录（M8-3）默认空串 = 没配
+    assert_eq!(Settings::default().weread_local_dir, "");
+    // 文件同步的两格（M8-5）同样默认空串 = 没配
+    assert_eq!(Settings::default().sync_local_dir, "");
+    assert_eq!(Settings::default().github_repo, "");
     // 🔴 另三格默认**空**：「配了就走云端、没配就走本地」那个二态判定的下侧就是这三格空串，
     // 默认值只要有一格非空，「没配」就再也判不出来
     assert_eq!(Settings::default().oss_bucket, "");
@@ -1570,6 +1581,9 @@ fn loaded_settings_的线上形状() {
             oss_access_key_id: "LTAI5tExampleId".into(),
             oss_prefix: "docs".into(),
             markdown_toolbar: true,
+            weread_local_dir: "/Users/me/notes/微信读书".into(),
+            sync_local_dir: "/Users/me/notes".into(),
+            github_repo: "xuanke/notes".into(),
         },
         report: SettingsReport {
             user_layer: LayerStatus::Present,
@@ -1579,7 +1593,7 @@ fn loaded_settings_的线上形状() {
     };
     assert_eq!(
         serde_json::to_string(&loaded).unwrap(),
-        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":true},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
+        r#"{"settings":{"fontSize":16,"fontVariant":"screen-r","codeFont":"inherit","lineHeight":2.0,"letterSpacing":0.05,"theme":"light","ossBucket":"vela-img","ossRegion":"cn-hangzhou","ossAccessKeyId":"LTAI5tExampleId","ossPrefix":"docs","markdownToolbar":true,"wereadLocalDir":"/Users/me/notes/微信读书","syncLocalDir":"/Users/me/notes","githubRepo":"xuanke/notes"},"report":{"userLayer":{"status":"present"},"projectLayer":{"status":"corrupt","reason":"坏"},"ignoredProjectKeys":["fontSize"]}}"#
     );
 }
 
@@ -1600,7 +1614,7 @@ fn 空现场下_load_的线上形状() {
     let loaded = load_settings(home.path(), None);
     assert_eq!(
         serde_json::to_string(&loaded).unwrap(),
-        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
+        r#"{"settings":{"fontSize":14,"fontVariant":"screen-gb","codeFont":"maple-cn","lineHeight":1.75,"letterSpacing":0.0,"theme":"dark","ossBucket":"","ossRegion":"","ossAccessKeyId":"","ossPrefix":"assets","markdownToolbar":true,"wereadLocalDir":"","syncLocalDir":"","githubRepo":""},"report":{"userLayer":{"status":"absent"},"projectLayer":{"status":"absent"},"ignoredProjectKeys":[]}}"#
     );
 }
 
@@ -1626,16 +1640,19 @@ fn save_落盘再_load_回来一致() {
         oss_access_key_id: "LTAI5tExampleId".into(),
         oss_prefix: "docs".into(),
         markdown_toolbar: false,
+        weread_local_dir: "/Users/me/notes/微信读书".into(),
+        sync_local_dir: "/Users/me/notes".into(),
+        github_repo: "xuanke/notes".into(),
     };
 
     let report = save_settings(home.path(), &settings).unwrap();
     let path = user_settings_path(home.path());
     assert_eq!(report.bytes_written, fs::read(&path).unwrap().len() as u64);
 
-    // pretty 排版：十一键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
+    // pretty 排版：十四键各占一行，两空格缩进（serde_json::to_vec_pretty 的默认）
     assert_eq!(
         fs::read_to_string(&path).unwrap(),
-        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\",\n  \"lineHeight\": 2.0,\n  \"letterSpacing\": 0.0,\n  \"theme\": \"dark\",\n  \"ossBucket\": \"vela-img\",\n  \"ossRegion\": \"cn-hangzhou\",\n  \"ossAccessKeyId\": \"LTAI5tExampleId\",\n  \"ossPrefix\": \"docs\",\n  \"markdownToolbar\": false\n}"
+        "{\n  \"fontSize\": 18,\n  \"fontVariant\": \"system-mono\",\n  \"codeFont\": \"inherit\",\n  \"lineHeight\": 2.0,\n  \"letterSpacing\": 0.0,\n  \"theme\": \"dark\",\n  \"ossBucket\": \"vela-img\",\n  \"ossRegion\": \"cn-hangzhou\",\n  \"ossAccessKeyId\": \"LTAI5tExampleId\",\n  \"ossPrefix\": \"docs\",\n  \"markdownToolbar\": false,\n  \"wereadLocalDir\": \"/Users/me/notes/微信读书\",\n  \"syncLocalDir\": \"/Users/me/notes\",\n  \"githubRepo\": \"xuanke/notes\"\n}"
     );
 
     // 读回来：用户层生效，项目层 absent

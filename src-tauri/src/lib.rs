@@ -1,6 +1,9 @@
 mod commands;
 mod imgproto;
 mod menu;
+// M8-2 起两条出站路（OSS 上传 / 微信读书网关）共用同一个 `reqwest::Client`。
+// 单独的模块是为了让「必须在 build 之前装 crypto provider」这个坑只有一处
+mod net;
 // M7-2 那一版这一层还没有调用方，所以要 `pub` 躲开 `dead_code`（`-D warnings`）。
 // M7-3 把 [`commands::upload_image`] 接上之后不需要了：改回私有实测过门禁是干净的，
 // 而少一个公开模块就少一个「以后有人往里加只给测试用的 pub 项」的借口
@@ -13,6 +16,15 @@ mod print;
 pub mod secrets;
 mod shard;
 mod watcher;
+// M8-2 的微信读书落地层。M8-2 那一版这里写的是 `pub mod`：当时 `gateway` 还没有
+// crate 内调用方，私有模块里的 `pub fn` 会被 `dead_code` 判死（`-D warnings`）。
+// M8-3 的 `weread_sync_dir` 接上之后，模块内每一个 `pub` 项都有真实调用方，
+// 所以改回私有——少一个对外面，就少一个「以后有人往里加只给测试用的 pub 项」的借口。
+// ⚠️ `gateway` 仍然刻意**不是** command（见那个模块文档的 🔴）
+mod weread;
+// M8-5 的 GitHub token 钥匙串层（REST 六条在 M8-8）。与 `weread` 同一个理由保持私有：
+// 三条命令在 `invoke_handler` 里注册，模块内每个 `pub` 项都有真实调用方
+mod github;
 
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 
@@ -55,6 +67,41 @@ const REPLACE_DONE: &str = "vela://replace-done";
 /// 替换在 `start_replace` 的预检**之后**才失败，载荷里带 `SearchError`。
 /// 与 `SEARCH_FAILED` 同一种罕见情形（root 在两步之间被删掉/被卸载）
 const REPLACE_FAILED: &str = "vela://replace-failed";
+
+/// 微信读书全量同步的进度：「第几本 / 共几本」（M8-3）。另一半在 `src/ipc/weread.ts`
+/// （M8-6 接侧栏图标时才有消费者）。
+///
+/// ⚠️ 与 `SEARCH_BATCH` 不同，它**只是计数**、不带任何笔记内容：同步的产物全部落在
+/// 配置目录里，前端要看就看文件，别让划线原文过一次 IPC。
+const WEREAD_PROGRESS: &str = "vela://weread-progress";
+
+/// 微信读书同步正常结束，载荷里带 `WereadSummary`。**这是唯一的正常终止信号**——
+/// 用户取消也走它（`summary.cancelled = true`），已经写完的书留在盘上。
+///
+/// ⚠️ 拼错的后果与 `REPLACE_DONE` 同一档：界面永远停在「同步中…」，
+/// 而素材文件其实已经写完了。
+const WEREAD_DONE: &str = "vela://weread-done";
+
+/// 微信读书同步在预检**之后**失败，载荷里带 `WereadError`。预检失败（目录不对、
+/// key 没配）走的是 invoke reject，事件不会来。
+const WEREAD_FAILED: &str = "vela://weread-failed";
+
+/// GitHub 目录同步的进度：「第几个文件 / 共几个」（M8-8）。另一半在 `src/ipc/github.ts`
+/// （M8-6b 接侧栏云图标时才有消费者）。
+///
+/// ⚠️ 与 `WEREAD_PROGRESS` 同一条：只是计数，不带任何笔记内容。
+const GITHUB_PROGRESS: &str = "vela://github-progress";
+
+/// GitHub 目录同步正常结束，载荷里带 `GithubSummary`。**这是唯一的正常终止信号**——
+/// 用户取消也走它（`summary.cancelled = true`）。
+const GITHUB_DONE: &str = "vela://github-done";
+
+/// GitHub 目录同步在预检**之后**失败，载荷里带 `GithubError`。预检失败（目录不对、
+/// 仓库地址解析不了、token 没配）走的是 invoke reject，事件不会来。
+///
+/// ⚠️ **冲突也走这一个**（`kind = "conflict"`，载荷里带逐条路径与三个 sha）：
+/// 对调用方来说「停在冲突上」与「失败」是同一件事——这次同步没有完成。
+const GITHUB_FAILED: &str = "vela://github-failed";
 
 /// 一个**被打开着的**文件在外部被改了或被删了（M2-G）。另一半在 `src/ipc/watch.ts`。
 ///
@@ -125,6 +172,26 @@ pub fn run() {
             secrets::set_oss_secret,
             secrets::delete_oss_secret,
             secrets::oss_secret_status,
+            // M8-2 微信读书那把 key：与上面三条同形（写 / 删 / 只问配没配）。
+            // 🔴 同样没有任何一条回得来值；也⛔ 不要把 `weread::gateway` 注册成命令——
+            // 那等于把「拿用户的 key 打任意 api_name」交给 webview，理由在 `weread.rs` 文件头
+            weread::set_weread_key,
+            weread::delete_weread_key,
+            weread::weread_key_status,
+            // M8-5 GitHub token：与上面六条逐字同形（写 / 删 / 只问配没配）。
+            // 🔴 同样没有任何一条回得来值——token 只从钥匙串进 Rust 的 Authorization 头
+            github::set_github_token,
+            github::delete_github_token,
+            github::github_token_status,
+            // M8-3 全量同步：立刻返回 taskId，进度与终止走 vela://weread-*。
+            // 🔴 参数只有一个 `dir`，它只用来核对「打开的就是配置的那个目录」；
+            // 真正写盘的位置来自用户全局配置里的 wereadLocalDir，前端改不了
+            weread::weread_sync_dir,
+            // M8-8 目录级 GitHub 同步：同样立刻返回 taskId，进度与终止走 vela://github-*。
+            // 🔴 参数只有 `dir`（只用来核对打开的就是配置的那个目录）；仓库地址与 token
+            // 都只从用户全局配置与钥匙串读。六条 REST 只在这一条命令的实现里出现，
+            // ⛔ 不注册成命令（理由见 `github.rs` 文件头）
+            github::github_sync_dir,
             commands::load_keybindings,
             commands::save_keybindings,
             commands::start_search,
@@ -215,5 +282,22 @@ mod tests {
         assert_eq!(super::REPLACE_PROGRESS, "vela://replace-progress");
         assert_eq!(super::REPLACE_DONE, "vela://replace-done");
         assert_eq!(super::REPLACE_FAILED, "vela://replace-failed");
+    }
+
+    /// M8-3 的三个事件。⚠️ 前端那一份镜像（`src/ipc/weread.ts`）要到 M8-6
+    /// 接侧栏图标时才落地；在那之前这条快照先钉住 Rust 这一侧的名字，
+    /// 免得将来两边各写各的、拼错的失败方式又是安静的。
+    #[test]
+    fn weread_events_match_frontend() {
+        assert_eq!(super::WEREAD_PROGRESS, "vela://weread-progress");
+        assert_eq!(super::WEREAD_DONE, "vela://weread-done");
+        assert_eq!(super::WEREAD_FAILED, "vela://weread-failed");
+    }
+
+    #[test]
+    fn github_events_match_frontend() {
+        assert_eq!(super::GITHUB_PROGRESS, "vela://github-progress");
+        assert_eq!(super::GITHUB_DONE, "vela://github-done");
+        assert_eq!(super::GITHUB_FAILED, "vela://github-failed");
     }
 }

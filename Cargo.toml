@@ -44,6 +44,12 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# M8-7 目录级 GitHub 同步：本地的 `path → sha` 表必须与 GitHub 回的 blob sha 同口径，
+# 而 Git 的仓库对象格式是 SHA-1。许可证已核实：sha1 0.10.7 = MIT OR Apache-2.0
+# （与上面的 sha2 同属 RustCrypto，`license` 字段读自 `.crate` 里的 `Cargo.toml`）。
+# ⚠️ 这是本轮唯一新增的包（它依赖的 digest / cfg-if / cpufeatures 都已经在锁里）。
+sha1 = "0.10"
+
 # M7-2 OSS 上传落地层（`src-tauri/src/oss.rs`）。许可证已核实（闭源硬约束，见 PLAN.md）：
 #   reqwest 0.13.5 = MIT OR Apache-2.0，time 0.3.55 = MIT OR Apache-2.0，
 #   rustls 0.23.45 = Apache-2.0 OR ISC OR MIT；`license` 字段都从各自 `.crate` 包里的

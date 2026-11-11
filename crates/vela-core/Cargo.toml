@@ -29,6 +29,8 @@ serde_json.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# M8-7：本地文件的 Git blob id（与 GitHub 的远端 sha 同口径），理由见 `sync/blob.rs`
+sha1.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -9,7 +9,7 @@
 //!
 //! 合并顺序是「后一层盖前一层」，但 🔴 **不是每一层都能写每一个键**，见下面「可写层」。
 //!
-//! ## 🔴「哪一层能改哪些键」：十一个键**全都**只认用户全局
+//! ## 🔴「哪一层能改哪些键」：十四个键**全都**只认用户全局
 //!
 //! 用户裁定：字号 / 正文字体 / 代码字体 / 行高 / 字间距 / 主题 / Markdown 工具栏可见性是**个人偏好**，
 //! 只认「内置默认 + 用户全局」两层。
@@ -21,6 +21,10 @@
 //! 粘贴的图**改道到别人的 bucket**。签名在 Rust 侧算、`Authorization` 里带着我们的 AccessKey ID，
 //! 改道至少泄露一次派生签名。于是「项目层写了也忽略」这一条对两种动机都成立，
 //! 记账也共用同一个 [`SettingsReport::ignored_project_keys`]。
+//!
+//! M8-3 / M8-5 的同步配置（`wereadLocalDir` / `syncLocalDir` / `githubRepo`）同样只认用户全局，
+//! 动机与四格 OSS 同向：仓库若能改同步目录，打开一次就能让 Vela 往它指定的位置写几十个 `.md`；
+//! 若能改仓库地址，就能把用户的笔记推到别人的仓库。
 //!
 //! ⚠️ 这意味着 v1 的项目层是**接好线但空转**的——它要等第一个 project-safe 键进来才真的有
 //! 东西可配（`resolve` 里那条分支就是给它留的）。这道门现在就搭好、现在就测，
@@ -187,6 +191,26 @@ pub struct Settings {
     /// [`DEFAULT_MARKDOWN_TOOLBAR`]。写进这一层是为了「关了之后重启还是关着」——
     /// 这是 `Settings` 里唯一一个**布尔**键，Rust 只当它是值原样往返，没有需要夹的范围。
     pub markdown_toolbar: bool,
+    /// 微信读书笔记要同步进去的本地目录（M8-3，PLAN.md §3.22 ⑦）。
+    ///
+    /// 空 = 没配。🔴 **只认用户全局**，理由与四格 OSS 同向却更硬：仓库若能改这一格，
+    /// 打开一次就等价于「让别人的仓库决定 Vela 往你机器上写几十个 `.md`」。
+    /// ⚠️ Rust 这一层**不校验、不规范**这个字符串：它可能是手改出来的任何东西。
+    /// 解软链、去尾斜杠、与「当前打开的目录」比相等，全部发生在真要用它的那一步
+    /// （`src-tauri/src/weread.rs` 的前置闸），那里失败会指名是哪一格。
+    pub weread_local_dir: String,
+    /// 「文件同步」要同步的本地目录（M8-5，PLAN.md §3.22 ⑦）。
+    ///
+    /// 空 = 没配。🔴 **只认用户全局**，理由与 [`Self::weread_local_dir`] 完全相同。
+    /// ⚠️ Rust 这一层**不校验、不规范**：解软链、去尾斜杠、与「当前打开的目录」比相等，
+    /// 全部发生在真要用它的那一步（同步命令的前置闸）。
+    pub sync_local_dir: String,
+    /// GitHub 仓库地址（M8-5）。`owner/repo` 或整条 URL 都收，**解析归落地层**。
+    ///
+    /// 空 = 没配。🔴 **只认用户全局**：仓库若能改这一格，它就能把用户的笔记推到别人的仓库。
+    /// ⚠️ 与 `oss_region` 同一条口径，这一层不校验形状——配置文件可以手改，读的时候把它
+    /// 改「对」等于程序在瞎猜；拒绝它的是真正要打 GitHub 的那一步。
+    pub github_repo: String,
 }
 
 impl Default for Settings {
@@ -204,6 +228,9 @@ impl Default for Settings {
             oss_access_key_id: String::new(),
             oss_prefix: DEFAULT_OSS_PREFIX.to_owned(),
             markdown_toolbar: DEFAULT_MARKDOWN_TOOLBAR,
+            weread_local_dir: String::new(),
+            sync_local_dir: String::new(),
+            github_repo: String::new(),
         }
     }
 }
@@ -236,6 +263,11 @@ pub struct SettingsLayer {
     /// Markdown 工具栏可见性。与上面七个偏好键同一条规则：**只有用户全局层能写**。
     /// `None` = 这一层没写这一格，留给下一层（最终落到内置默认，见 [`Settings::default`]）。
     pub markdown_toolbar: Option<bool>,
+    /// 微信读书同步目录（M8-3）。与四格 OSS 同一条规则：**只有用户全局层能写**。
+    pub weread_local_dir: Option<String>,
+    /// 「文件同步」的本地目录与仓库地址（M8-5）。与上面两格同一条规则：**只有用户全局层能写**。
+    pub sync_local_dir: Option<String>,
+    pub github_repo: Option<String>,
 }
 
 /// 一层配置文件在读取时的下场。
@@ -260,8 +292,8 @@ pub struct SettingsReport {
     pub project_layer: LayerStatus,
     /// 项目层试图写「仅全局」的键、因而被忽略的键名（wire 名，前端可直接引用）。
     ///
-    /// v1 里十一个键全是仅全局类（七个偏好 + 四格 OSS 账号配置），所以项目层写的任何键
-    /// 都会落在这里。前端可以据此说一句
+    /// v1 里十四个键全是仅全局类（七个偏好 + 四格 OSS 账号配置 + 微信读书同步目录 + 文件同步的目录与仓库地址），
+    /// 所以项目层写的任何键都会落在这里。前端可以据此说一句
     /// 「这个仓库的 `.vela/settings.json` 想改你的 <键>，但 <键> 只认用户全局，已忽略」。
     pub ignored_project_keys: Vec<String>,
 }
@@ -325,7 +357,7 @@ fn read_layer(path: &Path) -> (Option<SettingsLayer>, LayerStatus) {
 
 /// 把两层文件内容合并成最终配置，并记账项目层被忽略的键。
 ///
-/// 🔴 **可写层门在这里**：v1 十一个键都只认全局，只有 `user`（用户全局）能盖过内置默认；
+/// 🔴 **可写层门在这里**：v1 十四个键都只认全局，只有 `user`（用户全局）能盖过内置默认；
 /// `project`（项目级）里的同名键一律**丢弃并记账**。将来第一个 project-safe 键进来时，
 /// 就在这个函数里给它加一条「也接受 project」的分支——门已经在这儿了，不用临时搭。
 pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<String>) {
@@ -366,8 +398,17 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     if let Some(v) = user.markdown_toolbar {
         settings.markdown_toolbar = v;
     }
+    if let Some(v) = user.weread_local_dir {
+        settings.weread_local_dir = v;
+    }
+    if let Some(v) = user.sync_local_dir {
+        settings.sync_local_dir = v;
+    }
+    if let Some(v) = user.github_repo {
+        settings.github_repo = v;
+    }
 
-    // 项目层：v1 没有 project-safe 键，十一个键写了都忽略，只记账给前端一句话。
+    // 项目层：v1 没有 project-safe 键，十四个键写了都忽略，只记账给前端一句话。
     // 前七个是偏好（「别改我的字号」），后四格是账号配置（「别把我的图改道到别人的 bucket」）
     let mut ignored_project_keys = Vec::new();
     if project.font_size.is_some() {
@@ -406,6 +447,18 @@ pub fn resolve(user: SettingsLayer, project: SettingsLayer) -> (Settings, Vec<St
     // Markdown 工具栏可见性也是偏好类（「别让仓库决定我打开文档时看到什么」），同一个门
     if project.markdown_toolbar.is_some() {
         ignored_project_keys.push("markdownToolbar".to_owned());
+    }
+    // 🔴 微信读书同步目录（M8-3）：一个仓库若能改这一格，打开一次就能让 Vela 往它指定的
+    // 位置写几十个 `.md`。与四格 OSS 同一个门、同一个记账出口
+    if project.weread_local_dir.is_some() {
+        ignored_project_keys.push("wereadLocalDir".to_owned());
+    }
+    // 🔴 文件同步的两格（M8-5）：仓库能改目录/仓库地址，就等于决定「笔记写到哪、推到哪」
+    if project.sync_local_dir.is_some() {
+        ignored_project_keys.push("syncLocalDir".to_owned());
+    }
+    if project.github_repo.is_some() {
+        ignored_project_keys.push("githubRepo".to_owned());
     }
 
     (settings, ignored_project_keys)
@@ -567,7 +620,7 @@ mod tests {
 
     #[test]
     fn 未知键被忽略而不让整层作废() {
-        // forward-compat：将来才有的键不该让只认十一个键的这一版读不动。
+        // forward-compat：将来才有的键不该让只认这一版键清单的旧版本读不动。
         // theme 在 M4-C 之后已是**已知**键，正好顺带钉住「用户层写的 theme 生效」
         let home = tempfile::tempdir().unwrap();
         write_user(home.path(), r#"{"fontSize":18,"theme":"light","将来才有的键":123}"#);
@@ -592,6 +645,9 @@ mod tests {
             oss_access_key_id: "LTAI5tExampleId".into(),
             oss_prefix: "docs/notes".into(),
             markdown_toolbar: false,
+            weread_local_dir: "/Users/me/notes/微信读书".into(),
+            sync_local_dir: "/Users/me/notes".into(),
+            github_repo: "xuanke/notes".into(),
         };
         let report = save(home.path(), &settings).unwrap();
         assert_eq!(report.bytes_written, fs::read(user_settings_path(home.path())).unwrap().len() as u64);
@@ -656,8 +712,8 @@ mod tests {
     }
 
     #[test]
-    fn 存下来的文件是干净的十一个键_json() {
-        // 整份重写：只含这十一个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
+    fn 存下来的文件是干净的十四个键_json() {
+        // 整份重写：只含这十四个键，没有 null、没有多余字段。pretty 是为了用户手改时读得下去
         let home = tempfile::tempdir().unwrap();
         save(home.path(), &Settings::default()).unwrap();
         let text = fs::read_to_string(user_settings_path(home.path())).unwrap();
@@ -674,6 +730,11 @@ mod tests {
         assert!(text.contains("\"ossPrefix\": \"assets\""), "{text}");
         // 布尔键也写成具体值：`true` 是内置默认，而这一份是「整份重写」写出来的
         assert!(text.contains("\"markdownToolbar\": true"), "{text}");
+        // 微信读书同步目录（M8-3）默认空串 = 没配
+        assert!(text.contains("\"wereadLocalDir\": \"\""), "{text}");
+        // 文件同步的两格（M8-5）同样默认空串 = 没配
+        assert!(text.contains("\"syncLocalDir\": \"\""), "{text}");
+        assert!(text.contains("\"githubRepo\": \"\""), "{text}");
         assert!(!text.contains("null"), "不该写 null 键：{text}");
         // 🔴 这一条是「secret 不进配置文件」那条硬约束的可执行版本：整份文件里
         // 不许出现任何长得像 secret 的键。`ossAccessKeyId` 里有 "AccessKey" 但没有 "Secret"，
@@ -761,6 +822,66 @@ mod tests {
         assert_eq!(loaded.settings.oss_bucket, "mine", "项目层不该把上传目标换掉");
         assert_eq!(loaded.settings.oss_access_key_id, "", "项目层写的 AccessKey ID 不该生效");
         assert_eq!(loaded.report.ignored_project_keys, vec!["ossBucket".to_owned(), "ossAccessKeyId".to_owned()]);
+    }
+
+    #[test]
+    fn 微信读书同步目录走用户全局层并能往返() {
+        // M8-3：这一格只认用户全局。Rust 侧照样**不校验形状**（软链、尾斜杠、相对路径
+        // 都原样存回来），解软链与相等判定在真要用它的那一步（`src-tauri/src/weread.rs`）
+        let home = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"wereadLocalDir":"/Users/me/notes/微信读书/"}"#);
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.weread_local_dir, "/Users/me/notes/微信读书/", "不归一、不 trim");
+
+        save(home.path(), &loaded.settings).unwrap();
+        let again = load(home.path(), None);
+        assert_eq!(again.settings.weread_local_dir, "/Users/me/notes/微信读书/", "往返之后变了");
+        // 一个字符串键不该顺带改动别的键
+        assert_eq!(again.settings.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn 项目层想改微信读书同步目录也被忽略并记账() {
+        // 🔴 与四格 OSS 同一个门、更硬的理由：仓库若能改这一格，打开一次就等于
+        // 「让别人的仓库决定 Vela 往你机器上写几十个 `.md`」
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"wereadLocalDir":"/Users/me/notes"}"#);
+        write_project(root.path(), r#"{"wereadLocalDir":"/tmp/elsewhere"}"#);
+        let loaded = load(home.path(), Some(root.path()));
+        assert_eq!(loaded.settings.weread_local_dir, "/Users/me/notes", "项目层不该改道同步目录");
+        assert_eq!(loaded.report.ignored_project_keys, vec!["wereadLocalDir".to_owned()]);
+    }
+
+    #[test]
+    fn 文件同步的两格走用户全局层并能往返() {
+        // M8-5：与微信读书目录同一条口径，Rust 不校验形状（`owner/repo` 与整条 URL
+        // 都原样存回来），解析归真正要打 GitHub 的那一步
+        let home = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"syncLocalDir":"/Users/me/notes/","githubRepo":"xuanke/notes"}"#);
+        let loaded = load(home.path(), None);
+        assert_eq!(loaded.settings.sync_local_dir, "/Users/me/notes/", "不归一、不 trim");
+        assert_eq!(loaded.settings.github_repo, "xuanke/notes");
+
+        save(home.path(), &loaded.settings).unwrap();
+        let again = load(home.path(), None);
+        assert_eq!(again.settings.sync_local_dir, "/Users/me/notes/", "往返之后变了");
+        assert_eq!(again.settings.github_repo, "xuanke/notes", "往返之后变了");
+        // 两个字符串键不该顺带改动别的键
+        assert_eq!(again.settings.weread_local_dir, "");
+    }
+
+    #[test]
+    fn 项目层想改文件同步的两格也被忽略并记账() {
+        // 🔴 仓库若能改这两格，就等于决定「笔记写到哪、推到哪」
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_user(home.path(), r#"{"syncLocalDir":"/Users/me/notes","githubRepo":"xuanke/notes"}"#);
+        write_project(root.path(), r#"{"syncLocalDir":"/tmp/elsewhere","githubRepo":"someone-else/notes"}"#);
+        let loaded = load(home.path(), Some(root.path()));
+        assert_eq!(loaded.settings.sync_local_dir, "/Users/me/notes", "项目层不该改道同步目录");
+        assert_eq!(loaded.settings.github_repo, "xuanke/notes", "项目层不该换仓库");
+        assert_eq!(loaded.report.ignored_project_keys, vec!["syncLocalDir".to_owned(), "githubRepo".to_owned()]);
     }
 
     #[test]

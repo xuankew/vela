@@ -35,18 +35,14 @@
 //! [`UPLOAD_TIMEOUT`] 这一个数字。不重试：一次 30 秒没走完的 PUT，更可能是没网或配错，
 //! 而不是值得再赌一次的瞬时抖动；而在一个没有取消入口的界面上，重试等于把「毫无反馈」翻倍。
 //!
-//! ## TLS：为什么这层必须自己装一个 crypto provider
+//! ## TLS
 //! 走 reqwest 的 `rustls-no-provider`，也就是 rustls + `rustls-platform-verifier`
 //! （**系统信任库**），与 M6 自动更新同一套：不引入第二套 CA，也不往锁文件里加任何东西
 //! （依赖声明的理由与许可证核实见根 `Cargo.toml` 的 M7-2 那段）。
 //!
-//! 🔴 但 `rustls-no-provider` 这个名字是字面意思：reqwest 在 `build()` 时会取
-//! `CryptoProvider::get_default()`，取不到就**当场 panic**（`async_impl/client.rs` 里那句
-//! "No rustls crypto provider is configured"）。而 panic 在 `async fn` 的 command 里是最坏
-//! 的一种失败——前端那个 `invoke` 的 Promise 永远不会 resolve，用户看到的是「点了没反应」。
-//! tauri 核心与 updater 各自在某条路径上 `install_default()` 过，但那两条都是**按需**触发的，
-//! 第一次粘贴完全可能走在它们前面。所以 [`client`] 自己先装（ring，就是它们装的那一个），
-//! 让这一刻不依赖任何别的东西是否先跑过。
+//! 🔴 「reqwest 在 `build()` 里取不到 crypto provider 就 panic，而 async command 里的 panic
+//! 会让前端 Promise 永远挂着」这个坑与它的修法现在**只有一处**，在 [`crate::net`] 的模块
+//! 文档里；M8-2 起微信读书网关与这一条共用同一个 client（见 [`crate::net::client`]）。
 //!
 //! ## 这一层能测到哪儿
 //! 联网那一段（[`put_object`] 发请求与收响应）在本项目的门禁里刻意不测：`reqwest::Error`
@@ -55,7 +51,6 @@
 //! 它们覆盖了 403 的头两个嫌疑（签名用的头与发出去的头不一致、`Authorization` 的形状）。
 
 use std::fmt::{self, Debug};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use percent_encoding::percent_decode_str;
@@ -67,7 +62,11 @@ use vela_core::oss::{self, Credentials, SignContext};
 ///
 /// 30 秒是按「用户在等一次粘贴」定的上限，不是按 OSS 的能力定的：一张 5 MB 的截图在
 /// 家用宽带上一两秒就完，走到 30 秒说明这条路本来就不通。
-pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// ⚠️ 数字本体住在 [`crate::net::REQUEST_TIMEOUT`]（M8-2 起两条出站路共用一个 client，
+/// 超时只能有一个数）；这里留一个业务名字，是因为 [`network_error`] 那句「30 秒」说的是
+/// 粘贴这件事，而不是「一次 HTTP 请求」。
+pub const UPLOAD_TIMEOUT: Duration = crate::net::REQUEST_TIMEOUT;
 
 /// 上传正文的上限：10 MB。
 ///
@@ -305,47 +304,6 @@ fn check_size(len: usize) -> Result<(), UploadError> {
     Ok(())
 }
 
-/// 共用一个 client：连接池与 TLS 配置都复用，第二次粘贴不用再付一次握手。
-///
-/// 为什么是 `OnceLock` 而不是 `tauri::State`：这层没有要注入的依赖，也不需要按窗口区分；
-/// 而 `upload_image` 是 `async fn`，两次粘贴可能同时在两个 worker 上进来，`get_or_init`
-/// 会把后到的那个挡住等前一个建完——只可能建一个，不可能建两个。
-///
-/// ⚠️ 建不出来时把错误**存起来**而不是 panic：command 里 panic 会让前端那个 `invoke` 的
-/// Promise 永远挂着，用户看到的是「点了没反应」，而这本来只是一句能显示的失败。
-/// 这种失败也不会自愈，所以只建一次就够。
-fn client() -> Result<&'static reqwest::Client, String> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            // 🔴 顺序是硬要求：reqwest 在 `build()` 里取 `CryptoProvider::get_default()`，
-            // 取不到就直接 panic（见模块文档「TLS」那一节）。这一个 client 是全 App 第一条
-            // 真的走 rustls 的请求，所以没有任何人替我们保证这一刻已经装好了
-            ensure_crypto_provider()?;
-            reqwest::Client::builder()
-                .timeout(UPLOAD_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| e.to_string())
-        })
-        .as_ref()
-        .map_err(String::clone)
-}
-
-/// 保证进程里有一个可用的 rustls crypto provider（ring —— tauri 与 updater 装的那一个）。
-///
-/// 幂等，所以放在 [`client`] 的 `get_or_init` 里而不是模块加载时：这一句与 reqwest 那句
-/// panic 是同一件事的两半，隔开了就没人会想起它们必须挨着。
-fn ensure_crypto_provider() -> Result<(), String> {
-    // `let _ =` 不是敷衍：已经装过（tauri 或 updater 先跑了那一条）时这里返回 Err，
-    // 而那正是要的状态——有一个可用的 provider 就行，不必是我们装的这一个
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    // 装完再确认一次，把「ring 这一份到底在不在」变成一条能看见的失败，而不是一句 panic
-    rustls::crypto::CryptoProvider::get_default()
-        .map(|_| ())
-        .ok_or_else(|| "rustls 没装上一个可用的 crypto provider".to_owned())
-}
-
 /// 把 `bytes` 作为 `key` 传进 `target` 那个 bucket，成功返回**正文里要写的那个 URL**。
 ///
 /// 返回的是不带签名的标准 OSS 地址。这是刻意的：bucket 是私读的，那个地址在浏览器里直接
@@ -368,7 +326,7 @@ pub async fn put_object(
 ) -> Result<String, UploadError> {
     check_size(bytes.len())?;
     let Prepared { url, headers } = preflight(target, key, content_type)?;
-    let mut req = client()
+    let mut req = crate::net::client()
         .map_err(|message| UploadError::Network { reason: "ClientInit".to_owned(), message })?
         .put(url.as_str());
     for (name, value) in headers {
@@ -1076,19 +1034,6 @@ mod tests {
         for (err, expected) in cases {
             assert_eq!(serde_json::to_string(&err).unwrap(), expected);
         }
-    }
-
-    #[test]
-    fn 建得出_client_且不_panic_也只建一个() {
-        // 这一条是真的走一遍 `reqwest::Client::builder().build()`。
-        // 它存在的唯一理由是那句 "No rustls crypto provider is configured"：
-        // `rustls-no-provider` feature 下 reqwest 取不到进程默认 provider 就 panic，
-        // 而 panic 在这层是最坏的失败（前端的 Promise 永远挂着）。除了真的建一次，
-        // 没有任何静态检查能告诉我们 ring 那一份到底在不在
-        let first = client().unwrap();
-        // 第二次拿到的必须是同一个：连接池复用这件事不许靠调用方记得传
-        let second = client().unwrap();
-        assert!(std::ptr::eq(first, second), "两次 build 出了两个 client");
     }
 
     // ===== 预览里的临时签名地址（M7-8）=====

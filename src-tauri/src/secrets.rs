@@ -1,4 +1,5 @@
-//! 阿里云 OSS 的 AccessKeySecret 存在 macOS 钥匙串里，**不存在配置文件里**（M7-4）。
+//! 两把凭证放在 macOS 钥匙串里，**不存在配置文件里**：阿里云 OSS 的 AccessKeySecret（M7-4）
+//! 与微信读书的 API key（M8-2）。
 //!
 //! ## 为什么这一格必须与另外四格分开存
 //!
@@ -12,15 +13,26 @@
 //!    进崩溃转储、进某个调试面板」的机会，而前端**根本用不上**它：上传与签名都在 Rust
 //!    （[`crate::oss`]，M7-2 与 M7-3）。
 //!
-//! ## 🔴 这三条命令里没有任何一条能把密钥读出来
+//! ## 🔴 这一族命令里没有任何一条能把密钥读出来
 //!
-//! [`set_oss_secret`] 写、[`delete_oss_secret`] 删、[`oss_secret_status`] 只回一个 bool。
-//! ⛔ **不要加 `get_oss_secret`**：那一条命令的存在本身就是漏洞——webview 里任何一段脚本
-//! （预览的 Markdown 注入一个 `<script>` 就够了）都能把它读走再发到任意地址。
+//! OSS 那三条：[`set_oss_secret`] 写、[`delete_oss_secret`] 删、[`oss_secret_status`] 只回一个
+//! bool。微信读书那三条同形，住在 [`crate::weread`]（`set_weread_key` / `delete_weread_key` /
+//! `weread_key_status`）。
+//!
+//! ⛔ **不要加 `get_oss_secret` / `get_weread_key`**：那一条命令的存在本身就是漏洞——webview
+//! 里任何一段脚本（预览的 Markdown 注入一个 `<script>` 就够了）都能把它读走再发到任意地址。
 //! 前端要的只是「该显示「已配置」还是「未配置」」，那一个 bool 就是它需要的全部信息量。
 //!
-//! 那 M7-3 的 `upload_image` 怎么拿到密钥？走 [`load_access_key_secret`]：同一个进程里的
-//! 一次函数调用，不过 IPC。
+//! 那 Rust 那一侧怎么拿到密钥？走 [`load_access_key_secret`] / [`crate::weread`] 的内部
+//! 读取：同一个进程里的一次函数调用，不过 IPC。
+//!
+//! ## 两条凭证共用这一层，但**不共用一个槽**
+//!
+//! [`SERVICE`] / [`ACCOUNT`] 是 OSS 那一对的固定值，微信读书那一对写在 [`crate::weread`]
+//! 里，两者必须不同（有一条测试钉着）。共用的是 `backend` 那六个系统调用、
+//! [`clean`] / [`decode`] 两条口径与 [`SecretError`] 这一套文案——**分开写第二份的代价是
+//! 那四句中文与 OSStatus 码表会各漂各的**，而症状只是「两个面板里钥匙串失败的说法不一样」，
+//! 没人会当 bug 报上来。
 //!
 //! ## 这一层能测到哪儿
 //!
@@ -64,9 +76,10 @@ const UNSUPPORTED_MESSAGE: &str = "当前系统还没有可用的钥匙串：密
 ///
 /// `src/ipc/asset.ts` 那一种「静态句子归前端」的写法在这里会漂：同一句「拿不到密钥」有
 /// **两个出口**——`oss_secret_status` 的失败，以及 `upload_image` 把它塞进
-/// [`crate::oss::UploadError::NotConfigured`] 的 `reason`。前端写一份、Rust 再写一份，
-/// 漂移的症状只是措辞不一样，没人会当 bug 报上来。所以一整组句子只留这一处，
-/// 前端那个 `describeSecretError` 只做透传。
+/// [`crate::oss::UploadError::NotConfigured`] 的 `reason`。M8-2 起微信读书那一侧也复用这一族
+/// （面板三条命令 + `weread::gateway` 的 `Keychain` 变体），于是句子只留这一处就更值钱了。
+/// 前端写一份、Rust 再写一份，漂移的症状只是措辞不一样，没人会当 bug 报上来。
+/// 所以一整组句子只留这一处，前端那个 `describeSecretError` 只做透传。
 ///
 /// 🔴 四个变体里没有任何一个可能带密钥。[`Keychain`](SecretError::Keychain) 只装 OSStatus
 /// 与苹果自己对那一个码的描述（`SecCopyErrorMessageString` 的输入**只有码本身**，它拿不到
@@ -97,7 +110,8 @@ pub enum SecretError {
 
 impl SecretError {
     /// 这一条失败该对用户说的那句话。[`crate::oss::UploadError::NotConfigured`] 的
-    /// `reason` 用它填——同一句话的第二个出口，见上面那一节
+    /// `reason` 与 `weread::WereadError::Keychain` 的 `message` 都用它填
+    /// ——同一句话的第二、第三个出口，见上面那一节
     pub fn message(&self) -> &str {
         match self {
             SecretError::Empty { message }
@@ -141,9 +155,12 @@ pub struct SecretStatus {
 /// 为什么必须去首尾空白：从控制台那一行复制很容易顺手带上一个换行或空格，而它会一路进到
 /// HMAC 的密钥里。失败的表现是 OSS 回 `SignatureDoesNotMatch`，我们的文案说的是
 /// 「Secret 填错了或已经轮换过」——一句指向密钥的错话，真正多出来的只是一个 `\n`。
+/// 微信读书那一侧同样：`Authorization: Bearer wrk-…` 里多一个换行，服务端只回一句
+/// 认不出 key。
 ///
-/// 为什么**不做格式校验**：阿里云没有承诺过 AccessKeySecret 的长度与字母表，
-/// 任何校验都会先把某一天换了格式的合法密钥拒掉，而那一种失败用户完全无从下手。
+/// 为什么**不做格式校验**：阿里云没有承诺过 AccessKeySecret 的长度与字母表，微信读书的
+/// `wrk-` 前缀也只是观察到的形状。任何校验都会先把某一天换了格式的合法密钥拒掉，
+/// 而那一种失败用户完全无从下手。
 fn clean(input: &str) -> Option<&str> {
     let trimmed = input.trim();
     (!trimmed.is_empty()).then_some(trimmed)
@@ -151,9 +168,8 @@ fn clean(input: &str) -> Option<&str> {
 
 /// 读出来那一段字节 → 可以签名的字符串。
 ///
-/// 为什么单独一个函数：[`load_access_key_secret`]（M7-3 要调的那一个）与
-/// [`oss_secret_status`] 判的是同一件事「这一项到底能不能用」。两份判定迟早会漂，
-/// 而漂了的症状是「面板说已配置，上传却说没配」。
+/// 为什么单独一个函数：[`load`]（两条凭证都走它）与两族 `*_status` 命令判的是同一件事
+/// 「这一项到底能不能用」。两份判定迟早会漂，而漂了的症状是「面板说已配置，同步却说没配」。
 fn decode(bytes: Vec<u8>) -> Result<String, SecretError> {
     if bytes.is_empty() {
         return Err(SecretError::corrupt());
@@ -161,24 +177,45 @@ fn decode(bytes: Vec<u8>) -> Result<String, SecretError> {
     String::from_utf8(bytes).map_err(|_| SecretError::corrupt())
 }
 
-/// 取回密钥本身。**只在进程内用**，⛔ 永远不要把它变成一条 command 的返回值。
+/// 读一个槽（`service` + `account`）里的密钥。**只在进程内用**，⛔ 永远不要把它变成
+/// 一条 command 的返回值。
 ///
 /// 三态分开的理由：`Ok(None)` = 没配过（不是失败，要说「还没填」）；`Err` = 配了但用不了，
 /// 或者这个平台压根没有钥匙串（要说「填的读不出来」）。把第二种说成第一种，
 /// 用户会一遍一遍重填同一个本来正确的密钥。
-pub fn load_access_key_secret() -> Result<Option<String>, SecretError> {
-    match backend::read()? {
+pub(crate) fn load(service: &str, account: &str) -> Result<Option<String>, SecretError> {
+    match backend::read(service, account)? {
         Some(bytes) => decode(bytes).map(Some),
         None => Ok(None),
     }
 }
 
+/// 写一个槽。空输入在这里就被 [`SecretError::empty`] 挡掉，不落到系统调用上。
+pub(crate) fn store(service: &str, account: &str, secret: &str) -> Result<(), SecretError> {
+    let value = clean(secret).ok_or_else(SecretError::empty)?;
+    backend::write(service, account, value)
+}
+
+/// 删一个槽。不存在也算成功（幂等），见 `backend::delete`。
+pub(crate) fn clear(service: &str, account: &str) -> Result<(), SecretError> {
+    backend::delete(service, account)
+}
+
+/// 取回 OSS 的 AccessKeySecret。**只在进程内用**，⛔ 永远不要把它变成一条 command 的返回值。
+pub fn load_access_key_secret() -> Result<Option<String>, SecretError> {
+    load(SERVICE, ACCOUNT)
+}
+
 /// 平台相关的三件事：写、读、删。两份实现签名一致，由 cfg 选一份。
+///
+/// 三个函数都收 `(service, account)`：两条凭证（OSS secret / 微信读书 key）共用这一份，
+/// 各自的槽名写在自己的模块里。⛔ 不要把 `service` / `account` 暴露给 command 参数——
+/// 钥匙串的寻址只有编译期常量这一种来路。
 ///
 /// 为什么错误文案在这一个模块里而不是在外面：文案要 OSStatus，而只有 macOS 那一份拿得到码。
 #[cfg(target_os = "macos")]
-mod backend {
-    use super::{SecretError, ACCOUNT, SERVICE};
+pub(crate) mod backend {
+    use super::SecretError;
     use security_framework::passwords::{
         delete_generic_password, generic_password, set_generic_password, PasswordOptions,
     };
@@ -224,17 +261,17 @@ mod backend {
         SecretError::Keychain { code, message: message_for(code, err.message().as_deref()) }
     }
 
-    pub fn write(secret: &str) -> Result<(), SecretError> {
+    pub fn write(service: &str, account: &str, secret: &str) -> Result<(), SecretError> {
         // `set_generic_password` 自己处理 `errSecDuplicateItem`（先 Add，撞了就 Update），
         // 所以这里不需要「先判存在再决定走哪一条」——那种两步之间也没有竞态可言
-        match set_generic_password(SERVICE, ACCOUNT, secret.as_bytes()) {
+        match set_generic_password(service, account, secret.as_bytes()) {
             Ok(()) => Ok(()),
             Err(err) => Err(to_failure(err)),
         }
     }
 
-    pub fn read() -> Result<Option<Vec<u8>>, SecretError> {
-        match generic_password(PasswordOptions::new_generic_password(SERVICE, ACCOUNT)) {
+    pub fn read(service: &str, account: &str) -> Result<Option<Vec<u8>>, SecretError> {
+        match generic_password(PasswordOptions::new_generic_password(service, account)) {
             Ok(bytes) => Ok(Some(bytes)),
             // 「没存过」不是一种失败：它是初始状态，前端要据此显示「未配置」
             Err(err) if err.code() == ITEM_NOT_FOUND => Ok(None),
@@ -242,8 +279,8 @@ mod backend {
         }
     }
 
-    pub fn delete() -> Result<(), SecretError> {
-        match delete_generic_password(SERVICE, ACCOUNT) {
+    pub fn delete(service: &str, account: &str) -> Result<(), SecretError> {
+        match delete_generic_password(service, account) {
             // 删一项不存在的东西 = 想要的那个状态已经达成。幂等，所以「清除」多点一次
             // 不该弹一条红字
             Ok(()) => Ok(()),
@@ -276,18 +313,18 @@ mod backend {
 /// 一条都不少，而那种退化是不报错的——用户会以为自己的密钥进了钥匙串。这笔债与
 /// `run_macos_tool` 那一条同性质。
 #[cfg(not(target_os = "macos"))]
-mod backend {
+pub(crate) mod backend {
     use super::SecretError;
 
-    pub fn write(_secret: &str) -> Result<(), SecretError> {
+    pub fn write(_service: &str, _account: &str, _secret: &str) -> Result<(), SecretError> {
         Err(SecretError::unsupported())
     }
 
-    pub fn read() -> Result<Option<Vec<u8>>, SecretError> {
+    pub fn read(_service: &str, _account: &str) -> Result<Option<Vec<u8>>, SecretError> {
         Err(SecretError::unsupported())
     }
 
-    pub fn delete() -> Result<(), SecretError> {
+    pub fn delete(_service: &str, _account: &str) -> Result<(), SecretError> {
         Err(SecretError::unsupported())
     }
 }
@@ -300,14 +337,13 @@ mod backend {
 /// 那一个授权弹窗，而那一刻用户在看弹窗，不在敲键盘。
 #[command]
 pub async fn set_oss_secret(secret: String) -> Result<(), SecretError> {
-    let value = clean(&secret).ok_or_else(SecretError::empty)?;
-    backend::write(value)
+    store(SERVICE, ACCOUNT, &secret)
 }
 
 /// 删（面板上「清除」那一个按钮）。不存在也算成功。
 #[command]
 pub async fn delete_oss_secret() -> Result<(), SecretError> {
-    backend::delete()
+    clear(SERVICE, ACCOUNT)
 }
 
 /// 只回「配没配」。

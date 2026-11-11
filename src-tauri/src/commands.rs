@@ -639,12 +639,52 @@ pub async fn save_session(app: AppHandle, session: Session) -> Result<SessionRep
 /// `save_settings` 就成了「往任意目录写一份 `.vela/settings.json`」的原语——而配置是
 /// 启动即读、内容会灌进 UI 信号的东西。拿不到主目录时映射成 [`WriteError::Io`]，
 /// 前端当日志展示（reason 只是标签，用户看的是 message）。
-fn home_dir(app: &AppHandle) -> Result<PathBuf, WriteError> {
+pub(crate) fn home_dir(app: &AppHandle) -> Result<PathBuf, WriteError> {
     app.path()
         .home_dir()
         .map_err(|e| WriteError::Io {
             reason: "HomeDir".to_owned(), message: format!("拿不到用户主目录：{e}")
         })
+}
+
+/// 配置目录闸门：设置里那一格与当前打开的根，canonicalize 之后必须相等。
+///
+/// 微信读书同步（M8-3）与 GitHub 文件同步（M8-8）共用这一份。🔴 比较用相等、
+/// **不是 `startsWith`**（PLAN §3.22 ⑨）：子目录打开时不算，软链与尾斜杠不该造成
+/// 两种答案；两份实现各写一遍，就是「将来只有一处被改对」的那个老问题。
+///
+/// 失败一律回一句人话（调用方包进自己的错误枚举）：`empty_message` 是「没配」那一句，
+/// 两个功能各自说自己设置面板的落点。
+pub(crate) fn resolve_configured_dir(
+    configured: &str,
+    opened: &Path,
+    configured_label: &str,
+    opened_label: &str,
+    empty_message: &str,
+) -> Result<PathBuf, String> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return Err(empty_message.to_owned());
+    }
+    let configured_path = canonical_dir(Path::new(configured), configured_label)?;
+    let opened_path = canonical_dir(opened, opened_label)?;
+    if configured_path != opened_path {
+        return Err(format!(
+            "{configured_label}是 {}，与{opened_label} {} 不一致。同步只写配置的那个目录。",
+            configured_path.display(),
+            opened_path.display()
+        ));
+    }
+    Ok(configured_path)
+}
+
+/// 「解软链 + 去尾斜杠 + 必须是文件夹」。
+fn canonical_dir(path: &Path, what: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|err| format!("{what}打不开：{}（{err}）", path.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("{what}不是文件夹：{}", canonical.display()));
+    }
+    Ok(canonical)
 }
 
 /// 读回合并好的分层配置（内置默认 → 用户全局 → 项目级）。
@@ -776,7 +816,7 @@ impl TaskRegistry {
     /// ⚠️ **id 永不复用**，这是用单调计数器而不是「找个空位」的全部理由：
     /// 复用的话一次迟到的 `cancel_task("search-3")` 会取消掉**另一个**任务，
     /// 失败方式是「我明明没点取消，结果只出来一半」，而且只在特定时序下出现。
-    fn register(&self, prefix: &str) -> (String, Arc<AtomicBool>) {
+    pub(crate) fn register(&self, prefix: &str) -> (String, Arc<AtomicBool>) {
         let task_id = format!("{prefix}-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let cancel = Arc::new(AtomicBool::new(false));
         self.lock().insert(task_id.clone(), Arc::clone(&cancel));
@@ -785,7 +825,7 @@ impl TaskRegistry {
 
     /// 任务结束了，把条目摘掉。**由后台线程调**，不依赖前端来收尾——
     /// 前端要是在收到 done 之前就崩了或者被刷新了，条目照样会被清掉。
-    fn forget(&self, task_id: &str) {
+    pub(crate) fn forget(&self, task_id: &str) {
         self.lock().remove(task_id);
     }
 
