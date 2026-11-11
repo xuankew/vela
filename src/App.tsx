@@ -792,6 +792,24 @@ export default function App() {
   }
 
   /**
+   * 预览里点了一条相对 Markdown 链接（M8-10）：在 Vela 里打开它。
+   *
+   * 与 `gotoCommit` 的 `openFile` 那一支同一个形状：先记原点、`openAt`、确认真的换了
+   * 文件、再把原点压栈、把焦点还给新的那块编辑器。⚠️ 不做 `reveal`：换文件本身就是
+   * 目的地，没有行号可跳，而 `openAt` 复原的是用户上次读到哪儿。
+   *
+   * 路径由预览那一层按当前文档所在目录解析好（`md/linkPath.ts` 的 `resolveDocLink`），
+   * 这里拿到的已经是一个绝对路径。
+   */
+  async function openPreviewLink(path: string) {
+    const origin = navHere()
+    await ws.openAt(path)
+    if (ws.activeTab().doc.path() !== path) return
+    nav.push(origin)
+    ws.focusedEditor()?.focus()
+  }
+
+  /**
    * `Cmd+P` / `Cmd+R` 浮层的状态（M2-E）。
    *
    * 四个注入点与 `search` 那四个是同一条道理。`symbols` 那一个是**现读**的：
@@ -2053,6 +2071,7 @@ export default function App() {
                 revision={ws.revision}
                 tabId={() => ws.activeTab().id}
                 alone={editorHidden}
+                onOpenLink={(path) => void openPreviewLink(path)}
                 onClose={() => setPreviewMode('off')}
               />
             </Suspense>

@@ -20,6 +20,8 @@
  * 列目录或写盘。最坏结果是一条点了没反应的链接，不是越权访问。
  */
 
+import { MARKDOWN_EXT } from '../editor/language'
+
 /**
  * 分隔符：`/` 与 `\` 都算。与 `doc/document.ts` 的 `baseName`、`ipc/project.ts` 的
  * `revealFile` 逐字同一条口径（那两处也是 `lastIndexOf` 两个都找）。
@@ -46,6 +48,19 @@ const UNSAFE = /[%()<>#? ]/g
 
 function encodeSegment(segment: string): string {
   return segment.replace(UNSAFE, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+}
+
+/**
+ * [`encodeSegment`] 的逆运算。坏的编码原样留着：一个真的叫 `100%.md` 的文件
+ * 不该因为 `%` 后面跟的不是两位十六进制就整条链接失效。
+ */
+function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment
+  try {
+    return decodeURIComponent(segment)
+  } catch {
+    return segment
+  }
 }
 
 /**
@@ -131,4 +146,46 @@ export function linkTargets(docPath: string | null, paths: readonly string[]): s
     if (target !== null) out.push(target)
   }
   return out
+}
+
+/**
+ * 预览里点一条链接时，它指向本地哪一份文本文档（M8-10）。
+ *
+ * 只认**相对的 Markdown 链接**——这正是工具写进素材与整理文件的那两条
+ * （`划线素材/作者 - 书名·划线素材.md` 与 `../作者 - 书名.md`）。其余一律回 `null`，
+ * 交还给 webview 的默认行为：站外地址、`mailto:` 那类方案、以 `/` 开头的绝对路径、
+ * 以及同文档的 `#锚点`。
+ *
+ * 🔴 空格与方括号两种来源都要能落到同一个文件名上：两个工具生成的目标用 `<…>` 包住，
+ * 空格在 `href` 里是**真空格**；编辑器补全（[`linkTarget`]）那一条则百分号编码。
+ * 所以这里逐段解码，而不是拿 `href` 直接拼路径。
+ *
+ * ⚠️ `#片段` 与 `?查询` 按 URL 语义切掉：本地文件名里的这两个字符在生成侧都已经被
+ * `encodeSegment` 编掉了，能原样出现在 `href` 里的只可能是片段或查询。
+ */
+export function resolveDocLink(docPath: string | null, href: string): string | null {
+  // `''` 是 `pathOf()` 对未命名草稿的写法（`?? ''`），不是一份真的相对路径
+  if (docPath === null || docPath === '') return null
+  const raw = href.trim()
+  if (raw === '' || raw.startsWith('#') || raw.startsWith('/') || SCHEME_LIKE.test(raw)) return null
+  const bare = raw.split(/[?#]/)[0]!
+  if (!MARKDOWN_EXT.test(bare)) return null
+
+  const from = docPath.split(SEP)
+  const absolute = from[0] === ''
+  // 文档所在目录；`floor` 是「不许再往上爬」的那一层——绝对路径爬穿了会得到一个
+  // 相对路径，而那正是「拼错了要能论证逃不出去」的反面
+  const out = from.slice(0, -1)
+  const floor = absolute ? 1 : 0
+  for (const rawSeg of bare.split(SEP)) {
+    const seg = decodeSegment(rawSeg)
+    if (seg === '' || seg === '.') continue
+    if (seg === '..') {
+      if (out.length > floor) out.pop()
+      continue
+    }
+    out.push(seg)
+  }
+  if (out.length <= floor) return null
+  return out.join('/')
 }

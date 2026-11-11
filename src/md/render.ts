@@ -174,6 +174,17 @@ export function safeUrl(raw: string): string | null {
 }
 
 /**
+ * `[a](<…>)` / `![x](<…>)` 这种写法：**尖括号只是定界符，不属于目标**。
+ *
+ * ⚠️ Lezer 把 `<` 与 `>` 一起放进了 URL token（实测），于是不剥的话 `href` 与
+ * 本地图片的 `data-path` 都会带着一对尖括号，而在文件树里那个名字下什么都没有。
+ * 安全判定**在看到剥掉之后的目标时才做**，所以 `[a](<javascript:…>)` 照旧被拒。
+ */
+function linkDestination(raw: string): string {
+  return raw.length >= 2 && raw.startsWith('<') && raw.endsWith('>') ? raw.slice(1, -1) : raw
+}
+
+/**
  * U+0000–U+0020：控制字符 + 空格。
  *
  * ⚠️ 写成 `\u0000-\u0020` 转义而不是字面控制字符，因为字面的会被 prettier 与编辑器
@@ -1013,7 +1024,8 @@ class Renderer {
       if (title === '') title = def.title
     }
 
-    const safe = safeUrl(url)
+    // ⚠️ 剥在解析引用之后：两种写法（行内、引用定义）都可能写成 `<…>`
+    const safe = safeUrl(linkDestination(url))
     if (safe === null) {
       // ⛔ title 里**不放**那个原始目标。它虽然是转义过的、执行不了，但把
       // `javascript:alert(1)` 原样搬进 DOM 没有必要——用户要的信息是「这条被拦了」，
@@ -1062,7 +1074,7 @@ class Renderer {
     const alt = this.altText(node)
     const altText = escapeHtml(alt === '' ? '图片' : alt)
 
-    const raw = url === null ? '' : this.text(url)
+    const raw = linkDestination(url === null ? '' : this.text(url))
     const safe = safeUrl(raw)
     if (safe === null || !/^https?:/i.test(safe)) {
       // ⚠️ title 里放的是路径本身（用户要的就是「哪张图没出来」），但 `data:` 那种

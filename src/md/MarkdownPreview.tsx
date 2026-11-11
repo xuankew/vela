@@ -85,6 +85,18 @@
  * ⚠️ 这一层也不给「打开链接」「在 Finder 里显示」：前者点在图外面的链接文字上就能做，
  * 后者需要绝对路径，而绝对路径的归一化只有一个权威（见 `./imageActions.ts` 最后那一节）
  *
+ * ## ⚠️ 相对 Markdown 链接在本应用里打开（M8-10）
+ *
+ * 微信读书同步写出的两份文件互相链着（`划线素材/…` 与 `../书名.md`），用户在预览里点一下
+ * 就该换到对面那一份，而不是让 webview 去开一个 `target="_blank"` 的窗口——
+ * 那个地址会解析到 `tauri://localhost/…`，谁都打不开。所以这一层在**点击处**拦一道：
+ * 目标按当前文档所在目录解析成绝对路径，交给宿主的 `onOpenLink`。
+ *
+ * 只认**相对的 Markdown 链接**（判据在 `./linkPath.ts` 的 `resolveDocLink`）；
+ * 站外链接、`#锚点`、绝对路径一律原样放行，⛔ 不要顺着这条先例把所有链接都收进 Vela。
+ * 与勾选框那一条一样，这一下**只读**：打开别的文件走的是宿主的普通 `openAt`，
+ * 预览自己一个字节都不写。
+ *
  * ## ⚠️ 阅读模式：这一栏可能是屏幕上唯一的一栏
  *
  * `previewMode.ts` 的 `only` 档把 `.body` 藏起来，于是这块面板吃掉整个正文区。
@@ -110,6 +122,7 @@ import { createPanelRefresh, type FollowedEditor, type PanelRefreshSource } from
 import { copyTargetOf, markZoomableImages, zoomOf, type CopyTarget, type ZoomTarget } from './imageActions'
 import { ImageLightbox } from './ImageLightbox'
 import { restorePlaceholder, rewriteLocalImages } from './localImage'
+import { resolveDocLink } from './linkPath'
 import { resignAfterError, rewriteCloudImages } from './ossImage'
 import { previewHtml } from './preview'
 import { atBottom, collectAnchors, fractionalLine, topForLine, type LineAnchor } from './scrollSync'
@@ -128,6 +141,13 @@ export interface MarkdownPreviewProps extends PanelRefreshSource {
    * 而**为什么必须藏而不能卸载**写在 `previewMode.ts` 的文件头
    */
   alone: () => boolean
+  /**
+   * 预览里点了一条相对 Markdown 链接（M8-10）：宿主拿这份**绝对路径**去打开它。
+   *
+   * 解析在这一层做完（基准是当前文档所在目录，见 `./linkPath.ts` 的 `resolveDocLink`）：
+   * 宿主拿到的已经是一个路径，⛔ 不需要也不该再认识 `href` 那套相对写法。
+   */
+  onOpenLink: (path: string) => void
 }
 
 /**
@@ -492,6 +512,18 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
   }
 
   /**
+   * 这次点击命中的那条链接的原始 `href`（M8-10）；不是链接就 null。
+   *
+   * ⚠️ 用 `getAttribute` 而不是 `anchor.href`：后者是**解析过**的绝对 URL，
+   * 相对目标会被拼到 webview 自己的源（`tauri://localhost/…`）上，再想还原出
+   * 「用户写的那一串」就得做一次反向运算——而这里要的正是原文。
+   */
+  function linkHrefOf(target: EventTarget | null): string | null {
+    if (!(target instanceof HTMLElement)) return null
+    return target.closest<HTMLAnchorElement>('a[href]')?.getAttribute('href') ?? null
+  }
+
+  /**
    * 把 `[ ]` ↔ `[x]` 写回源文档。
    *
    * 🔴 `data-pos` 是**渲染那一刻**的偏移，而预览有 150ms 防抖：这中间用户完全可能在
@@ -542,6 +574,17 @@ export function MarkdownPreview(props: MarkdownPreviewProps) {
     if (box !== null) {
       toggleTask(box)
       return
+    }
+    // M8-10：相对 Markdown 链接在本应用里打开。⚠️ 拦的是 webview 的默认动作
+    // （相对目标也被 `render.ts` 加上了 `target="_blank"`），不是这条链接本身
+    const href = linkHrefOf(event.target)
+    if (href !== null) {
+      const path = resolveDocLink(pathOf(untrack(() => props.source())), href)
+      if (path !== null) {
+        event.preventDefault()
+        props.onOpenLink(path)
+        return
+      }
     }
     // M7-11：点一张已经显示出来的图 → 看大图。判断「该不该弹」全在 `zoomOf` 里
     // （被链接包住的图归链接、占位 `span` 不算图），这里只管把命中的那一份记下来

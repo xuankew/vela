@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { linkNeedle, linkTarget, linkTargets } from './linkPath'
+import { linkNeedle, linkTarget, linkTargets, resolveDocLink } from './linkPath'
 
 /**
  * 链接目标是**插进正文的一段文本**，写错了不会有异常、不会有红点，只会有一条点了没反应的链接。
@@ -159,5 +159,57 @@ describe('linkTargets：一批候选 → 一批可插入的目标', () => {
 
   it('空候选进来就是空候选出去', () => {
     expect(linkTargets('/repo/a.md', [])).toEqual([])
+  })
+})
+
+/**
+ * M8-10：预览里点一条相对链接该打开哪一份文件。
+ *
+ * 这组用例的来历就是工具写出来的那两条链接（素材 ↔ 整理），所以头两条照抄真实形状，
+ * 连空格都不省；百分号编码、爬穿根、Windows 盘符这几条是同一个函数在别处被用到的
+ * 可能性，一并钉住，不指望下一处调用点自己去发现。
+ */
+describe('resolveDocLink：相对链接 → 本地绝对路径', () => {
+  it('整理文件里那条「划线素材」链接：空格原样留着，落到子目录里', () => {
+    expect(resolveDocLink('/notes/某人 - 合成之书.md', '划线素材/某人 - 合成之书·划线素材.md')).toBe(
+      '/notes/划线素材/某人 - 合成之书·划线素材.md',
+    )
+  })
+
+  it('素材里那条回链爬一层回到整理文件', () => {
+    expect(resolveDocLink('/notes/划线素材/某人 - 合成之书·划线素材.md', '../某人 - 合成之书.md')).toBe(
+      '/notes/某人 - 合成之书.md',
+    )
+  })
+
+  it('编辑器补全出来的目标带百分号编码，逐段解码后与上面是同一个文件', () => {
+    expect(resolveDocLink('/notes/a.md', '%E7%AC%94%E8%AE%B0%20b.md')).toBe('/notes/笔记 b.md')
+    expect(resolveDocLink('/notes/a.md', './b.md')).toBe('/notes/b.md')
+  })
+
+  it('`#片段` 与 `?查询` 按 URL 语义切掉', () => {
+    expect(resolveDocLink('/notes/a.md', 'b.md#某节')).toBe('/notes/b.md')
+    expect(resolveDocLink('/notes/a.md', 'b.md?x=1')).toBe('/notes/b.md')
+  })
+
+  it('爬穿根部就停在根上，⛔ 不得到一条相对路径', () => {
+    expect(resolveDocLink('/a.md', '../../../b.md')).toBe('/b.md')
+  })
+
+  it('Windows 风格的文档路径也认，结果统一用 /', () => {
+    expect(resolveDocLink('C:\\repo\\notes\\a.md', '..\\b.md')).toBe('C:/repo/b.md')
+  })
+
+  it('站外、锚点、绝对路径、非 Markdown、没有文档路径——一律不认', () => {
+    for (const href of ['https://x/a.md', 'mailto:x', '#top', '/abs/a.md', 'img/a.png', '']) {
+      expect(resolveDocLink('/notes/a.md', href), href).toBeNull()
+    }
+    expect(resolveDocLink(null, 'b.md')).toBeNull()
+    // 预览那一层的 `pathOf()` 把「未命名草稿」写成空串，不是 null
+    expect(resolveDocLink('', 'b.md')).toBeNull()
+  })
+
+  it('大写扩展名同样认（与编辑器/导出的那一份判据同源）', () => {
+    expect(resolveDocLink('/notes/a.md', 'B.MD')).toBe('/notes/B.MD')
   })
 })

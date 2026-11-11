@@ -53,8 +53,10 @@
 //!
 //! ### 每本书落两份，所有权按文件分
 //!
-//! `作者 - 书名·划线素材.md` 是**机器的**：每次整份重写，时间戳每同步一次就变。
+//! `划线素材/作者 - 书名·划线素材.md` 是**机器的**：每次整份重写，时间戳每同步一次就变。
 //! `作者 - 书名.md` 是**人的**：只在缺失时写一份种子，之后一个字都不改（决定 1 / ④）。
+//! 素材统一收进 [`MATERIAL_DIR`] 子目录（M8-10），配置目录的根上只剩人那份；两份文件
+//! 各自在开头放了指向对方的相对链接，用户在预览里点一下就能来回跳。
 //! 两份都走 [`write_text_atomic`]（同目录 `.tmp` + rename），所以取消或断电只会
 //! 得到「上一份完整的文件」，不会得到半个。
 //!
@@ -92,7 +94,7 @@ use vela_core::settings::{self, VELA_DIR_NAME};
 use vela_core::weread::gateway::MAX_PAGES;
 use vela_core::weread::{
     classify, next_notebook_sort, next_review_synckey, plan_material, request_body, BookNotebook, BookmarkList,
-    GatewayError, MaterialInput, NotebooksPage, ReviewCore, ReviewsPage, GATEWAY_URL,
+    GatewayError, MaterialInput, NotebooksPage, ReviewCore, ReviewsPage, GATEWAY_URL, MATERIAL_DIR,
 };
 
 use crate::commands::TaskRegistry;
@@ -472,7 +474,9 @@ fn storage_error(path: &Path, err: WriteError) -> WereadError {
     WereadError::Storage { message: format!("写 {} 失败：{err}", path.display()) }
 }
 
-/// 把渲染层给的文件名拼到配置目录上，**只接受一个普通路径段**。
+/// 把渲染层给的文件名拼到给定目录上，**只接受一个普通路径段**。
+///
+/// 素材落 `划线素材/` 那一层，人那份落配置目录的根——两处用同一个把关。
 ///
 /// 名字来自 [`safe_name`](vela_core::weread::safe_name)，本来就不含分隔符；这里再挡一道，
 /// 是因为「渲染层保证安全」是一条会在下一次改 render 时悄悄失效的不变式（⑥.4 同一姿势）。
@@ -615,7 +619,13 @@ fn write_book(
     };
     let plan = plan_material(&input);
 
-    let material = material_path(dir, &plan.material_name)?;
+    // 素材统一收进子目录（M8-10）：根上只留人那份，用户整理时不会被几十份素材夹住。
+    // ⚠️ `write_text_atomic` 只在目标目录里建 `.tmp`，⛔ 不替我们建目录（第一次同步时
+    // 这个子目录还不存在），所以先建出来。已存在时 `create_dir_all` 是空操作
+    let material_dir = dir.join(MATERIAL_DIR);
+    fs::create_dir_all(&material_dir)
+        .map_err(|err| WereadError::Storage { message: format!("建不出 {}：{err}", material_dir.display()) })?;
+    let material = material_path(&material_dir, &plan.material_name)?;
     write_text_atomic(&material, &plan.material, FILE_FORMAT).map_err(|err| storage_error(&material, err))?;
 
     // 人那份**只在缺失时**写种子，之后一个字都不改（决定 1 / ④ 的所有权模型）
@@ -864,13 +874,17 @@ mod tests {
     #[test]
     fn 素材与整理文件只能落在配置目录里() {
         let root = Path::new("/Users/me/notes");
+        // 素材那一层与根那一层走同一个把关；目录名本身也钉在这儿，
+        // 免得改成别处之后种子里的相对链接还指向老名字
+        let material_dir = root.join(MATERIAL_DIR);
+        assert_eq!(MATERIAL_DIR, "划线素材");
         assert_eq!(
-            material_path(root, "某人 - 合成之书·划线素材.md").unwrap(),
-            root.join("某人 - 合成之书·划线素材.md")
+            material_path(&material_dir, "某人 - 合成之书·划线素材.md").unwrap(),
+            material_dir.join("某人 - 合成之书·划线素材.md")
         );
         // 绝对路径、`..`、分隔符、空串、以及「带尾斜杠但只有一个 Normal 段」全部拒
         for bad in ["/etc/passwd", "../escape.md", "a/b.md", "..", ".", "", "a/"] {
-            match material_path(root, bad) {
+            match material_path(&material_dir, bad) {
                 Err(WereadError::Directory { .. }) => {}
                 other => panic!("{bad:?} 不该被接受：{other:?}"),
             }
@@ -1000,13 +1014,18 @@ mod tests {
         assert_eq!(written.marks, 1);
         assert_eq!(written.reviews, 0);
 
-        let material = dir.path().join("某人 - 合成之书·划线素材.md");
+        let material_dir = dir.path().join(MATERIAL_DIR);
+        let material = material_dir.join("某人 - 合成之书·划线素材.md");
         let organize = dir.path().join("某人 - 合成之书.md");
         let material_text = fs::read_to_string(&material).unwrap();
         assert!(material_text.contains("合成正文甲"), "{material_text}");
         assert!(material_text.contains("首次同步"), "{material_text}");
+        assert!(material_text.contains("[← 回到整理](<../某人%20-%20合成之书.md>)"), "{material_text}");
         let seed = fs::read_to_string(&organize).unwrap();
-        assert!(seed.contains("某人 - 合成之书·划线素材.md"), "种子该指向素材文件：{seed}");
+        assert!(
+            seed.contains("[划线素材](<划线素材/某人%20-%20合成之书·划线素材.md>)"),
+            "种子该指向子目录里的素材文件：{seed}"
+        );
         assert_eq!(state.get("3300000001").unwrap().ids, vec!["3300000001_54_515-528".to_owned()]);
         assert_eq!(state.get("3300000001").unwrap().synced_at, 1_740_000_000);
 
@@ -1019,13 +1038,19 @@ mod tests {
         assert!(rewritten.contains("本次没有新增"), "{rewritten}");
         assert_eq!(state.get("3300000001").unwrap().synced_at, 1_800_000_000);
 
-        // 目录里只有这两份，临时文件不残留
+        // 根上只有人那份与素材子目录；素材目录里只有这一份，临时文件不残留
         let mut names: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["某人 - 合成之书.md".to_owned(), "某人 - 合成之书·划线素材.md".to_owned()], "{names:?}");
+        assert_eq!(names, vec![MATERIAL_DIR.to_owned(), "某人 - 合成之书.md".to_owned()], "{names:?}");
+        let mut inner: Vec<String> = fs::read_dir(&material_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        inner.sort();
+        assert_eq!(inner, vec!["某人 - 合成之书·划线素材.md".to_owned()], "{inner:?}");
     }
 
     #[test]

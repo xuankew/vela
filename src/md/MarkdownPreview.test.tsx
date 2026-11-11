@@ -111,10 +111,20 @@ function mount(doc: string, path: string | null, alone = false) {
   const [tabId, setTabId] = createSignal(1)
   const [aloneSig, setAlone] = createSignal(alone)
   const onClose = vi.fn()
+  const onOpenLink = vi.fn()
   container = document.createElement('div')
   document.body.appendChild(container)
   const dispose = render(
-    () => <MarkdownPreview source={source} revision={revision} tabId={tabId} alone={aloneSig} onClose={onClose} />,
+    () => (
+      <MarkdownPreview
+        source={source}
+        revision={revision}
+        tabId={tabId}
+        alone={aloneSig}
+        onOpenLink={onOpenLink}
+        onClose={onClose}
+      />
+    ),
     container,
   )
   let disposed = false
@@ -138,6 +148,8 @@ function mount(doc: string, path: string | null, alone = false) {
     /** 阅读模式开/关。真实链路里这一下由 App 的 `editorHidden()` 发出 */
     setAlone,
     onClose,
+    /** M8-10：预览里点相对 md 链接时报给宿主的那一份绝对路径 */
+    onOpenLink,
     unmount: () => unmount(),
     /** 正文变了一次。真实链路里这一下由 workspace 的 `revision` 计数发出 */
     bump: () => setRevision((n) => n + 1),
@@ -541,6 +553,58 @@ describe('MarkdownPreview：点勾选框回写源文档（M3-A-5）', () => {
     p.setSource(null)
     expect(p.tasks()).toHaveLength(0)
     expect(p.text(), '摘掉 source 不该动文档').toBe(TWO)
+  })
+})
+
+/**
+ * M8-10：相对 Markdown 链接在应用里打开。
+ *
+ * 微信读书同步写在两端的那两条链接是这一组用例的来源：素材在 `划线素材/` 里链回整理，
+ * 整理链到素材。解析规则本身在 `linkPath.test.ts` 里穷举，这里钉的是**接线**：
+ * 拦住 webview 的默认动作、把解析后的绝对路径交给宿主、别的链接一概不碰。
+ */
+describe('MarkdownPreview：相对 md 链接在本应用里打开（M8-10）', () => {
+  function anchor(text: string): HTMLAnchorElement {
+    const el = [...container.querySelectorAll<HTMLAnchorElement>('.md-preview-body a')].find(
+      (a) => a.textContent === text,
+    )
+    if (!el) throw new Error(`预览里没有「${text}」这条链接`)
+    return el
+  }
+
+  function click(el: HTMLElement): MouseEvent {
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true })
+    el.dispatchEvent(event)
+    return event
+  }
+
+  it('整理文件里的「划线素材」链接：解析到子目录里的素材文件，并拦住默认动作', () => {
+    const p = mount('[划线素材](<划线素材/某人%20-%20合成之书·划线素材.md>)\n', '/notes/某人 - 合成之书.md')
+    const event = click(anchor('划线素材'))
+    expect(p.onOpenLink).toHaveBeenCalledWith('/notes/划线素材/某人 - 合成之书·划线素材.md')
+    expect(event.defaultPrevented).toBe(true)
+  })
+
+  it('素材里的回链走 `../` 回到上一层', () => {
+    const p = mount('[← 回到整理](<../某人%20-%20合成之书.md>)\n', '/notes/划线素材/某人 - 合成之书·划线素材.md')
+    click(anchor('← 回到整理'))
+    expect(p.onOpenLink).toHaveBeenCalledWith('/notes/某人 - 合成之书.md')
+  })
+
+  it('站外链接、锚点、非 Markdown 目标一概不抢', () => {
+    const p = mount('[站外](https://example.com/a.md) [锚点](#top) [图](assets/a.png)\n', '/notes/a.md')
+    for (const text of ['站外', '锚点', '图']) {
+      const event = click(anchor(text))
+      expect(event.defaultPrevented, text).toBe(false)
+    }
+    expect(p.onOpenLink).not.toHaveBeenCalled()
+  })
+
+  it('还没落盘的文档没有基准，不拦也不报', () => {
+    const p = mount('[素材](划线素材/a.md)\n', null)
+    const event = click(anchor('素材'))
+    expect(p.onOpenLink).not.toHaveBeenCalled()
+    expect(event.defaultPrevented).toBe(false)
   })
 })
 

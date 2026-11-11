@@ -580,6 +580,14 @@ describe('链接', () => {
     expect(html('[a](/local)')).not.toContain('target=')
   })
 
+  it('⚠️ `<…>` 只是定界符：尖括号不进 href，安全判定看的是剥掉之后的目标', () => {
+    const output = html('[素材](<划线素材/某人%20-%20书.md>)')
+    expect(output).toContain('href="划线素材/某人%20-%20书.md"')
+    expect(output).not.toContain('&lt;')
+    // 剥掉之后才是真正的目标：`<javascript:…>` 与不带尖括号的那一条一样被拒
+    expect(html('[a](<javascript:alert(1)>)')).not.toContain('<a ')
+  })
+
   it('自动链接', () => {
     const output = html('<https://example.com>')
     expect(output).toContain('<a href="https://example.com"')

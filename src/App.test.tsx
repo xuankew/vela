@@ -3731,6 +3731,42 @@ describe('Markdown 预览接线（M3-A-3）', () => {
     expect(previewBody()).toContain('甲')
     expect(previewBody()).not.toContain('乙')
   })
+
+  it('点预览里的相对 md 链接：在本应用里打开那份素材，链接不跳浏览器（M8-10）', async () => {
+    // 微信读书同步出来的两份：整理文件在配置目录根上，素材在 `划线素材/` 里，互相用相对链接
+    // 指着对方。这里用的是生成器**实际写出来**的形态（`%20` 编码 + `<…>` 定界符），
+    // 不是手写的理想形态——渲染层与解析层任何一层漏掉编码或没剥尖括号，这条都会红
+    const seed = '/repo/笔记/作者 - 书名.md'
+    const material = '/repo/笔记/划线素材/作者 - 书名·划线素材.md'
+    const files: Record<string, string> = {
+      [seed]: '## 作者 - 书名\n\n[划线素材](<划线素材/作者%20-%20书名·划线素材.md>)\n',
+      [material]: '## 划线\n\n[← 回到整理](<../作者%20-%20书名.md>)\n',
+    }
+    ipc.openFile.mockImplementation(async (path: string) => textFile({ text: files[path] ?? '正文' }))
+    dialog.open.mockResolvedValue(seed)
+    press('o', modInit())
+    await settle()
+
+    toggle()
+    await settle()
+    const link = container.querySelector<HTMLAnchorElement>('.md-preview-body a[href]')
+    expect(link).not.toBeNull()
+
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true })
+    link!.dispatchEvent(event)
+    await settle()
+    // ⚠️ 新标签先以**空文档**激活（预览立刻重算一次），正文是 `openAt` 异步取回来之后才灌进去的，
+    // 而那一下走的是「同一个 view、同一个 tabId」的防抖路（150ms）。等不到它，预览那一格
+    // 还停在「这份文档还是空的」——不是接线没通，是比用户早看了 150ms
+    await new Promise((resolve) => setTimeout(resolve, 200))
+
+    // 拦下来才算真的「在应用里打开」：没 preventDefault 的话 webview 会另起一次导航，
+    // 界面看着没动静，用户以为链接坏了
+    expect(event.defaultPrevented).toBe(true)
+    expect(ipc.openFile.mock.calls.at(-1)?.[0]).toBe(material)
+    expect(tabs().map((t) => t.querySelector('.tab-name')?.textContent)).toContain('作者 - 书名·划线素材.md')
+    expect(previewBody()).toContain('回到整理')
+  })
 })
 
 describe('大纲接线（M3-A-4）', () => {

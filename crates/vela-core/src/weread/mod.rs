@@ -46,7 +46,8 @@ pub use gateway::{
 pub use group::{attach_reviews, group_marks, ChapterGroup, MarkView};
 pub use model::{BookNotebook, BookmarkList, Chapter, Mark, NotebooksPage, ReviewCore, ReviewEntry, ReviewsPage};
 pub use render::{
-    file_base_name, fresh_marks, material_file_name, render_material, render_organize_seed, FreshMark, MaterialInput,
+    file_base_name, fresh_marks, material_file_name, material_rel_name, organize_file_name, render_material,
+    render_organize_seed, FreshMark, MaterialInput, MATERIAL_DIR, MATERIAL_SUFFIX,
 };
 pub use text::{anchor, crc32, day_of, flatten, range_start, safe_name, stamp_of};
 
@@ -55,11 +56,13 @@ use std::collections::BTreeSet;
 /// 一次同步要落下去的东西。
 ///
 /// 名字与内容一起交出去，是为了让 `src-tauri` 那边**没有拼装的机会**：素材文件名和种子文案里
-/// 那句「同目录的 `xxx.md`」必须指向同一个名字，分两处拼就会有一处拼错、
-/// 而错的症状是用户点说明去找文件、找不到。
+/// 那条链接必须指向同一个名字，分两处拼就会有一处拼错、而错的症状是用户点链接找不到文件。
+///
+/// ⚠️ `material_name` 是**素材文件名**（不含子目录）；落盘位置由 [`MATERIAL_DIR`] 决定，
+/// 种子里的链接目标用 [`material_rel_name`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterialPlan {
-    /// `作者 - 书名·划线素材.md`：机器那份，每次整份重写
+    /// `作者 - 书名·划线素材.md`：机器那份，每次整份重写，落在 `划线素材/` 下
     pub material_name: String,
     /// `作者 - 书名.md`：人那份，只在缺失时写 [`render_organize_seed`]
     pub organize_name: String,
@@ -71,12 +74,11 @@ pub struct MaterialPlan {
 
 /// 把 [`MaterialInput`] 走一遍，连文件名一起给出。
 pub fn plan_material(input: &MaterialInput) -> MaterialPlan {
-    let base = file_base_name(input.author, input.title);
     let mut ids: BTreeSet<String> = BTreeSet::new();
     ids.extend(input.marks.iter().map(|mark| mark.bookmark_id.clone()));
     MaterialPlan {
         material_name: material_file_name(input.author, input.title),
-        organize_name: format!("{base}.md"),
+        organize_name: organize_file_name(input.author, input.title),
         material: render_material(input),
         organize_seed: render_organize_seed(input),
         ids: ids.into_iter().collect(),

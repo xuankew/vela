@@ -9,7 +9,11 @@
 //! | 文件 | 谁拥有 | 同步时 | 进不进 git |
 //! |---|---|---|---|
 //! | `作者 - 书名.md` | **人** | 只在**缺失**时建一份种子，之后一个字都不改 | 进 |
-//! | `作者 - 书名·划线素材.md` | **机器** | 整份重写 | ⛔ 不进（`.gitignore` 点名） |
+//! | `划线素材/作者 - 书名·划线素材.md` | **机器** | 整份重写 | ⛔ 不进（`.gitignore` 点名） |
+//!
+//! 素材统一收在 `划线素材/` 子目录里（M8-10）：整理文件那一层只剩书，机器区不会和它
+//! 并排出现。两份文件互相给一条相对链接，预览里点一下就跳过去；素材顶部那条
+//! `../作者 - 书名.md` 是**每次重写时生成**的，所以永远跟着当前布局。
 //!
 //! ⚠️ 「素材文件不进 git」不只是版权考虑：那行「同步于 …」的时间戳每次同步都会变，
 //! 文件一旦进版本库，每次同步必然产生一次脏改动。**时间戳能留在这份文件里，
@@ -29,6 +33,10 @@ use super::text::{anchor, day_of, flatten, safe_name, stamp_of};
 /// 素材文件名的后缀。⚠️ 用「·」而不是空格连着「划线素材」，是为了在同一堆
 /// `作者 - 书名.md` 里一眼分得出来，同时不让两个工具生成同一个文件名。
 pub const MATERIAL_SUFFIX: &str = "·划线素材";
+
+/// 素材文件的统一子目录（M8-10）。⛔ 改这个值要同步 `.gitignore` 那条规则：
+/// `*·划线素材.md` 没有斜杠，对任意深度的同名文件都生效，所以它不用改。
+pub const MATERIAL_DIR: &str = "划线素材";
 
 /// 一次渲染的全部输入。
 ///
@@ -106,6 +114,40 @@ pub fn material_file_name(author: Option<&str>, title: Option<&str>) -> String {
     format!("{}{MATERIAL_SUFFIX}.md", file_base_name(author, title))
 }
 
+/// 整理文件名（带 `.md`）。人那份，种子与素材里的返回链接都指向它。
+pub fn organize_file_name(author: Option<&str>, title: Option<&str>) -> String {
+    format!("{}.md", file_base_name(author, title))
+}
+
+/// 从配置目录根看过去的素材相对路径：`划线素材/作者 - 书名·划线素材.md`。
+/// 这是种子文件里那条链接的目标，也是 `src-tauri` 写盘时的落点依据。
+pub fn material_rel_name(author: Option<&str>, title: Option<&str>) -> String {
+    format!("{MATERIAL_DIR}/{}", material_file_name(author, title))
+}
+
+/// 相对路径 → Markdown 链接目标里那一串。空格必须写成 `%20`。
+///
+/// 🔴 不是「为了好看」：Vela 的预览渲染器（`src/md/render.ts` 的 `safeUrl`）会把 `href` 里
+/// 所有 U+0000–U+0020 删掉——那一条是防 `java\tscript:` 这类拆协议的绕法，而合法 URL
+/// 本就不该有裸空格。我们的文件名来自 [`safe_name`]，空格是**保留**的，所以裸空格在这里
+/// 会被渲染成去掉空格的另一个文件名，链接在预览里点了没反应。
+///
+/// ⚠️ 外层的 `<…>` 仍然要留：书名里可能有成对的半角括号，而 `(…)` 写法会被第一个
+/// 右括号截断。`%` 先编，否则一个真的叫 `100%.md` 的文件会被下游解码成别的东西。
+fn link_dest(rel: &str) -> String {
+    let mut out = String::with_capacity(rel.len());
+    for ch in rel.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            ' ' => out.push_str("%20"),
+            '#' => out.push_str("%23"),
+            '?' => out.push_str("%3F"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// 渲染素材文件全文。
 ///
 /// 行形状与 CLI 逐字一致（`- 正文 \`锚点\` · 日期`），差别只在**外层结构**：
@@ -115,6 +157,13 @@ pub fn material_file_name(author: Option<&str>, title: Option<&str>) -> String {
 pub fn render_material(input: &MaterialInput) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(heading(input.title, input.author));
+    lines.push(String::new());
+    // 返回整理文件那条链接：素材在子目录里，所以是 `../`。
+    // ⚠️ 目标里的空格编成 `%20`（理由见 `link_dest`），外面再用 `<…>` 包起来
+    lines.push(format!(
+        "[← 回到整理](<{}>)",
+        link_dest(&format!("../{}", organize_file_name(input.author, input.title)))
+    ));
     lines.push(String::new());
     lines.push(format!(
         "> 划线 {} · 想法 {} · 同步于 {} · bookId {}",
@@ -129,7 +178,7 @@ pub fn render_material(input: &MaterialInput) -> String {
     let loose = attach_reviews(&mut groups, input.reviews);
 
     if input.first_time {
-        lines.push("**首次同步**：下面按章节分组。整理请写到同目录的整理文件，本文件每次同步整份重写。".to_owned());
+        lines.push("**首次同步**：下面按章节分组。整理请写到上一层的整理文件，本文件每次同步整份重写。".to_owned());
         lines.push(String::new());
     } else {
         let fresh = fresh_marks(input.marks, input.seen_ids);
@@ -220,9 +269,10 @@ fn entry(bullet: &str, text: &str, anchor: &str, day: &str) -> String {
 /// 是唯一必须存在的字：用户得知道旁边那个文件是什么、以及为什么不要把它并进来。
 pub fn render_organize_seed(input: &MaterialInput) -> String {
     format!(
-        "{}\n\n同目录的 `{}` 是微信读书的划线与想法，每次同步整份重写，⛔ 不要把它并进本文件（并进去下次就没了）。整理请写在下面。\n\n## 我的整理\n",
+        "{}\n\n[划线素材](<{}>)\n\n`{}` 里那份记录的是微信读书的划线与想法，每次同步整份重写，⛔ 不要把它并进本文件（并进去下次就没了）。整理请写在下面。\n\n## 我的整理\n",
         heading(input.title, input.author),
-        material_file_name(input.author, input.title),
+        link_dest(&material_rel_name(input.author, input.title)),
+        MATERIAL_DIR,
     )
 }
 
@@ -290,9 +340,11 @@ mod tests {
             expected(&[
                 "# 《测试之书》— 某人",
                 "",
+                "[← 回到整理](<../某人%20-%20测试之书.md>)",
+                "",
                 "> 划线 3 · 想法 1 · 同步于 2025-02-19 21:20 · bookId bk1",
                 "",
-                "**首次同步**：下面按章节分组。整理请写到同目录的整理文件，本文件每次同步整份重写。",
+                "**首次同步**：下面按章节分组。整理请写到上一层的整理文件，本文件每次同步整份重写。",
                 "",
                 "## 第一章 起",
                 "",
@@ -399,9 +451,11 @@ mod tests {
             expected(&[
                 "# 《测试之书》— 某人",
                 "",
+                "[← 回到整理](<../某人%20-%20测试之书.md>)",
+                "",
                 "> 划线 0 · 想法 1 · 同步于 2025-02-19 21:20 · bookId bk1",
                 "",
-                "**首次同步**：下面按章节分组。整理请写到同目录的整理文件，本文件每次同步整份重写。",
+                "**首次同步**：下面按章节分组。整理请写到上一层的整理文件，本文件每次同步整份重写。",
                 "",
                 "## 正文上的想法（没挂在划线下）",
                 "",
@@ -462,12 +516,15 @@ mod tests {
         // ⚠️ 少了这个一致性，`weread.mjs` 与 Vela 会在同一目录里各写一份、互不相认
         assert_eq!(file_base_name(Some("某人"), Some("测试之书")), "某人 - 测试之书");
         assert_eq!(material_file_name(Some("某人"), Some("测试之书")), "某人 - 测试之书·划线素材.md");
+        assert_eq!(organize_file_name(Some("某人"), Some("测试之书")), "某人 - 测试之书.md");
+        // 素材统一在子目录下（M8-10）：种子链接与落盘位置都以这个相对路径为准
+        assert_eq!(material_rel_name(Some("某人"), Some("测试之书")), "划线素材/某人 - 测试之书·划线素材.md");
         assert_eq!(file_base_name(Some("a/b"), Some("c:d")), "a·b - c·d");
     }
 
     #[test]
     fn 种子里指的就是素材那个文件名() {
-        // 🔴 两处拼装必须相等：错了的症状是用户照着说明去找文件、找不到
+        // 🔴 两处拼装必须相等：错了的症状是用户点链接、找不到文件
         let list = marks();
         let chapters = chapters();
         let mine = reviews("[]");
@@ -484,7 +541,16 @@ mod tests {
             synced_at: SYNCED_AT,
         };
         let plan = crate::weread::plan_material(&input);
-        assert!(plan.organize_seed.contains(&plan.material_name), "{}", plan.organize_seed);
+        assert!(
+            plan.organize_seed.contains("[划线素材](<划线素材/某人%20-%20测试之书·划线素材.md>)"),
+            "{}",
+            plan.organize_seed
+        );
+        assert!(plan.organize_seed.contains(&link_dest(&plan.material_name)), "{}", plan.organize_seed);
+        assert!(!plan.organize_seed.contains("<划线素材/某人 - "), "裸空格会被渲染层删掉：{}", plan.organize_seed);
+        assert!(!plan.organize_seed.contains("同目录"), "素材已经不在同目录了：{}", plan.organize_seed);
+        // 反向那条由素材自己带着，每次重写都重新生成，所以永远跟着当前布局
+        assert!(plan.material.contains("[← 回到整理](<../某人%20-%20测试之书.md>)"), "{}", plan.material);
         assert_eq!(plan.organize_name, "某人 - 测试之书.md");
         assert_eq!(plan.ids, vec!["1001".to_owned(), "1002".to_owned(), "1003".to_owned()]);
     }
