@@ -34,14 +34,40 @@
 //! 那四句中文与 OSStatus 码表会各漂各的**，而症状只是「两个面板里钥匙串失败的说法不一样」，
 //! 没人会当 bug 报上来。
 //!
+//! ## 一次进程只问一次钥匙串
+//!
+//! 钥匙串那一项在开发机上**每读一次都可能弹一次授权框**：重建出来的二进制不在那一项的
+//! ACL 里，而 macOS 的授权判定是逐次调用做的。麻烦在于读取次数不是一次两次——
+//! 微信读书同步 91 本书，每发一个请求都要取一遍 `Authorization`（`gateway` 一次一读，
+//! 180+ 次），预览每刷新一次都要签一组图，两个 `*_status` 各读一次。
+//! 用户看到的就是一串一模一样的弹窗。
+//!
+//! 所以这一层在进程内记一份：[`memo`] 按 (service, account) 记住**读到的那一个值**，
+//! 第二次起直接用记下的，不再碰系统调用。写与删是**写穿**的——刚写进去的值就是本进程
+//! 之后该看到的值，没有理由再回钥匙串确认一遍。
+//!
+//! 记的是 `Option<String>` 而不只是 `Some`：**「没配」也是答案**，而且它是最常被问到的那
+//! 一种（每次打开面板，`*_status` 都要问一次）。失败（读不出来、平台不支持）**不记**——
+//! 那两种都可能是暂时的，下一次读取还有机会成功；记成定局就等于让用户连重试的机会都没有。
+//!
+//! 两条代价写在这里，免得后来的人自己撞上：
+//!
+//! 1. 用 `security(1)` 从外面改了钥匙串，Vela 要重启才看得见。真实用法是「在终端里换了
+//!    一把 key 再回来」——那种时候同步本来就得重开一次，重启 Vela 并不更麻烦。
+//! 2. 值在进程内存里多留了一份。它不进 IPC、不进 JSON、不进日志、不进 `Debug`
+//!    （[`Slot`] 刻意不实现 `Debug`），与「不进 settings.json」是同一条立身之本。
+//!
 //! ## 这一层能测到哪儿
 //!
 //! 钥匙串那三个调用是**系统调用**，单测里不能真跑：CI 的 rust job 在 ubuntu 上（压根没有
 //! 钥匙串），而在本机跑就等于往开发机的真实钥匙串里写一项、第一次还可能弹一个模态框把
 //! 门禁挂住。与 `trash::delete`、`watcher` 不进 vela-core 是同一条纪律（见 `commands.rs`
-//! 开头那段）。所以进测试的是这四件纯的事：[`clean`]、码表、错误枚举的 JSON 形状，
-//! 以及「密钥不可能出现在这些形状里」。真正没测到的只有 `SecItem*` 那三行——
+//! 开头那段）。所以进测试的是这几件纯的事：[`clean`]、码表、错误枚举的 JSON 形状、
+//! 「密钥不可能出现在这些形状里」，以及备忘录的计数行为（[`Memo`] 不碰系统调用，
+//! 读那一步是从外面传进去的闭包）。真正没测到的只有 `SecItem*` 那三行——
 //! 它们薄到只有一句调用与一次状态码分派。
+
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde::Serialize;
 use tauri::command;
@@ -177,28 +203,93 @@ fn decode(bytes: Vec<u8>) -> Result<String, SecretError> {
     String::from_utf8(bytes).map_err(|_| SecretError::corrupt())
 }
 
+/// 进程内记住的一个槽。**刻意不实现 `Debug`**：它装着明文密钥，一次 `dbg!` 就会把整份
+/// 写进终端——本模块立身的那条 🔴 就会在调试时被人无意踩穿。
+struct Slot {
+    service: String,
+    account: String,
+    /// `None` 也记：见模块文档「一次进程只问一次钥匙串」
+    value: Option<String>,
+}
+
+/// 进程内的那一份备忘录。键是 (service, account)，一共两三对，线性找就够。
+#[derive(Default)]
+struct Memo {
+    slots: Vec<Slot>,
+}
+
+impl Memo {
+    fn get(&self, service: &str, account: &str) -> Option<&Option<String>> {
+        self.slots.iter().find(|slot| slot.service == service && slot.account == account).map(|slot| &slot.value)
+    }
+
+    /// 记下一个槽的答案。已经有这一格就改值，不再压一条新的。
+    fn remember(&mut self, service: &str, account: &str, value: Option<String>) {
+        match self.slots.iter_mut().find(|slot| slot.service == service && slot.account == account) {
+            Some(slot) => slot.value = value,
+            None => self.slots.push(Slot { service: service.to_owned(), account: account.to_owned(), value }),
+        }
+    }
+
+    /// 记着就直接给，没记着才调 `read` 并把结果记下。**读失败不记**（见模块文档）。
+    ///
+    /// 读的时候**握着锁**：两个线程同时第一次问同一个槽，第二个应当等第一个读完，
+    /// 而不是把同一个授权框再弹一次。锁里只是一次毫秒级的系统调用（或者一次用户的点击），
+    /// 而外面的调用者本来就都在等同一个答案。
+    fn get_or_read<F>(&mut self, service: &str, account: &str, read: F) -> Result<Option<String>, SecretError>
+    where
+        F: FnOnce() -> Result<Option<String>, SecretError>,
+    {
+        if let Some(value) = self.get(service, account) {
+            return Ok(value.clone());
+        }
+        let value = read()?;
+        self.remember(service, account, value.clone());
+        Ok(value)
+    }
+}
+
+/// 全局那一份。`OnceLock` + `Mutex` 而不是 `thread_local`：命令跑在 Tauri 的线程池上，
+/// 每线程各记一份等于把弹窗数乘以线程数。
+fn memo() -> MutexGuard<'static, Memo> {
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    // 中毒不影响这份备忘录的正确性：里面只有读到的值，没有「写了一半」的不变量。
+    // 而在这里让一次 panic 把后续所有密钥读取都变失败，代价远大于回收它
+    MEMO.get_or_init(|| Mutex::new(Memo::default())).lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 读一个槽（`service` + `account`）里的密钥。**只在进程内用**，⛔ 永远不要把它变成
 /// 一条 command 的返回值。
 ///
 /// 三态分开的理由：`Ok(None)` = 没配过（不是失败，要说「还没填」）；`Err` = 配了但用不了，
 /// 或者这个平台压根没有钥匙串（要说「填的读不出来」）。把第二种说成第一种，
 /// 用户会一遍一遍重填同一个本来正确的密钥。
+///
+/// 同一个槽只会问钥匙串一次（见模块文档「一次进程只问一次钥匙串」）：`gateway` 每个请求
+/// 都要调一次这里，缓存之前那是 180+ 个弹窗。
 pub(crate) fn load(service: &str, account: &str) -> Result<Option<String>, SecretError> {
-    match backend::read(service, account)? {
+    memo().get_or_read(service, account, || match backend::read(service, account)? {
         Some(bytes) => decode(bytes).map(Some),
         None => Ok(None),
-    }
+    })
 }
 
 /// 写一个槽。空输入在这里就被 [`SecretError::empty`] 挡掉，不落到系统调用上。
 pub(crate) fn store(service: &str, account: &str, secret: &str) -> Result<(), SecretError> {
     let value = clean(secret).ok_or_else(SecretError::empty)?;
-    backend::write(service, account, value)
+    backend::write(service, account, value)?;
+    // 写穿：写进去的就是本进程之后该看到的值。不写穿的话，紧接着那次 `*_status`
+    // 会为了一把刚存进去的密钥再弹一次授权框
+    memo().remember(service, account, Some(value.to_owned()));
+    Ok(())
 }
 
 /// 删一个槽。不存在也算成功（幂等），见 `backend::delete`。
 pub(crate) fn clear(service: &str, account: &str) -> Result<(), SecretError> {
-    backend::delete(service, account)
+    backend::delete(service, account)?;
+    // 同理：删完记成「没配」，随后那次 `*_status` 不必为一个已知的答案再问钥匙串
+    memo().remember(service, account, None);
+    Ok(())
 }
 
 /// 取回 OSS 的 AccessKeySecret。**只在进程内用**，⛔ 永远不要把它变成一条 command 的返回值。
@@ -471,6 +562,91 @@ mod tests {
         }
         let status = format!("{:?}", SecretStatus { configured: true });
         assert!(!status.contains(SECRET), "状态里带了密钥：{status}");
+    }
+
+    #[test]
+    fn 同一个槽只问一次读() {
+        let mut cache = Memo::default();
+        let calls = std::cell::Cell::new(0);
+        let hit = || {
+            calls.set(calls.get() + 1);
+            Ok::<Option<String>, SecretError>(Some(SECRET.to_owned()))
+        };
+        assert_eq!(cache.get_or_read("s", "a", hit).unwrap(), Some(SECRET.to_owned()));
+        // 第二次的读会给出另一个答案；它不该被调用，答案该是第一次那一个
+        assert_eq!(
+            cache
+                .get_or_read("s", "a", || {
+                    calls.set(calls.get() + 1);
+                    Ok(None)
+                })
+                .unwrap(),
+            Some(SECRET.to_owned())
+        );
+        assert_eq!(calls.get(), 1, "同一个槽第二次不该再读");
+    }
+
+    #[test]
+    fn 没配也记着() {
+        // 「没配」是最常被问到的那一种答案（每次打开面板 `*_status` 都问）。
+        // 不记它的话，什么都没存的用户反而每开一次面板被弹一次框
+        let mut cache = Memo::default();
+        let calls = std::cell::Cell::new(0);
+        let miss = || {
+            calls.set(calls.get() + 1);
+            Ok::<Option<String>, SecretError>(None)
+        };
+        assert_eq!(cache.get_or_read("s", "a", miss).unwrap(), None);
+        assert_eq!(
+            cache
+                .get_or_read("s", "a", || {
+                    calls.set(calls.get() + 1);
+                    Ok(None)
+                })
+                .unwrap(),
+            None
+        );
+        assert_eq!(calls.get(), 1, "「没配」也是答案，不该问第二遍");
+    }
+
+    #[test]
+    fn 不同的槽互不串味() {
+        // OSS secret 与微信读书 key、GitHub token 共用一个进程，寻址必须两段都比
+        let mut cache = Memo::default();
+        assert_eq!(cache.get_or_read("s", "a", || Ok(Some("A".to_owned()))).unwrap().as_deref(), Some("A"));
+        assert_eq!(cache.get_or_read("s", "b", || Ok(Some("B".to_owned()))).unwrap().as_deref(), Some("B"));
+        assert_eq!(cache.get_or_read("t", "a", || Ok(Some("C".to_owned()))).unwrap().as_deref(), Some("C"));
+        assert_eq!(
+            cache.get_or_read("s", "a", || Ok(Some("X".to_owned()))).unwrap().as_deref(),
+            Some("A"),
+            "只有 service 与 account 都相同才算同一格"
+        );
+    }
+
+    #[test]
+    fn 读失败不记() {
+        // 失败可能是暂时的（钥匙串锁着、在授权框里点了取消）。记成定局的话，
+        // 用户解锁钥匙串或重填之后都拿不到第二次机会
+        let mut cache = Memo::default();
+        let calls = std::cell::Cell::new(0);
+        let broken = || {
+            calls.set(calls.get() + 1);
+            Err::<Option<String>, SecretError>(SecretError::corrupt())
+        };
+        assert!(cache.get_or_read("s", "a", broken).is_err());
+        assert_eq!(cache.get_or_read("s", "a", || Ok(Some(SECRET.to_owned()))).unwrap(), Some(SECRET.to_owned()));
+        assert_eq!(calls.get(), 1, "第二次不该被上一次的失败挡住");
+    }
+
+    #[test]
+    fn 写入与清除是写穿的() {
+        // 写穿的意义：紧接着那次 `*_status` 不该为刚存/刚删的密钥再弹一次框
+        let mut cache = Memo::default();
+        assert_eq!(cache.get_or_read("s", "a", || Ok(None)).unwrap(), None);
+        cache.remember("s", "a", Some(SECRET.to_owned()));
+        assert_eq!(cache.get_or_read("s", "a", || panic!("写穿之后不该再读钥匙串")).unwrap(), Some(SECRET.to_owned()));
+        cache.remember("s", "a", None);
+        assert_eq!(cache.get_or_read("s", "a", || panic!("清除之后不该再读钥匙串")).unwrap(), None);
     }
 
     #[test]
