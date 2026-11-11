@@ -430,12 +430,13 @@ body {
   border-color: var(--vela-border);
 }
 
-/* 设置对话框（M4-B，菜单触发入口）。居中模态对话框，复用 appearance 的控件样式 */
+/* 设置对话框（M4-B，菜单触发入口）。2026-11-11 改成「左索引 + 右分页」：
+   宽度从 360 涨到 680，高度固定，左右两侧各自滚动——分类变多时索引不会跟着正文滚走 */
 .settings-dialog {
   display: flex;
   flex-direction: column;
-  width: 360px;
-  max-height: 80vh;
+  width: min(680px, calc(100vw - 48px));
+  height: min(560px, 82vh);
   background: var(--vela-bg);
   border: 1px solid var(--vela-border);
   border-radius: 12px;
@@ -480,10 +481,104 @@ body {
 
 .settings-body {
   display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ── 左侧索引（2026-11-11）────────────────────────────────────────
+   底色比右侧正文暗一档：它是一条「导航」，不是又一块内容。
+   每一项两行——分类名 + 一句当前值，点进去之前就能看出值不值得点。 */
+.settings-nav {
+  display: flex;
+  flex: 0 0 180px;
   flex-direction: column;
-  gap: 16px;
-  padding: 20px 24px;
+  gap: 2px;
+  padding: 12px 10px;
   overflow-y: auto;
+  background: var(--vela-bg-alt);
+  border-right: 1px solid var(--vela-border);
+}
+
+.settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-family: var(--vela-font-ui);
+  color: var(--vela-fg);
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.settings-nav-item:hover {
+  background: var(--vela-bg);
+}
+
+.settings-nav-item[aria-selected='true'] {
+  background: var(--vela-bg-panel);
+  /* 选中不靠「字更亮」区分——四条标签本来就同色，加一条左缘的强调线才是稳定的锚点 */
+  box-shadow: inset 2px 0 0 var(--vela-accent);
+}
+
+.settings-nav-item:focus-visible {
+  outline: 2px solid var(--vela-accent);
+  outline-offset: -2px;
+}
+
+.settings-nav-glyph {
+  flex: 0 0 auto;
+  color: var(--vela-fg-dim);
+}
+
+.settings-nav-item[aria-selected='true'] .settings-nav-glyph {
+  color: var(--vela-accent);
+}
+
+.settings-nav-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.settings-nav-label {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.settings-nav-status {
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--vela-fg-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右侧一次只显示一页；四页都挂在 DOM 里，非当前页靠 `hidden` 藏起来（不卸载） */
+.settings-panes {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.settings-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 22px 26px 26px;
+  overflow-y: auto;
+}
+
+.settings-pane[hidden] {
+  display: none;
 }
 
 .settings-row {
@@ -552,6 +647,19 @@ body {
   border-top: 1px solid var(--vela-border);
 }
 
+/* 只在「外观」那一页出现时，快捷键按钮自己贴右；否则左半边空着会把它拽到中间 */
+.settings-keybindings-btn {
+  margin-left: auto;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vela-accent);
+  background: transparent;
+  border: 1px solid var(--vela-accent);
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 .settings-reset {
   font-size: 13px;
   font-weight: 500;
@@ -568,34 +676,18 @@ body {
   border-color: var(--vela-border);
 }
 
-.settings-keybindings-btn {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--vela-accent);
-  background: transparent;
-  border: 1px solid var(--vela-accent);
-  padding: 8px 16px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
 .settings-keybindings-btn:hover {
   background: var(--vela-bg-alt);
 }
 
-/* ── M7-6：分组（外观 / 阿里云 OSS）────────────────────────────
-   小标题的权重要低于它下面那些控件：它是「这一组是什么」，不是又一个可点的东西。
-   组与组之间用一条分隔线，不用卡片——卡片会让 OSS 那组看起来比外观那组「更重要」。 */
+/* ── 2026-11-11：一页 = 一个分组 ────────────────────────────────────
+   原来四组竖着摞、靠分隔线区分（M7-6），现在一页只装一组，分隔线没有用武之地。
+   组标题刻意压成小号浅灰：这一页叫什么，左索引已经用更大的字说过一遍了，
+   正文再喊一次只会让人以为有两个「外观」。 */
 .settings-group {
   display: flex;
   flex-direction: column;
   gap: 14px;
-}
-
-.settings-group + .settings-group {
-  margin-top: 4px;
-  padding-top: 18px;
-  border-top: 1px solid var(--vela-border);
 }
 
 .settings-group-title {

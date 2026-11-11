@@ -101,6 +101,15 @@ const group = (title: string): HTMLElement =>
   [...container.querySelectorAll<HTMLElement>('.settings-group')].find((g) =>
     g.querySelector('.settings-group-title')?.textContent?.includes(title),
   )!
+/** 二级导航：左侧四页的按钮、它们各自的第二行状态、以及右侧四块面板 */
+const tabs = (): HTMLElement[] => [...container.querySelectorAll<HTMLElement>('[role="tab"]')]
+const tab = (label: string): HTMLElement =>
+  tabs().find((t) => t.querySelector('.settings-nav-label')?.textContent === label)!
+const navStatus = (label: string): string | null =>
+  tab(label).querySelector('.settings-nav-status')?.textContent ?? null
+const pane = (id: string): HTMLElement => container.querySelector<HTMLElement>(`#settings-pane-${id}`)!
+const visiblePanes = (): string[] =>
+  [...container.querySelectorAll<HTMLElement>('.settings-pane')].filter((p) => !p.hidden).map((p) => p.id)
 /** 按标签找某一组里那一行的 input：`AccessKey Secret` 那一个标签后面还会挂 badge，所以用前缀匹配 */
 function inputIn(title: string, label: string): HTMLInputElement {
   const rows = [...group(title).querySelectorAll<HTMLElement>('.settings-row')]
@@ -532,6 +541,90 @@ describe('微信读书 / 文件同步两组（M8-5）', () => {
     await flush()
     expect(group('文件同步').textContent).toContain('PROBE-GH-KEYCHAIN')
     expect(token.value).toBe('ghp-abc')
+  })
+})
+
+describe('二级导航：左侧分类、右侧一页', () => {
+  it('四页按「外观、阿里云 OSS、微信读书、文件同步」排', () => {
+    expect(tabs().map((t) => t.querySelector('.settings-nav-label')?.textContent)).toEqual([
+      '外观',
+      '阿里云 OSS',
+      '微信读书',
+      '文件同步',
+    ])
+  })
+
+  it('打开时停在外观：只有它 aria-selected / tabindex=0，右侧只有它的面板可见', () => {
+    expect(tab('外观').getAttribute('aria-selected')).toBe('true')
+    expect(tab('外观').getAttribute('tabindex')).toBe('0')
+    expect(tab('阿里云 OSS').getAttribute('aria-selected')).toBe('false')
+    expect(tab('阿里云 OSS').getAttribute('tabindex')).toBe('-1')
+    expect(visiblePanes()).toEqual(['settings-pane-appearance'])
+  })
+
+  it('tab 与面板互相指认：aria-controls ↔ aria-labelledby', () => {
+    for (const label of ['外观', '阿里云 OSS', '微信读书', '文件同步']) {
+      const t = tab(label)
+      const controlled = t.getAttribute('aria-controls')!
+      expect(pane(controlled.replace('settings-pane-', ''))).toBeTruthy()
+      expect(container.querySelector(`#${controlled}`)!.getAttribute('aria-labelledby')).toBe(t.id)
+      expect(pane(controlled.replace('settings-pane-', '')).getAttribute('role')).toBe('tabpanel')
+    }
+  })
+
+  it('点另一页：只有那一页可见，其余 hidden；四页都没从 DOM 上摘掉', () => {
+    click(tab('微信读书'))
+    expect(visiblePanes()).toEqual(['settings-pane-weread'])
+    expect(tab('微信读书').getAttribute('aria-selected')).toBe('true')
+    expect(tab('外观').getAttribute('aria-selected')).toBe('false')
+    expect(container.querySelectorAll('.settings-pane')).toHaveLength(4)
+  })
+
+  it('🔴 切页不卸载：外观页里填了一半的草稿，去隔壁看一眼再回来还在', () => {
+    const bucket = fieldInput('Bucket')
+    type(bucket, 'draft-bucket')
+    click(tab('阿里云 OSS'))
+    click(tab('外观'))
+    expect(fieldInput('Bucket').value).toBe('draft-bucket')
+  })
+
+  it('方向键在四页之间移动并跟走焦点；Home/End 直达两头，顶/底不越界', () => {
+    press(tab('外观'), 'ArrowDown')
+    expect(tab('阿里云 OSS').getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(tab('阿里云 OSS'))
+
+    press(tab('阿里云 OSS'), 'End')
+    expect(tab('文件同步').getAttribute('aria-selected')).toBe('true')
+
+    press(tab('文件同步'), 'ArrowDown')
+    expect(tab('文件同步').getAttribute('aria-selected')).toBe('true')
+
+    press(tab('文件同步'), 'Home')
+    expect(tab('外观').getAttribute('aria-selected')).toBe('true')
+
+    press(tab('外观'), 'ArrowUp')
+    expect(tab('外观').getAttribute('aria-selected')).toBe('true')
+  })
+
+  it('导航第二行是这一页的当前值：外观报主题与字号，三把钥匙报已/未配置', () => {
+    expect(navStatus('外观')).toBe('暗色 · 14px')
+    expect(navStatus('阿里云 OSS')).toBe('密钥未配置')
+    expect(navStatus('微信读书')).toBe('key 未配置')
+    expect(navStatus('文件同步')).toBe('token 未配置')
+  })
+
+  it('三把钥匙都配好之后：导航第二行跟着变，文件同步显示仓库地址', async () => {
+    wireInvoke({ configured: true })
+    await reopen()
+    expect(navStatus('阿里云 OSS')).toBe('密钥已配置')
+    expect(navStatus('微信读书')).toBe('key 已配置')
+    expect(navStatus('文件同步')).toBe('xuanke/notes')
+  })
+
+  it('「恢复默认」只属于外观：切到别的页它就收起来', () => {
+    expect(container.querySelector('.settings-reset')).not.toBeNull()
+    click(tab('文件同步'))
+    expect(container.querySelector('.settings-reset')).toBeNull()
   })
 })
 

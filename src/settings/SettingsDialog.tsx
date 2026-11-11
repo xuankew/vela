@@ -1,4 +1,4 @@
-import { Show, onCleanup, onMount, createSignal } from 'solid-js'
+import { For, Show, onCleanup, onMount, createSignal } from 'solid-js'
 import { open as pickDirectory } from '@tauri-apps/plugin-dialog'
 import {
   CODE_FONTS,
@@ -29,6 +29,61 @@ export interface SettingsDialogProps {
   onClose: () => void
   /** 打开快捷键配置对话框（M4-E） */
   onOpenKeybindings?: () => void
+}
+
+/**
+ * 设置的四页。左侧是索引、右侧只显示当前那一页——原来四组竖着摞在一条
+ * 360px 的滚动条里，填一次 OSS 要滚过外观六项，找微信读书又得从顶上重新数。
+ *
+ * ⚠️ 四页仍然**同时挂在 DOM 里**，非当前页用 `hidden`：切页不重新挂载，用户填了一半
+ * 的草稿、异步查回来的「已配置」、就地那句失败都不会因为去隔壁看一眼而丢掉。
+ */
+type SectionId = 'appearance' | 'oss' | 'weread' | 'sync'
+
+const SECTIONS: Array<{ id: SectionId; label: string }> = [
+  { id: 'appearance', label: '外观' },
+  { id: 'oss', label: '阿里云 OSS' },
+  { id: 'weread', label: '微信读书' },
+  { id: 'sync', label: '文件同步' },
+]
+
+/** 导航上那四枚 16px 图形。与树里的图标同一条口径：内联 SVG、`currentColor`、图形自身隐身 */
+function SectionIcon(props: { id: SectionId }) {
+  return (
+    <svg
+      class="settings-nav-glyph"
+      viewBox="0 0 16 16"
+      width="16"
+      height="16"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.3"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <Show when={props.id === 'appearance'}>
+        <path d="M2.8 5h10.4M2.8 11h10.4" />
+        <circle cx="6" cy="5" r="1.7" />
+        <circle cx="10" cy="11" r="1.7" />
+      </Show>
+      <Show when={props.id === 'oss'}>
+        <ellipse cx="8" cy="4.3" rx="5" ry="2" />
+        <path d="M3 4.3v7c0 1.1 2.24 2 5 2s5-.9 5-2v-7" />
+        <path d="M3 7.8c0 1.1 2.24 2 5 2s5-.9 5-2" />
+      </Show>
+      <Show when={props.id === 'weread'}>
+        <path d="M8 3.6C6.6 2.6 4.6 2.5 3 3.1v9c1.6-.6 3.6-.5 5 .5 1.4-1 3.4-1.1 5-.5v-9c-1.6-.6-3.6-.5-5 .5Z" />
+        <path d="M8 3.6v9" />
+      </Show>
+      <Show when={props.id === 'sync'}>
+        <path d="M3.4 6.6a4.9 4.9 0 0 1 8.4-2.4" />
+        <path d="M12.3 2.8v3.1H9.2" />
+        <path d="M12.6 9.4a4.9 4.9 0 0 1-8.4 2.4" />
+        <path d="M3.7 13.2v-3.1h3.1" />
+      </Show>
+    </svg>
+  )
 }
 
 /** OSS 组里那四个文本框的形状（M7-6）。 */
@@ -207,6 +262,41 @@ export function SettingsDialog(props: SettingsDialogProps) {
   const letterSpacingLabel = (): string => {
     const n = settings.letterSpacing()
     return n === 0 ? '正常' : `${n}em`
+  }
+
+  /** 当前是第几页。默认外观——App 的两组用例打开就找字号/行高，默认值变了它们会先红 */
+  const [section, setSection] = createSignal<SectionId>('appearance')
+
+  /**
+   * 导航项的第二行：一眼能看出这一页值不值得点进去。
+   *
+   * ⚠️ 只写「已配置 / 未配置」，**不写密钥本身**——这里与面板里那三行是同一条红线。
+   */
+  const sectionStatus = (id: SectionId): string => {
+    switch (id) {
+      case 'appearance':
+        return `${THEME_LABELS[settings.theme()]} · ${settings.fontSize()}px`
+      case 'oss':
+        return secretConfigured() ? '密钥已配置' : '密钥未配置'
+      case 'weread':
+        return wereadKeyConfigured() ? 'key 已配置' : 'key 未配置'
+      case 'sync':
+        if (!githubTokenConfigured()) return 'token 未配置'
+        return settings.githubRepo() || 'token 已配置'
+    }
+  }
+
+  /** 方向键在四页之间移动：`role=tablist` 的那套键盘约定，Home/End 直达两头 */
+  function onNavKeyDown(e: KeyboardEvent, index: number): void {
+    const delta =
+      e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : e.key === 'ArrowUp' || e.key === 'ArrowLeft' ? -1 : 0
+    const target = e.key === 'Home' ? 0 : e.key === 'End' ? SECTIONS.length - 1 : index + delta
+    if (delta === 0 && e.key !== 'Home' && e.key !== 'End') return
+    e.preventDefault()
+    const next = Math.min(SECTIONS.length - 1, Math.max(0, target))
+    const id = SECTIONS[next]!.id
+    setSection(id)
+    dialogEl?.querySelector<HTMLButtonElement>(`#settings-tab-${id}`)?.focus()
   }
 
   /**
@@ -427,290 +517,350 @@ export function SettingsDialog(props: SettingsDialogProps) {
         </div>
 
         <div class="settings-body">
-          <section class="settings-group">
-            <h3 class="settings-group-title">外观</h3>
-
-            <label class="settings-row">
-              <span class="settings-label">主题</span>
-              <select
-                value={settings.theme()}
-                onChange={(e) => settings.setTheme(e.currentTarget.value as ThemeId)}
-                title="亮色 / 暗色 / 跟随系统"
-              >
-                {THEME_IDS.map((id) => (
-                  <option value={id}>{THEME_LABELS[id]}</option>
-                ))}
-              </select>
-            </label>
-
-            <label class="settings-row">
-              <span class="settings-label">字号</span>
-              <select
-                onChange={(e) => settings.setFontSize(Number(e.currentTarget.value))}
-                title="字号（也可用 Cmd/Ctrl + = / - / 0）"
-              >
-                {fontSizeChoices(settings.fontSize()).map((s) => (
-                  <option value={String(s)} selected={s === settings.fontSize()}>
-                    {s}px
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div class="settings-row">
-              <span class="settings-label">行高</span>
-              <div class="settings-stepper">
-                <button onClick={() => settings.stepLineHeight(-1)} aria-label="行高减小" title="行高减小">
-                  −
+          <nav class="settings-nav" role="tablist" aria-label="设置分类" aria-orientation="vertical">
+            <For each={SECTIONS}>
+              {(s, i) => (
+                <button
+                  class="settings-nav-item"
+                  id={`settings-tab-${s.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={section() === s.id}
+                  aria-controls={`settings-pane-${s.id}`}
+                  tabindex={section() === s.id ? 0 : -1}
+                  onClick={() => setSection(s.id)}
+                  onKeyDown={(e) => onNavKeyDown(e, i())}
+                >
+                  <SectionIcon id={s.id} />
+                  <span class="settings-nav-text">
+                    <span class="settings-nav-label">{s.label}</span>
+                    <span class="settings-nav-status">{sectionStatus(s.id)}</span>
+                  </span>
                 </button>
-                <span class="settings-value" aria-live="polite">
-                  {settings.lineHeight()}
-                </span>
-                <button onClick={() => settings.stepLineHeight(1)} aria-label="行高增大" title="行高增大">
-                  +
-                </button>
-              </div>
-            </div>
+              )}
+            </For>
+          </nav>
 
-            <div class="settings-row">
-              <span class="settings-label">字间距</span>
-              <div class="settings-stepper">
-                <button onClick={() => settings.stepLetterSpacing(-1)} aria-label="字间距减小" title="字间距减小">
-                  −
-                </button>
-                <span class="settings-value" aria-live="polite">
-                  {letterSpacingLabel()}
-                </span>
-                <button onClick={() => settings.stepLetterSpacing(1)} aria-label="字间距增大" title="字间距增大">
-                  +
-                </button>
-              </div>
-            </div>
+          <div class="settings-panes">
+            <div
+              class="settings-pane"
+              id="settings-pane-appearance"
+              role="tabpanel"
+              aria-labelledby="settings-tab-appearance"
+              hidden={section() !== 'appearance'}
+            >
+              <section class="settings-group">
+                <h3 class="settings-group-title">外观</h3>
 
-            <label class="settings-row">
-              <span class="settings-label">正文字体</span>
-              <select
-                value={settings.fontKey()}
-                onChange={(e) => settings.setFontVariant(e.currentTarget.value as FontVariantId)}
-                title="正文与 UI 字体"
-              >
-                {Object.values(FONT_VARIANTS).map((v) => (
-                  <option value={v.id}>{v.label}</option>
-                ))}
-              </select>
-            </label>
-
-            <label class="settings-row">
-              <span class="settings-label">代码字体</span>
-              <select
-                value={settings.codeFontKey()}
-                onChange={(e) => settings.setCodeFont(e.currentTarget.value as CodeFontId)}
-                title="代码区字体（代码块 / 表格）"
-              >
-                {Object.values(CODE_FONTS).map((v) => (
-                  <option value={v.id}>{v.label}</option>
-                ))}
-              </select>
-            </label>
-          </section>
-
-          <section class="settings-group">
-            <h3 class="settings-group-title">阿里云 OSS</h3>
-            <p class="settings-group-hint">
-              四格加上钥匙串里的密钥都配好，粘贴的图片就传到 bucket、正文写公网地址； 缺任何一项就存到文档旁边的
-              `assets/`。
-            </p>
-
-            {OSS_FIELDS.map((field) => (
-              <div class="settings-field">
                 <label class="settings-row">
-                  <span class="settings-label">{field.label}</span>
+                  <span class="settings-label">主题</span>
+                  <select
+                    value={settings.theme()}
+                    onChange={(e) => settings.setTheme(e.currentTarget.value as ThemeId)}
+                    title="亮色 / 暗色 / 跟随系统"
+                  >
+                    {THEME_IDS.map((id) => (
+                      <option value={id}>{THEME_LABELS[id]}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <label class="settings-row">
+                  <span class="settings-label">字号</span>
+                  <select
+                    onChange={(e) => settings.setFontSize(Number(e.currentTarget.value))}
+                    title="字号（也可用 Cmd/Ctrl + = / - / 0）"
+                  >
+                    {fontSizeChoices(settings.fontSize()).map((s) => (
+                      <option value={String(s)} selected={s === settings.fontSize()}>
+                        {s}px
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <div class="settings-row">
+                  <span class="settings-label">行高</span>
+                  <div class="settings-stepper">
+                    <button onClick={() => settings.stepLineHeight(-1)} aria-label="行高减小" title="行高减小">
+                      −
+                    </button>
+                    <span class="settings-value" aria-live="polite">
+                      {settings.lineHeight()}
+                    </span>
+                    <button onClick={() => settings.stepLineHeight(1)} aria-label="行高增大" title="行高增大">
+                      +
+                    </button>
+                  </div>
+                </div>
+
+                <div class="settings-row">
+                  <span class="settings-label">字间距</span>
+                  <div class="settings-stepper">
+                    <button onClick={() => settings.stepLetterSpacing(-1)} aria-label="字间距减小" title="字间距减小">
+                      −
+                    </button>
+                    <span class="settings-value" aria-live="polite">
+                      {letterSpacingLabel()}
+                    </span>
+                    <button onClick={() => settings.stepLetterSpacing(1)} aria-label="字间距增大" title="字间距增大">
+                      +
+                    </button>
+                  </div>
+                </div>
+
+                <label class="settings-row">
+                  <span class="settings-label">正文字体</span>
+                  <select
+                    value={settings.fontKey()}
+                    onChange={(e) => settings.setFontVariant(e.currentTarget.value as FontVariantId)}
+                    title="正文与 UI 字体"
+                  >
+                    {Object.values(FONT_VARIANTS).map((v) => (
+                      <option value={v.id}>{v.label}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <label class="settings-row">
+                  <span class="settings-label">代码字体</span>
+                  <select
+                    value={settings.codeFontKey()}
+                    onChange={(e) => settings.setCodeFont(e.currentTarget.value as CodeFontId)}
+                    title="代码区字体（代码块 / 表格）"
+                  >
+                    {Object.values(CODE_FONTS).map((v) => (
+                      <option value={v.id}>{v.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </section>
+            </div>
+
+            <div
+              class="settings-pane"
+              id="settings-pane-oss"
+              role="tabpanel"
+              aria-labelledby="settings-tab-oss"
+              hidden={section() !== 'oss'}
+            >
+              <section class="settings-group">
+                <h3 class="settings-group-title">阿里云 OSS</h3>
+                <p class="settings-group-hint">
+                  四格加上钥匙串里的密钥都配好，粘贴的图片就传到 bucket、正文写公网地址； 缺任何一项就存到文档旁边的
+                  `assets/`。
+                </p>
+
+                {OSS_FIELDS.map((field) => (
+                  <div class="settings-field">
+                    <label class="settings-row">
+                      <span class="settings-label">{field.label}</span>
+                      <input
+                        class="settings-input"
+                        type="text"
+                        spellcheck={false}
+                        placeholder={field.placeholder}
+                        value={draft()[field.key]}
+                        onInput={(e) => {
+                          setDraft((d) => ({ ...d, [field.key]: e.currentTarget.value }))
+                          // 一边改一边把上一句失败清掉：留着它，用户会以为改完还是不行
+                          if (uploadMsg() !== null) setUploadMsg(null)
+                        }}
+                        onBlur={(e) => commitOss(field.key, e.currentTarget.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault()
+                            commitOss(field.key, e.currentTarget.value)
+                          }
+                        }}
+                      />
+                    </label>
+                    <Show when={field.hint}>
+                      <p class="settings-hint">{field.hint}</p>
+                    </Show>
+                  </div>
+                ))}
+
+                <div class="settings-field">
+                  <SecretRow
+                    label="AccessKey Secret"
+                    placeholder="填完按回车，或点旁边的「保存密钥」"
+                    saveLabel="保存密钥"
+                    configured={secretConfigured()}
+                    busy={secretBusy()}
+                    draft={secretDraft()}
+                    msg={secretMsg()}
+                    failed={secretFailed()}
+                    onDraft={setSecretDraft}
+                    onSave={() => void saveSecret()}
+                    onClear={() => void clearSecret()}
+                  />
+                </div>
+
+                <div class="settings-field">
+                  <button class="settings-action" onClick={() => void runTestUpload()} disabled={uploading()}>
+                    {uploading() ? '正在上传…' : '测试上传'}
+                  </button>
+                  <Show when={uploadMsg() !== null}>
+                    <p class={uploadFailed() ? 'settings-result settings-result-bad' : 'settings-result'} role="status">
+                      {uploadMsg()}
+                    </p>
+                  </Show>
+                </div>
+              </section>
+            </div>
+
+            <div
+              class="settings-pane"
+              id="settings-pane-weread"
+              role="tabpanel"
+              aria-labelledby="settings-tab-weread"
+              hidden={section() !== 'weread'}
+            >
+              <section class="settings-group">
+                <h3 class="settings-group-title">微信读书</h3>
+                <p class="settings-group-hint">
+                  同步这个账号下的全部划线与想法。每本书落两份：`…·划线素材.md` 每次同步整份重写， 同名的 `.md`
+                  只在你还没改过时写一份种子。
+                </p>
+
+                <div class="settings-field">
+                  <label class="settings-row">
+                    <span class="settings-label">本地目录</span>
+                    <input
+                      class="settings-input"
+                      type="text"
+                      spellcheck={false}
+                      placeholder="选一个目录，笔记就落在那里"
+                      value={wereadDirDraft()}
+                      onInput={(e) => setWereadDirDraft(e.currentTarget.value)}
+                      onBlur={(e) => commitWereadDir(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          commitWereadDir(e.currentTarget.value)
+                        }
+                      }}
+                    />
+                  </label>
+                  <div class="settings-inline">
+                    <button
+                      class="settings-action"
+                      onClick={() => void chooseDir(setWereadDirDraft, commitWereadDir)}
+                      title="选择同步目录"
+                    >
+                      选择…
+                    </button>
+                  </div>
+                </div>
+
+                <div class="settings-field">
+                  <SecretRow
+                    label="API key"
+                    placeholder="填完按回车，或点旁边的「保存密钥」"
+                    saveLabel="保存密钥"
+                    configured={wereadKeyConfigured()}
+                    busy={wereadKeyBusy()}
+                    draft={wereadKeyDraft()}
+                    msg={wereadKeyMsg()}
+                    failed={wereadKeyFailed()}
+                    onDraft={setWereadKeyDraft}
+                    onSave={() => void saveWereadKey()}
+                    onClear={() => void clearWereadKey()}
+                  />
+                </div>
+              </section>
+            </div>
+
+            <div
+              class="settings-pane"
+              id="settings-pane-sync"
+              role="tabpanel"
+              aria-labelledby="settings-tab-sync"
+              hidden={section() !== 'sync'}
+            >
+              <section class="settings-group">
+                <h3 class="settings-group-title">文件同步</h3>
+                <p class="settings-group-hint">
+                  只往上面这个仓库里写，不会建仓库、不推分支、也不删远端文件。token 建议用只授权这一个仓库的
+                  fine-grained PAT。`…·划线素材.md` 是机器生成的，不进仓库。
+                </p>
+
+                <div class="settings-field">
+                  <label class="settings-row">
+                    <span class="settings-label">本地目录</span>
+                    <input
+                      class="settings-input"
+                      type="text"
+                      spellcheck={false}
+                      placeholder="要同步进仓库的那个目录"
+                      value={syncDirDraft()}
+                      onInput={(e) => setSyncDirDraft(e.currentTarget.value)}
+                      onBlur={(e) => commitSyncDir(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          commitSyncDir(e.currentTarget.value)
+                        }
+                      }}
+                    />
+                  </label>
+                  <div class="settings-inline">
+                    <button
+                      class="settings-action"
+                      onClick={() => void chooseDir(setSyncDirDraft, commitSyncDir)}
+                      title="选择同步目录"
+                    >
+                      选择…
+                    </button>
+                  </div>
+                </div>
+
+                <label class="settings-row">
+                  <span class="settings-label">仓库地址</span>
                   <input
                     class="settings-input"
                     type="text"
                     spellcheck={false}
-                    placeholder={field.placeholder}
-                    value={draft()[field.key]}
-                    onInput={(e) => {
-                      setDraft((d) => ({ ...d, [field.key]: e.currentTarget.value }))
-                      // 一边改一边把上一句失败清掉：留着它，用户会以为改完还是不行
-                      if (uploadMsg() !== null) setUploadMsg(null)
-                    }}
-                    onBlur={(e) => commitOss(field.key, e.currentTarget.value)}
+                    placeholder="owner/repo 或 https://github.com/owner/repo"
+                    value={githubRepoDraft()}
+                    onInput={(e) => setGithubRepoDraft(e.currentTarget.value)}
+                    onBlur={(e) => commitGithubRepo(e.currentTarget.value)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault()
-                        commitOss(field.key, e.currentTarget.value)
+                        commitGithubRepo(e.currentTarget.value)
                       }
                     }}
                   />
                 </label>
-                <Show when={field.hint}>
-                  <p class="settings-hint">{field.hint}</p>
-                </Show>
-              </div>
-            ))}
 
-            <div class="settings-field">
-              <SecretRow
-                label="AccessKey Secret"
-                placeholder="填完按回车，或点旁边的「保存密钥」"
-                saveLabel="保存密钥"
-                configured={secretConfigured()}
-                busy={secretBusy()}
-                draft={secretDraft()}
-                msg={secretMsg()}
-                failed={secretFailed()}
-                onDraft={setSecretDraft}
-                onSave={() => void saveSecret()}
-                onClear={() => void clearSecret()}
-              />
+                <div class="settings-field">
+                  <SecretRow
+                    label="GitHub token"
+                    placeholder="填完按回车，或点旁边的「保存 token」"
+                    saveLabel="保存 token"
+                    configured={githubTokenConfigured()}
+                    busy={githubTokenBusy()}
+                    draft={githubTokenDraft()}
+                    msg={githubTokenMsg()}
+                    failed={githubTokenFailed()}
+                    onDraft={setGithubTokenDraft}
+                    onSave={() => void saveGithubToken()}
+                    onClear={() => void clearGithubToken()}
+                  />
+                </div>
+              </section>
             </div>
-
-            <div class="settings-field">
-              <button class="settings-action" onClick={() => void runTestUpload()} disabled={uploading()}>
-                {uploading() ? '正在上传…' : '测试上传'}
-              </button>
-              <Show when={uploadMsg() !== null}>
-                <p class={uploadFailed() ? 'settings-result settings-result-bad' : 'settings-result'} role="status">
-                  {uploadMsg()}
-                </p>
-              </Show>
-            </div>
-          </section>
-
-          <section class="settings-group">
-            <h3 class="settings-group-title">微信读书</h3>
-            <p class="settings-group-hint">
-              同步这个账号下的全部划线与想法。每本书落两份：`…·划线素材.md` 每次同步整份重写， 同名的 `.md`
-              只在你还没改过时写一份种子。
-            </p>
-
-            <div class="settings-field">
-              <label class="settings-row">
-                <span class="settings-label">本地目录</span>
-                <input
-                  class="settings-input"
-                  type="text"
-                  spellcheck={false}
-                  placeholder="选一个目录，笔记就落在那里"
-                  value={wereadDirDraft()}
-                  onInput={(e) => setWereadDirDraft(e.currentTarget.value)}
-                  onBlur={(e) => commitWereadDir(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      commitWereadDir(e.currentTarget.value)
-                    }
-                  }}
-                />
-              </label>
-              <div class="settings-inline">
-                <button
-                  class="settings-action"
-                  onClick={() => void chooseDir(setWereadDirDraft, commitWereadDir)}
-                  title="选择同步目录"
-                >
-                  选择…
-                </button>
-              </div>
-            </div>
-
-            <div class="settings-field">
-              <SecretRow
-                label="API key"
-                placeholder="填完按回车，或点旁边的「保存密钥」"
-                saveLabel="保存密钥"
-                configured={wereadKeyConfigured()}
-                busy={wereadKeyBusy()}
-                draft={wereadKeyDraft()}
-                msg={wereadKeyMsg()}
-                failed={wereadKeyFailed()}
-                onDraft={setWereadKeyDraft}
-                onSave={() => void saveWereadKey()}
-                onClear={() => void clearWereadKey()}
-              />
-            </div>
-          </section>
-
-          <section class="settings-group">
-            <h3 class="settings-group-title">文件同步</h3>
-            <p class="settings-group-hint">
-              只往上面这个仓库里写，不会建仓库、不推分支、也不删远端文件。token 建议用只授权这一个仓库的 fine-grained
-              PAT。`…·划线素材.md` 是机器生成的，不进仓库。
-            </p>
-
-            <div class="settings-field">
-              <label class="settings-row">
-                <span class="settings-label">本地目录</span>
-                <input
-                  class="settings-input"
-                  type="text"
-                  spellcheck={false}
-                  placeholder="要同步进仓库的那个目录"
-                  value={syncDirDraft()}
-                  onInput={(e) => setSyncDirDraft(e.currentTarget.value)}
-                  onBlur={(e) => commitSyncDir(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      commitSyncDir(e.currentTarget.value)
-                    }
-                  }}
-                />
-              </label>
-              <div class="settings-inline">
-                <button
-                  class="settings-action"
-                  onClick={() => void chooseDir(setSyncDirDraft, commitSyncDir)}
-                  title="选择同步目录"
-                >
-                  选择…
-                </button>
-              </div>
-            </div>
-
-            <label class="settings-row">
-              <span class="settings-label">仓库地址</span>
-              <input
-                class="settings-input"
-                type="text"
-                spellcheck={false}
-                placeholder="owner/repo 或 https://github.com/owner/repo"
-                value={githubRepoDraft()}
-                onInput={(e) => setGithubRepoDraft(e.currentTarget.value)}
-                onBlur={(e) => commitGithubRepo(e.currentTarget.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    commitGithubRepo(e.currentTarget.value)
-                  }
-                }}
-              />
-            </label>
-
-            <div class="settings-field">
-              <SecretRow
-                label="GitHub token"
-                placeholder="填完按回车，或点旁边的「保存 token」"
-                saveLabel="保存 token"
-                configured={githubTokenConfigured()}
-                busy={githubTokenBusy()}
-                draft={githubTokenDraft()}
-                msg={githubTokenMsg()}
-                failed={githubTokenFailed()}
-                onDraft={setGithubTokenDraft}
-                onSave={() => void saveGithubToken()}
-                onClear={() => void clearGithubToken()}
-              />
-            </div>
-          </section>
+          </div>
         </div>
 
         <div class="settings-footer">
-          <button class="settings-reset" onClick={resetAll} title="外观那六项回到内置默认（不动 OSS 配置）">
-            恢复默认
-          </button>
+          <Show when={section() === 'appearance'}>
+            <button class="settings-reset" onClick={resetAll} title="外观那六项回到内置默认（不动 OSS 配置）">
+              恢复默认
+            </button>
+          </Show>
           {props.onOpenKeybindings && (
             <button class="settings-keybindings-btn" onClick={props.onOpenKeybindings} title="配置快捷键">
               快捷键配置
