@@ -285,11 +285,6 @@ function routeMenuEvent(
   else if (id === 'window.focus_next') actions.focusNextPane()
   else if (id === 'window.focus_prev') actions.focusPrevPane()
   else if (id === 'window.close_pane') actions.closePane()
-  // Help
-  else if (id === 'help.about') {
-    // TODO: 打开关于对话框
-    console.log('About Vela')
-  }
 }
 
 export default function App() {
@@ -2176,7 +2171,6 @@ export default function App() {
         <Suspense>
           <SettingsDialog
             settings={settings}
-            visible={settingsDialogVisible()}
             onClose={() => setSettingsDialogVisible(false)}
             onOpenKeybindings={() => {
               setSettingsDialogVisible(false)
@@ -2189,7 +2183,6 @@ export default function App() {
       {/* 快捷键配置对话框（M4-E）*/}
       <Show when={keybindingsDialogVisible()}>
         <KeybindingsDialog
-          visible={keybindingsDialogVisible()}
           onClose={() => setKeybindingsDialogVisible(false)}
           commands={commandList()}
           platform={registry.platform}

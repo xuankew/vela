@@ -1,5 +1,5 @@
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu},
     AppHandle, Runtime,
 };
 
@@ -105,7 +105,18 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         app,
         "帮助",
         true,
-        &[&MenuItem::with_id(app, "help.about", "关于 Vela", true, Option::<&str>::None)?],
+        // 用系统自带的「关于」面板（名称、版本、图标都取自应用配置），不往前端转发：
+        // 前端没有对应对话框，自绘一个也会吃掉首屏预算
+        &[&PredefinedMenuItem::about(
+            app,
+            Some("关于 Vela"),
+            Some(AboutMetadata {
+                name: Some("Vela".to_owned()),
+                version: Some(app.package_info().version.to_string()),
+                comments: Some("Vela - lightweight editor for developers".to_owned()),
+                ..Default::default()
+            }),
+        )?],
     )?;
 
     Menu::with_items(app, &[&file_menu, &edit_menu, &view_menu, &window_menu, &help_menu])
