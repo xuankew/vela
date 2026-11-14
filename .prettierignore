@@ -1,5 +1,7 @@
 # 生成物：格式化了下次生成又会被覆盖回去，只会制造无意义的 diff
 pnpm-lock.yaml
+# 本地 pnpm 缓存：不进仓库，但会躺在工作区里被 `prettier .` 扫到
+.pnpm-store/
 dist/
 target/
 src-tauri/target/

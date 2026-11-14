@@ -1,4 +1,5 @@
 node_modules/
+.pnpm-store/
 dist/
 /target/
 src-tauri/target/
