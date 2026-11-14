@@ -83,7 +83,7 @@ export function JsonPreview(props: JsonPreviewProps) {
     <div class="json-preview-panel">
       <div class="json-preview-header">
         <span class="json-preview-title">JSON 预览</span>
-        <button class="json-preview-close" onClick={props.onClose} title="关闭预览">
+        <button class="json-preview-close" onClick={() => props.onClose()} title="关闭预览">
           ✕
         </button>
       </div>

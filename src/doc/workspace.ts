@@ -1466,6 +1466,8 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   // 起始的那一个空标签与那一块分屏。放在所有函数声明之后：
   // makeTab 要用 host，host 要用 activeTab，activeTab 要用 focusedPane
+  // 同下面 `syncMetrics` 的理由：这是初始化时的一次性调用，不该进 tracked scope
+  // eslint-disable-next-line solid/reactivity
   const firstTab = makeTab()
   const firstPane = makePane([firstTab])
   setPanes([firstPane])

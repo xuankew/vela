@@ -1,9 +1,8 @@
-import { createSignal, For, onCleanup, Show } from 'solid-js'
+import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { formatKeybinding, keyFromEvent, type Modifier, type Platform } from '../commands/keybinding'
 import type { CommandInfo } from '../commands/registry'
 
 export interface KeybindingsDialogProps {
-  visible: boolean
   onClose: () => void
   /** 所有可配置命令列表 */
   commands: CommandInfo[]
@@ -36,7 +35,6 @@ export function KeybindingsDialog(props: KeybindingsDialogProps) {
   }
 
   function setupOutsideClick() {
-    if (!props.visible) return
     const onDocDown = (e: PointerEvent): void => {
       const target = e.target as Node | null
       if (dialogEl && target && !dialogEl.contains(target)) close()
@@ -108,9 +106,8 @@ export function KeybindingsDialog(props: KeybindingsDialogProps) {
     setTempKey('')
   }
 
-  if (props.visible) {
-    setupOutsideClick()
-  }
+  // 显隐由调用方的 `<Show>` 决定：组件存在就是可见
+  onMount(setupOutsideClick)
 
   return (
     <div class="modal-backdrop" role="presentation">

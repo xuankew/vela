@@ -85,7 +85,7 @@ function wireInvoke(options: { configured?: boolean; upload?: string; secret?: S
 function mount(): void {
   container = document.createElement('div')
   document.body.appendChild(container)
-  dispose = render(() => <SettingsDialog settings={store} visible onClose={() => closeCalls.push(1)} />, container)
+  dispose = render(() => <SettingsDialog settings={store} onClose={() => closeCalls.push(1)} />, container)
 }
 
 const dialog = (): HTMLElement => container.querySelector<HTMLElement>('.settings-dialog')!

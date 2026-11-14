@@ -245,7 +245,12 @@ export function MarkdownToolbar(props: MarkdownToolbarProps) {
   return (
     <div class="md-toolbar" role="toolbar" aria-label="Markdown 工具栏">
       <div class="md-toolbar-toggle">
-        <button class="md-toolbar-toggle-btn" onClick={props.onToggle} title="隐藏工具栏" aria-label="隐藏工具栏">
+        <button
+          class="md-toolbar-toggle-btn"
+          onClick={() => props.onToggle()}
+          title="隐藏工具栏"
+          aria-label="隐藏工具栏"
+        >
           ✕
         </button>
       </div>

@@ -25,7 +25,6 @@ import { DEFAULT_THEME, THEME_IDS, THEME_LABELS, type ThemeId } from './theme'
 export interface SettingsDialogProps {
   /** App 建一次、从不换引用的那份配置状态 */
   settings: SettingsStore
-  visible: boolean
   onClose: () => void
   /** 打开快捷键配置对话框（M4-E） */
   onOpenKeybindings?: () => void
@@ -189,6 +188,8 @@ function SecretRow(props: SecretRowProps) {
  * 「改成同一个值不重复写」钉的就是这一条）。
  */
 export function SettingsDialog(props: SettingsDialogProps) {
+  // `settings` 是 App 建一次、从不换引用的 store（见 props 上的说明），读一次即可
+  // eslint-disable-next-line solid/reactivity
   const settings = props.settings
   let dialogEl: HTMLDivElement | undefined
 
@@ -238,7 +239,6 @@ export function SettingsDialog(props: SettingsDialogProps) {
    * 用 `dialogEl.contains` 判断，对话框自己里的点击不算「外面」。
    */
   function setupOutsideClick() {
-    if (!props.visible) return
     const onDocDown = (e: PointerEvent): void => {
       const target = e.target as Node | null
       if (dialogEl && target && !dialogEl.contains(target)) close()
@@ -495,12 +495,9 @@ export function SettingsDialog(props: SettingsDialogProps) {
     }
   }
 
-  // 只在可见时挂上外部点击监听
-  if (props.visible) {
-    setupOutsideClick()
-  }
-
+  // 显隐由调用方的 `<Show>` 决定：组件存在就是可见，所以挂载时无条件挂上外部点击监听
   onMount(() => {
+    setupOutsideClick()
     void refreshSecret()
     void refreshWereadKey()
     void refreshGithubToken()

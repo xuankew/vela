@@ -29,7 +29,6 @@ function mount(): void {
   setKeybinding = vi.fn((_id: string, _kb: string) => true)
   resetKeybinding = vi.fn((_id: string) => {})
   const props: KeybindingsDialogProps = {
-    visible: true,
     onClose: vi.fn(),
     commands: COMMANDS,
     platform: 'macos',
