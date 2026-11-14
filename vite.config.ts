@@ -20,7 +20,11 @@ export default defineConfig({
     // vite 8 起 esbuild 不再是内置依赖，minify:'esbuild' 会抛 ERR_MODULE_NOT_FOUND。
     // 用 rolldown 自带的 oxc minifier，无需额外安装。
     minify: 'oxc',
-    sourcemap: true,
+    // 默认不产出 sourcemap：Tauri 会把 `frontendDist` 里的文件整个嵌进二进制，
+    // 138 个 .map 共 6.9MB（压缩后约 2MB），白白进了安装包。
+    // 做首屏体积归因（PLAN.md M4-I：按 `sources` × `sourcesContent` 拆账）时再开：
+    //   VELA_SOURCEMAP=1 pnpm build
+    sourcemap: process.env.VELA_SOURCEMAP === '1',
     reportCompressedSize: true,
     // woff2 一律不内联。
     //
